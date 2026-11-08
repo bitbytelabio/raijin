@@ -1,0 +1,41 @@
+# This is just for making sure the engine works during development
+# Run it from the Raijin Turbo script dialog against any target you control.
+def queueRequests(target, wordlists):
+    engine = RequestEngine(endpoint='https://hackxor.net:443',
+                           engine=Engine.THREADED,
+                           concurrentConnections=1,
+                           requestsPerConnection=10,
+                           pipeline=False
+                           )
+
+    noPayload = '''GET /static/404 HTTP/1.1
+Host: hackxor.net
+Connection: close
+
+'''
+    engine.queue(noPayload)
+
+    onePayload = '''GET /static/404?q=%s HTTP/1.1
+Host: hackxor.net
+Connection: close
+
+'''
+    engine.queue(onePayload, 'one payload')
+
+    twoPayloads = '''GET /static/404?q=%s HTTP/1.1
+Host: hackxor.net
+Connection: close
+
+'''
+
+    engine.queue(twoPayloads, ['first payload', 'second payload'])
+
+
+
+def handleResponse(req, interesting):
+    table.add(req)
+
+
+def completed(requests):
+    for req in requests:
+        print(req.code)

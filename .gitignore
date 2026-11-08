@@ -1,0 +1,35 @@
+# Build
+build/
+.gradle/
+.kotlin/
+out/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Package files (dependencies come from Maven; nothing vendored)
+*.jar
+*.war
+*.zip
+*.tar.gz
+# ...except the Gradle wrapper, required for ./gradlew after a fresh clone
+!gradle/wrapper/gradle-wrapper.jar
+
+# JVM crash logs
+hs_err_pid*
+replay_pid*
+*.log
+
+# Python
+__pycache__/
+*.class
+
+# Local
+*.local
+*.burp

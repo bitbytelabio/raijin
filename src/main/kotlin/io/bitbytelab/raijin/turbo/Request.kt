@@ -1,0 +1,237 @@
+package io.bitbytelab.raijin.turbo
+import burp.api.montoya.core.ByteArray as MontoyaBytes
+import burp.api.montoya.http.HttpService
+import burp.api.montoya.http.message.HttpRequestResponse
+import burp.api.montoya.http.message.requests.HttpRequest
+import burp.api.montoya.http.message.responses.HttpResponse
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.lang.Exception
+import java.net.URL
+import java.util.*
+import kotlin.collections.HashMap
+
+/**
+ * Returns the effective port for a URL, using the default port for the protocol
+ * if no explicit port is specified. This handles the case where URL.getPort()
+ * returns -1 for URLs like "https://example.com" without explicit port.
+ */
+fun getEffectivePort(url: URL): Int {
+    return if (url.port == -1) url.defaultPort else url.port
+}
+
+open class Request(val template: String, val words: List<String?>, val learnBoring: Int, var label: String = "") {
+
+    var response: String? = null
+    var interesting: Boolean = false
+    var targetUrl: URL? = null
+    var engine: Any? = null
+    var connectionId: String? = null   // connection identifier (user-specified or auto-assigned)
+    var gateMode: String? = null       // which gate released this request, for gated HTTP/3 requests
+    var callback: ((Request, Boolean) -> Boolean)? = null
+    var gate: Floodgate? = null
+    var order: Int = 0
+    var time: Long = 0L
+    var ttfb: Long = 0L
+    var ttlb: Long = 0L
+    var sent: Long = 0L
+    var arrival: Long = 0
+    var id = -1
+    var pauseBefore: Int = 0
+    var pauseTime: Int = 1000
+    var pauseMarkers: List<String> = emptyList()
+    var delayCompletion: Long = 0L
+    var endpointOverride: String? = null
+    var montoyaReq: HttpRequestResponse? = null
+    var autoFixContentLength: Boolean = true
+    var kettled: Boolean = false
+    var anomalyRank: Int? = null
+
+    private val attributes: HashMap<String, Any> = HashMap()
+
+    val code: Int get() = getAttribute("code") as Int
+    val status: Int get() = code
+    val length: Int get() = getAttribute("length") as Int
+    val wordcount: Int get() = getAttribute("wordcount") as Int
+
+    fun invokeCallback(isinteresting: Boolean) {
+        if (callback != null) {
+            callback!!.invoke(this, isinteresting)
+        }
+        else {
+            throw IllegalStateException("Request has no callback set")
+        }
+    }
+
+    fun getAttribute(name: String): Any? {
+        return attributes.getOrPut(name) {
+            when(name) {
+                "length" -> response?.length ?: 0
+                "wordcount" -> (response ?: "").split(Regex("[^a-zA-Z0-9]")).size
+                "code" -> calculateCode()
+                else -> "Unknown attribute"
+            }
+        }
+    }
+
+    fun materializeAttributes() {
+        getAttribute("code")
+        getAttribute("length")
+        getAttribute("wordcount")
+    }
+
+    fun stripResponseBody() {
+        materializeAttributes()
+        response = null
+        montoyaReq = null
+        engine = null
+        callback = null
+        gate = null
+    }
+
+    fun calculateCode(): Int {
+        if (response == null) {
+            return 0
+        }
+        try {
+            if(response!!.startsWith(":status")) {
+                return Integer.parseInt(response!!.split(" ", "\r", "\n", limit=3).get(1))
+            }
+
+            return Integer.parseInt(response?.split(" ", ignoreCase = false, limit = 3)?.get(1))
+        } catch (e: Exception) {
+            return 0
+        }
+    }
+
+    constructor(template: String): this(template, emptyList<String>(), 0, "")
+    constructor(template: String, words: List<String?>): this(template, words, 0, "")
+    constructor(template: String, words: List<String?>, learnBoring: Int): this(template, words, learnBoring, "")
+
+    /** Montoya service for [targetUrl]. */
+    fun getHttpService(): HttpService {
+        val url = targetUrl!!
+        return HttpService.httpService(url.host, getEffectivePort(url), url.protocol == "https")
+    }
+
+    fun getMontoyaRequest(): HttpRequestResponse? {
+        montoyaReq?.let {
+            return montoyaReq
+        }
+        val resp = response
+        if (resp == null || !(resp.startsWith("HTTP/") || resp.startsWith(":status"))) {
+            return null
+        }
+        return HttpRequestResponse.httpRequestResponse(
+            HttpRequest.httpRequest(getHttpService(), MontoyaBytes.byteArray(*getRequestAsBytes())),
+            HttpResponse.httpResponse(MontoyaBytes.byteArray(*Utils.stringToBytes(resp)))
+        )
+    }
+
+    fun getRequest(): String {
+        if (words.isEmpty()) {
+            return fixContentLength(template)
+        }
+
+        if (!template.contains("%s")) {
+            Utils.out("Bad base request - nowhere to inject payload")
+        }
+
+        var req = template
+
+        for (w in words){
+            req = req.replaceFirst("%s", w.toString(), false)
+        }
+
+        if (req.contains("%s")) {
+
+            Utils.out("Bad base request ${words.size} words and more %s")
+        }
+
+        return fixContentLength(req)
+    }
+
+    fun getRequestAsBytes(): ByteArray {
+        return fixContentLength(Utils.stringToBytes(getRequest()))
+    }
+
+    fun getResponseAsBytes(): ByteArray? {
+        val current = response ?: return "null".toByteArray()
+        return Utils.stringToBytes(current)
+    }
+
+    // todo fix performance
+    fun fixContentLength(request: String): String {
+        return String(fixContentLength(request.toByteArray(Charsets.ISO_8859_1)))
+    }
+
+    fun fixContentLength(request: ByteArray): ByteArray {
+        if (!autoFixContentLength) {
+            return request
+        }
+
+        if (Utils.getHeaders(String(request)).contains("Content-Length: ")) {
+            val start = Utils.getBodyStart(request)
+            val contentLength = request.size - start
+            try {
+                return setHeader(request, "Content-Length", Integer.toString(contentLength))
+            } catch (e: RuntimeException) {
+                return request
+            }
+
+        } else {
+            return request
+        }
+    }
+
+    fun setHeader(request: ByteArray, header: String, value: String): ByteArray {
+        val offsets = getHeaderOffsets(request, header)
+        val outputStream = ByteArrayOutputStream()
+        try {
+            outputStream.write(Arrays.copyOfRange(request, 0, offsets[1]))
+            outputStream.write(value.toByteArray(Charsets.ISO_8859_1))
+            outputStream.write(Arrays.copyOfRange(request, offsets[2], request.size))
+            return outputStream.toByteArray()
+        } catch (e: IOException) {
+            throw RuntimeException("Request creation unexpectedly failed")
+        } catch (e: NullPointerException) {
+            Utils.out("header locating fail: $header")
+            throw RuntimeException("Can't find the header")
+        }
+
+    }
+
+    fun getHeaderOffsets(request: ByteArray, header: String): IntArray {
+        var i = 0
+        val end = request.size
+        while (i < end) {
+            val line_start = i
+
+            // Make ' foo: bar' get interpreted as 'foo: bar'
+            if (request[i] == ' '.code.toByte()) {
+                i++
+            }
+
+            while (i < end && request[i++] != ' '.code.toByte()) {
+            }
+            val header_name = request.copyOfRange(line_start, i - 2)
+            val headerValueStart = i
+            while (i < end && request[i++] != '\n'.code.toByte()) {
+            }
+            if (i == end) {
+                break
+            }
+
+            val header_str = String(header_name) // todo check this actually works
+
+            if (header == header_str) {
+                return intArrayOf(line_start, headerValueStart, i - 2)
+            }
+
+            if (i + 2 < end && request[i] == '\r'.code.toByte() && request[i + 1] == '\n'.code.toByte()) {
+                break
+            }
+        }
+        throw RuntimeException("Couldn't find header: '$header'")
+    }
+}
