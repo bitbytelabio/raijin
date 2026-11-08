@@ -138,7 +138,7 @@ class RecordResize: ComponentAdapter() {
 
 }
 
-class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: IntArray, val fixedScript: String?, val requestOverride: ByteArray?, val reqs: MutableList<HttpRequestResponse>?): ActionListener, JDialog(findBurpFrame(), "Raijin Turbo - " + inputReq.httpService().host())  {
+class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: IntArray, val fixedScript: String?, val requestOverride: ByteArray?, val reqs: MutableList<HttpRequestResponse>?): ActionListener, JDialog(findBurpFrame(), "Raijin Turbo - " + inputReq.request().httpService().host())  {
 
     private companion object {
         // Owned by Burp's main frame so the editor window follows Burp's monitor and window
@@ -166,6 +166,7 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
 
     override fun actionPerformed(e: ActionEvent?) {
         SwingUtilities.invokeLater {
+          try {
             val pane = JSplitPane(JSplitPane.VERTICAL_SPLIT)
             pane.setDividerLocation(0.25)
             pane.addComponentListener(RecordResize())
@@ -275,7 +276,7 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
             val topPanel = JPanel(BorderLayout())
 
             // Host/Port/Protocol controls
-            val initialService = TurboService.fromMontoya(req.httpService())
+            val initialService = TurboService.fromMontoya(req.request().httpService())
             val hostField = JTextField(initialService.host, 16)
             val portField = JTextField(initialService.port.toString(), 5)
             val protocolCombo = JComboBox(arrayOf("http", "https"))
@@ -313,7 +314,7 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
             val api = Utils.montoyaApi!!
             val messageEditor = api.userInterface().createHttpRequestEditor()
             fun setMessage(bytes: ByteArray) {
-                messageEditor.request = HttpRequest.httpRequest(req.httpService(), MontoyaBytes.byteArray(*bytes))
+                messageEditor.request = HttpRequest.httpRequest(req.request().httpService(), MontoyaBytes.byteArray(*bytes))
             }
             fun currentMessage(): ByteArray = messageEditor.request.toByteArray().bytes
 
@@ -393,7 +394,7 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
                                     button.text = "Run"
                                     button.requestFocusInWindow()
                                     pane.rootPane.defaultButton = button
-                                    title = "Raijin Turbo - " + req.httpService().host()
+                                    title = "Raijin Turbo - " + req.request().httpService().host()
                                 }
                             }
                             else -> {
@@ -480,6 +481,10 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
                 button.requestFocus()
                 button.requestFocusInWindow()
             }
+          } catch (t: Throwable) {
+            Utils.out("Raijin Turbo: failed to open script dialog: " + errorToStacktrace(Exception(t)))
+            JOptionPane.showMessageDialog(null, "Could not open the Turbo script dialog: $t", "Raijin Turbo", JOptionPane.ERROR_MESSAGE)
+          }
         }
     }
 

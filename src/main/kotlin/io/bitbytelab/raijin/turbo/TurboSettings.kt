@@ -54,7 +54,7 @@ object TurboSettings {
     val learnWords get() = bool(LEARN_WORDS, false)
     val desyncAgent get() = bool(DESYNC_AGENT, false)
     val allowMcpRuns get() = bool(ALLOW_MCP_RUNS, false)
-    val fontSize get() = int(FONT_SIZE, 14)
+    val fontSize get() = int(FONT_SIZE, 14).let { if (it > 0) it else 14 }
     val lineNumbers get() = bool(LINE_NUMBERS, true)
     val showEol get() = bool(SHOW_EOL, false)
     val visibleWhitespace get() = bool(VISIBLE_WHITESPACE, false)
