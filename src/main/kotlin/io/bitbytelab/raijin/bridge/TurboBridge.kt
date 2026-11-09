@@ -22,15 +22,7 @@ class TurboBridge(val manager: RunManager = TurboModule.runManager) {
     val tools = McpToolHandlers(manager, organizer, BurpCollaboratorProvider())
     val resources = McpResourceHandlers(manager, organizer) { TurboSettings.desyncAgent }
 
-    /** Starting a run executes Python inside Burp's JVM, so it is opt-in. */
-    fun runsAllowed(): Boolean = TurboSettings.allowMcpRuns
-
     companion object {
-        const val RUNS_DISABLED_MESSAGE =
-            "Script runs from MCP clients are disabled. A run executes Python inside Burp's JVM, so it is " +
-                "off by default. The user can enable it in Burp > Settings > Extensions > Raijin Turbo > " +
-                "\"Allow MCP clients to run Turbo scripts\"."
-
         /** Converts the handler result maps (String/Number/Boolean/List/Map/null) to JSON. */
         fun toJson(value: Any?): JsonElement = when (value) {
             null -> JsonNull

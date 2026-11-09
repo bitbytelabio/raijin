@@ -45,11 +45,4 @@ class TurboBridgeTest {
         assertIs<JsonObject>(parsed)
         assertIs<JsonArray>(parsed.jsonObject["a"])
     }
-
-    @Test fun `running scripts from MCP is off by default`() {
-        // Outside Burp no settings panel is registered, so every setting reports its default.
-        assertFalse(TurboSettings.allowMcpRuns)
-        assertFalse(TurboBridge().runsAllowed())
-        assertTrue(TurboBridge.RUNS_DISABLED_MESSAGE.contains("Allow MCP clients to run Turbo scripts"))
-    }
 }

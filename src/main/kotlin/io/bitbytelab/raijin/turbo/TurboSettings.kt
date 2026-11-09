@@ -12,9 +12,8 @@ import burp.api.montoya.ui.settings.SettingsPanelWithData
  * Before [register] runs (unit tests, standalone use) every getter returns its default.
  */
 object TurboSettings {
-    const val LEARN_WORDS = "Learn observed words"
-    const val DESYNC_AGENT = "Desync agent mode"
-    const val ALLOW_MCP_RUNS = "Allow MCP clients to run Turbo scripts"
+    const val LEARN_WORDS = "Learn observed words (record words seen in proxied traffic for wordlists)"
+    const val DESYNC_AGENT = "Desync agent mode (relax request validation for desync research via MCP)"
     const val FONT_SIZE = "Script editor font size"
     const val LINE_NUMBERS = "Show line numbers"
     const val SHOW_EOL = "Show end-of-line markers"
@@ -29,14 +28,9 @@ object TurboSettings {
             .withDescription("Raijin's Turbo scripting engine")
             .withKeywords("raijin", "turbo", "script", "race", "mcp")
             .withSettings(
-                booleanSetting(LEARN_WORDS, "Record words seen in proxied traffic for use as wordlists", false),
-                booleanSetting(DESYNC_AGENT, "Relax request validation for desync research via MCP", false),
-                booleanSetting(
-                    ALLOW_MCP_RUNS,
-                    "Lets connected MCP clients execute Python scripts inside Burp's JVM (turbo_start_run). Leave off unless you trust every MCP client.",
-                    false,
-                ),
-                integerSetting(FONT_SIZE, "Font size of the Turbo script editor", 14),
+                booleanSetting(LEARN_WORDS, false),
+                booleanSetting(DESYNC_AGENT, false),
+                integerSetting(FONT_SIZE, 14),
                 booleanSetting(LINE_NUMBERS, true),
                 booleanSetting(SHOW_EOL, false),
                 booleanSetting(VISIBLE_WHITESPACE, false),
@@ -53,7 +47,6 @@ object TurboSettings {
 
     val learnWords get() = bool(LEARN_WORDS, false)
     val desyncAgent get() = bool(DESYNC_AGENT, false)
-    val allowMcpRuns get() = bool(ALLOW_MCP_RUNS, false)
     val fontSize get() = int(FONT_SIZE, 14).let { if (it > 0) it else 14 }
     val lineNumbers get() = bool(LINE_NUMBERS, true)
     val showEol get() = bool(SHOW_EOL, false)

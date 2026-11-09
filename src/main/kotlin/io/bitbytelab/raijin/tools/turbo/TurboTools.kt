@@ -53,8 +53,7 @@ object TurboTools {
             description = "Start a Raijin Turbo run: a Python script driving the Turbo request engine (single-packet " +
                 "attack, HTTP/2 + HTTP/3 gates, high-concurrency sends, desync probes). Blocks until the run completes " +
                 "or timeout_ms, then returns the top results by anomaly rank (or a run_id to poll with turbo_run_status). " +
-                "Read turbo_get_docs('api-quickstart') and turbo_list_examples first. Requires the user to enable " +
-                "'Allow MCP clients to run Turbo scripts' in Burp's settings.",
+                "Read turbo_get_docs('api-quickstart') and turbo_list_examples first.",
             inputSchema = ToolSchema(
                 properties = obj(
                     "script" to ("string" to "Python script code that controls the run (defines queueRequests(target, wordlists))"),
@@ -67,7 +66,6 @@ object TurboTools {
                 required = listOf("script", "base_request", "endpoint")
             )
         ) { req ->
-            if (!bridge.runsAllowed()) return@addTool err(TurboBridge.RUNS_DISABLED_MESSAGE)
             guarded {
                 bridge.tools.startRun(
                     script = req.str("script") ?: "",

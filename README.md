@@ -56,8 +56,7 @@ Turbo drives a Python (Jython) script over its own request engine.
 - **From an agent:** `turbo_start_run`, then `turbo_run_status`, `turbo_run_results`, `turbo_run_result`, `turbo_stop_run`, `turbo_search_responses`, `turbo_save_to_organizer`. Read `turbo_get_docs` and `turbo_list_examples` first.
 - **Runs** from the dialog and from agents are listed together on the **Turbo** sub-tab.
 
-Because a run executes Python inside Burp's JVM, agents cannot start one until you enable
-**Burp → Settings → Raijin Turbo → "Allow MCP clients to run Turbo scripts"** (off by default).
+A run executes Python inside Burp's JVM, so only connect MCP clients you trust.
 
 Prefer the `http_*` tools for ordinary requests; use Turbo when you need volume or timing precision.
 
