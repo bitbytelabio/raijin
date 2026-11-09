@@ -65,6 +65,8 @@ jobs:
             $0 ~ "^## " { if (found) exit; if ($2 == v) { found = 1; next } }
             found { print }
           ' CHANGELOG.md > notes.md
+          # Relative links (docs/...) do not resolve on the release page: point them at the tag.
+          sed -i -E "s#\]\(([^)#:]+)\)#](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/\1)#g" notes.md
           if [ ! -s notes.md ]; then
             echo "::warning::No '## $VERSION' section in CHANGELOG.md; using generated notes only"
           fi
