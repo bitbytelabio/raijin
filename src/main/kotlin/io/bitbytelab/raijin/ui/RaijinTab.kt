@@ -80,6 +80,7 @@ class RaijinTab(
     private val activityById = ConcurrentHashMap<Long, McpActivityEntry>()
     private var activityFilter = "all"
     private var activitySearch = ""
+    private val activityPrettyJson = Json { prettyPrint = true; prettyPrintIndent = "  " }
 
     init {
         tabbedPane.font = tabbedPane.font.deriveFont(12f)
@@ -89,6 +90,7 @@ class RaijinTab(
         tabbedPane.addTab("Findings", buildFindingsTab())
         tabbedPane.addTab("Collaborator", buildCollaboratorTab())
         tabbedPane.addTab("Rules", buildRulesTab())
+        tabbedPane.addTab("JWT", JwtPanel(bridges.jwt))
         tabbedPane.addTab("Turbo", TurboRunsPanel())
         tabbedPane.addTab("Server", buildServerTab())
         mainPanel.add(RaijinTheme.brandHeader(BuildInfo.VERSION), BorderLayout.NORTH)
@@ -373,12 +375,34 @@ class RaijinTab(
         val vr = activityTable.selectedRow; if (vr < 0) return
         val id = activityTableModel.getValueAt(activityTable.convertRowIndexToModel(vr), 0) as? Long ?: return
         val entry = activityById[id] ?: return
-        activityDetailInfo.text = "Tool: ${entry.toolName}  |  Duration: ${entry.durationMs}ms  |  Error: ${entry.isError}\nURL: ${entry.url}\nHost: ${entry.host}\n\nArguments:\n${entry.argsSummary}\n\nResult:\n${entry.resultSummary}"
+        activityDetailInfo.text = "Tool: ${entry.toolName}  |  Duration: ${entry.durationMs}ms  |  Error: ${entry.isError}\n" +
+            "URL: ${entry.url}\nHost: ${entry.host}\n\n" +
+            "Arguments:\n${prettyActivityJson(entry.argsSummary)}\n\n" +
+            "Result:\n${prettyActivityJson(entry.resultSummary)}"
         activityDetailInfo.caretPosition = 0
         entry.requestResponse?.let { rr ->
             try { rr.request()?.let { activityRequestEditor.setRequest(it) } } catch (_: Exception) {}
             try { rr.response()?.let { activityResponseEditor.setResponse(it) } } catch (_: Exception) {}
         }
+    }
+
+    /**
+     * Pretty-prints a compact JSON string ([McpActivityEntry.argsSummary]/`resultSummary`) for
+     * the Activity tab's Info panel: parses and re-indents it, then un-escapes literal `\r\n`/
+     * `\n` sequences remaining *inside* string leaves (the same normalization idiom
+     * [io.bitbytelab.raijin.bridge.InjectionBridge] uses on raw request text) so a multi-line
+     * `script`/`base_request` field reads as real lines instead of one escaped blob. Falls back
+     * to the raw string on any parse failure (e.g. a legacy or malformed entry) — this is purely
+     * a rendering step; the stored/persisted value is untouched.
+     */
+    private fun prettyActivityJson(raw: String): String {
+        if (raw.isBlank()) return raw
+        val pretty = try {
+            activityPrettyJson.encodeToString(JsonElement.serializer(), Json.parseToJsonElement(raw))
+        } catch (_: Exception) {
+            return raw
+        }
+        return pretty.replace("\\r\\n", "\n").replace("\\n", "\n")
     }
 
     private fun showActivityContextMenu(viewRow: Int, e: MouseEvent) {

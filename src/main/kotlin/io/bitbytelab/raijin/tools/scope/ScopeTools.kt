@@ -123,5 +123,49 @@ object ScopeTools {
                 )
             }
         }
+
+        server.addTool(
+            name = "scope_list",
+            description = "Lists Burp Suite's target scope include/exclude rules individually, with the index each " +
+                "needs for scope_remove. scope_get_config returns the same data as one opaque exported JSON blob; " +
+                "this is the per-rule, indexed view.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {},
+                required = emptyList()
+            )
+        ) { _ ->
+            try {
+                CallToolResult(content = listOf(TextContent(bridge.list().toString())))
+            } catch (e: Exception) {
+                CallToolResult(content = listOf(TextContent("""{"error":"${e.message}"}""")), isError = true)
+            }
+        }
+
+        server.addTool(
+            name = "scope_remove",
+            description = "Removes one scope rule by its index in the include or exclude list (use scope_list first " +
+                "to find the index). Montoya's Scope API can only add rules (scope_include/scope_exclude); removing " +
+                "one is done by re-exporting Burp's target.scope config with that entry dropped and re-importing it, " +
+                "then reading it back to confirm Burp actually accepted the change.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("list") { put("type", "string"); put("description", "'include' or 'exclude'") }
+                    putJsonObject("index") { put("type", "integer"); put("description", "Index of the rule to remove, from scope_list") }
+                },
+                required = listOf("list", "index")
+            )
+        ) { request ->
+            try {
+                val args = request.params.arguments ?: emptyMap()
+                val list = args["list"]?.jsonPrimitive?.contentOrNull
+                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Missing required parameter: list"}""")), isError = true)
+                val index = args["index"]?.jsonPrimitive?.intOrNull
+                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Missing required parameter: index"}""")), isError = true)
+                val result = bridge.remove(list, index)
+                CallToolResult(content = listOf(TextContent(result.toString())), isError = result["error"] != null)
+            } catch (e: Exception) {
+                CallToolResult(content = listOf(TextContent("""{"error":"${e.message}"}""")), isError = true)
+            }
+        }
     }
 }

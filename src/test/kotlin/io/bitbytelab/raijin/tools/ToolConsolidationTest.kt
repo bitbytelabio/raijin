@@ -80,7 +80,7 @@ class ToolConsolidationTest {
         val groups = ToolConsolidation.GROUPS // real table; only register what it needs for this assertion
         // apply() requires every member, so use a trimmed copy of the logic via the public contract:
         val partial = legacy
-        listOf("scope_exclude", "scope_get_config").forEach { fake(partial, it, emptyList(), "url") }
+        listOf("scope_exclude", "scope_get_config", "scope_list", "scope_remove").forEach { fake(partial, it, emptyList(), "url") }
         // register the other groups' members as empty stubs
         groups.filter { it.tool != "scope" }.flatMap { it.actions.values }.forEach { fake(partial, it) }
         ToolConsolidation.apply(partial, target)
@@ -93,7 +93,7 @@ class ToolConsolidationTest {
         assertTrue("check(url*)" in desc, desc)
         assertTrue("get_config(" in desc, desc)
         val action = scope.inputSchema.properties!!.getValue("action").jsonObject
-        assertEquals(setOf("check", "include", "exclude", "get_config"),
+        assertEquals(setOf("check", "include", "exclude", "get_config", "list", "remove"),
             action.getValue("enum").jsonArray.map { it.jsonPrimitive.content }.toSet())
 
         val ok = call(target, "scope", buildJsonObject { put("action", "check"); put("url", "https://a") })

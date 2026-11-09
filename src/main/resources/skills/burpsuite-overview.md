@@ -23,7 +23,7 @@ Raijin exposes Burp Suite through MCP as about 40 tools. Most tools take an `act
 
 ## Standard workflow
 1. `scope(action=get_config)`, then `scope(action=include)` for the target. Probes refuse out-of-scope hosts.
-2. Look at existing traffic first: `proxy_history`, `proxy_history_search`, `sitemap(action=query)`.
+2. Look at existing traffic first: `proxy_history`, `proxy_history_search` for traffic that passed through Burp's Proxy; `sitemap(action=query)` for everything else, including anything this server itself sent with `http_send_*` (which never reaches Proxy history).
 3. Understand a request with `analyze(action=request)`, `analyze(action=insertion_points)`, `analyze(action=response)`.
 4. Run focused tests with `http_*` or a guided probe. Use `turbo_*` only when you need volume or timing.
 5. Record results with `findings(action=add)`; review with `findings(action=list)`.

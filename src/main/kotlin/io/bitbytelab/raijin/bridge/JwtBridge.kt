@@ -4,6 +4,7 @@ import io.bitbytelab.raijin.jwt.Jwt
 import io.bitbytelab.raijin.jwt.JwtJose
 import io.bitbytelab.raijin.jwt.JwtKey
 import io.bitbytelab.raijin.jwt.JwtKeyRing
+import io.bitbytelab.raijin.jwt.jwkTextToPem
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
@@ -82,7 +83,21 @@ class JwtBridge(
                     }
                 }
                 "alg_confusion" -> {
-                    val key = publicKey ?: return err("alg_confusion requires public_key (the server's RSA/EC public key text, e.g. PEM)")
+                    // publicKey is used as literal HMAC-secret bytes by Jwt.resign, so it needs
+                    // byte-exact PEM text. key_id reuses the ring key's own PEM export; a raw
+                    // publicKey that looks like JWK JSON is converted the same way, so a JWKS
+                    // entry can be pasted directly instead of round-tripping through jwt_keys
+                    // import -> export format=pem by hand.
+                    val key = when {
+                        keyId != null -> joseKey(keyId).exportPem(includePrivate = false)
+                        publicKey == null -> return err("alg_confusion requires public_key (PEM text or JWK/JWK-set JSON) or key_id")
+                        publicKey.trim().startsWith("{") -> try {
+                            jwkTextToPem(publicKey)
+                        } catch (e: Exception) {
+                            return err("Could not parse public_key as JWK JSON: ${e.message}")
+                        }
+                        else -> publicKey
+                    }
                     val forged = Jwt.resign(token, key, alg ?: "HS256", overrides) ?: return err("Could not forge token")
                     buildJsonObject {
                         put("token", forged)

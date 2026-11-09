@@ -17,7 +17,7 @@ object AuthDiffTools {
 
 Provide auth_levels as an array of objects: [{"name": "admin", "header_name": "Authorization", "header_value": "Bearer admin-token"}, {"name": "user", "header_name": "Authorization", "header_value": "Bearer user-token"}, {"name": "none"}]
 
-The tool automatically strips auth headers for "none"/"unauth" levels. Analyzes status codes, body content, body length, and headers for differences. Flags critical findings like identical responses across auth levels.""",
+The tool automatically strips auth headers for "none"/"unauth" levels. Analyzes status codes, body content, body length, and headers for differences. Flags critical findings like identical responses across auth levels — except when the target looks like a static asset (content-type or file extension: CSS/JS/image/font), where identical-across-levels is expected and the finding is downgraded to informational instead.""",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("request") { put("type", "string"); put("description", "Raw HTTP request string") }

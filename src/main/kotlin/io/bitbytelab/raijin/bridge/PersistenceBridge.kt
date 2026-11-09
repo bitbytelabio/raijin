@@ -148,4 +148,18 @@ class PersistenceBridge(private val api: MontoyaApi) {
             }
         }
     }
+
+    /**
+     * Deletes a preference key (user-level). Unlike [delete]'s extensionData, no shadow index
+     * is needed here — Montoya's `Preferences` already exposes `deleteString` directly.
+     */
+    fun preferenceDelete(key: String): JsonObject {
+        val existed = try { api.persistence().preferences().getString(key) != null } catch (_: Exception) { false }
+        api.persistence().preferences().deleteString(key)
+        return buildJsonObject {
+            put("key", key)
+            put("scope", "preferences")
+            put("deleted", existed)
+        }
+    }
 }

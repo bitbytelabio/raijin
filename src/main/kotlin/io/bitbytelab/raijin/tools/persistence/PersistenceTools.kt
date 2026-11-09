@@ -191,5 +191,34 @@ object PersistenceTools {
                 )
             }
         }
+
+        // 7. preference_delete
+        server.addTool(
+            name = "preference_delete",
+            description = "Delete a key from Burp Suite's user-level preferences. Returns whether the key existed " +
+                "before deletion. Parameters: key (string, the preference key to delete).",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("key") { put("type", "string"); put("description", "The preference key to delete") }
+                },
+                required = listOf("key")
+            )
+        ) { request ->
+            try {
+                val args = request.params.arguments ?: emptyMap()
+                val key = args["key"]?.jsonPrimitive?.contentOrNull
+                    ?: return@addTool CallToolResult(
+                        content = listOf(TextContent("""{"error":"Missing required parameter: key"}""")),
+                        isError = true
+                    )
+                val result = bridge.preferenceDelete(key)
+                CallToolResult(content = listOf(TextContent(result.toString())))
+            } catch (e: Exception) {
+                CallToolResult(
+                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
+                    isError = true
+                )
+            }
+        }
     }
 }

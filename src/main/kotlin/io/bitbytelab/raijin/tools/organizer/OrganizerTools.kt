@@ -89,5 +89,30 @@ object OrganizerTools {
                 )
             }
         }
+
+        server.addTool(
+            name = "organizer_annotate",
+            description = "Set notes and/or a highlight color on an Organizer item by id (from organizer_get_items).",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("id") { put("type", "integer"); put("description", "Organizer item id, from organizer_get_items") }
+                    putJsonObject("notes") { put("type", "string"); put("description", "Note text to set") }
+                    putJsonObject("highlight") { put("type", "string"); put("description", "RED|ORANGE|YELLOW|GREEN|CYAN|BLUE|PINK|MAGENTA|GRAY|NONE (NONE clears it)") }
+                },
+                required = listOf("id")
+            )
+        ) { request ->
+            try {
+                val args = request.params.arguments ?: emptyMap()
+                val id = args["id"]?.jsonPrimitive?.intOrNull
+                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Missing required parameter: id"}""")), isError = true)
+                val notes = args["notes"]?.jsonPrimitive?.contentOrNull
+                val highlight = args["highlight"]?.jsonPrimitive?.contentOrNull
+                val result = bridge.annotate(id, notes, highlight)
+                CallToolResult(content = listOf(TextContent(result.toString())), isError = result["error"] != null)
+            } catch (e: Exception) {
+                CallToolResult(content = listOf(TextContent("""{"error":"${e.message}"}""")), isError = true)
+            }
+        }
     }
 }

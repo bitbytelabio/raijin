@@ -73,6 +73,17 @@ class FindingsBridge(private val stateManager: StateManager) {
         }
     }
 
+    /** Removes a finding by id. */
+    fun remove(id: String): JsonObject {
+        val removed = stateManager.removeFinding(id)
+        return buildJsonObject {
+            put("id", id)
+            put("removed", removed)
+            if (!removed) put("error", "Finding not found: $id")
+            put("total_findings", stateManager.findings.size)
+        }
+    }
+
     /** Lists findings, optionally filtered by [severity] and/or [type]. */
     fun list(severity: String?, type: String?): JsonObject {
         val items = stateManager.findings.filter {

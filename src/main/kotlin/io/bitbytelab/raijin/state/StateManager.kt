@@ -73,7 +73,16 @@ data class TrafficRule(
     val modifyAddHeader: String? = null,
     val modifyRemoveHeader: String? = null,
     val modifyReplaceHeader: Map<String, String>? = null,
-    var enabled: Boolean = true
+    var enabled: Boolean = true,
+    /**
+     * "modify" (default, header add/remove/replace above), "drop", or "spoof_response".
+     * drop/spoof_response only apply to direction="request" — they short-circuit before
+     * the request is ever sent, via Montoya's RequestToBeSentAction.drop()/.spoof() (Burp
+     * 2026.7+; falls back to sending the real request on an older Burp, see HttpBridge).
+     */
+    val action: String = "modify",
+    /** Raw HTTP response text to spoof when [action] is "spoof_response". */
+    val spoofResponse: String? = null
 )
 
 /**
@@ -170,7 +179,14 @@ data class ScanTask(
     val taskId: String,
     val type: String,
     val taskObject: Any,
-    val createdAt: String
+    val createdAt: String,
+    /** Crawl tasks only: the seed URL prefixes the baseline/progress count is scoped to. */
+    val sitemapSeeds: List<String>? = null,
+    /** Crawl tasks only: site map "has a response" count under [sitemapSeeds] at crawl start.
+     *  Burp's own Crawl.requestCount()/statusMessage() can be unreliable (see
+     *  ScannerBridge.safeRequestCount's comment), so scanner_task_status diffs the current
+     *  count against this as a heuristic for crawl progress. */
+    val sitemapBaselineCount: Int? = null
 )
 
 /**
@@ -313,6 +329,9 @@ class StateManager {
             try { listener(f) } catch (_: Exception) {}
         }
     }
+
+    /** Removes a finding by id. Returns true if one was found and removed. */
+    fun removeFinding(id: String): Boolean = findings.removeIf { it.id == id }
 
     /**
      * Seeds the findings from the durable store on startup WITHOUT notifying

@@ -12,9 +12,11 @@ object GraphQlTools {
     fun register(server: Server, bridge: GraphQlBridge) {
         server.addTool(
             name = "graphql_probe",
-            description = "Probe a GraphQL endpoint: run introspection and summarize the schema (root query/mutation " +
-                "fields); if introspection is disabled, enumerate fields via 'Did you mean' suggestions. " +
-                "Respects the operator scope policy (mcp_scope_mode).",
+            description = "Probe a GraphQL endpoint. Three outcomes, in 'verdict': introspection_enabled (full schema " +
+                "disclosed, summarized); introspection_disabled (a real GraphQL server, introspection off — 'Did you " +
+                "mean' field suggestions are tried as a fallback); not_graphql (neither probe got a response shaped " +
+                "like GraphQL at all — re-check the URL, this is a different condition from introspection_disabled, " +
+                "not the same thing worded differently). Respects the operator scope policy (mcp_scope_mode).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("url") { put("type", "string"); put("description", "GraphQL endpoint URL (e.g. https://target/graphql)") }

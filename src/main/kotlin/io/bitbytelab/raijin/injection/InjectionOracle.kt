@@ -7,6 +7,9 @@ package io.bitbytelab.raijin.injection
  *  - template math-evaluation for SSTI
  *  - file-content markers for path traversal / LFI
  *  - response-time delta for time-based (blind) SQLi / cmdi
+ *  - boolean-differential (TRUE/FALSE payload pair divergence) for blind SQLi with no error
+ *    text and no observable delay — the only oracle that can confirm this, since the other
+ *    three all need something to detect (an error, a delay, or an echoed value).
  */
 object InjectionOracle {
 
@@ -43,5 +46,31 @@ object InjectionOracle {
         if (expectedDelaySec <= 0) return false
         val threshold = (expectedDelaySec * 1000L * 0.7).toLong()
         return (probeMs - baselineMs) >= threshold && probeMs >= threshold
+    }
+
+    /**
+     * True if a `TRUE`-condition payload's response resembles [baselineBody] (>=95 similar)
+     * while a `FALSE`-condition payload's response diverges from it (<70 similar) — or the
+     * reverse polarity (the app renders the FALSE case as "normal" and TRUE as different) —
+     * and the two probe bodies differ from each other. This is the fallback oracle for blind
+     * SQLi when error text is suppressed (WAF/custom error pages) and a sleep-based payload is
+     * clamped, rate-limited, or simply never reaches the vulnerable sink in this insertion
+     * context (e.g. a payload shaped for comment-truncation never executes in a
+     * string-concatenation context) — a true/false divergence survives all three cases.
+     *
+     * @param similarity 0..100 body similarity (bigram-Dice via [io.bitbytelab.raijin.core.TextSimilarity.dice] in production; tests may stub it).
+     */
+    fun booleanDifferential(
+        baselineBody: String,
+        trueBody: String,
+        falseBody: String,
+        similarity: (String, String) -> Double
+    ): Boolean {
+        if (trueBody == falseBody) return false // payload had no effect at all — not a signal
+        val trueVsBase = similarity(baselineBody, trueBody)
+        val falseVsBase = similarity(baselineBody, falseBody)
+        val trueVsFalse = similarity(trueBody, falseBody)
+        if (trueVsFalse >= 95.0) return false // TRUE and FALSE look the same — no divergence
+        return (trueVsBase >= 95.0 && falseVsBase < 70.0) || (falseVsBase >= 95.0 && trueVsBase < 70.0)
     }
 }

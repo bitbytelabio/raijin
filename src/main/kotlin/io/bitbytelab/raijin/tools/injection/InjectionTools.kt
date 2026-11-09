@@ -14,17 +14,21 @@ object InjectionTools {
         server.addTool(
             name = "injection_probe",
             description = "Guided injection detection with confirmation oracles (not blind fuzzing). Mark the injection " +
-                "point with the FUZZ keyword in the raw request. Tests sqli (error-based + time-based), ssti " +
-                "(math-evaluation), and lfi/traversal (file-content markers), and returns only CONFIRMED findings with " +
-                "the triggering payload. Optional 'classes' to limit which are tested. Scope-gated (mcp_scope_mode). " +
-                "For blind/OOB (SSRF, blind cmdi) pair collaborator_* with http_fuzz.",
+                "point with the FUZZ keyword anywhere in the raw request — including inside a header line, e.g. " +
+                "'Cookie: TrackingId=FUZZ' to target a cookie. Tests sqli (error-based, time-based with both comment-" +
+                "truncation and string-concatenation-breakout payload shapes, and boolean-differential for when errors " +
+                "are suppressed and no delay lands), ssti (math-evaluation), and lfi/traversal (file-content markers), " +
+                "and returns only CONFIRMED findings with the triggering payload. Optional 'classes' to limit which are " +
+                "tested; 'delay_seconds' to tune the timing oracle. Scope-gated (mcp_scope_mode). For blind/OOB (SSRF, " +
+                "blind cmdi) pair collaborator_* with http_fuzz.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("request") { put("type", "string"); put("description", "Raw HTTP request with the FUZZ keyword at the injection point") }
+                    putJsonObject("request") { put("type", "string"); put("description", "Raw HTTP request with the FUZZ keyword at the injection point (any header line or the body)") }
                     putJsonObject("host") { put("type", "string"); put("description", "Target hostname") }
                     putJsonObject("port") { put("type", "integer"); put("description", "Target port (default 443)") }
                     putJsonObject("use_tls") { put("type", "boolean"); put("description", "Use HTTPS (default: port==443)") }
                     putJsonObject("classes") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Subset to test: sqli | ssti | lfi (default: all)") }
+                    putJsonObject("delay_seconds") { put("type", "integer"); put("description", "Sleep duration for time-based sqli payloads, default 5. Raise it for network jitter or a lab that requires a longer sleep.") }
                 },
                 required = listOf("request", "host")
             )
@@ -38,7 +42,8 @@ object InjectionTools {
                 val port = args["port"]?.jsonPrimitive?.intOrNull ?: 443
                 val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull ?: (port == 443)
                 val classes = args["classes"].asStringList()
-                CallToolResult(content = listOf(TextContent(bridge.probe(req, host, port, useTls, classes).toString())))
+                val delaySeconds = args["delay_seconds"]?.jsonPrimitive?.intOrNull ?: 5
+                CallToolResult(content = listOf(TextContent(bridge.probe(req, host, port, useTls, classes, delaySeconds).toString())))
             } catch (e: Exception) {
                 err(e.message)
             }

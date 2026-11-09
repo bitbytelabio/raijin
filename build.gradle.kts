@@ -27,7 +27,7 @@ repositories {
 }
 
 val ktorVersion = "3.5.2"
-val montoyaVersion = "2026.2"
+val montoyaVersion = "2026.7"
 
 dependencies {
     // Burp Suite Montoya API — provided by Burp at runtime, never bundled

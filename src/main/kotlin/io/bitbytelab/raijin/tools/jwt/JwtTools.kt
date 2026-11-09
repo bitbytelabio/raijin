@@ -19,7 +19,7 @@ object JwtTools {
             description = "Run or inspect a JSON Web Token. Modes: " +
                 "analyze (flag alg:none, HMAC, asymmetric alg, kid/jku, missing exp); " +
                 "forge_none (unsigned tokens, case variants); " +
-                "alg_confusion (RS->HS — pass public_key); " +
+                "alg_confusion (RS->HS — pass public_key as PEM or JWK JSON, or key_id); " +
                 "crack (HMAC secret from wordlist or the built-in list); " +
                 "sign (HMAC secret); " +
                 "sign_key (key_id from jwt_keys); " +
@@ -40,7 +40,7 @@ object JwtTools {
                         )
                     }
                     putJsonObject("secret") { put("type", "string"); put("description", "HMAC secret for mode=sign") }
-                    putJsonObject("public_key") { put("type", "string"); put("description", "Server public key text (e.g. PEM) for mode=alg_confusion") }
+                    putJsonObject("public_key") { put("type", "string"); put("description", "Server public key for mode=alg_confusion: PEM text, or JWK/JWK-set JSON (converted to PEM automatically). Alternatively pass key_id for a ring key.") }
                     putJsonObject("wordlist") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Candidate secrets for mode=crack") }
                     putJsonObject("alg") { put("type", "string"); put("description", "JWS or JWE alg. Defaults from the key or HS256 / RSA-OAEP-256") }
                     putJsonObject("enc") { put("type", "string"); put("description", "JWE content encryption method for encrypt (default A256GCM)") }

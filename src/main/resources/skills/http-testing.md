@@ -4,6 +4,10 @@ description: Sending and varying HTTP requests with the http_* tools; when to us
 ---
 # HTTP testing
 
+Results from every `http_send_*` tool are recorded in the Burp **site map** (annotated `[MCP] Raijin`), not Proxy history —
+`proxy_history_search` will never find them. Use `sitemap(action=query, note_contains="[MCP]")` (or `search_in=request|response|all`
+with `search_pattern`) instead.
+
 - `http_send_request`: one request. Start here.
 - `http_send_request_chain`: dependent requests (login, then use the token).
 - `http_send_requests_parallel`: independent requests at once.

@@ -1,5 +1,6 @@
 package io.bitbytelab.raijin.transport
 
+import io.bitbytelab.raijin.core.truncateJsonForSummary
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.state.StateManager
 import io.modelcontextprotocol.kotlin.sdk.server.RegisteredTool
@@ -64,12 +65,7 @@ object ToolCallTracker {
         val action = request.params.arguments?.get("action")?.jsonPrimitive?.contentOrNull
         val toolName = io.bitbytelab.raijin.tools.ToolConsolidation.legacyName(mergedToolName, action) ?: mergedToolName
         val argsJson = buildJsonObject {
-            request.params.arguments?.forEach { (key, value) ->
-                val truncated = value.toString().let {
-                    if (it.length > 200) it.take(200) + "..." else it
-                }
-                put(key, truncated)
-            }
+            request.params.arguments?.forEach { (key, value) -> put(key, truncateJsonForSummary(value, 200)) }
         }
 
         val resultSummary = result.content

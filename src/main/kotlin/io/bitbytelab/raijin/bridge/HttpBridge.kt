@@ -480,6 +480,49 @@ class HttpBridge(
         }
     }
 
+    /**
+     * Deletes a cookie from Burp's cookie jar. Montoya's `CookieJar` has no delete method —
+     * only `setCookie(name, value, path, domain, expiration)` — so this sets an empty value
+     * with an expiration a year in the past, the standard cookie-expiry idiom. Whether Burp's
+     * jar actually drops the entry (vs. retaining an expired record) is not documented; this
+     * re-reads the jar afterward and reports `deleted` from what it actually finds rather than
+     * assuming the idiom worked.
+     */
+    fun deleteCookie(name: String, domain: String, path: String): JsonObject {
+        return try {
+            val past = ZonedDateTime.now().minusYears(1)
+            // Same (path, domain) argument order as setCookie above — see its comment.
+            api.http().cookieJar().setCookie(name, "", path, domain, past)
+
+            val stillPresent = try {
+                api.http().cookieJar().cookies().any {
+                    it.name() == name && it.domain().equals(domain, ignoreCase = true) && it.path() == path
+                }
+            } catch (_: Exception) { null }
+
+            buildJsonObject {
+                put("name", name)
+                put("domain", domain)
+                put("path", path)
+                when (stillPresent) {
+                    false -> put("deleted", true)
+                    true -> {
+                        put("deleted", false)
+                        put("note", "The cookie still appears in the jar after setting an expired value — Burp may retain an expired record rather than dropping it. Try an empty 'value' lookup, or clear it manually in the Proxy > HTTP history > Cookie jar UI.")
+                    }
+                    null -> {
+                        put("deleted", "unknown")
+                        put("note", "Could not confirm removal by re-reading the cookie jar.")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            buildJsonObject {
+                put("error", "Failed to delete cookie: ${e.message}")
+            }
+        }
+    }
+
     // ---------------------------------------------------------------
     // Response analysis
     // ---------------------------------------------------------------
@@ -621,12 +664,27 @@ class HttpBridge(
                         matchesTrafficRuleRequest(rule, requestToBeSent)
                 }
 
-                for (rule in matchingRules) {
+                // A matching drop/spoof_response rule short-circuits before any header
+                // modification — the request is never sent, so modifying it first is pointless.
+                // First match wins. Falls through to the ordinary modify pipeline below when the
+                // running Burp predates Montoya 2026.7 (no drop()/spoof() on this Burp) or the
+                // stored spoof_response text fails to parse as an HTTP response.
+                val terminating = matchingRules.firstOrNull {
+                    it.action.equals("drop", true) || it.action.equals("spoof_response", true)
+                }
+                if (terminating != null) {
+                    val terminated = applyTerminatingRule(terminating, requestToBeSent, currentAnnotations)
+                    if (terminated != null) return terminated
+                }
+
+                val modifyRules = matchingRules.filter { it.action.equals("modify", true) }
+                for (rule in modifyRules) {
                     currentRequest = applyTrafficRuleToRequest(rule, currentRequest)
 
                     eventBus.emit("http.traffic_rule.applied", buildJsonObject {
                         put("rule_id", rule.ruleId)
                         put("direction", "request")
+                        put("action", "modify")
                         put("url", requestToBeSent.url())
                         put("timestamp", Instant.now().toString())
                     })
@@ -655,7 +713,7 @@ class HttpBridge(
                     }
                 }
 
-                return if (matchingRules.isEmpty() && !sessionChanged) {
+                return if (modifyRules.isEmpty() && !sessionChanged) {
                     RequestToBeSentAction.continueWith(requestToBeSent)
                 } else {
                     RequestToBeSentAction.continueWith(currentRequest, currentAnnotations)
@@ -801,6 +859,69 @@ class HttpBridge(
     // ---------------------------------------------------------------
     // Traffic rule application helpers
     // ---------------------------------------------------------------
+
+    /**
+     * Applies a matched "drop" or "spoof_response" [rule] via Montoya's
+     * `RequestToBeSentAction.drop()` / `.spoof()` (added in the Montoya API shipped with
+     * Burp 2026.7 — [RequestToBeSentAction] offered no way to suppress a request before
+     * that). Returns the terminating action, or `null` to fall through to the ordinary
+     * modify pipeline when the running Burp is older than 2026.7 ([NoSuchMethodError] —
+     * the interface this extension compiles against declares the method, but an older
+     * Burp's runtime implementation does not) or when a "spoof_response" rule's stored
+     * text fails to parse as an HTTP response.
+     */
+    private fun applyTerminatingRule(
+        rule: TrafficRule,
+        requestToBeSent: HttpRequestToBeSent,
+        annotations: burp.api.montoya.core.Annotations
+    ): RequestToBeSentAction? {
+        val degraded = { reason: String ->
+            eventBus.emit("http.traffic_rule.degraded", buildJsonObject {
+                put("rule_id", rule.ruleId)
+                put("action", rule.action.lowercase())
+                put("url", requestToBeSent.url())
+                put("reason", reason)
+                put("timestamp", Instant.now().toString())
+            })
+        }
+        val applied = { action: String ->
+            eventBus.emit("http.traffic_rule.applied", buildJsonObject {
+                put("rule_id", rule.ruleId)
+                put("direction", "request")
+                put("action", action)
+                put("url", requestToBeSent.url())
+                put("timestamp", Instant.now().toString())
+            })
+        }
+
+        if (rule.action.equals("drop", true)) {
+            return try {
+                RequestToBeSentAction.drop(annotations).also { applied("drop") }
+            } catch (_: NoSuchMethodError) {
+                degraded("drop() needs Burp's Montoya API 2026.7 or later; this Burp is older, so the request was sent instead.")
+                null
+            }
+        }
+
+        // action == "spoof_response"
+        val spoofText = rule.spoofResponse
+        if (spoofText == null) {
+            degraded("spoof_response action has no stored response text; the request was sent instead.")
+            return null
+        }
+        val spoofed = try {
+            HttpResponse.httpResponse(RequestHygiene.normalizeCrlf(spoofText))
+        } catch (e: Exception) {
+            degraded("spoof_response text could not be parsed as an HTTP response (${e.message}); the request was sent instead.")
+            return null
+        }
+        return try {
+            RequestToBeSentAction.spoof(spoofed, annotations).also { applied("spoof_response") }
+        } catch (_: NoSuchMethodError) {
+            degraded("spoof() needs Burp's Montoya API 2026.7 or later; this Burp is older, so the request was sent instead.")
+            null
+        }
+    }
 
     private fun applyTrafficRuleToRequest(rule: TrafficRule, request: HttpRequest): HttpRequest {
         var modified = request

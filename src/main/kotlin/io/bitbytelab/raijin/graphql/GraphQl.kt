@@ -59,6 +59,17 @@ object GraphQl {
         }
     }
 
+    /**
+     * True when [bodyJson] has the GraphQL response envelope shape — a top-level `data` or
+     * `errors` key. Real GraphQL servers return this shape even with introspection disabled or
+     * on a malformed query; an arbitrary non-GraphQL webpage/API never does. Distinguishes
+     * "GraphQL but locked down" (introspection_disabled) from "this isn't GraphQL at all"
+     * (not_graphql) — without this check, both cases produce the exact same signal: neither
+     * probe's body parses with a `__schema`, and no suggestions are found.
+     */
+    fun looksLikeGraphQlResponse(bodyJson: JsonObject?): Boolean =
+        bodyJson != null && ("data" in bodyJson || "errors" in bodyJson)
+
     /** Extracts suggested field names from a "Did you mean ..." GraphQL error message (decoded). */
     fun extractSuggestions(decodedMessage: String): List<String> {
         val out = linkedSetOf<String>()

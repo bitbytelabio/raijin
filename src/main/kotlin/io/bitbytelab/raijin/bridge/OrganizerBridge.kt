@@ -1,10 +1,12 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
+import burp.api.montoya.core.HighlightColor
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.HttpRequestResponse
+import io.bitbytelab.raijin.core.HighlightColorName
 import io.bitbytelab.raijin.safety.RequestHygiene
 import kotlinx.serialization.json.*
 
@@ -116,6 +118,39 @@ class OrganizerBridge(private val api: MontoyaApi) {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Sets notes/highlight on the Organizer item with the given [id] (from [getItems]).
+     * `OrganizerItem extends HttpRequestResponse`, so it exposes the same mutable
+     * `annotations()` Proxy history does — Turbo's own `OrganizerProvider.setNotes`
+     * already relies on this exact mutation working, so unlike [SitemapBridge.annotate]
+     * this one is not a new, unverified assumption.
+     */
+    fun annotate(id: Int, notes: String?, highlight: String?): JsonObject {
+        val canonicalHighlight = if (highlight != null) {
+            HighlightColorName.canonical(highlight)
+                ?: return buildJsonObject {
+                    put("error", "Invalid highlight color: '$highlight'. Valid values: ${HighlightColorName.validValues()}")
+                }
+        } else null
+
+        val item = try {
+            api.organizer().items().firstOrNull { it.id() == id }
+        } catch (e: Exception) {
+            return buildJsonObject { put("error", "Failed to query Organizer items: ${e.message}") }
+        } ?: return buildJsonObject { put("error", "No Organizer item found with id $id (use organizer_get_items to find it)") }
+
+        val annotations = item.annotations()
+        if (notes != null) annotations.setNotes(notes)
+        if (canonicalHighlight != null) annotations.setHighlightColor(HighlightColor.valueOf(canonicalHighlight))
+
+        return buildJsonObject {
+            put("annotated", true)
+            put("id", id)
+            if (notes != null) put("notes", notes)
+            if (canonicalHighlight != null) put("highlight", canonicalHighlight)
         }
     }
 

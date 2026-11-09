@@ -235,6 +235,39 @@ object CollaboratorTools {
         }
 
         // ---------------------------------------------------------------
+        // collaborator_remove_client
+        // ---------------------------------------------------------------
+        server.addTool(
+            name = "collaborator_remove_client",
+            description = "Drop a Collaborator client from Raijin's tracking. Montoya's Collaborator API has no " +
+                "server-side client teardown (a client is just a secret-key handle, not a resource Burp needs " +
+                "told to close) — this is local bookkeeping only. Returns the secret_key one last time so the " +
+                "client can still be brought back later with collaborator_restore_client if needed.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("client_id") { put("type", "string"); put("description", "Collaborator client id") }
+                },
+                required = listOf("client_id")
+            )
+        ) { request ->
+            try {
+                val args = request.params.arguments ?: emptyMap()
+                val clientId = args["client_id"]?.jsonPrimitive?.contentOrNull
+                    ?: return@addTool CallToolResult(
+                        content = listOf(TextContent(buildJsonObject { put("error", "Parameter 'client_id' is required") }.toString())),
+                        isError = true
+                    )
+                val result = bridge.removeClient(clientId)
+                CallToolResult(content = listOf(TextContent(result.toString())), isError = result["error"] != null)
+            } catch (e: Exception) {
+                CallToolResult(
+                    content = listOf(TextContent(buildJsonObject { put("error", e.message ?: "Unknown error") }.toString())),
+                    isError = true
+                )
+            }
+        }
+
+        // ---------------------------------------------------------------
         // 7. collaborator_default_payload
         // ---------------------------------------------------------------
         server.addTool(

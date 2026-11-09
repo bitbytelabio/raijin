@@ -49,6 +49,7 @@ object ToolConsolidation {
         "proxy_history", "proxy_history_search", "proxy_annotate", "proxy_auto_auth",
         "auth_diff", "api_import_openapi", "bambda_import",
         "jwt_keys",
+        "search_skills", "load_skill", "read_skill_file",
     )
 
     val GROUPS: List<Group> = listOf(
@@ -82,6 +83,7 @@ object ToolConsolidation {
                 "collaborator_", "collaborator_create_client", "collaborator_restore_client",
                 "collaborator_get_secret", "collaborator_generate_payload",
                 "collaborator_default_payload", "collaborator_poll", "collaborator_server_info",
+                "collaborator_remove_client",
             ),
         ),
         Group(
@@ -93,14 +95,17 @@ object ToolConsolidation {
             ) + mapOf("intruder_payload_processor_register" to "intruder_register_payload_processor"),
         ),
         Group(
-            "scope", "Burp target scope: check a URL, include, exclude, show the configuration.",
-            prefixed("scope_", "scope_check", "scope_include", "scope_exclude", "scope_get_config"),
+            "scope", "Burp target scope: check a URL, include, exclude, list and remove rules, show the configuration.",
+            prefixed(
+                "scope_", "scope_check", "scope_include", "scope_exclude", "scope_get_config",
+                "scope_list", "scope_remove",
+            ),
         ),
         Group(
             "persistence", "Key/value storage in the Burp project (persistence) and user preferences.",
             prefixed(
                 "persistence_", "persistence_store", "persistence_get", "persistence_delete",
-                "persistence_list", "preference_store", "preference_get",
+                "persistence_list", "preference_store", "preference_get", "preference_delete",
             ),
         ),
         Group(
@@ -131,8 +136,11 @@ object ToolConsolidation {
             ),
         ),
         Group(
-            "http_state", "Burp cookie jar: read and set cookies.",
-            mapOf("cookie_jar_get" to "http_cookie_jar_get", "cookie_jar_set" to "http_cookie_jar_set"),
+            "http_state", "Burp cookie jar: read, set and delete cookies.",
+            mapOf(
+                "cookie_jar_get" to "http_cookie_jar_get", "cookie_jar_set" to "http_cookie_jar_set",
+                "cookie_jar_delete" to "http_cookie_jar_delete",
+            ),
         ),
         Group(
             "proxy_rule", "Proxy request/response rules (modify, drop, tag): set, list, remove.",
@@ -190,8 +198,11 @@ object ToolConsolidation {
             ),
         ),
         Group(
-            "sitemap", "Burp site map: query, issues, add requests or issues.",
-            prefixed("sitemap_", "sitemap_query", "sitemap_get_issues", "sitemap_add_request", "sitemap_add_issue"),
+            "sitemap", "Burp site map: query, issues, add requests or issues, annotate.",
+            prefixed(
+                "sitemap_", "sitemap_query", "sitemap_get_issues", "sitemap_add_request", "sitemap_add_issue",
+                "sitemap_annotate",
+            ),
         ),
         Group(
             "recon", "Recon on in-scope targets: JS endpoints, content discovery, parameter mining, fingerprinting.",
@@ -208,12 +219,12 @@ object ToolConsolidation {
             ),
         ),
         Group(
-            "findings", "Findings you record during testing: add and list.",
-            prefixed("findings_", "findings_add", "findings_list"),
+            "findings", "Findings you record during testing: add, list, remove.",
+            prefixed("findings_", "findings_add", "findings_list", "findings_remove"),
         ),
         Group(
-            "organizer", "Burp Organizer: send items to it and read them back.",
-            prefixed("organizer_", "organizer_send", "organizer_get_items"),
+            "organizer", "Burp Organizer: send items to it, read them back, annotate.",
+            prefixed("organizer_", "organizer_send", "organizer_get_items", "organizer_annotate"),
         ),
         Group(
             "send_to_tool", "Send a request to a Burp tool: Repeater, Intruder, Comparer or Decoder.",

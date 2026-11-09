@@ -319,6 +319,39 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
         }
 
         // ---------------------------------------------------------------
+        // http_cookie_jar_delete
+        // ---------------------------------------------------------------
+        server.addTool(
+            name = "http_cookie_jar_delete",
+            description = "Delete a cookie from Burp Suite's cookie jar. Montoya has no delete API for this — it's " +
+                "implemented by setting the cookie to expire in the past, then re-reading the jar to confirm the " +
+                "entry is actually gone (reported in 'deleted'); if Burp retains an expired record instead of " +
+                "dropping it, this is reported honestly rather than claiming success.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("name") { put("type", "string"); put("description", "Cookie name") }
+                    putJsonObject("domain") { put("type", "string"); put("description", "Cookie domain") }
+                    putJsonObject("path") { put("type", "string"); put("description", "Cookie path (default /)") }
+                },
+                required = listOf("name", "domain")
+            )
+        ) { request ->
+            try {
+                val args = request.params.arguments ?: emptyMap()
+                val name = args["name"]?.jsonPrimitive?.contentOrNull
+                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Parameter 'name' is required"}""")), isError = true)
+                val domain = args["domain"]?.jsonPrimitive?.contentOrNull
+                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Parameter 'domain' is required"}""")), isError = true)
+                val path = args["path"]?.jsonPrimitive?.contentOrNull ?: "/"
+
+                val result = bridge.deleteCookie(name, domain, path)
+                CallToolResult(content = listOf(TextContent(result.toString())))
+            } catch (e: Exception) {
+                CallToolResult(content = listOf(TextContent(buildJsonObject { put("error", e.message ?: "Unknown error") }.toString())), isError = true)
+            }
+        }
+
+        // ---------------------------------------------------------------
         // 6. http_analyze_keywords
         // ---------------------------------------------------------------
         server.addTool(
@@ -416,7 +449,10 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
         // ---------------------------------------------------------------
         server.addTool(
             name = "http_set_traffic_rule",
-            description = "Register a global HTTP traffic modification rule. Rules apply to all HTTP traffic (not just proxy) and can add, remove, or replace headers on matching requests or responses. If rule_id matches an existing rule, it is replaced.",
+            description = "Register a global HTTP traffic rule. Rules apply to all HTTP traffic (not just proxy). action=modify (default) adds/removes/replaces headers. " +
+                "action=drop or action=spoof_response (direction=request only) suppress the request entirely before it is sent, via Burp's Montoya API 2026.7+ " +
+                "(RequestToBeSentAction.drop()/.spoof()) — on an older Burp these fall back to sending the request unmodified and report it via a " +
+                "'http.traffic_rule.degraded' event. If rule_id matches an existing rule, it is replaced.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("rule_id") { put("type", "string"); put("description", "Rule ID; if it matches an existing rule it is replaced (auto-generated if omitted)") }
@@ -424,9 +460,11 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                     putJsonObject("match_url") { put("type", "string"); put("description", "Match on request URL") }
                     putJsonObject("match_host") { put("type", "string"); put("description", "Match on host") }
                     putJsonObject("match_header") { put("type", "string"); put("description", "Match on header") }
-                    putJsonObject("modify_add_header") { put("type", "string"); put("description", "Header to add") }
-                    putJsonObject("modify_remove_header") { put("type", "string"); put("description", "Header to remove") }
-                    putJsonObject("modify_replace_header") { put("type", "object"); put("description", "Map of header name to replacement value") }
+                    putJsonObject("action") { put("type", "string"); put("description", "modify (default) | drop | spoof_response. drop/spoof_response only take effect when direction=request; needs Burp's Montoya API 2026.7+ (falls back to sending the request on an older Burp).") }
+                    putJsonObject("modify_add_header") { put("type", "string"); put("description", "Header to add (action=modify)") }
+                    putJsonObject("modify_remove_header") { put("type", "string"); put("description", "Header to remove (action=modify)") }
+                    putJsonObject("modify_replace_header") { put("type", "object"); put("description", "Map of header name to replacement value (action=modify)") }
+                    putJsonObject("spoof_response") { put("type", "string"); put("description", "Raw HTTP response text to return without sending the request (action=spoof_response, direction=request)") }
                     putJsonObject("enabled") { put("type", "boolean"); put("description", "Whether the rule is active (default true)") }
                 },
                 required = listOf("direction")
@@ -457,6 +495,33 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                     )
                 }
 
+                val action = args["action"]?.jsonPrimitive?.contentOrNull ?: "modify"
+                if (!action.equals("modify", true) && !action.equals("drop", true) && !action.equals("spoof_response", true)) {
+                    return@addTool CallToolResult(
+                        content = listOf(TextContent(buildJsonObject {
+                            put("error", "Parameter 'action' must be 'modify', 'drop', or 'spoof_response'")
+                        }.toString())),
+                        isError = true
+                    )
+                }
+                val spoofResponse = args["spoof_response"]?.jsonPrimitive?.contentOrNull
+                if (action.equals("spoof_response", true) && spoofResponse.isNullOrBlank()) {
+                    return@addTool CallToolResult(
+                        content = listOf(TextContent(buildJsonObject {
+                            put("error", "action=spoof_response requires 'spoof_response' (raw HTTP response text)")
+                        }.toString())),
+                        isError = true
+                    )
+                }
+                if ((action.equals("drop", true) || action.equals("spoof_response", true)) && direction.equals("response", true)) {
+                    return@addTool CallToolResult(
+                        content = listOf(TextContent(buildJsonObject {
+                            put("error", "action=drop/spoof_response only apply to direction=request (a response has already been received by the time a direction=response rule runs — use action=modify with modify_replace_header/modify_add_header to rewrite it instead)")
+                        }.toString())),
+                        isError = true
+                    )
+                }
+
                 val replaceHeader = args["modify_replace_header"]?.jsonObject?.let { obj ->
                     obj.entries.associate { (k, v) -> k to v.jsonPrimitive.content }
                 }
@@ -470,7 +535,9 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                     modifyAddHeader = args["modify_add_header"]?.jsonPrimitive?.contentOrNull,
                     modifyRemoveHeader = args["modify_remove_header"]?.jsonPrimitive?.contentOrNull,
                     modifyReplaceHeader = replaceHeader,
-                    enabled = args["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
+                    enabled = args["enabled"]?.jsonPrimitive?.booleanOrNull ?: true,
+                    action = action.lowercase(),
+                    spoofResponse = spoofResponse
                 )
 
                 // Remove existing rule with same ID, then add the new one
@@ -481,6 +548,7 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                     put("rule_set", true)
                     put("rule_id", ruleId)
                     put("direction", direction.lowercase())
+                    put("action", action.lowercase())
                     put("total_rules", stateManager.trafficRules.size)
                 }.toString())))
             } catch (e: Exception) {

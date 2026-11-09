@@ -293,6 +293,38 @@ class CollaboratorBridge(
     }
 
     /**
+     * Drops a Collaborator client from Raijin's own tracking. Montoya's Collaborator API has
+     * no server-side teardown for a client — it's just a [SecretKey] handle, not a resource
+     * Burp needs told to close — so this is purely local bookkeeping. The secret key is
+     * returned one last time (not just `client_id`) since that, not the local id, is what
+     * `collaborator_restore_client` actually needs to bring the same client back later.
+     *
+     * @param clientId The Collaborator client identifier.
+     * @return JSON object confirming removal, with the secret key for later restoration.
+     */
+    fun removeClient(clientId: String): JsonObject {
+        val clientState = stateManager.collaboratorClients.remove(clientId)
+            ?: return buildJsonObject { put("error", "Client not found: $clientId") }
+
+        val secretKey = try {
+            (clientState.client as CollaboratorClient).getSecretKey().toString()
+        } catch (_: Exception) {
+            null
+        }
+
+        return buildJsonObject {
+            put("client_id", clientId)
+            put("removed", true)
+            if (secretKey != null) {
+                put("secret_key", secretKey)
+                put("note", "Removed from Raijin's tracking. Use collaborator_restore_client with this secret_key to bring it back later.")
+            } else {
+                put("note", "Removed from Raijin's tracking. The secret key could not be read, so this client cannot be restored later.")
+            }
+        }
+    }
+
+    /**
      * Returns the secret key for the given Collaborator client, base64-encoded.
      * This key can be used to restore the client in a future session.
      *

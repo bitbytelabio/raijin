@@ -47,15 +47,39 @@ class ScannerBridge(
     /**
      * Starts a crawl task against the given URLs.
      *
+     * Montoya's [CrawlConfiguration] only accepts seed URLs — there is no depth or scope
+     * control anywhere in the Scanner API, so [maxDepth] cannot be enforced; it is accepted
+     * for schema compatibility but always reported back as ignored. [inScopeOnly] *can* be
+     * enforced: seeds outside Burp's target scope are filtered out before the crawl starts,
+     * instead of being silently accepted and merely echoed back as before.
+     *
      * @param urls Seed URLs for the crawler.
-     * @param maxDepth Optional maximum crawl depth.
-     * @param inScopeOnly Whether to restrict the crawl to in-scope URLs.
-     * @return JSON object with the task ID and status.
+     * @param maxDepth Accepted but not enforced — see above.
+     * @param inScopeOnly When true, out-of-scope seeds are dropped before crawling.
+     * @return JSON object with the task ID, status, and which parameters were actually applied.
      */
     fun startCrawl(urls: List<String>, maxDepth: Int?, inScopeOnly: Boolean): JsonObject {
+        val seeds = if (inScopeOnly) {
+            urls.filter { try { api.scope().isInScope(it) } catch (_: Exception) { false } }
+        } else {
+            urls
+        }
+        val droppedCount = urls.size - seeds.size
+        if (seeds.isEmpty()) {
+            return buildJsonObject {
+                put(
+                    "error",
+                    if (droppedCount > 0)
+                        "All ${urls.size} seed URL(s) are out of scope; nothing to crawl. " +
+                            "Pass in_scope_only=false, or add the target(s) to scope first."
+                    else "No seed URLs provided."
+                )
+            }
+        }
+
         val crawlTask: Crawl
         try {
-            val crawlConfig = CrawlConfiguration.crawlConfiguration(*urls.toTypedArray())
+            val crawlConfig = CrawlConfiguration.crawlConfiguration(*seeds.toTypedArray())
             crawlTask = api.scanner().startCrawl(crawlConfig)
         } catch (e: UnsupportedOperationException) {
             return buildJsonObject {
@@ -68,11 +92,14 @@ class ScannerBridge(
         }
 
         val taskId = stateManager.generateId("scan")
+        val baseline = sitemapResponseCount(seeds)
         stateManager.scanTasks[taskId] = ScanTask(
             taskId = taskId,
             type = "crawl",
             taskObject = crawlTask,
-            createdAt = Instant.now().toString()
+            createdAt = Instant.now().toString(),
+            sitemapSeeds = seeds,
+            sitemapBaselineCount = baseline
         )
 
         val statusMsg = try { crawlTask.statusMessage() } catch (_: Exception) { "started" }
@@ -81,8 +108,18 @@ class ScannerBridge(
             put("task_id", taskId)
             put("type", "crawl")
             put("status", statusMsg)
-            put("urls", buildJsonArray { urls.forEach { add(it) } })
+            put("urls", buildJsonArray { seeds.forEach { add(it) } })
             put("in_scope_only", inScopeOnly)
+            if (droppedCount > 0) put("seeds_dropped_out_of_scope", droppedCount)
+            put("applied", buildJsonArray { add("urls"); if (inScopeOnly) add("in_scope_only") })
+            put("ignored", buildJsonArray { if (maxDepth != null) add("max_depth") })
+            if (maxDepth != null) {
+                put(
+                    "note",
+                    "max_depth is not supported by Burp's Montoya Scanner API " +
+                        "(CrawlConfiguration has no depth control) and was ignored."
+                )
+            }
             put("created_at", stateManager.scanTasks[taskId]!!.createdAt)
         }
     }
@@ -90,12 +127,21 @@ class ScannerBridge(
     /**
      * Starts an audit task.
      *
-     * @param urls Target URLs to audit.
+     * Montoya's [BuiltInAuditConfiguration] has exactly two values (legacy passive / legacy
+     * active) — there is no "thorough" preset, so `thorough` and `normal` currently run the
+     * identical configuration; this is reported back rather than left implicit.
+     * [insertionPointTypes] cannot restrict the built-in audit (no such Montoya API exists)
+     * and is reported as ignored when supplied. [urls] are now actually added to the audit
+     * (previously accepted but never used — only [requests] reached the task). [crawlFirst]
+     * now actually starts a real crawl when [urls] are given — Montoya has no crawl-then-audit
+     * pipe, so the crawl's discoveries are not auto-added to this audit; the response says so.
+     *
+     * @param urls Target URLs to audit directly.
      * @param requests Optional base64-encoded HTTP requests to audit directly.
-     * @param auditMode Audit mode: "light", "normal", "thorough". Defaults to "normal".
-     * @param crawlFirst Whether to crawl before auditing.
-     * @param insertionPointTypes Optional list of insertion point types to test.
-     * @return JSON object with task ID and status.
+     * @param auditMode Audit mode: "light" (passive), "normal" or "thorough" (both active). Defaults to "normal".
+     * @param crawlFirst When true and [urls] is non-empty, starts a real crawl on those URLs alongside the audit.
+     * @param insertionPointTypes Accepted but not enforced — see above.
+     * @return JSON object with task ID, status, and which parameters were actually applied.
      */
     fun startAudit(
         urls: List<String>?,
@@ -133,14 +179,47 @@ class ScannerBridge(
 
             val auditTask: Audit = api.scanner().startAudit(auditConfig)
 
-            // If raw requests are provided, add them to the audit task
+            // Raw requests are added directly.
+            var requestsAdded = 0
+            var requestsFailed = 0
             requests?.forEach { reqBase64 ->
                 try {
                     val decoded = Base64.getDecoder().decode(reqBase64)
                     val httpRequest = HttpRequest.httpRequest(BurpByteArray.byteArray(*decoded))
                     auditTask.addRequest(httpRequest)
+                    requestsAdded++
                 } catch (_: Exception) {
-                    // Skip malformed requests
+                    requestsFailed++
+                }
+            }
+
+            // URLs are resolved to requests and added the same way (previously ignored entirely).
+            var urlsAdded = 0
+            val urlsFailed = mutableListOf<String>()
+            urls?.forEach { url ->
+                try {
+                    auditTask.addRequest(HttpRequest.httpRequestFromUrl(url))
+                    urlsAdded++
+                } catch (_: Exception) {
+                    urlsFailed.add(url)
+                }
+            }
+
+            // crawl_first now actually crawls when there's something to seed it with. Montoya
+            // has no API to chain a crawl's discoveries into this audit automatically, so the
+            // two tasks run independently and the response says so explicitly.
+            var crawlTaskId: String? = null
+            var crawlSkipped: String? = null
+            if (crawlFirst) {
+                if (!urls.isNullOrEmpty()) {
+                    val crawlResult = startCrawl(urls, null, false)
+                    crawlTaskId = crawlResult["task_id"]?.jsonPrimitive?.contentOrNull
+                    if (crawlTaskId == null) {
+                        crawlSkipped = "crawl_first was requested but the crawl failed to start: " +
+                            (crawlResult["error"]?.jsonPrimitive?.contentOrNull ?: "unknown error")
+                    }
+                } else {
+                    crawlSkipped = "crawl_first was requested but no 'urls' were given to seed a crawl from"
                 }
             }
 
@@ -160,7 +239,38 @@ class ScannerBridge(
                 put("type", "audit")
                 put("status", statusMsg)
                 put("audit_mode", auditMode ?: "normal")
+                put(
+                    "audit_mode_effective",
+                    if (builtInConfig == BuiltInAuditConfiguration.LEGACY_PASSIVE_AUDIT_CHECKS) "passive" else "active"
+                )
+                put("requests_added", requestsAdded)
+                if (requestsFailed > 0) put("requests_failed", requestsFailed)
+                put("urls_added", urlsAdded)
+                if (urlsFailed.isNotEmpty()) put("urls_failed", buildJsonArray { urlsFailed.forEach { add(it) } })
                 put("crawl_first", crawlFirst)
+                if (crawlTaskId != null) {
+                    put("crawl_task_id", crawlTaskId)
+                    put(
+                        "crawl_note",
+                        "The crawl runs independently; its newly discovered pages are NOT " +
+                            "automatically added to this audit. Poll sitemap_query after it " +
+                            "finishes and start a new audit with the URLs you want covered."
+                    )
+                }
+                if (crawlSkipped != null) put("crawl_skipped", crawlSkipped)
+                val ignored = buildList {
+                    if (!insertionPointTypes.isNullOrEmpty()) add("insertion_point_types")
+                    if (auditMode?.lowercase() == "thorough") add("thorough (runs identically to normal)")
+                }
+                if (ignored.isNotEmpty()) {
+                    put("ignored", buildJsonArray { ignored.forEach { add(it) } })
+                    put(
+                        "ignored_note",
+                        "Burp's Montoya Scanner API cannot restrict the built-in audit by " +
+                            "insertion point type, and BuiltInAuditConfiguration only has two " +
+                            "values (passive/active) — there is no distinct 'thorough' preset."
+                    )
+                }
                 put("created_at", scanTask.createdAt)
                 if (authRuleId != null) {
                     put("auth_rule_id", authRuleId)
@@ -201,8 +311,32 @@ class ScannerBridge(
             if (reqCount >= 0) put("request_count", reqCount)
             if (errCount >= 0) put("error_count", errCount)
             if (task is Audit && issueCount >= 0) put("issue_count", issueCount)
+            if (scanTask.type == "crawl" && scanTask.sitemapBaselineCount != null && !scanTask.sitemapSeeds.isNullOrEmpty()) {
+                val current = sitemapResponseCount(scanTask.sitemapSeeds)
+                put("sitemap_new_entries", current - scanTask.sitemapBaselineCount)
+                put(
+                    "sitemap_progress_note",
+                    "Heuristic: site map entries with a response under the crawl's seed URL(s), " +
+                        "now vs. at crawl start. Burp's own status/request_count above can be " +
+                        "unreliable (e.g. stuck at 0) on some Burp versions — poll this twice and " +
+                        "watch for it to stop growing instead."
+                )
+            }
             put("created_at", scanTask.createdAt)
         }
+    }
+
+    /**
+     * Counts distinct site map entries with a response under any of [seeds]' URL prefixes.
+     * Used as the crawl-progress baseline/current-count in [startCrawl] / [getTaskStatus] —
+     * see [io.bitbytelab.raijin.state.ScanTask.sitemapBaselineCount].
+     */
+    private fun sitemapResponseCount(seeds: List<String>): Int = try {
+        seeds.flatMap { seed -> api.siteMap().requestResponses(SiteMapFilter.prefixFilter(seed)) }
+            .distinctBy { it.request()?.url() }
+            .count { it.hasResponse() }
+    } catch (_: Exception) {
+        0
     }
 
     /**

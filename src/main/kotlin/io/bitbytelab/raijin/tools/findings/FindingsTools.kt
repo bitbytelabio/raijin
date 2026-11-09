@@ -85,6 +85,26 @@ object FindingsTools {
                 err(e.message ?: "Unknown error")
             }
         }
+
+        server.addTool(
+            name = "findings_remove",
+            description = "Remove a recorded finding by id (from findings_add's response or findings_list).",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("id") { put("type", "string"); put("description", "Finding id to remove") }
+                },
+                required = listOf("id")
+            )
+        ) { request ->
+            try {
+                val a = request.params.arguments ?: emptyMap()
+                val id = a["id"]?.jsonPrimitive?.contentOrNull ?: return@addTool err("Parameter 'id' is required")
+                val result = bridge.remove(id)
+                CallToolResult(content = listOf(TextContent(result.toString())), isError = result["error"] != null)
+            } catch (e: Exception) {
+                err(e.message ?: "Unknown error")
+            }
+        }
     }
 
     private fun err(msg: String): CallToolResult =

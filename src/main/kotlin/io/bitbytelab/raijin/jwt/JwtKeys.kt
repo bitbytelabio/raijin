@@ -367,6 +367,31 @@ private fun parseJwkText(text: String): List<JWK> {
     return listOf(JWK.parse(trimmed))
 }
 
+/**
+ * Converts standalone JWK or JWK-set JSON text to a public-key PEM document — the form
+ * `jwt_attack`'s `alg_confusion` mode needs for `public_key` (it treats that parameter as
+ * literal HMAC-secret bytes, so it needs byte-exact PEM text, not JSON). A JWK set uses its
+ * first entry. This lets a caller pass a server's JWKS entry directly instead of first
+ * importing it into the key ring and exporting it as PEM by hand.
+ *
+ * Same JWK -> PEM conversion as [JwtKey.Jose.exportPem]'s public-key path, kept as an
+ * independent function here (rather than shared code) since that one also handles private-key
+ * export with ring-specific, id-scoped error messages this standalone case has no use for.
+ */
+fun jwkTextToPem(jwkJson: String): String {
+    val jwk = parseJwkText(jwkJson).firstOrNull()
+        ?: throw IllegalArgumentException("No JWK found in the supplied JSON")
+    val obj: Any = when (val pub = jwk.toPublicJWK() ?: jwk) {
+        is RSAKey -> pub.toPublicKey()
+        is ECKey -> pub.toECPublicKey()
+        is OctetKeyPair -> pub.toPublicKey()
+        else -> throw IllegalArgumentException("JWK has no exportable public key (kty=${jwk.keyType?.value})")
+    }
+    val sw = StringWriter()
+    JcaPEMWriter(sw).use { it.writeObject(obj) }
+    return sw.toString()
+}
+
 private fun pemToJwks(pem: String): List<JWK> {
     val parsed = JWK.parseFromPEMEncodedObjects(pem.trim())
     return listOf(parsed)

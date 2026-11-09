@@ -6,6 +6,7 @@ import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.sitemap.SiteMapFilter
+import io.bitbytelab.raijin.core.TextSimilarity
 import io.bitbytelab.raijin.safety.ScopeGate
 import kotlinx.serialization.json.*
 
@@ -536,12 +537,17 @@ class AnalysisBridge(private val api: MontoyaApi) {
                 val bodyLength: Int,
                 val body: String,
                 val headers: Map<String, String>,
-                val responseTime: Long
+                val responseTime: Long,
+                val contentType: String? = null
             )
 
             val results = mutableListOf<AuthResult>()
 
             val errors = mutableListOf<String>()
+
+            // Every level hits the same path (only headers vary across the loop below) — used
+            // only for AuthDiffVerdict's static-asset downgrade (file-extension fallback).
+            val sharedUrl = try { HttpRequest.httpRequest(service, baseRequest).url() } catch (_: Exception) { null }
 
             for (level in authLevels) {
                 val levelName = level["name"]?.jsonPrimitive?.contentOrNull ?: "unknown"
@@ -575,7 +581,8 @@ class AnalysisBridge(private val api: MontoyaApi) {
                         bodyLength = resp?.body()?.length() ?: 0,
                         body = resp?.bodyToString() ?: "",
                         headers = resp?.headers()?.associate { it.name() to it.value() } ?: emptyMap(),
-                        responseTime = elapsed
+                        responseTime = elapsed,
+                        contentType = try { resp?.headerValue("Content-Type") } catch (_: Exception) { null }
                     ))
                 } catch (e: Exception) {
                     errors.add("Level '$levelName' failed: ${describe(e)}")
@@ -647,8 +654,10 @@ class AnalysisBridge(private val api: MontoyaApi) {
             val allSameBody = results.map { it.body }.distinct().size == 1
 
             val verdict = AuthDiffVerdict.assess(
-                results.map { AuthDiffVerdict.LevelResult(it.levelName, it.statusCode, it.body) }
-            ) { x, y -> calculateSimilarity(x, y).toDouble() }
+                results.map { AuthDiffVerdict.LevelResult(it.levelName, it.statusCode, it.body, it.contentType) },
+                similarity = { x, y -> calculateSimilarity(x, y) },
+                url = sharedUrl
+            )
 
             buildJsonObject {
                 put("auth_levels_tested", results.size)
@@ -953,19 +962,7 @@ class AnalysisBridge(private val api: MontoyaApi) {
      * Calculates a rough similarity percentage between two strings using
      * character-level bigram overlap (Dice coefficient).
      */
-    private fun calculateSimilarity(s1: String, s2: String): Double {
-        if (s1 == s2) return 100.0
-        if (s1.isEmpty() && s2.isEmpty()) return 100.0
-        if (s1.isEmpty() || s2.isEmpty()) return 0.0
-
-        val bigrams1 = s1.zipWithNext().toSet()
-        val bigrams2 = s2.zipWithNext().toSet()
-        val intersection = bigrams1.intersect(bigrams2).size
-        val total = bigrams1.size + bigrams2.size
-
-        if (total == 0) return 100.0
-        return Math.round((2.0 * intersection / total) * 10000.0) / 100.0
-    }
+    private fun calculateSimilarity(s1: String, s2: String): Double = TextSimilarity.dice(s1, s2)
 
     /**
      * Pure, Burp-independent helpers. Kept `internal` so unit tests can

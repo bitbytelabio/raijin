@@ -25,12 +25,15 @@ object ScannerTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "scanner_start_crawl",
-            description = "Start a web crawl against one or more target URLs. Returns a task ID for tracking progress. Pro edition only.",
+            description = "Start a web crawl against one or more target URLs. Returns a task ID for tracking progress. Pro edition only. " +
+                "max_depth is NOT supported by Burp's Montoya API (no depth control exists) and is always ignored — check the response's " +
+                "'ignored' field. in_scope_only IS enforced: out-of-scope seed URLs are dropped before crawling. Burp's own request_count " +
+                "in scanner_task_status can be unreliable; use sitemap_query (only_with_response=true) to gauge real progress.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("urls") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Target URLs to crawl") }
-                    putJsonObject("max_depth") { put("type", "integer"); put("description", "Maximum crawl depth") }
-                    putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Restrict crawl to in-scope URLs") }
+                    putJsonObject("max_depth") { put("type", "integer"); put("description", "Not supported by Montoya's CrawlConfiguration — accepted but always ignored") }
+                    putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Restrict crawl to in-scope URLs (enforced by filtering seeds before crawling)") }
                 },
                 required = listOf("urls")
             )
@@ -66,14 +69,19 @@ object ScannerTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "scanner_start_audit",
-            description = "Start an active audit (vulnerability scan) against target URLs or specific HTTP requests. Supports light, normal, and thorough audit modes. Pro edition only.",
+            description = "Start an active audit (vulnerability scan) against target URLs or specific HTTP requests. Pro edition only. " +
+                "'urls' are resolved to requests and added to the audit. audit_mode: light=passive checks, normal/thorough=active checks — " +
+                "Montoya's BuiltInAuditConfiguration has no separate 'thorough' preset, so thorough currently runs identically to normal " +
+                "(see the response's 'ignored' field). insertion_point_types is accepted but NOT enforced — Montoya cannot restrict the " +
+                "built-in audit by insertion point type. crawl_first, when urls is non-empty, starts a REAL crawl on those urls — but " +
+                "Montoya has no crawl-then-audit pipe, so the crawl's discoveries are not auto-added to this audit (see 'crawl_note').",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("urls") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Target URLs to audit") }
+                    putJsonObject("urls") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Target URLs to audit (resolved to requests and added directly)") }
                     putJsonObject("requests") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Base64-encoded HTTP requests to audit") }
-                    putJsonObject("audit_mode") { put("type", "string"); put("description", "Audit mode: light, normal, or thorough") }
-                    putJsonObject("crawl_first") { put("type", "boolean"); put("description", "Crawl targets before auditing") }
-                    putJsonObject("insertion_point_types") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Insertion point types to audit") }
+                    putJsonObject("audit_mode") { put("type", "string"); put("description", "light (passive) | normal | thorough (normal and thorough currently run the same Montoya audit configuration)") }
+                    putJsonObject("crawl_first") { put("type", "boolean"); put("description", "When true and urls is non-empty, starts a real crawl on those urls alongside the audit — the two tasks run independently, see 'crawl_note' in the response") }
+                    putJsonObject("insertion_point_types") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Not enforced — Montoya's built-in audit cannot be restricted by insertion point type") }
                     putJsonObject("auth_header_name") { put("type", "string"); put("description", "Authentication header name") }
                     putJsonObject("auth_header_value") { put("type", "string"); put("description", "Authentication header value") }
                 },
