@@ -53,6 +53,32 @@ class POIScannerTest {
     }
 
     @Test
+    fun `a root-level query field name is itself checked, not just fields inside its return type`() {
+        // Previously scan() only ever called checkField() on INNER fields reached while walking
+        // a root field's return type — the root field itself (e.g. "login") was never checked.
+        val schema = GQLSchema("type Query { login: String }")
+        val found = POIScanner(schema).scan()
+        assertEquals(true, found["auth"]?.any { it.path == "-> login" && it.queryType == "Query" })
+    }
+
+    @Test
+    fun `a root-level mutation field name is itself checked`() {
+        val schema = GQLSchema("type Query { ping: String }\ntype Mutation { admin: Boolean }")
+        val found = POIScanner(schema).scan()
+        assertEquals(true, found["privileged"]?.any { it.path == "-> admin" && it.queryType == "Mutation" })
+    }
+
+    @Test
+    fun `the correctly-spelled 'privileged' category id matches the bundled upstream-typo'd keywords file`() {
+        // keywords.json has id "priviliged" (typo, vendored verbatim from InQL); every other
+        // place in Raijin's own API (DEFAULT_CATEGORIES, the tool description, the skill docs)
+        // says "privileged" — a caller using that obvious spelling must not match nothing.
+        val schema = GQLSchema("type Query { admin: Boolean }")
+        val found = POIScanner(schema, categories = setOf("privileged")).scan()
+        assertEquals(true, found["privileged"]?.any { it.path.endsWith("-> admin") })
+    }
+
+    @Test
     fun `custom keywords are flagged under the custom category`() {
         // Note: the schema's User<->Account cycle means this field is reachable via more than one
         // distinct path (once directly, once through account->owner), so each gets its own entry —

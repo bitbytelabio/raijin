@@ -6,8 +6,13 @@ Raijin combines two projects:
   * Turbo Intruder, Copyright 2018-2026 PortSwigger Ltd and contributors (AGPL-3.0, see below).
   * BurpMCP-Ultra, Copyright (c) 2026 Cy-S3c (MIT, text in LICENSE-MIT).
 
+It also contains code and data ported from three Apache-2.0 Burp extensions
+(InQL, HTTP Request Smuggler, Param Miner); see "Ported and vendored components"
+below.
+
 The combined work is distributed under the GNU Affero General Public License, version 3
-(LICENSE). MIT is compatible with it; the MIT notice above must be retained.
+(LICENSE). MIT and Apache-2.0 are compatible with it; the notices in this file must be
+retained.
 
 
 Turbo Intruder
@@ -68,9 +73,58 @@ No relicensing of these contributions is claimed or implied. Redistributors of
 this work must retain this NOTICE and the attributions above.
 
 
+Ported and vendored components
+------------------------------
+
+The following parts of Raijin are ported (translated to Kotlin, with changes)
+or copied from other projects licensed under the Apache License, Version 2.0
+(full text in LICENSE-APACHE-2.0). Each ported source file says in its header
+comment which upstream code it comes from. Copyright in the original code and
+data is retained by its holders.
+
+InQL
+  https://github.com/doyensec/inql
+  Copyright 2020 Doyensec LLC.
+  Apache License, Version 2.0.
+  Ported:   src/main/kotlin/io/bitbytelab/raijin/graphql/
+              GQLSchema.kt        (from GQLSchema)
+              GQLQueryPrinter.kt  (from GQLQueryPrinter)
+              BatchAttack.kt      (from Attacker.generateAttackRequest)
+              scanners/POIScanner.kt, scanners/CyclesScanner.kt
+                                  (from POIScanner, CyclesScanner)
+  Vendored: src/main/resources/graphql/keywords.json
+
+HTTP Request Smuggler
+  https://github.com/PortSwigger/http-request-smuggler
+  Copyright 2022 PortSwigger Web Security
+  Copyright 2022 James Kettle
+  Apache License, Version 2.0.
+  Ported:   src/main/kotlin/io/bitbytelab/raijin/turbo/
+              DesyncTechniques.kt    (from DesyncBox.applyDesync)
+              DesyncProbePayloads.kt (from ProbePayloads)
+              DesyncCanary.kt        (from CanaryUtils)
+  The Turbo examples desync-smuggler.py and desync-h2-downgrade.py and the
+  doc turbo-docs/desync-techniques.md are written for this port.
+
+Param Miner
+  https://github.com/PortSwigger/param-miner
+  Copyright 2016 PortSwigger Web Security
+  Copyright 2016 James Kettle
+  Apache License, Version 2.0.
+  Vendored: src/main/resources/wordlists/param-miner-params.txt  (resources/params)
+            src/main/resources/wordlists/param-miner-headers.txt (resources/headers)
+
+Autorize
+  https://github.com/PortSwigger/autorize (Barak Tawily, AppSec Labs)
+  The autorize tool (live proxy tap that replays requests under other
+  identities) follows the idea of this extension. It is an independent
+  implementation; no Autorize code is included.
+
+
 Third-party components
 ----------------------
 
-Binary distributions of Turbo Intruder (the fat jar) bundle third-party
-libraries that are licensed separately by their respective authors. Those
+Binary distributions of Raijin (the fat jar) bundle third-party libraries that
+are licensed separately by their respective authors, among them
+graphql-java (MIT, https://github.com/graphql-java/graphql-java). Those
 licenses are unaffected by the license of this work.

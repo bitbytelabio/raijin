@@ -5,7 +5,7 @@
 **One Burp Suite extension that gives AI agents hands.**
 
 An [MCP](https://modelcontextprotocol.io) server that runs inside Burp Suite, merged with the **Turbo** scripting engine
-for high-speed work: single-packet race conditions, HTTP/2 and HTTP/3 gates, desync probes.
+for high-speed work: single-packet race conditions, HTTP/2 and HTTP/3 gates, request-smuggling probes.
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 ![Burp Suite 2026.2+](https://img.shields.io/badge/Burp%20Suite-2026.2%2B-orange.svg)
@@ -18,6 +18,7 @@ for high-speed work: single-packet race conditions, HTTP/2 and HTTP/3 gates, des
 [Skills](#-skills) ·
 [Turbo](#-turbo) ·
 [JWT](#-jwt-toolkit) ·
+[Credits](#-credits) ·
 [Security](#-security-model) ·
 [Configuration](#%EF%B8%8F-configuration) ·
 [Development](#-development)
@@ -32,14 +33,18 @@ for high-speed work: single-packet race conditions, HTTP/2 and HTTP/3 gates, des
 |---|---|
 | 🧰 **160+ operations, ~40 tools** | Proxy, Scanner, Repeater, Intruder, Collaborator, Organizer, site map, scope, WebSockets, cookies, config, Burp AI. Families of operations are grouped behind an `action` parameter so the client's tool list stays small. |
 | 🏎️ **Turbo engine** | Python (Jython) scripts on a custom request engine: single-packet attack, HTTP/2 and HTTP/3, pipelining, timing analysis. Runs from Burp's UI or from an agent. |
-| 🔎 **Recon and guided probes** | JS endpoint extraction, content discovery, parameter mining, fingerprinting; CORS, GraphQL, injection, access control, IDOR and JWT probes, all limited to in-scope targets. |
+| 🔎 **Recon and guided probes** | JS endpoint extraction, content discovery, parameter mining with Param Miner's wordlists, fingerprinting; CORS, GraphQL, injection, access control, IDOR and JWT probes, all limited to in-scope targets. |
+| 🛂 **Live access-control checks** | Autorize-style proxy tap: matching traffic is replayed in the background under lower-privilege identities and mismatches land in findings. |
+| 🕸️ **GraphQL toolkit** | Ported from InQL: query templates per field, points-of-interest and cycle scans, batched alias queries for brute force and rate-limit testing. |
+| 🧬 **Request smuggling** | HTTP Request Smuggler's desync technique catalog, probe payloads and canaries, available to Turbo scripts. |
 | 🔑 **JWT toolkit** | Key ring (RSA, EC, OKP, oct, password), sign, verify, JWE encrypt/decrypt, and the usual JWT test cases (`alg:none`, algorithm confusion, embedded JWK, psychic signatures, `jku`/`x5u`, secret cracking). |
 | 📚 **Built-in skills** | Eight usage guides served as MCP prompts and resources, so an agent learns the tools and workflows on its own. |
 | 🖥️ **Native UI** | A **Raijin** tab that follows Burp's theme (dark or light): MCP activity, proxy explorer, scanner, findings, Collaborator, rules, JWT, Turbo runs, server info. |
 | 🔒 **No token to manage** | Loopback bind plus Host and Origin checks. Point your client at a URL and go. |
 
-> Raijin merges [BurpMCP-Ultra](docs/dev/ultra/README-burpmcp-ultra.md) and [Turbo Intruder](docs/dev/turbo/readme-turbo-intruder.md).
-> See [NOTICE](NOTICE) for attribution and licensing.
+> Raijin merges [BurpMCP-Ultra](docs/dev/ultra/README-burpmcp-ultra.md) and [Turbo Intruder](docs/dev/turbo/readme-turbo-intruder.md),
+> and ports parts of [InQL](https://github.com/doyensec/inql), [HTTP Request Smuggler](https://github.com/PortSwigger/http-request-smuggler)
+> and [Param Miner](https://github.com/PortSwigger/param-miner). See [Credits](#-credits) and [NOTICE](NOTICE).
 
 ---
 
@@ -141,9 +146,10 @@ Raijin exposes about **40 MCP tools**. Frequently used tools stay individual; fa
 | `scanner` | Start crawls and audits, read issues, generate reports, register checks. |
 | `scanner_task` | Status, list, delete running scan tasks; add requests; read their issues. |
 | `custom_check` | BChecks and passive/active scan checks: create from a template, import, list, remove. |
-| `recon` | JS endpoints, content discovery, parameter mining, fingerprinting (in scope only). |
-| `probe` | Guided probes: `cors`, `graphql`, `injection`, `access_control`, `idor`, `jwt` (in scope only). |
+| `recon` | JS endpoints, content discovery, fingerprinting, parameter mining (in scope only). `param_mine` checks reflection or behaviour changes (`mode=diff`) in the query, body, JSON body, cookies or headers, with Param Miner's wordlists when no candidates are given. |
+| `probe` | Guided probes: `cors`, `graphql`, `injection`, `access_control`, `idor`, `jwt` (in scope only). See [GraphQL](#graphql) for the GraphQL modes. |
 | `auth_diff` | Send the same request at different auth levels (admin, user, none) and compare responses. |
+| `autorize` | Live access-control tap: replay matching proxied requests under other identities and flag mismatches (`set_rule`, `list_rules`, `remove_rule`, `list_matches`, `clear_matches`). |
 | `analyze` | Offline analysis: parse requests/responses, reflections, parameters, insertion points, diffs, keywords, passive intel. |
 | `api_import_openapi` | Import an OpenAPI 3 / Swagger 2 spec: build sample requests, optionally send them and add them to scope and the site map. |
 | `bambda_import` | Import a `.bambda` file into Burp. |
@@ -263,10 +269,32 @@ Runs started from the dialog and from agents are listed together on the **Raijin
 | | |
 |---|---|
 | Docs | [`src/main/resources/turbo-docs/`](src/main/resources/turbo-docs/): quick start, engines, decorators, race conditions, performance, settings |
-| Examples | [`src/main/resources/examples/`](src/main/resources/examples/): single-packet races (H1, H2, H3), multi-endpoint races, 0.CL desync, rate limits, timing, crawling and more |
+| Examples | [`src/main/resources/examples/`](src/main/resources/examples/): single-packet races (H1, H2, H3), multi-endpoint races, 0.CL desync, desync technique sweeps (`desync-smuggler`, `desync-h2-downgrade`), rate limits, timing, crawling and more |
+
+**Request smuggling.** `turbo.DesyncTechniques` (obfuscated `Content-Length`/`Transfer-Encoding` variants, H1 and H2), `turbo.DesyncProbePayloads` and `turbo.DesyncCanary` are ported from [HTTP Request Smuggler](https://github.com/PortSwigger/http-request-smuggler). They only build and match bytes; Turbo's engine does the timing and connection pinning. Read `turbo_docs(action=get_docs, topic=desync-techniques)` first.
 
 > [!WARNING]
 > A Turbo run executes Python inside Burp's JVM. Only connect MCP clients you trust.
+
+---
+
+## 🛂 Access control and GraphQL
+
+### Autorize-style tap
+
+`autorize(action=set_rule, identities=[...])` starts a background tap on Proxy traffic, the idea behind the [Autorize](https://github.com/PortSwigger/autorize) extension. Every proxied request that matches the rule (scope, host glob, methods, URL exclusions, static assets skipped) is replayed once per endpoint under each identity, for example `{"name":"none"}` for unauthenticated or `{"name":"low_priv","header_name":"Cookie","header_value":"session=..."}`. Responses are compared with the original by status and body similarity (`similarity_threshold`, default 90). Mismatches are listed by `autorize(action=list_matches)` and also recorded as findings. Replays never block the proxy.
+
+### GraphQL
+
+`probe(action=graphql, url=..., mode=...)`, ported from [InQL](https://github.com/doyensec/inql):
+
+| Mode | Purpose |
+|---|---|
+| `probe` (default) | Introspection enabled, disabled (falls back to "Did you mean" suggestions), or not GraphQL. |
+| `query_templates` | A runnable example query, mutation or subscription for each schema field (`max_depth`, default 6). Needs introspection. |
+| `poi_scan` | Fields that look security-relevant by name (auth, privileged, PII, payment, database, debugging, files), deprecated fields, custom scalars. |
+| `cycles_scan` | Types that can recurse into themselves (deep nesting, denial of service). |
+| `batch_attack` | Expand `$[INT:first:last]` or `$[LIST]` in `template` into aliased operations in one request (2FA brute force, IDOR enumeration, rate limits). Generates only unless `send=true`. |
 
 ---
 
@@ -340,9 +368,11 @@ All source is Kotlin, Montoya API only (`compileOnly`), namespace `io.bitbytelab
 
 ```text
 src/main/kotlin/io/bitbytelab/raijin/
-├── core/        shared helpers (JSON truncation, payload libraries, similarity)
+├── core/        shared helpers (JSON truncation, payload libraries, wordlists, similarity)
 ├── transport/   MCP server, Streamable HTTP + SSE, security checks, prompts, resources, dashboard
 ├── bridge/      *Bridge.kt wrappers over Burp APIs
+├── graphql/     schema model, query printer, scanners, batch queries (ported from InQL)
+├── state/       shared state (Autorize-style rules and matches)
 ├── tools/       <area>/*Tools.kt MCP tools; ToolConsolidation.kt groups them into action tools
 ├── skills/      SkillCatalog (skill markdown lives in src/main/resources/skills/)
 ├── jwt/         JOSE operations and the key ring
@@ -363,9 +393,22 @@ MCP SDK: `io.modelcontextprotocol:kotlin-sdk-server` 0.16, which pins Kotlin 2.4
 
 ---
 
+## 🙏 Credits
+
+| Project | License | Used for |
+|---|---|---|
+| [Turbo Intruder](https://github.com/PortSwigger/turbo-intruder) (PortSwigger) | AGPL-3.0 (Apache-2.0 up to 1.62) | The Turbo engine. |
+| [BurpMCP-Ultra](docs/dev/ultra/README-burpmcp-ultra.md) (Cy-S3c) | MIT | The MCP server and tools. |
+| [InQL](https://github.com/doyensec/inql) (Doyensec) | Apache-2.0 | GraphQL schema model, query templates, scanners, batch queries, POI keywords. |
+| [HTTP Request Smuggler](https://github.com/PortSwigger/http-request-smuggler) (PortSwigger, James Kettle) | Apache-2.0 | Desync techniques, probe payloads, canaries. |
+| [Param Miner](https://github.com/PortSwigger/param-miner) (PortSwigger, James Kettle) | Apache-2.0 | Parameter and header wordlists. |
+| [Autorize](https://github.com/PortSwigger/autorize) (Barak Tawily) | | The idea behind the `autorize` tool; no code copied. |
+
+---
+
 ## 📄 License
 
-[GNU AGPL-3.0](LICENSE). Contains MIT-licensed code from BurpMCP-Ultra ([LICENSE-MIT](LICENSE-MIT)) and Apache-2.0 contributions to Turbo Intruder ([LICENSE-APACHE-2.0](LICENSE-APACHE-2.0)). See [NOTICE](NOTICE).
+[GNU AGPL-3.0](LICENSE). Contains MIT-licensed code from BurpMCP-Ultra ([LICENSE-MIT](LICENSE-MIT)), and Apache-2.0 code from Turbo Intruder contributions, InQL, HTTP Request Smuggler and Param Miner ([LICENSE-APACHE-2.0](LICENSE-APACHE-2.0)). See [NOTICE](NOTICE).
 
 <div align="center">
 <sub>Made by <a href="https://github.com/bitbytelabio">bitbytelab</a></sub>

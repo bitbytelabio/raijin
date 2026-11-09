@@ -52,6 +52,57 @@ class AutorizeBridgeTest {
     }
 
     @Test
+    fun `updating one field without resending others keeps the rule's existing values`() {
+        val b = AutorizeBridge(StateManager())
+        val r1 = b.setRule(
+            ruleId = null,
+            identities = listOf(identity("admin"), identity("none")),
+            inScopeOnly = true,
+            includeHostPattern = "*.example.com",
+            excludeUrlRegex = null,
+            methods = listOf("GET"),
+            ignoreStaticAssets = true,
+            similarityThreshold = 90.0,
+            enabled = true,
+        )
+        val ruleId = r1["rule_id"]!!.jsonPrimitive.content
+
+        // Only similarity_threshold is resent — everything else is omitted (null), as an MCP
+        // client would do when it only wants to tune one knob.
+        b.setRule(
+            ruleId = ruleId,
+            identities = null,
+            inScopeOnly = null,
+            includeHostPattern = null,
+            excludeUrlRegex = null,
+            methods = null,
+            ignoreStaticAssets = null,
+            similarityThreshold = 50.0,
+            enabled = null,
+        )
+
+        val rule = b.listRules()["rules"]!!.jsonArray[0].jsonObject
+        assertEquals(50.0, rule["similarity_threshold"]?.jsonPrimitive?.contentOrNull?.toDouble())
+        // Everything NOT resent must survive the update unchanged.
+        assertEquals(true, rule["enabled"]?.jsonPrimitive?.contentOrNull?.toBoolean())
+        assertEquals("*.example.com", rule["include_host_pattern"]?.jsonPrimitive?.contentOrNull)
+        assertEquals(listOf("GET"), rule["methods"]?.jsonArray?.map { it.jsonPrimitive.content })
+        assertEquals(2, rule["identities"]?.jsonArray?.size)
+    }
+
+    @Test
+    fun `omitting enabled on an update does not re-enable a disabled rule`() {
+        val b = AutorizeBridge(StateManager())
+        val r1 = b.setRule(null, listOf(identity("admin"), identity("none")), true, null, null, null, true, 90.0, false)
+        val ruleId = r1["rule_id"]!!.jsonPrimitive.content
+        assertEquals("disabled", r1["status"]?.jsonPrimitive?.contentOrNull)
+
+        val r2 = b.setRule(ruleId, null, null, null, null, null, null, 75.0, null)
+        assertEquals("disabled", r2["status"]?.jsonPrimitive?.contentOrNull)
+        assertEquals(false, b.listRules()["rules"]!!.jsonArray[0].jsonObject["enabled"]?.jsonPrimitive?.contentOrNull?.toBoolean())
+    }
+
+    @Test
     fun `removeRule removes an existing rule and reports a miss for an unknown id`() {
         val b = AutorizeBridge(StateManager())
         val r1 = b.setRule(null, listOf(identity("admin"), identity("none")), true, null, null, null, true, 90.0, true)

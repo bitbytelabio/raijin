@@ -32,17 +32,27 @@ class POIScanner(
     data class FieldResult(val type: String, val path: String, val queryType: String, val description: String?)
 
     companion object {
-        val DEFAULT_CATEGORIES = setOf("auth", "priviliged", "pii", "payment", "database", "debugging", "files")
+        val DEFAULT_CATEGORIES = setOf("auth", "privileged", "pii", "payment", "database", "debugging", "files")
 
         private data class KeywordCategory(val name: String, val id: String, val keywords: List<String>)
+
+        /**
+         * The bundled `keywords.json` (vendored verbatim from InQL) has a typo'd category id,
+         * "priviliged". Every other place in Raijin's own API surface — [DEFAULT_CATEGORIES],
+         * the `poi_scan` tool description, the skill docs — uses the correctly-spelled
+         * "privileged", so a caller typing the obvious spelling matched nothing. Remapped at load
+         * time so "privileged" is the one id that exists anywhere in the public API/output.
+         */
+        private val categoryIdAliases = mapOf("priviliged" to "privileged")
 
         private val allCategories: List<KeywordCategory> by lazy {
             val text = POIScanner::class.java.getResource("/graphql/keywords.json")?.readText() ?: "[]"
             Json.parseToJsonElement(text).jsonArray.map { el ->
                 val o = el.jsonObject
+                val rawId = o["id"]?.jsonPrimitive?.contentOrNull ?: ""
                 KeywordCategory(
                     name = o["name"]?.jsonPrimitive?.contentOrNull ?: "",
-                    id = o["id"]?.jsonPrimitive?.contentOrNull ?: "",
+                    id = categoryIdAliases[rawId] ?: rawId,
                     keywords = o["keywords"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList(),
                 )
             }
@@ -64,9 +74,26 @@ class POIScanner(
     /** Scans and returns results grouped by concern type, each entry deduplicated by path. */
     fun scan(depth: Int = 10): Map<String, List<FieldResult>> {
         val results = mutableListOf<FieldResult>()
-        for (q in schema.queries) results.addAll(scanField(q.value.type, "", "Query", depth))
-        for (q in schema.mutations) results.addAll(scanField(q.value.type, "", "Mutation", depth))
-        for (q in schema.subscriptions) results.addAll(scanField(q.value.type, "", "Subscription", depth))
+        // Root fields (e.g. "login", "deleteUser") must be checked themselves, not just the
+        // fields nested inside their return type — a mutation named "deleteUser" is exactly the
+        // kind of security-interesting name this scanner exists to flag, and checkField() was
+        // previously only ever called on INNER fields reached from scanField()'s object-type
+        // branch, never on the root field definitions scan() starts from.
+        for (q in schema.queries) {
+            val path = "-> ${q.key}"
+            results.addAll(checkField(q.value, path, "Query"))
+            results.addAll(scanField(q.value.type, path, "Query", depth))
+        }
+        for (q in schema.mutations) {
+            val path = "-> ${q.key}"
+            results.addAll(checkField(q.value, path, "Mutation"))
+            results.addAll(scanField(q.value.type, path, "Mutation", depth))
+        }
+        for (q in schema.subscriptions) {
+            val path = "-> ${q.key}"
+            results.addAll(checkField(q.value, path, "Subscription"))
+            results.addAll(scanField(q.value.type, path, "Subscription", depth))
+        }
 
         val finalResults = linkedMapOf<String, MutableList<FieldResult>>()
         val seenPaths = mutableMapOf<String, MutableSet<String>>()

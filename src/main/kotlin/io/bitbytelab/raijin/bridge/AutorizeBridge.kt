@@ -21,18 +21,28 @@ class AutorizeBridge(private val stateManager: StateManager) {
 
     private val severityRank = mapOf("critical" to 3, "high" to 2, "info" to 1)
 
+    /**
+     * Creates a new rule, or — when [ruleId] names an existing rule — updates it. Every parameter
+     * besides [ruleId] and [identities] is nullable and PATCH-like: a null means "not specified",
+     * which on an update inherits the existing rule's value instead of silently reverting to the
+     * hardcoded default (the opposite would mean e.g. updating only `similarity_threshold` without
+     * resending `methods` wipes the method filter, or omitting `enabled` re-enables a disabled
+     * rule) — only a genuinely new rule (no existing [ruleId] match) falls back to defaults.
+     */
     fun setRule(
         ruleId: String?,
-        identities: List<JsonObject>,
-        inScopeOnly: Boolean,
+        identities: List<JsonObject>?,
+        inScopeOnly: Boolean?,
         includeHostPattern: String?,
         excludeUrlRegex: String?,
         methods: List<String>?,
-        ignoreStaticAssets: Boolean,
-        similarityThreshold: Double,
-        enabled: Boolean,
+        ignoreStaticAssets: Boolean?,
+        similarityThreshold: Double?,
+        enabled: Boolean?,
     ): JsonObject {
-        if (identities.size < 2) {
+        val existing = ruleId?.let { id -> stateManager.autorizeRules.firstOrNull { it.ruleId == id } }
+        val resolvedIdentities = identities ?: existing?.identities
+        if (resolvedIdentities == null || resolvedIdentities.size < 2) {
             return buildJsonObject {
                 put(
                     "error",
@@ -42,22 +52,23 @@ class AutorizeBridge(private val stateManager: StateManager) {
             }
         }
         val id = ruleId ?: stateManager.generateId("arule")
+        val resolvedEnabled = enabled ?: existing?.enabled ?: true
         val rule = AutorizeRule(
             ruleId = id,
-            identities = identities,
-            inScopeOnly = inScopeOnly,
-            includeHostPattern = includeHostPattern,
-            excludeUrlRegex = excludeUrlRegex,
-            methods = methods?.map { it.uppercase() }?.toSet(),
-            ignoreStaticAssets = ignoreStaticAssets,
-            similarityThreshold = similarityThreshold,
-            enabled = enabled,
+            identities = resolvedIdentities,
+            inScopeOnly = inScopeOnly ?: existing?.inScopeOnly ?: true,
+            includeHostPattern = includeHostPattern ?: existing?.includeHostPattern,
+            excludeUrlRegex = excludeUrlRegex ?: existing?.excludeUrlRegex,
+            methods = methods?.map { it.uppercase() }?.toSet() ?: existing?.methods,
+            ignoreStaticAssets = ignoreStaticAssets ?: existing?.ignoreStaticAssets ?: true,
+            similarityThreshold = similarityThreshold ?: existing?.similarityThreshold ?: 90.0,
+            enabled = resolvedEnabled,
         )
         stateManager.autorizeRules.removeIf { it.ruleId == id }
         stateManager.autorizeRules.add(rule)
         return buildJsonObject {
             put("rule_id", id)
-            put("status", if (enabled) "active" else "disabled")
+            put("status", if (resolvedEnabled) "active" else "disabled")
         }
     }
 

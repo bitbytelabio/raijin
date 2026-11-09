@@ -102,9 +102,8 @@ class GraphQlBridge(private val api: MontoyaApi) {
         val check = scopeGate.check(url)
         check.deny?.let { return it }
         val result = try {
-            val schema = fetchFullSchema(url) ?: return buildJsonObject {
-                put("error", "Could not build a schema from this endpoint's introspection response (introspection may be disabled).")
-            }
+            val (schema, err) = fetchFullSchema(url)
+            if (schema == null) return buildJsonObject { put("error", err) }
             buildJsonObject {
                 put("endpoint", url)
                 put("max_depth", maxDepth)
@@ -126,9 +125,8 @@ class GraphQlBridge(private val api: MontoyaApi) {
         val check = scopeGate.check(url)
         check.deny?.let { return it }
         val result = try {
-            val schema = fetchFullSchema(url) ?: return buildJsonObject {
-                put("error", "Could not build a schema from this endpoint's introspection response (introspection may be disabled).")
-            }
+            val (schema, err) = fetchFullSchema(url)
+            if (schema == null) return buildJsonObject { put("error", err) }
             val scanner = POIScanner(schema, categories ?: POIScanner.DEFAULT_CATEGORIES, customKeywords ?: emptyList())
             val found = scanner.scan()
             buildJsonObject {
@@ -160,9 +158,8 @@ class GraphQlBridge(private val api: MontoyaApi) {
         val check = scopeGate.check(url)
         check.deny?.let { return it }
         val result = try {
-            val schema = fetchFullSchema(url) ?: return buildJsonObject {
-                put("error", "Could not build a schema from this endpoint's introspection response (introspection may be disabled).")
-            }
+            val (schema, err) = fetchFullSchema(url)
+            if (schema == null) return buildJsonObject { put("error", err) }
             val cycles = CyclesScanner(schema).detect().cyclesAsStrings()
             buildJsonObject {
                 put("endpoint", url)
@@ -210,11 +207,26 @@ class GraphQlBridge(private val api: MontoyaApi) {
         return withScopeWarning(result, check.warning)
     }
 
-    /** Fetches the FULL official introspection query (needed for schema modeling) and builds a [GQLSchema]; null on any failure. */
-    private fun fetchFullSchema(url: String): GQLSchema? {
+    /**
+     * Fetches the FULL official introspection query (needed for schema modeling) and builds a
+     * [GQLSchema]. The failure message distinguishes a connection failure (couldn't reach the
+     * endpoint at all — `status == 0`) from a real HTTP response that just doesn't parse into a
+     * schema (introspection genuinely disabled/malformed) — conflating the two previously made a
+     * bad URL/unreachable host look identical to "introspection may be disabled".
+     */
+    private fun fetchFullSchema(url: String): Pair<GQLSchema?, String?> {
         val resp = postQuery(url, graphql.introspection.IntrospectionQuery.INTROSPECTION_QUERY)
-        if (resp.status == 0 || resp.body.isBlank()) return null
-        return try { GQLSchema(resp.body) } catch (_: Exception) { null }
+        if (resp.status == 0) {
+            return null to "Could not reach $url (connection failed) — check the URL and that the target is reachable."
+        }
+        if (resp.body.isBlank()) {
+            return null to "Endpoint returned an empty response body (HTTP ${resp.status}); introspection may be disabled."
+        }
+        val schema = try { GQLSchema(resp.body) } catch (_: Exception) { null }
+        return schema to (
+            if (schema == null) "Could not build a schema from this endpoint's introspection response (HTTP ${resp.status}); introspection may be disabled."
+            else null
+        )
     }
 
     private fun withScopeWarning(result: JsonObject, warning: String?): JsonObject =

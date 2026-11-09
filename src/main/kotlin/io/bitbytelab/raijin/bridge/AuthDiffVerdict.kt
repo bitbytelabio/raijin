@@ -77,24 +77,53 @@ object AuthDiffVerdict {
         val authLevels = results.filter { it.isAuthLevel }
         val unauthLevels = results.filter { !it.isAuthLevel }
 
-        for (u in unauthLevels) {
-            if (!u.isSuccess) continue
-            val match = authLevels.firstOrNull { a -> a.isSuccess && similarity(a.body, u.body) >= unauthMatchThreshold }
-            if (match != null) {
-                findings.add(
-                    Finding(
-                        "critical", "unauth_reads_protected",
-                        "'${u.name}' returns ${u.status} with a body ~matching authed level '${match.name}' — broken access control: the protected resource is served without proper authorization."
+        // Pairwise cross-identity match: does ANY two different-named levels share a status and a
+        // near-identical body? Covers both "an unauth level reads what an authed level reads"
+        // (existing) AND the case the old unauth-only loop missed entirely — two DIFFERENT
+        // authenticated identities (e.g. "captured"/the browsing session, and a lower-privilege
+        // "low_priv" identity) getting the same protected content, while an unrelated third level
+        // (e.g. "none") differs in status. That third level pulls allSameStatus false, so the
+        // all-identical branch above never fires, but captured/low_priv matching each other is
+        // still exactly the broken-access-control signal Autorize's documented
+        // "low-priv identity + none" setup is supposed to catch.
+        val matchedNames = mutableSetOf<String>()
+        for (i in results.indices) {
+            for (j in i + 1 until results.size) {
+                val a = results[i]
+                val b = results[j]
+                if (a.name.equals(b.name, true)) continue
+                if (a.status != b.status || !a.isSuccess) continue
+                if (similarity(a.body, b.body) < unauthMatchThreshold) continue
+                matchedNames.add(a.name)
+                matchedNames.add(b.name)
+                if (!a.isAuthLevel || !b.isAuthLevel) {
+                    val unauthSide = if (!a.isAuthLevel) a else b
+                    val authSide = if (a.isAuthLevel) a else b
+                    findings.add(
+                        Finding(
+                            "critical", "unauth_reads_protected",
+                            "'${unauthSide.name}' returns ${unauthSide.status} with a body ~matching authed level '${authSide.name}' — broken access control: the protected resource is served without proper authorization."
+                        )
                     )
-                )
-            } else {
-                findings.add(
-                    Finding(
-                        "high", "unauth_accessible",
-                        "'${u.name}' returns ${u.status} (2xx/3xx) — the endpoint is reachable without authentication; confirm it is meant to be public."
+                } else {
+                    findings.add(
+                        Finding(
+                            "critical", "cross_identity_match",
+                            "'${a.name}' and '${b.name}' both return status ${a.status} with near-identical bodies — broken access control: '${b.name}' may be able to access data belonging to '${a.name}'."
+                        )
                     )
-                )
+                }
             }
+        }
+
+        for (u in unauthLevels) {
+            if (!u.isSuccess || u.name in matchedNames) continue
+            findings.add(
+                Finding(
+                    "high", "unauth_accessible",
+                    "'${u.name}' returns ${u.status} (2xx/3xx) — the endpoint is reachable without authentication; confirm it is meant to be public."
+                )
+            )
         }
 
         // Same status across multiple authed identities but differing bodies → classic IDOR shape.

@@ -5,6 +5,7 @@ import io.bitbytelab.raijin.safety.BoundedHttp
 import burp.api.montoya.http.message.params.HttpParameter
 import burp.api.montoya.http.message.requests.HttpRequest
 import io.bitbytelab.raijin.core.BehavioralDiff
+import io.bitbytelab.raijin.core.JsonBodyMerge
 import io.bitbytelab.raijin.core.ParamMinerWordlists
 import io.bitbytelab.raijin.core.ProbeResult
 import io.bitbytelab.raijin.recon.JsEndpoints
@@ -131,7 +132,11 @@ class ReconBridge(private val api: MontoyaApi) {
             val useReflection = mode == "reflection" || mode == "both"
             val resolvedMethod = method ?: if (injectIn == "body" || injectIn == "json_body") "POST" else "GET"
 
-            val source = candidates ?: ParamMinerWordlists.load(wordlist ?: ParamMinerWordlists.DEFAULT)
+            val wordlistName = wordlist ?: ParamMinerWordlists.DEFAULT
+            val source = when (val resolved = ParamMinerWordlists.resolve(candidates, wordlistName)) {
+                is ParamMinerWordlists.Resolved.Error -> return buildJsonObject { put("error", resolved.message) }
+                is ParamMinerWordlists.Resolved.Ok -> resolved.candidates
+            }
             // Caller-supplied lists get the existing generous cap; an auto-loaded dictionary is capped
             // tighter by default so a bare call doesn't silently fire ~1000 requests at the target.
             val tested = source.take(if (candidates != null) 1000 else 300)
@@ -169,7 +174,7 @@ class ReconBridge(private val api: MontoyaApi) {
                 put("mode", mode)
                 put("inject_in", injectIn)
                 put("marker", MARKER)
-                put("wordlist_used", if (candidates == null) (wordlist ?: ParamMinerWordlists.DEFAULT) else null)
+                put("wordlist_used", if (candidates == null) wordlistName else null)
                 put("tested", tested.size)
                 put("interesting_count", interesting.size)
                 put("interesting_params", buildJsonArray { interesting.forEach { add(it) } })
@@ -210,20 +215,10 @@ class ReconBridge(private val api: MontoyaApi) {
         if (request.hasParameter(param.name(), param.type())) request.withUpdatedParameters(param)
         else request.withAddedParameters(param)
 
-    /** Adds [name]:[value] as a top-level key to a JSON object body; leaves the request untouched if the body isn't a JSON object. */
+    /** Adds [name]:[value] as a top-level key to a JSON object body (see [JsonBodyMerge]). */
     private fun injectJsonBody(request: HttpRequest, name: String, value: String): HttpRequest {
-        val bodyText = try { request.body().toString() } catch (_: Exception) { "" }.trim()
-        if (!bodyText.startsWith("{")) return request
-        return try {
-            val parsed = kotlinx.serialization.json.Json.parseToJsonElement(bodyText)
-            if (parsed !is JsonObject) return request
-            val merged = buildJsonObject {
-                parsed.forEach { (k, v) -> put(k, v) }
-                put(name, value)
-            }
-            request.withBody(merged.toString()).withHeader("Content-Type", "application/json")
-        } catch (_: Exception) {
-            request
-        }
+        val bodyText = try { request.bodyToString() } catch (_: Exception) { "" }
+        val merged = JsonBodyMerge.mergeKey(bodyText, name, value)
+        return request.withBody(merged).withHeader("Content-Type", "application/json")
     }
 }

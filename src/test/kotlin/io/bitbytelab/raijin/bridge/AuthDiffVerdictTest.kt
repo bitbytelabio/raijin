@@ -37,6 +37,29 @@ class AuthDiffVerdictTest {
         assertFalse(f.any { it.severity == "critical" || it.severity == "high" })
     }
 
+    @Test
+    fun `flags two different authenticated identities sharing protected content even when a third level differs`() {
+        // The documented Autorize setup: a "captured" browsing session, a lower-privilege
+        // identity, and "none". If low_priv sees the SAME content as the real session while none
+        // is correctly blocked, overall status is not uniform (captured/low_priv=200, none=403),
+        // so the all-identical branch never fires — but captured vs low_priv must still be flagged.
+        val f = AuthDiffVerdict.assess(
+            listOf(lr("captured", 200, "secret"), lr("low_priv", 200, "secret"), lr("none", 403, "denied")), sim
+        )
+        assertTrue(f.any { it.id == "cross_identity_match" && it.severity == "critical" })
+        // none was properly blocked (403, not a 2xx/3xx) — must not also be flagged as accessible.
+        assertFalse(f.any { it.id == "unauth_accessible" })
+    }
+
+    @Test
+    fun `a matched unauth level is not also reported as unauth_accessible`() {
+        val f = AuthDiffVerdict.assess(
+            listOf(lr("admin", 200, "secret"), lr("user", 403, "denied"), lr("none", 200, "secret")), sim
+        )
+        assertTrue(f.any { it.id == "unauth_reads_protected" })
+        assertFalse(f.any { it.id == "unauth_accessible" })
+    }
+
     // Graduated similarity (not just exact-match) so the threshold overrides below are meaningful.
     private val gradedSim = { a: String, b: String ->
         if (a == b) 100.0 else if (a.take(3) == b.take(3)) 80.0 else 0.0

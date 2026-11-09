@@ -27,31 +27,36 @@ object AutorizeTools {
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("rule_id") { put("type", "string"); put("description", "Omit to create a new rule; pass an existing id to update it") }
-                    putJsonObject("identities") { put("type", "array"); putJsonObject("items") { put("type", "object") }; put("description", "At least 2: [{\"name\":\"none\"}] to test unauthenticated, or [{\"name\":\"low_priv\",\"header_name\":\"Cookie\",\"header_value\":\"session=...\"}] for a second session") }
-                    putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Only tap requests Burp's scope considers in scope (default true)") }
-                    putJsonObject("include_host_pattern") { put("type", "string"); put("description", "Optional hostname glob, e.g. '*.example.com'; omit to tap every host") }
-                    putJsonObject("exclude_url_regex") { put("type", "string"); put("description", "Optional URL regex; matching requests are skipped") }
-                    putJsonObject("methods") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Optional HTTP methods to tap; omit to tap every method") }
-                    putJsonObject("ignore_static_assets") { put("type", "boolean"); put("description", "Skip responses that look like a static asset (default true)") }
-                    putJsonObject("similarity_threshold") { put("type", "number"); put("description", "Body-similarity percent (0-100) controlling match strictness (default 90)") }
-                    putJsonObject("enabled") { put("type", "boolean"); put("description", "Whether the rule taps traffic immediately (default true)") }
+                    putJsonObject("identities") { put("type", "array"); putJsonObject("items") { put("type", "object") }; put("description", "At least 2, required when creating a rule: [{\"name\":\"none\"}] to test unauthenticated, or [{\"name\":\"low_priv\",\"header_name\":\"Cookie\",\"header_value\":\"session=...\"}] for a second session. Omit on an update to keep the rule's existing identities.") }
+                    putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Only tap requests Burp's scope considers in scope (default true on create; omit on an update to keep the existing value)") }
+                    putJsonObject("include_host_pattern") { put("type", "string"); put("description", "Optional hostname glob, e.g. '*.example.com'; omit to tap every host (or, on an update, to keep the existing value)") }
+                    putJsonObject("exclude_url_regex") { put("type", "string"); put("description", "Optional URL regex; matching requests are skipped (omit on an update to keep the existing value)") }
+                    putJsonObject("methods") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Optional HTTP methods to tap; omit to tap every method (or, on an update, to keep the existing filter)") }
+                    putJsonObject("ignore_static_assets") { put("type", "boolean"); put("description", "Skip responses that look like a static asset (default true on create; omit on an update to keep the existing value)") }
+                    putJsonObject("similarity_threshold") { put("type", "number"); put("description", "Body-similarity percent (0-100) controlling match strictness (default 90 on create; omit on an update to keep the existing value)") }
+                    putJsonObject("enabled") { put("type", "boolean"); put("description", "Whether the rule taps traffic (default true on create; omit on an update to keep the existing value — it does NOT re-enable a disabled rule)") }
                 },
-                required = listOf("identities")
+                required = emptyList()
             )
         ) { request ->
             try {
                 val a = request.params.arguments ?: emptyMap()
-                val identities = a["identities"].asJsonObjectList() ?: return@addTool err("Parameter 'identities' (array of >=2 objects) is required")
+                // Every optional field is passed through AS-IS (null when omitted) rather than
+                // defaulted here — AutorizeBridge.setRule treats null as "keep the existing rule's
+                // value" on an update, and only falls back to a hardcoded default when creating a
+                // brand-new rule. Defaulting here instead would silently wipe out any field the
+                // caller didn't resend on every update (e.g. updating just similarity_threshold
+                // would otherwise clear 'methods' back to "all methods").
                 val result = bridge.setRule(
                     ruleId = a["rule_id"]?.jsonPrimitive?.contentOrNull,
-                    identities = identities,
-                    inScopeOnly = a["in_scope_only"]?.jsonPrimitive?.booleanOrNull ?: true,
+                    identities = a["identities"].asJsonObjectList(),
+                    inScopeOnly = a["in_scope_only"]?.jsonPrimitive?.booleanOrNull,
                     includeHostPattern = a["include_host_pattern"]?.jsonPrimitive?.contentOrNull,
                     excludeUrlRegex = a["exclude_url_regex"]?.jsonPrimitive?.contentOrNull,
                     methods = a["methods"].asStringList(),
-                    ignoreStaticAssets = a["ignore_static_assets"]?.jsonPrimitive?.booleanOrNull ?: true,
-                    similarityThreshold = a["similarity_threshold"]?.jsonPrimitive?.doubleOrNull ?: 90.0,
-                    enabled = a["enabled"]?.jsonPrimitive?.booleanOrNull ?: true,
+                    ignoreStaticAssets = a["ignore_static_assets"]?.jsonPrimitive?.booleanOrNull,
+                    similarityThreshold = a["similarity_threshold"]?.jsonPrimitive?.doubleOrNull,
+                    enabled = a["enabled"]?.jsonPrimitive?.booleanOrNull,
                 )
                 CallToolResult(content = listOf(TextContent(result.toString())), isError = result["error"] != null)
             } catch (e: Exception) { err(e.message) }
