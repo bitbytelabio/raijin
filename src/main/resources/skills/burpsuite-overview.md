@@ -31,4 +31,4 @@ Raijin exposes Burp Suite through MCP as about 40 tools. Most tools take an `act
 ## Rules
 - Only run against targets you are authorised to test.
 - Prefer one small request over a broad run; keep result sets small (most tools page or cap output).
-- Other skills: `http-testing`, `proxy-traffic`, `scanner-audit`, `recon-and-probes`, `findings-reporting`, `collaborator-oob`, `turbo-scripting`. Read them as MCP resources at `skill://burpsuite/<name>`, or run them as MCP prompts named `<name>_skill` with `-` as `_` (for example `http_testing_skill`).
+- Other skills: `http-testing`, `proxy-traffic`, `scanner-audit`, `recon-and-probes`, `findings-reporting`, `collaborator-oob`, `turbo-scripting`. Read them as MCP resources at `skill://<name>/SKILL.md`, or run them as MCP prompts named `<name>_skill` with `-` as `_` (for example `http_testing_skill`).

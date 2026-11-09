@@ -11,7 +11,7 @@ import java.io.File
  * checks every entry resolves and that its frontmatter name matches.
  *
  * Each skill is served two ways: as an MCP prompt named [promptName] (`PromptRegistry`; this is
- * what Claude Code and omp list as slash commands) and as a `skill://burpsuite/<name>` resource
+ * what Claude Code and omp list as slash commands) and as a `skill://<name>/SKILL.md` resource
  * (`ResourceRegistry`; this is how a model reads one on its own).
  */
 object SkillCatalog {

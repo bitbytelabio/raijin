@@ -18,7 +18,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.TextContent
  * without it). Both pickers filter on the command name, hence the `_skill` suffix: typing `skill`
  * finds every skill prompt, from every server.
  *
- * The same text is served as `skill://burpsuite/<name>` resources by [ResourceRegistry], which is how
+ * The same text is served as `skill://<name>/SKILL.md` resources by [ResourceRegistry], which is how
  * a model reads a skill on its own. Skills are static guides, so prompts take no arguments.
  */
 object PromptRegistry {
