@@ -1,8 +1,12 @@
+// The legacy HTTP+SSE transport is deprecated in the SDK; it stays for clients still configured with "type": "sse".
+@file:Suppress("DEPRECATION")
+
 package io.bitbytelab.raijin.transport
 
 import burp.api.montoya.logging.Logging
 import io.bitbytelab.raijin.bridge.BridgeFactory
 import io.bitbytelab.raijin.core.BuildInfo
+import io.bitbytelab.raijin.core.ConnectionInfo
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.skills.SkillCatalog
 import io.bitbytelab.raijin.state.StateManager
@@ -18,6 +22,7 @@ import io.ktor.server.routing.*
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.server.SseServerTransport
+import io.modelcontextprotocol.kotlin.sdk.server.mcpStreamableHttp
 import io.modelcontextprotocol.kotlin.sdk.shared.Transport
 import io.modelcontextprotocol.kotlin.sdk.shared.TransportSendOptions
 import io.modelcontextprotocol.kotlin.sdk.types.Implementation
@@ -30,14 +35,13 @@ import java.util.concurrent.ConcurrentHashMap
  * Manages the lifecycle of MCP server instances and their underlying
  * Ktor HTTP servers.
  *
- * Two SSE transports are exposed on separate ports so that multiple
- * MCP clients can connect independently:
- * - **Primary SSE** on [ssePort] (default 9876).
- * - **Secondary SSE** on [httpPort] (default 9877).
- *
- * Both are plain MCP SSE transports: the SSE stream is the ROOT path "/" (GET) and
- * the back-channel is "/?sessionId=..." (POST) — NOT "/sse". There is no "Streamable
- * HTTP" or "stdio" transport — those were previously advertised but never implemented.
+ * Two listeners are exposed on separate ports so that multiple MCP clients can connect
+ * independently: **primary** on [ssePort] (default 9876) and **secondary** on [httpPort]
+ * (default 9877). Each serves the same two transports:
+ * - **Streamable HTTP** at [STREAMABLE_HTTP_PATH] (`/mcp`): what clients should use
+ *   (`"type": "http"` in Claude Code and omp).
+ * - **Legacy HTTP+SSE** (deprecated by the MCP spec, kept for old client configs): the SSE
+ *   stream is the ROOT path "/" (GET) and the back-channel is "/?sessionId=..." (POST), NOT "/sse".
  *
  * @param bridges All bridge instances for tool/resource registration.
  * @param eventBus Shared event bus for event-related tools/resources.
@@ -72,6 +76,9 @@ class McpServerManager(
     private val sendTimeoutMs: Long = 45_000L
 
     companion object {
+        /** Path of the Streamable HTTP endpoint on both listeners. */
+        const val STREAMABLE_HTTP_PATH = ConnectionInfo.MCP_PATH
+
         /**
          * Sent to every client on initialize. Keep it short (omp keeps only the first 4000
          * characters) and point at the skills; the skills themselves carry the detail.
@@ -81,8 +88,9 @@ class McpServerManager(
                 "Most tools take an `action` parameter; the tool description lists the actions. " +
                 "New here? Read the resource ${SkillCatalog.uri(SkillCatalog.ENTRY_SKILL)} first; " +
                 "the other skills are at ${SkillCatalog.uri("<name>")}. " +
-                "Every skill is also an MCP prompt with the same name (clients list prompts as slash commands). " +
                 "Skills: ${SkillCatalog.NAMES.joinToString(", ")}. " +
+                "Each is also an MCP prompt (clients list prompts as slash commands; type /skill): " +
+                "${SkillCatalog.NAMES.joinToString(", ") { SkillCatalog.promptName(it) }}. " +
                 "Check scope first (scope: get_config / check); the recon and probe tools " +
                 "only run against in-scope targets."
 
@@ -103,9 +111,9 @@ class McpServerManager(
     }
 
     /**
-     * Creates a fresh MCP [Server] instance with all tools, resources and
-     * prompts registered. Each transport gets its own server instance so they
-     * maintain independent session state.
+     * Creates a fresh MCP [Server] instance with all tools, resources and prompts registered.
+     * Each listener builds one and serves every client session from it ([Server.createSession]
+     * keeps per-client state).
      */
     fun createMcpServer(): Server {
         val server = Server(
@@ -185,6 +193,7 @@ class McpServerManager(
                     )
                     return@launch
                 }
+                val mcpServer = createMcpServer()
                 val server = embeddedServer(CIO, port = port, host = bindHost) {
                     installLocalhostSecurity(listOf(port), allowedSecurityHosts())
                     val sessions = ConcurrentHashMap<String, SseServerTransport>()
@@ -197,6 +206,7 @@ class McpServerManager(
                     install(SSE)
                     // Accept the URL with or without a trailing slash.
                     install(IgnoreTrailingSlash)
+                    installStreamableHttp(mcpServer)
                     routing {
                         // NOTE: every SSE mount is wrapped in an explicit GET selector. Ktor's
                         // no-path `sse { }` overload registers a bare handler with NO HttpMethod
@@ -204,7 +214,7 @@ class McpServerManager(
                         // OPTIONS-skips-everything rule let an unauthenticated request open a
                         // stream and harvest a session id. Never drop the `method(Get)` wrapper.
 
-                        method(HttpMethod.Get) { sse { serveMcpSse(sessions) } }
+                        method(HttpMethod.Get) { sse { serveMcpSse(mcpServer, sessions) } }
                         post { handleMcpPost(sessions) }
                     }
                 }
@@ -212,7 +222,10 @@ class McpServerManager(
                 assign(server)
 
                 if (verifyListening(port)) {
-                    logging.logToOutput("Raijin: $label transport listening on http://$bindHost:$port (MCP SSE endpoint is the root path '/', not '/sse')")
+                    logging.logToOutput(
+                        "Raijin: $label listening: Streamable HTTP at http://$bindHost:$port$STREAMABLE_HTTP_PATH, " +
+                            "legacy SSE at http://$bindHost:$port/ (not '/sse')"
+                    )
                 } else {
                     logging.logToError(
                         if (portInUse(port))
@@ -251,14 +264,20 @@ class McpServerManager(
      * Serves one MCP SSE session. The advertised POST endpoint is deliberately the relative
      * reference `?sessionId=...`: the client resolves it against the URL it connected to.
      */
-    private suspend fun ServerSSESession.serveMcpSse(sessions: ConcurrentHashMap<String, SseServerTransport>) {
+    private suspend fun ServerSSESession.serveMcpSse(
+        mcpServer: Server,
+        sessions: ConcurrentHashMap<String, SseServerTransport>
+    ) {
         val raw = SseServerTransport("", this)
         val tx = TimeoutSseTransport(raw, coroutineContext.job, sendTimeoutMs, logging)
-        val mcpServer = createMcpServer()
         sessions[raw.sessionId] = raw
-        mcpServer.onClose { sessions.remove(raw.sessionId) }
-        mcpServer.connect(tx)        // responses flow through the bounded send
-        awaitCancellation()          // keep the SSE stream open until torn down
+        try {
+            val session = mcpServer.createSession(tx)   // responses flow through the bounded send
+            session.onClose { sessions.remove(raw.sessionId) }
+            awaitCancellation()                         // keep the SSE stream open until torn down
+        } finally {
+            sessions.remove(raw.sessionId)
+        }
     }
 
     /** Routes one back-channel POST into its SSE session (`onMessage` -> server -> bounded `tx.send`). */
@@ -340,6 +359,15 @@ class McpServerManager(
         }
         return false
     }
+}
+
+/**
+ * Mounts the Streamable HTTP endpoint at [McpServerManager.STREAMABLE_HTTP_PATH], serving every session
+ * from [mcpServer]. Install [installLocalhostSecurity] first: the SDK's own Host/Origin check is off
+ * because it only knows loopback names and would refuse the opt-in LAN bind.
+ */
+internal fun Application.installStreamableHttp(mcpServer: Server) {
+    mcpStreamableHttp(path = McpServerManager.STREAMABLE_HTTP_PATH, enableDnsRebindingProtection = false) { mcpServer }
 }
 
 /**

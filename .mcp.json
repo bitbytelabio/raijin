@@ -1,5 +1,5 @@
 {
   "mcpServers": {
-    "burpsuite": { "type": "sse", "url": "http://127.0.0.1:9876/" }
+    "burpsuite": { "type": "http", "url": "http://127.0.0.1:9876/mcp" }
   }
 }

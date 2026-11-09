@@ -8,12 +8,15 @@ import io.modelcontextprotocol.kotlin.sdk.types.Role
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 
 /**
- * Serves every skill as an MCP prompt, named after the skill (`http-testing`, ...).
+ * Serves every skill as an MCP prompt named [SkillCatalog.promptName] (`http-testing` becomes
+ * `http_testing_skill`).
  *
  * This is what makes skills show up in clients: Claude Code lists a server's prompts as slash
- * commands (`/mcp__burpsuite__http-testing`) and omp as `burpsuite:http-testing`. Both only ask a
- * server for prompts when it advertises the `prompts` capability, so [McpServerManager.serverCapabilities]
- * must keep declaring it (the SDK also refuses [Server.addPrompt] without it).
+ * commands (`/mcp__burpsuite__http_testing_skill`) and omp as `burpsuite:http_testing_skill`. Both only
+ * ask a server for prompts when it advertises the `prompts` capability, so
+ * [McpServerManager.serverCapabilities] must keep declaring it (the SDK also refuses [Server.addPrompt]
+ * without it). Both pickers filter on the command name, hence the `_skill` suffix: typing `skill`
+ * finds every skill prompt, from every server.
  *
  * The same text is served as `skill://burpsuite/<name>` resources by [ResourceRegistry], which is how
  * a model reads a skill on its own. Skills are static guides, so prompts take no arguments.
@@ -23,7 +26,7 @@ object PromptRegistry {
     /** Registers one prompt per [SkillCatalog] skill on [server]. Called once per server instance. */
     fun registerAll(server: Server) {
         SkillCatalog.list().forEach { skill ->
-            server.addPrompt(name = skill.name, description = skill.description) {
+            server.addPrompt(name = SkillCatalog.promptName(skill.name), description = skill.description) {
                 GetPromptResult(
                     messages = listOf(PromptMessage(Role.User, TextContent(skill.body))),
                     description = skill.description

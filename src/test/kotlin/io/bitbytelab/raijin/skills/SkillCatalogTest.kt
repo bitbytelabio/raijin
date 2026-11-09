@@ -28,6 +28,13 @@ class SkillCatalogTest {
     }
 
     @Test
+    fun `promptName is snake case with a _skill suffix`() {
+        assertEquals("http_testing_skill", SkillCatalog.promptName("http-testing"))
+        assertEquals("burpsuite_overview_skill", SkillCatalog.promptName(SkillCatalog.ENTRY_SKILL))
+        assertEquals("recon_and_probes_skill", SkillCatalog.promptName("recon-and-probes"))
+    }
+
+    @Test
     fun `parse reads frontmatter and falls back without it`() {
         val s = SkillCatalog.parse("x", "---\nname: foo\ndescription: bar baz\n---\n# Body\n")
         assertEquals("foo", s.name)

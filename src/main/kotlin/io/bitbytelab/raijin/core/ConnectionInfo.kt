@@ -5,7 +5,8 @@ package io.bitbytelab.raijin.core
  * Server UI tab (and mirrored in the README/configs) so the connection details can never drift.
  *
  * Invariants:
- *  1. The MCP SSE endpoint is the **root path `/`**, NOT `/sse`.
+ *  1. Clients connect over Streamable HTTP at [MCP_PATH] (`/mcp`). The legacy SSE transport
+ *     still answers at the root path `/` (never `/sse`) for old configs.
  *  2. There is **no token**: clients connect with the URL alone.
  */
 object ConnectionInfo {
@@ -16,23 +17,29 @@ object ConnectionInfo {
     /** MCP server name used in client configs. */
     const val SERVER_NAME = "burpsuite"
 
-    /** The MCP SSE endpoint URL for [port] on [host] — the ROOT path `/`, never `/sse`. */
-    fun sseUrl(port: Int, host: String = "127.0.0.1"): String = "http://$host:$port/"
+    /** Path of the Streamable HTTP endpoint. */
+    const val MCP_PATH = "/mcp"
 
-    val primarySseUrl: String get() = sseUrl(PRIMARY_PORT)
-    val secondarySseUrl: String get() = sseUrl(SECONDARY_PORT)
+    /** The Streamable HTTP endpoint URL for [port] on [host]. */
+    fun mcpUrl(port: Int, host: String = "127.0.0.1"): String = "http://$host:$port$MCP_PATH"
+
+    /** The legacy SSE endpoint URL for [port] on [host]: the ROOT path `/`, never `/sse`. */
+    fun legacySseUrl(port: Int, host: String = "127.0.0.1"): String = "http://$host:$port/"
+
+    val primaryMcpUrl: String get() = mcpUrl(PRIMARY_PORT)
+    val secondaryMcpUrl: String get() = mcpUrl(SECONDARY_PORT)
     val dashboardUrl: String get() = dashboardUrlForHost()
 
     // Host-aware variants — every displayed endpoint reflects the interface the servers bound to.
-    fun primarySseUrlForHost(host: String): String = sseUrl(PRIMARY_PORT, host)
-    fun secondarySseUrlForHost(host: String): String = sseUrl(SECONDARY_PORT, host)
+    fun primaryMcpUrlForHost(host: String): String = mcpUrl(PRIMARY_PORT, host)
+    fun secondaryMcpUrlForHost(host: String): String = mcpUrl(SECONDARY_PORT, host)
     fun dashboardUrlForHost(host: String = "127.0.0.1"): String = "http://$host:$DASHBOARD_PORT"
 
-    /** A ready-to-paste MCP client config (Claude Desktop / Claude Code / Cursor style). */
+    /** A ready-to-paste MCP client config (Claude Code / omp / Cursor style). */
     fun clientConfigJson(port: Int = PRIMARY_PORT, host: String = "127.0.0.1"): String =
-        """{"mcpServers":{"$SERVER_NAME":{"type":"sse","url":"${sseUrl(port, host)}"}}}"""
+        """{"mcpServers":{"$SERVER_NAME":{"type":"http","url":"${mcpUrl(port, host)}"}}}"""
 
     /** The equivalent one-liner for Claude Code. */
     fun claudeCodeCommand(port: Int = PRIMARY_PORT, host: String = "127.0.0.1"): String =
-        "claude mcp add --transport sse $SERVER_NAME ${sseUrl(port, host)}"
+        "claude mcp add --transport http $SERVER_NAME ${mcpUrl(port, host)}"
 }

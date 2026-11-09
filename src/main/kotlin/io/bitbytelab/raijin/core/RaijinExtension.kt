@@ -164,13 +164,12 @@ class RaijinExtension : BurpExtension {
             throw t
         }
 
-        // Single startup banner with REAL counts (no more 137/134/121 drift, no
-        // fake "Streamable HTTP"/"stdio" claims). uiTab.log() also writes to Burp's
+        // Single startup banner with REAL counts. uiTab.log() also writes to Burp's
         // output log, so one channel covers both surfaces.
         val (toolCount, resourceCount, promptCount) = serverManager.registeredCounts()
         uiTab.log("INFO", "System", "Raijin v${BuildInfo.VERSION} started")
-        uiTab.log("INFO", "System", "MCP SSE (primary):   http://$bindHost:$ssePort/  (root path '/')")
-        uiTab.log("INFO", "System", "MCP SSE (secondary): http://$bindHost:$httpPort/")
+        uiTab.log("INFO", "System", "MCP (primary):   ${ConnectionInfo.mcpUrl(ssePort, bindHost)}  (legacy SSE: ${ConnectionInfo.legacySseUrl(ssePort, bindHost)})")
+        uiTab.log("INFO", "System", "MCP (secondary): ${ConnectionInfo.mcpUrl(httpPort, bindHost)}")
         uiTab.log("INFO", "System", "Dashboard:                 http://$bindHost:$dashboardPort")
         uiTab.log("INFO", "System", "Tools: $toolCount  |  MCP Resources: $resourceCount  |  MCP Prompts: $promptCount")
         api.logging().raiseInfoEvent("Raijin v${BuildInfo.VERSION} started on $bindHost (SSE $ssePort/$httpPort, dashboard $dashboardPort)")

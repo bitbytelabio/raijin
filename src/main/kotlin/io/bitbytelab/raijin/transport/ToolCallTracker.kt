@@ -34,7 +34,7 @@ object ToolCallTracker {
                     val startTime = System.nanoTime()
                     val startInstant = Instant.now()
 
-                    val result: CallToolResult = originalHandler.invoke(request)
+                    val result: CallToolResult = originalHandler(this, request)
 
                     val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
 
@@ -73,8 +73,8 @@ object ToolCallTracker {
         }
 
         val resultSummary = result.content
-            ?.filterIsInstance<TextContent>()
-            ?.firstOrNull()
+            .filterIsInstance<TextContent>()
+            .firstOrNull()
             ?.text
             ?.let { if (it.length > 500) it.take(500) + "..." else it }
             ?: ""
@@ -86,8 +86,8 @@ object ToolCallTracker {
         var statusCode = 0
         try {
             val resultJson = result.content
-                ?.filterIsInstance<TextContent>()
-                ?.firstOrNull()
+                .filterIsInstance<TextContent>()
+                .firstOrNull()
                 ?.text
                 ?.let { Json.parseToJsonElement(it).jsonObject }
             url = resultJson?.get("url")?.jsonPrimitive?.contentOrNull ?: ""

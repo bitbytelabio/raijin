@@ -1,6 +1,6 @@
 plugins {
-    kotlin("jvm") version "2.1.20"
-    kotlin("plugin.serialization") version "2.1.20"
+    kotlin("jvm") version "2.4.21"
+    kotlin("plugin.serialization") version "2.4.21"
     id("com.github.johnrengelman.shadow") version "8.1.1"
 }
 
@@ -9,7 +9,7 @@ version = "1.0.0"
 
 // Build JDK: gradle/gradle-daemon-jvm.properties pins the Gradle daemon to JDK 21, so
 // `./gradlew` relaunches the build under JDK 21 even when started from a newer JVM (e.g.
-// Burp's bundled Java 25). Kotlin 2.1.20 cannot compile these .kts scripts on Java 22+.
+// Burp's bundled Java 25). The build is only tested on JDK 21.
 //
 // Bytecode target is 21: the Turbo engines use virtual threads
 // (Thread.ofVirtual / Executors.newThreadPerTaskExecutor). Burp ships Java 21+.
@@ -26,7 +26,7 @@ repositories {
     mavenCentral()
 }
 
-val ktorVersion = "3.2.3"
+val ktorVersion = "3.5.2"
 val montoyaVersion = "2026.2"
 
 dependencies {
@@ -34,10 +34,10 @@ dependencies {
     compileOnly("net.portswigger.burp.extensions:montoya-api:$montoyaVersion")
 
     // --- MCP server (Kotlin SDK on Ktor CIO) ---
-    implementation("io.modelcontextprotocol:kotlin-sdk-server:0.8.3")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
-    // Ktor versions must match what kotlin-sdk-server 0.8.3 was compiled against
+    implementation("io.modelcontextprotocol:kotlin-sdk-server:0.16.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
+    // Ktor, coroutines and serialization versions must match what kotlin-sdk-server 0.16.0 was compiled against
     implementation("io.ktor:ktor-server-cio:$ktorVersion")
     implementation("io.ktor:ktor-server-sse:$ktorVersion")
     implementation("io.ktor:ktor-server-cors:$ktorVersion")
@@ -56,7 +56,8 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
     // Montoya is compileOnly for main; tests construct Montoya-typed values directly.
     testImplementation("net.portswigger.burp.extensions:montoya-api:$montoyaVersion")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
+    testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 

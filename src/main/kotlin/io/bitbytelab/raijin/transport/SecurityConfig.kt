@@ -54,6 +54,11 @@ fun Application.installLocalhostSecurity(
         allowMethod(HttpMethod.Post)
         allowMethod(HttpMethod.Delete)
         allowHeader(HttpHeaders.ContentType)
+        // Streamable HTTP session and protocol headers.
+        allowHeader("Mcp-Session-Id")
+        allowHeader("Mcp-Protocol-Version")
+        allowHeader(HttpHeaders.LastEventID)
+        exposeHeader("Mcp-Session-Id")
         allowNonSimpleContentTypes = true
         // Only the explicitly configured host:port origins are ever permitted — never anyHost().
         allowedHosts.forEach { hostPort -> allowHost(hostPort, schemes = listOf("http")) }

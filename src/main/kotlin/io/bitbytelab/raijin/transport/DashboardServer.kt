@@ -199,8 +199,8 @@ class DashboardServer(
         // Host-aware substitution at request time (the bind host is instance state, not known at
         // the static DASHBOARD_HTML init) so every endpoint shown reflects the configured interface.
         return DASHBOARD_HTML
-            .replace("__PRIMARY_SSE_URL__", ConnectionInfo.primarySseUrlForHost(bindHost))
-            .replace("__SECONDARY_SSE_URL__", ConnectionInfo.secondarySseUrlForHost(bindHost))
+            .replace("__PRIMARY_MCP_URL__", ConnectionInfo.primaryMcpUrlForHost(bindHost))
+            .replace("__SECONDARY_MCP_URL__", ConnectionInfo.secondaryMcpUrlForHost(bindHost))
             .replace("__DASHBOARD_PROXY_HISTORY_URL__", "${ConnectionInfo.dashboardUrlForHost(bindHost)}/api/proxy/recent?limit=50")
             .replace("__DASHBOARD_URL__", ConnectionInfo.dashboardUrlForHost(bindHost))
             .replace("__MCP_CLIENT_CONFIG__", ConnectionInfo.clientConfigJson(host = bindHost))
@@ -481,8 +481,8 @@ body{font-family:var(--font);background:var(--bg-primary);color:var(--text-prima
 <!-- Connections Tab -->
 <div class="tab-panel" id="panel-connections">
     <div class="conn-grid">
-        <div class="conn-card"><h4>Primary MCP SSE (root path)</h4><div class="url">__PRIMARY_SSE_URL__</div></div>
-        <div class="conn-card"><h4>Secondary MCP SSE (root path)</h4><div class="url">__SECONDARY_SSE_URL__</div></div>
+        <div class="conn-card"><h4>Primary MCP (Streamable HTTP)</h4><div class="url">__PRIMARY_MCP_URL__</div></div>
+        <div class="conn-card"><h4>Secondary MCP (Streamable HTTP)</h4><div class="url">__SECONDARY_MCP_URL__</div></div>
         <div class="conn-card"><h4>Dashboard</h4><div class="url">__DASHBOARD_URL__</div></div>
         <div class="conn-card"><h4>Dashboard API - Proxy History</h4><div class="url">__DASHBOARD_PROXY_HISTORY_URL__</div></div>
         <div class="conn-card"><h4>MCP Client Config</h4><div class="url" style="font-size:11px;">__MCP_CLIENT_CONFIG__</div></div>

@@ -22,20 +22,21 @@ Building needs a JDK 21 (a newer JDK on `PATH` is fine; `gradle/gradle-daemon-jv
 
 | Endpoint | URL |
 |---|---|
-| MCP (SSE) | `http://127.0.0.1:9876/` (also `9877`) |
+| MCP (Streamable HTTP) | `http://127.0.0.1:9876/mcp` (also `9877`) |
+| MCP (legacy SSE) | `http://127.0.0.1:9876/` (root path, not `/sse`) |
 | Dashboard | `http://127.0.0.1:9878/` |
 
 ```bash
-claude mcp add --transport sse burpsuite http://127.0.0.1:9876/
+claude mcp add --transport http burpsuite http://127.0.0.1:9876/mcp
 ```
 
-or in a client config (`configs/` has ready-made files):
+or in a client config (`configs/` has ready-made files; omp reads the same shape from `.omp/mcp.json`):
 
 ```json
-{ "mcpServers": { "burpsuite": { "type": "sse", "url": "http://127.0.0.1:9876/" } } }
+{ "mcpServers": { "burpsuite": { "type": "http", "url": "http://127.0.0.1:9876/mcp" } } }
 ```
 
-The endpoint is the root path `/`, not `/sse`. The **Server** sub-tab shows the exact config for your bind address.
+Use Streamable HTTP. The legacy SSE endpoint is deprecated by the MCP spec and kept only for old `"type": "sse"` configs. The **Server** sub-tab shows the exact config for your bind address.
 
 ### Tools and actions
 
@@ -43,12 +44,12 @@ Raijin exposes about 40 tools. Families of operations are one tool with an `acti
 
 ### Skills
 
-The server ships short usage guides ("skills") so a client can learn the tool groups and workflows on its own. Each skill is served two ways, both named after the skill:
+The server ships short usage guides ("skills") so a client can learn the tool groups and workflows on its own. Each skill is served two ways:
 
-- **MCP prompts** (`prompts/list`, `prompts/get`, no arguments). Clients list prompts as slash commands: `/mcp__burpsuite__http-testing` in Claude Code, `/burpsuite:http-testing` in omp. Start with `burpsuite-overview`. The server declares the `prompts` capability; without it these clients never ask for prompts and no skill shows up.
-- **MCP resources** at `skill://burpsuite/<name>` (`text/markdown`), which a model can read on its own through the client's MCP resource reader (`ReadMcpResourceTool` in Claude Code).
+- **MCP prompts** (`prompts/list`, `prompts/get`, no arguments), named `<skill>_skill` with `-` written as `_`, for example `http_testing_skill`. Clients list prompts as slash commands: `/mcp__burpsuite__http_testing_skill` in Claude Code, `/burpsuite:http_testing_skill` in omp. Type `/skill` to list them: the pickers filter on the command name, which is why every name ends in `_skill`. (omp's `/skill:<name>` entries are its own local skills, not MCP prompts; to narrow the list type `/burpsuite`.) Start with `burpsuite_overview_skill`. The server declares the `prompts` capability; without it these clients never ask for prompts.
+- **MCP resources** at `skill://burpsuite/<name>` (`text/markdown`, the plain skill name such as `http-testing`), which a model can read on its own through the client's MCP resource reader (`ReadMcpResourceTool` in Claude Code).
 
-The server `instructions` sent on connect point clients at `skill://burpsuite/burpsuite-overview` and list the skill names. Clients read prompts and resources when they connect, so reconnect the MCP server (`/mcp`) after reloading the extension.
+The server `instructions` sent on connect point clients at `skill://burpsuite/burpsuite-overview` and list the skill and prompt names. Clients read prompts when they connect, so after reloading the extension reconnect the MCP server (`/mcp` in Claude Code; omp reconnects by itself). If no skill shows up, check that Burp runs the new jar: the startup log prints `MCP Prompts: 8`, and Claude Code's MCP log for `burpsuite` says `"hasPrompts":true`.
 
 Skills live in `src/main/resources/skills/*.md` (frontmatter `name`, `description`); add a file and list its name in `SkillCatalog.NAMES`.
 

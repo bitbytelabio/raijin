@@ -2,6 +2,7 @@ package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
 import io.bitbytelab.raijin.core.BuildInfo
+import io.bitbytelab.raijin.core.ConnectionInfo
 import io.bitbytelab.raijin.state.StateManager
 import kotlinx.serialization.json.*
 
@@ -31,17 +32,16 @@ class ExtensionBridge(
                 put("filename", extension.filename() ?: "unknown")
                 put("is_bapp", extension.isBapp())
 
-                // MCP server info. Both ports are plain MCP SSE transports; there is
-                // no Streamable HTTP or stdio transport (those were never implemented).
+                // MCP server info. Both ports serve Streamable HTTP at /mcp and legacy SSE at /.
                 put("mcp", buildJsonObject {
                     put("version", BuildInfo.VERSION)
                     put("sse_port_primary", 9876)
                     put("sse_port_secondary", 9877)
                     put("dashboard_port", 9878)
-                    put("auth_required", true)
+                    put("auth_required", false)
                     put("transports", buildJsonArray {
-                        add("SSE (primary)")
-                        add("SSE (secondary)")
+                        add("Streamable HTTP (${ConnectionInfo.MCP_PATH})")
+                        add("SSE (legacy, /)")
                     })
                 })
 

@@ -1,5 +1,6 @@
 package io.bitbytelab.raijin.tools
 
+import io.bitbytelab.raijin.testClientConnection
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
@@ -29,14 +30,14 @@ class ToolConsolidationTest {
             name = name,
             description = "Does $name. More detail follows.",
             inputSchema = ToolSchema(
-                buildJsonObject { props.forEach { p -> putJsonObject(p) { put("type", "string"); put("description", "the $p") } } },
-                required
+                properties = buildJsonObject { props.forEach { p -> putJsonObject(p) { put("type", "string"); put("description", "the $p") } } },
+                required = required
             )
         ) { req -> CallToolResult(content = listOf(TextContent("$name:" + req.params.arguments.toString()))) }
     }
 
     private fun call(s: Server, tool: String, args: JsonObject) = runBlocking {
-        s.tools.getValue(tool).handler(CallToolRequest(CallToolRequestParams(tool, args)))
+        s.tools.getValue(tool).handler(testClientConnection, CallToolRequest(CallToolRequestParams(tool, args)))
     }
 
     private fun text(r: CallToolResult) = (r.content.first() as TextContent).text

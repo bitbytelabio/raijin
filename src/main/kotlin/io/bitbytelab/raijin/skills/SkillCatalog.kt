@@ -10,7 +10,7 @@ import java.io.File
  * Jars cannot list a classpath directory, so [NAMES] is the authoritative list; the catalog test
  * checks every entry resolves and that its frontmatter name matches.
  *
- * Each skill is served two ways, both named after it: as an MCP prompt (`PromptRegistry`; this is
+ * Each skill is served two ways: as an MCP prompt named [promptName] (`PromptRegistry`; this is
  * what Claude Code and omp list as slash commands) and as a `skill://burpsuite/<name>` resource
  * (`ResourceRegistry`; this is how a model reads one on its own).
  */
@@ -35,6 +35,16 @@ object SkillCatalog {
 
     /** URI for the resource form of a skill. */
     fun uri(name: String) = "skill://burpsuite/$name"
+
+    /**
+     * Name of the MCP prompt for a skill: `http-testing` -> `http_testing_skill`.
+     *
+     * Clients show prompts as slash commands (`/mcp__burpsuite__http_testing_skill` in Claude Code,
+     * `burpsuite:http_testing_skill` in omp) and their pickers filter on the command name, so users find
+     * skills by typing `skill`. Every name therefore ends in `_skill`, as the other MCP servers' skill
+     * prompts do (a prompt called just `http-testing` is never listed for that search).
+     */
+    fun promptName(name: String) = name.replace('-', '_') + "_skill"
 
     /** All skills (parsed once, they are static resources). */
     val all: List<Skill> by lazy { NAMES.mapNotNull { load(it) } }

@@ -29,14 +29,14 @@ if command -v caddy &>/dev/null; then
         sudo cp "$SCRIPT_DIR/Caddyfile" /etc/caddy/Caddyfile
         sudo systemctl restart caddy
         echo "  Caddy configured and restarted"
-        MCP_URL="http://127.0.0.1:9900/"
+        MCP_URL="http://127.0.0.1:9900/mcp"
     else
-        MCP_URL="http://127.0.0.1:9876/"
+        MCP_URL="http://127.0.0.1:9876/mcp"
     fi
 else
     echo "  Caddy not installed. Using direct connection."
     echo "  Install with: sudo apt install caddy"
-    MCP_URL="http://127.0.0.1:9876/"
+    MCP_URL="http://127.0.0.1:9876/mcp"
 fi
 
 # Step 3: Claude Code MCP config
@@ -52,15 +52,15 @@ fi
 echo ""
 echo "  {"
 echo "    \"mcpServers\": {"
-echo "      \"raijin\": {"
-echo "        \"type\": \"sse\","
+echo "      \"burpsuite\": {"
+echo "        \"type\": \"http\","
 echo "        \"url\": \"$MCP_URL\""
 echo "      }"
 echo "    }"
 echo "  }"
 echo ""
-echo "  NOTE: the endpoint is the root path '/' (not /sse). No token is needed."
-echo "  Or, with Claude Code:  claude mcp add --transport sse burpsuite $MCP_URL"
+echo "  NOTE: Streamable HTTP at /mcp (legacy SSE still answers at '/'). No token is needed."
+echo "  Or, with Claude Code:  claude mcp add --transport http burpsuite $MCP_URL"
 echo ""
 
 # Step 4: Summary

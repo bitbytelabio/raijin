@@ -1215,8 +1215,8 @@ class RaijinTab(
         content.add(JLabel("Connection Information").apply { font = font.deriveFont(Font.BOLD, 14f) }, gbc)
         gbc.gridwidth = 1
 
-        serverPrimaryUrlLabel = JLabel(ConnectionInfo.primarySseUrlForHost(bindHost)); addRow(1, "MCP SSE (root /):", serverPrimaryUrlLabel)
-        serverSecondaryUrlLabel = JLabel(ConnectionInfo.secondarySseUrlForHost(bindHost)); addRow(2, "SSE (secondary):", serverSecondaryUrlLabel)
+        serverPrimaryUrlLabel = JLabel(ConnectionInfo.primaryMcpUrlForHost(bindHost)); addRow(1, "MCP (Streamable HTTP):", serverPrimaryUrlLabel)
+        serverSecondaryUrlLabel = JLabel(ConnectionInfo.secondaryMcpUrlForHost(bindHost)); addRow(2, "MCP (secondary):", serverSecondaryUrlLabel)
         serverDashboardUrlLabel = JLabel(ConnectionInfo.dashboardUrlForHost(bindHost)); addRow(3, "Dashboard:", serverDashboardUrlLabel)
 
         gbc.gridy = 4; gbc.gridx = 0; gbc.gridwidth = 2
@@ -1283,8 +1283,8 @@ class RaijinTab(
                 SwingUtilities.invokeLater {
                     saveBindHostBtn.isEnabled = true
                     saveBindHostBtn.text = prevText
-                    serverPrimaryUrlLabel.text = ConnectionInfo.primarySseUrlForHost(outcome.effectiveHost)
-                    serverSecondaryUrlLabel.text = ConnectionInfo.secondarySseUrlForHost(outcome.effectiveHost)
+                    serverPrimaryUrlLabel.text = ConnectionInfo.primaryMcpUrlForHost(outcome.effectiveHost)
+                    serverSecondaryUrlLabel.text = ConnectionInfo.secondaryMcpUrlForHost(outcome.effectiveHost)
                     serverDashboardUrlLabel.text = ConnectionInfo.dashboardUrlForHost(outcome.effectiveHost)
                     serverConfigArea.text = ConnectionInfo.clientConfigJson(host = outcome.effectiveHost)
                     serverCommandArea.text = ConnectionInfo.claudeCodeCommand(host = outcome.effectiveHost)

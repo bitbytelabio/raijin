@@ -1,5 +1,6 @@
 package io.bitbytelab.raijin.tools
 
+import io.modelcontextprotocol.kotlin.sdk.server.ClientConnection
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequestParams
@@ -304,7 +305,7 @@ object ToolConsolidation {
         return if (sentence.length <= 160) sentence else sentence.take(157).trimEnd() + "..."
     }
 
-    private suspend fun dispatch(
+    private suspend fun ClientConnection.dispatch(
         g: Group,
         members: Map<String, io.modelcontextprotocol.kotlin.sdk.server.RegisteredTool>,
         request: CallToolRequest,
@@ -336,6 +337,7 @@ object ToolConsolidation {
             args.forEach { (k, v) -> if (k != "action") put(toMember[k] ?: k, v) }
         }
         return member.handler(
+            this,
             CallToolRequest(CallToolRequestParams(name = member.tool.name, arguments = forwarded, meta = request.params.meta))
         )
     }

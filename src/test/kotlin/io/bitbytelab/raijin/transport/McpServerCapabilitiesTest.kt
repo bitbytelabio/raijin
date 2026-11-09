@@ -25,6 +25,9 @@ class McpServerCapabilitiesTest {
         // omp keeps only the first 4000 characters of server instructions.
         assertTrue(text.length < 4000, "instructions are ${text.length} characters")
         assertTrue(text.contains(SkillCatalog.uri(SkillCatalog.ENTRY_SKILL)), "instructions must name the entry skill resource")
-        SkillCatalog.NAMES.forEach { assertTrue(text.contains(it), "instructions lack skill '$it'") }
+        SkillCatalog.NAMES.forEach {
+            assertTrue(text.contains(it), "instructions lack skill '$it'")
+            assertTrue(text.contains(SkillCatalog.promptName(it)), "instructions lack prompt '${SkillCatalog.promptName(it)}'")
+        }
     }
 }
