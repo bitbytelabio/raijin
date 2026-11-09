@@ -36,4 +36,29 @@ class AuthDiffVerdictTest {
         val f = AuthDiffVerdict.assess(listOf(lr("admin", 200, "secret"), lr("none", 401, "denied")), sim)
         assertFalse(f.any { it.severity == "critical" || it.severity == "high" })
     }
+
+    // Graduated similarity (not just exact-match) so the threshold overrides below are meaningful.
+    private val gradedSim = { a: String, b: String ->
+        if (a == b) 100.0 else if (a.take(3) == b.take(3)) 80.0 else 0.0
+    }
+
+    @Test
+    fun `a lower unauthMatchThreshold flags a looser body match that the default would miss`() {
+        val results = listOf(lr("admin", 200, "secretXYZ"), lr("none", 200, "secretABC"))
+        val default = AuthDiffVerdict.assess(results, gradedSim)
+        assertFalse(default.any { it.id == "unauth_reads_protected" })
+
+        val loosened = AuthDiffVerdict.assess(results, gradedSim, unauthMatchThreshold = 75.0)
+        assertTrue(loosened.any { it.id == "unauth_reads_protected" })
+    }
+
+    @Test
+    fun `a lower allSimilarThreshold downgrades a near-identical response to all_identical`() {
+        val results = listOf(lr("admin", 200, "dataXYZ"), lr("user", 200, "dataABC"), lr("none", 200, "dataQRS"))
+        val default = AuthDiffVerdict.assess(results, gradedSim)
+        assertFalse(default.any { it.id == "all_identical" })
+
+        val loosened = AuthDiffVerdict.assess(results, gradedSim, allSimilarThreshold = 75.0)
+        assertTrue(loosened.any { it.id == "all_identical" })
+    }
 }

@@ -3,6 +3,8 @@ package io.bitbytelab.raijin.state
 import burp.api.montoya.core.Registration
 import burp.api.montoya.http.message.HttpRequestResponse
 import burp.api.montoya.http.message.requests.HttpRequest
+import kotlinx.serialization.json.JsonObject
+import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.CopyOnWriteArrayList
@@ -231,6 +233,62 @@ data class WebSocketInterceptRule(
 )
 
 /**
+ * A live "replay under a second identity" tap on proxy traffic — Autorize's core idea (replay
+ * captured traffic under a lower-privilege session and diff) applied continuously instead of to
+ * a caller-supplied request list. Matching proxied responses are cloned, replayed under each of
+ * [identities] in the background by [io.bitbytelab.raijin.bridge.ProxyBridge], and diffed via
+ * [io.bitbytelab.raijin.bridge.AuthDiffVerdict] against the already-captured response.
+ *
+ * @property ruleId Unique identifier (e.g. "arule-001").
+ * @property identities Replay identities, same `{name, header_name?, header_value?}` shape as auth_diff/access_control_sweep.
+ * @property inScopeOnly When true (default), only taps requests Burp's scope considers in scope.
+ * @property includeHostPattern Optional hostname glob (e.g. "*.example.com"); null taps every host.
+ * @property excludeUrlRegex Optional URL regex; matching requests are skipped.
+ * @property methods Optional set of HTTP methods (uppercase) to tap; null taps every method.
+ * @property ignoreStaticAssets When true (default), skip responses that look like a static asset.
+ * @property similarityThreshold Body-similarity percent (0-100) controlling how strictly a replay must match to be flagged.
+ * @property enabled Whether this rule is currently tapping traffic.
+ * @property createdAt ISO-8601 timestamp of rule creation.
+ */
+data class AutorizeRule(
+    val ruleId: String,
+    val identities: List<JsonObject>,
+    val inScopeOnly: Boolean = true,
+    val includeHostPattern: String? = null,
+    val excludeUrlRegex: String? = null,
+    val methods: Set<String>? = null,
+    val ignoreStaticAssets: Boolean = true,
+    val similarityThreshold: Double = 90.0,
+    var enabled: Boolean = true,
+    val createdAt: String = Instant.now().toString(),
+)
+
+/**
+ * One flagged mismatch recorded by a live [AutorizeRule] tap.
+ *
+ * @property id Monotonically increasing id for ordering/paging.
+ * @property ruleId The [AutorizeRule] that produced this match.
+ * @property timestamp ISO-8601 timestamp of the replay.
+ * @property method HTTP method of the original request.
+ * @property url URL of the original request.
+ * @property originalStatus Status code of the already-captured (original) response.
+ * @property findings Serialized [io.bitbytelab.raijin.bridge.AuthDiffVerdict.Finding]s (one per flagged identity comparison).
+ * @property request Raw original request text (evidence).
+ * @property response Raw original response text (evidence).
+ */
+data class AutorizeMatch(
+    val id: Long,
+    val ruleId: String,
+    val timestamp: String,
+    val method: String,
+    val url: String,
+    val originalStatus: Int,
+    val findings: List<JsonObject>,
+    val request: String,
+    val response: String,
+)
+
+/**
  * A record of an MCP tool invocation, stored for UI display and Burp tool integration.
  *
  * @property id Monotonically increasing id for ordering.
@@ -363,6 +421,62 @@ class StateManager {
     /** Rules for WebSocket message interception. */
     val websocketInterceptRules = CopyOnWriteArrayList<WebSocketInterceptRule>()
 
+    /** Live Autorize-style proxy taps (clone + replay matching traffic under a second identity, in the background). */
+    val autorizeRules = CopyOnWriteArrayList<AutorizeRule>()
+
+    /** Flagged mismatches recorded by [autorizeRules] taps, newest first. */
+    val autorizeMatches = ConcurrentLinkedDeque<AutorizeMatch>()
+    private val autorizeMatchIdCounter = AtomicLong(0)
+    private val maxAutorizeMatches = 2000
+
+    /**
+     * Dedup guard so a repeatedly-hit endpoint isn't replayed on every single proxied request.
+     * Keyed by "ruleId|method|path". A crude cap-and-clear (rather than an LRU) is enough here:
+     * a full reset just means some endpoints get retested, which is harmless.
+     */
+    private val autorizeSeen = ConcurrentHashMap<String, Long>()
+    private val maxAutorizeSeenEntries = 20_000
+
+    /** True the first time [key] is seen (caller should proceed); false on a repeat (caller should skip). */
+    fun autorizeSeenOnce(key: String): Boolean {
+        if (autorizeSeen.size > maxAutorizeSeenEntries) autorizeSeen.clear()
+        return autorizeSeen.putIfAbsent(key, System.currentTimeMillis()) == null
+    }
+
+    /** Records a flagged [AutorizeRule] mismatch, evicting the oldest beyond [maxAutorizeMatches]. */
+    fun addAutorizeMatch(
+        ruleId: String,
+        method: String,
+        url: String,
+        originalStatus: Int,
+        findings: List<JsonObject>,
+        request: String,
+        response: String,
+    ): AutorizeMatch {
+        val entry = AutorizeMatch(
+            id = autorizeMatchIdCounter.incrementAndGet(),
+            ruleId = ruleId,
+            timestamp = Instant.now().toString(),
+            method = method,
+            url = url,
+            originalStatus = originalStatus,
+            findings = findings,
+            request = request,
+            response = response,
+        )
+        autorizeMatches.addFirst(entry)
+        while (autorizeMatches.size > maxAutorizeMatches) {
+            autorizeMatches.pollLast()
+        }
+        return entry
+    }
+
+    /** Clears matches (optionally scoped to one rule) and, when [resetSeen] is true, the dedup guard too. */
+    fun clearAutorizeMatches(ruleId: String?, resetSeen: Boolean) {
+        if (ruleId == null) autorizeMatches.clear() else autorizeMatches.removeAll { it.ruleId == ruleId }
+        if (resetSeen) autorizeSeen.clear()
+    }
+
     /** Recent MCP tool call activity entries for the native Burp UI tab. */
     val mcpActivity = ConcurrentLinkedDeque<McpActivityEntry>()
     private val mcpActivityIdCounter = AtomicLong(0)
@@ -469,5 +583,7 @@ class StateManager {
         websocketInterceptRules.clear()
         mcpActivity.clear()
         mcpActivityListeners.clear()
+        autorizeRules.clear()
+        autorizeMatches.clear()
     }
 }

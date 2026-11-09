@@ -41,6 +41,7 @@ import io.bitbytelab.raijin.tools.webprobe.WebProbeTools
 import io.bitbytelab.raijin.tools.accesscontrol.AccessControlTools
 import io.bitbytelab.raijin.tools.injection.InjectionTools
 import io.bitbytelab.raijin.tools.idor.IdorTools
+import io.bitbytelab.raijin.tools.autorize.AutorizeTools
 import io.bitbytelab.raijin.tools.skills.SkillTools
 import io.bitbytelab.raijin.tools.ToolConsolidation
 import io.modelcontextprotocol.kotlin.sdk.server.Server
@@ -200,6 +201,9 @@ object ToolRegistry {
 
         // IDOR hunt: horizontal object-id swap with canary confirmation (scope-gated)
         IdorTools.register(server, bridges.idorHunt)
+
+        // Live Autorize-style tap: clone + replay proxy traffic under a second identity in the background
+        AutorizeTools.register(server, bridges.autorize)
 
         // Skill catalog compatibility tools: search/load/read skills via tools/call, for
         // clients without native Skills Extension support (see SkillTools kdoc)

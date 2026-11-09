@@ -219,6 +219,20 @@ object ToolConsolidation {
             ),
         ),
         Group(
+            "autorize",
+            "Live broken-access-control detection: taps proxy traffic and replays matching requests " +
+                "under lower-privilege identities in the background, flagging mismatches (the probe(action=access_control) " +
+                "idea applied continuously instead of to a caller-supplied request list). Flagged mismatches are also " +
+                "pushed to findings(action=add).",
+            mapOf(
+                "set_rule" to "autorize_set_rule",
+                "list_rules" to "autorize_list_rules",
+                "remove_rule" to "autorize_remove_rule",
+                "list_matches" to "autorize_list_matches",
+                "clear_matches" to "autorize_clear_matches",
+            ),
+        ),
+        Group(
             "findings", "Findings you record during testing: add, list, remove.",
             prefixed("findings_", "findings_add", "findings_list", "findings_remove"),
         ),

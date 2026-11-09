@@ -3,7 +3,11 @@ package io.bitbytelab.raijin.bridge
 import burp.api.montoya.MontoyaApi
 import io.bitbytelab.raijin.safety.BoundedHttp
 import burp.api.montoya.http.message.requests.HttpRequest
+import io.bitbytelab.raijin.graphql.BatchAttack
+import io.bitbytelab.raijin.graphql.GQLSchema
 import io.bitbytelab.raijin.graphql.GraphQl
+import io.bitbytelab.raijin.graphql.scanners.CyclesScanner
+import io.bitbytelab.raijin.graphql.scanners.POIScanner
 import io.bitbytelab.raijin.safety.ScopeGate
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -87,6 +91,134 @@ class GraphQlBridge(private val api: MontoyaApi) {
         }
         return if (check.warning != null) JsonObject(result + ("scope_warning" to JsonPrimitive(check.warning))) else result
     }
+
+    /**
+     * Generates example queries/mutations/subscriptions from the live schema (depth-limited SDL
+     * text per operation) — ported from InQL's `GQLQueryPrinter`, fed by a schema built from a
+     * full introspection fetch (not [probe]'s lightweight one, which lacks the field/argument
+     * detail schema modeling needs).
+     */
+    fun queryTemplates(url: String, maxDepth: Int): JsonObject {
+        val check = scopeGate.check(url)
+        check.deny?.let { return it }
+        val result = try {
+            val schema = fetchFullSchema(url) ?: return buildJsonObject {
+                put("error", "Could not build a schema from this endpoint's introspection response (introspection may be disabled).")
+            }
+            buildJsonObject {
+                put("endpoint", url)
+                put("max_depth", maxDepth)
+                put("queries", buildJsonObject { schema.queries.keys.forEach { put(it, schema.operationAsText(it, GQLSchema.OperationType.QUERY, maxDepth) ?: "") } })
+                put("mutations", buildJsonObject { schema.mutations.keys.forEach { put(it, schema.operationAsText(it, GQLSchema.OperationType.MUTATION, maxDepth) ?: "") } })
+                put("subscriptions", buildJsonObject { schema.subscriptions.keys.forEach { put(it, schema.operationAsText(it, GQLSchema.OperationType.SUBSCRIPTION, maxDepth) ?: "") } })
+            }
+        } catch (e: Exception) {
+            buildJsonObject { put("error", "Query template generation failed: ${e.message}") }
+        }
+        return withScopeWarning(result, check.warning)
+    }
+
+    /**
+     * Flags security-interesting fields by name (auth/privileged/pii/payment/database/debugging/
+     * files), deprecated fields, and custom scalars — ported from InQL's `POIScanner`.
+     */
+    fun poiScan(url: String, categories: Set<String>?, customKeywords: List<String>?): JsonObject {
+        val check = scopeGate.check(url)
+        check.deny?.let { return it }
+        val result = try {
+            val schema = fetchFullSchema(url) ?: return buildJsonObject {
+                put("error", "Could not build a schema from this endpoint's introspection response (introspection may be disabled).")
+            }
+            val scanner = POIScanner(schema, categories ?: POIScanner.DEFAULT_CATEGORIES, customKeywords ?: emptyList())
+            val found = scanner.scan()
+            buildJsonObject {
+                put("endpoint", url)
+                put("categories_scanned", buildJsonArray { (categories ?: POIScanner.DEFAULT_CATEGORIES).forEach { add(it) } })
+                put("flagged_count", found.values.sumOf { it.size })
+                put("flagged", buildJsonObject {
+                    found.forEach { (category, fields) ->
+                        put(category, buildJsonArray {
+                            fields.forEach { f ->
+                                add(buildJsonObject {
+                                    put("query_type", f.queryType)
+                                    put("path", f.path)
+                                    f.description?.let { put("description", it) }
+                                })
+                            }
+                        })
+                    }
+                })
+            }
+        } catch (e: Exception) {
+            buildJsonObject { put("error", "POI scan failed: ${e.message}") }
+        }
+        return withScopeWarning(result, check.warning)
+    }
+
+    /** Flags types that can recurse into themselves (deep-nesting/DoS risk) — ported from InQL's `CyclesScanner`. */
+    fun cyclesScan(url: String): JsonObject {
+        val check = scopeGate.check(url)
+        check.deny?.let { return it }
+        val result = try {
+            val schema = fetchFullSchema(url) ?: return buildJsonObject {
+                put("error", "Could not build a schema from this endpoint's introspection response (introspection may be disabled).")
+            }
+            val cycles = CyclesScanner(schema).detect().cyclesAsStrings()
+            buildJsonObject {
+                put("endpoint", url)
+                put("cycle_count", cycles.size)
+                put("cycles", buildJsonArray { cycles.forEach { add(it) } })
+                put(
+                    "note",
+                    if (cycles.isNotEmpty())
+                        "These types can recurse into themselves — a deeply/recursively nested query against them is a DoS risk if the server doesn't cap query depth/complexity."
+                    else "No self-recursive type cycles found."
+                )
+            }
+        } catch (e: Exception) {
+            buildJsonObject { put("error", "Cycle scan failed: ${e.message}") }
+        }
+        return withScopeWarning(result, check.warning)
+    }
+
+    /**
+     * Expands a `$[INT:first:last]`/`$[LIST]` placeholder in [template] into a batched/aliased
+     * GraphQL query (see [BatchAttack]) — for 2FA brute force, IDOR enumeration, or rate-limit
+     * bypass testing. Generates only by default; pass [send] to also fire it at [url].
+     */
+    fun batchAttack(url: String, template: String, values: List<String>?, send: Boolean): JsonObject {
+        val expanded = BatchAttack.expand(template, values)
+            ?: return buildJsonObject { put("error", "No \$[INT:first:last] or \$[LIST] placeholder found (immediately before a '{' selection set) in the template.") }
+
+        if (!send) {
+            return buildJsonObject {
+                put("operations_generated", expanded.count)
+                put("query", expanded.query)
+            }
+        }
+
+        val check = scopeGate.check(url)
+        check.deny?.let { return it }
+        val resp = postQuery(url, expanded.query)
+        val result = buildJsonObject {
+            put("endpoint", url)
+            put("operations_generated", expanded.count)
+            put("query", expanded.query)
+            put("status", resp.status)
+            put("response_body", resp.body.take(20_000))
+        }
+        return withScopeWarning(result, check.warning)
+    }
+
+    /** Fetches the FULL official introspection query (needed for schema modeling) and builds a [GQLSchema]; null on any failure. */
+    private fun fetchFullSchema(url: String): GQLSchema? {
+        val resp = postQuery(url, graphql.introspection.IntrospectionQuery.INTROSPECTION_QUERY)
+        if (resp.status == 0 || resp.body.isBlank()) return null
+        return try { GQLSchema(resp.body) } catch (_: Exception) { null }
+    }
+
+    private fun withScopeWarning(result: JsonObject, warning: String?): JsonObject =
+        if (warning != null) JsonObject(result + ("scope_warning" to JsonPrimitive(warning))) else result
 
     private fun postQuery(url: String, query: String): ProbeResponse {
         return try {

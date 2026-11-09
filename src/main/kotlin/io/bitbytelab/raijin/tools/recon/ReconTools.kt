@@ -57,21 +57,33 @@ object ReconTools {
 
         server.addTool(
             name = "recon_param_mine",
-            description = "Probe candidate parameter names on a URL and flag those reflected in the response — " +
-                "hidden params are where IDOR/XSS/SSRF often hide. Respects the operator scope policy.",
+            description = "Probe parameter names on a URL for hidden params — IDOR/XSS/SSRF/cache-poisoning often hide " +
+                "there. mode=reflection (default) flags names whose value is echoed back; mode=diff flags names that " +
+                "change server behavior (status/body) WITHOUT reflecting, catching params reflection alone misses; " +
+                "mode=both reports both. inject_in picks where the name is placed: query (default), body, json_body, " +
+                "cookie, or header. Omit candidates to use a bundled dictionary (param-miner-params by default, or " +
+                "param-miner-headers for header names). Respects the operator scope policy.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("url") { put("type", "string"); put("description", "Target URL") }
-                    putJsonObject("candidates") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Candidate parameter names") }
+                    putJsonObject("candidates") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Candidate parameter/header names; omit to use a bundled wordlist") }
+                    putJsonObject("mode") { put("type", "string"); put("description", "reflection (default) | diff | both") }
+                    putJsonObject("inject_in") { put("type", "string"); put("description", "query (default) | body | json_body | cookie | header") }
+                    putJsonObject("method") { put("type", "string"); put("description", "HTTP method; defaults to GET, or POST when inject_in is body/json_body") }
+                    putJsonObject("wordlist") { put("type", "string"); put("description", "Bundled wordlist name when candidates is omitted (default: param-miner-params)") }
                 },
-                required = listOf("url", "candidates")
+                required = listOf("url")
             )
         ) { request ->
             try {
                 val a = request.params.arguments ?: emptyMap()
                 val url = a["url"]?.jsonPrimitive?.contentOrNull ?: return@addTool err("Parameter 'url' is required")
-                val candidates = a["candidates"].asStringList() ?: return@addTool err("Parameter 'candidates' (array) is required")
-                CallToolResult(content = listOf(TextContent(bridge.paramMine(url, candidates).toString())))
+                val candidates = a["candidates"].asStringList()
+                val mode = a["mode"]?.jsonPrimitive?.contentOrNull ?: "reflection"
+                val injectIn = a["inject_in"]?.jsonPrimitive?.contentOrNull ?: "query"
+                val method = a["method"]?.jsonPrimitive?.contentOrNull
+                val wordlist = a["wordlist"]?.jsonPrimitive?.contentOrNull
+                CallToolResult(content = listOf(TextContent(bridge.paramMine(url, candidates, mode, injectIn, method, wordlist).toString())))
             } catch (e: Exception) { err(e.message) }
         }
     }

@@ -26,15 +26,27 @@ object AuthDiffVerdict {
      *   missing/generic); omit it and the downgrade falls back to content-type alone. Appended
      *   after [similarity], not between it and [results], so existing positional call sites
      *   (`assess(results, similarityFn)`) keep compiling unchanged.
+     * @param allSimilarThreshold Body-similarity percent (0-100) above which every level is considered
+     *   "near-identical" for the `all_identical` verdict. Defaults to the historical 95.0; callers that
+     *   want a stricter/looser bar (e.g. a live Autorize-style tap tuning sensitivity per rule) can override it.
+     * @param unauthMatchThreshold Body-similarity percent (0-100) above which an unauthenticated level's body is
+     *   considered a match of an authed level's body for the `unauth_reads_protected` verdict. Defaults to the
+     *   historical 90.0.
      */
-    fun assess(results: List<LevelResult>, similarity: (String, String) -> Double, url: String? = null): List<Finding> {
+    fun assess(
+        results: List<LevelResult>,
+        similarity: (String, String) -> Double,
+        url: String? = null,
+        allSimilarThreshold: Double = 95.0,
+        unauthMatchThreshold: Double = 90.0,
+    ): List<Finding> {
         val findings = mutableListOf<Finding>()
         if (results.size < 2) return findings
 
         val statuses = results.map { it.status }.distinct()
         val allSameStatus = statuses.size == 1
         val firstBody = results.first().body
-        val allSimilar = results.all { similarity(firstBody, it.body) >= 95.0 }
+        val allSimilar = results.all { similarity(firstBody, it.body) >= allSimilarThreshold }
 
         // Dominant case: every level gets the same status + near-identical body. Correct signal
         // for a protected resource; a false positive for a static asset (CSS/JS/image/font) that
@@ -67,7 +79,7 @@ object AuthDiffVerdict {
 
         for (u in unauthLevels) {
             if (!u.isSuccess) continue
-            val match = authLevels.firstOrNull { a -> a.isSuccess && similarity(a.body, u.body) >= 90.0 }
+            val match = authLevels.firstOrNull { a -> a.isSuccess && similarity(a.body, u.body) >= unauthMatchThreshold }
             if (match != null) {
                 findings.add(
                     Finding(
@@ -86,7 +98,8 @@ object AuthDiffVerdict {
         }
 
         // Same status across multiple authed identities but differing bodies → classic IDOR shape.
-        if (allSameStatus && authLevels.size >= 2 && !allSimilar) {
+        // (allSimilar is already known false here: the allSameStatus&&allSimilar case returned above.)
+        if (allSameStatus && authLevels.size >= 2) {
             findings.add(
                 Finding(
                     "info", "same_status_diff_body",

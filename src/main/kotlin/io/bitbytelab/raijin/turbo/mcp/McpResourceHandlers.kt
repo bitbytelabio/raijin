@@ -37,7 +37,8 @@ class McpResourceHandlers(
         "race-conditions" to "Race condition testing with gates",
         "response-processing" to "Handling and filtering responses",
         "decorators" to "Response decorator reference",
-        "misc" to "Wordlists and utilities"
+        "misc" to "Wordlists and utilities",
+        "desync-techniques" to "HTTP request smuggling: obfuscation technique catalog and canary confirmation"
     )
 
     // Auto-discovered from resources/examples/
@@ -45,6 +46,7 @@ class McpResourceHandlers(
         "0cl-exploit", "0cl-find-offset", "0cl-poc",
         "apis", "basic", "benchmark-h1-race", "benchmark-h2-race",
         "burpIntegration", "customSortOrder", "debug", "default", "desync-gadget-hunter",
+        "desync-smuggler", "desync-h2-downgrade",
         "email-link-extraction", "http2", "http3", "infinite", "micro-crawl",
         "misc", "multiHost", "multipleParameters", "outputToFile",
         "partialReadCallback", "pinwheel", "race-multi-endpoint",

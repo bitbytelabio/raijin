@@ -5,7 +5,7 @@ description: Recording findings and producing reports.
 # Findings and reporting
 
 - `findings(action=add)`: store a finding (title, severity, evidence request/response, notes). Add each confirmed issue once.
-- `findings(action=list)`: review everything recorded so far.
+- `findings(action=list)`: review everything recorded so far. A critical/high mismatch from a live `autorize` tap is added here automatically — no need to re-record it.
 - `scanner(action=generate_report)`: export Burp scanner issues as a report.
 - `organizer(action=send)` / `organizer(action=get_items)`: park interesting requests in Organizer.
 - `persistence(action=store)`, `persistence(action=get)`, `persistence(action=list)`, `persistence(action=delete)`: keep notes across calls in the Burp project.

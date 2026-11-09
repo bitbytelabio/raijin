@@ -2,7 +2,11 @@ package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
 import io.bitbytelab.raijin.safety.BoundedHttp
+import burp.api.montoya.http.message.params.HttpParameter
 import burp.api.montoya.http.message.requests.HttpRequest
+import io.bitbytelab.raijin.core.BehavioralDiff
+import io.bitbytelab.raijin.core.ParamMinerWordlists
+import io.bitbytelab.raijin.core.ProbeResult
 import io.bitbytelab.raijin.recon.JsEndpoints
 import io.bitbytelab.raijin.recon.ReconHeuristics
 import io.bitbytelab.raijin.safety.ScopeGate
@@ -99,34 +103,127 @@ class ReconBridge(private val api: MontoyaApi) {
         }
     }
 
-    /** Probe [candidates] as query params on [url], flagging those reflected in the response (injection candidates). */
-    fun paramMine(url: String, candidates: List<String>): JsonObject {
+    /**
+     * Probe [candidates] (or a bundled dictionary, when null) for hidden parameters on [url].
+     *
+     * [mode] `"reflection"` (default) flags only candidates whose value is echoed back verbatim —
+     * cheap, but blind to params that change server behavior without reflecting it. `"diff"` instead
+     * compares each candidate's response against an unmodified baseline (status/body similarity via
+     * [BehavioralDiff]), catching params that affect control flow (auth, caching, feature flags)
+     * without reflecting. `"both"` runs both checks and reports each separately.
+     *
+     * [injectIn] selects where the candidate name is placed: `"query"` (default), `"body"`
+     * (form-encoded), `"json_body"` (top-level key in a JSON object body), `"cookie"`, or `"header"`.
+     */
+    fun paramMine(
+        url: String,
+        candidates: List<String>?,
+        mode: String = "reflection",
+        injectIn: String = "query",
+        method: String? = null,
+        wordlist: String? = null,
+    ): JsonObject {
         return try {
             val check = scopeGate.check(url)
             check.deny?.let { return it }
-            val sep = if (url.contains("?")) "&" else "?"
-            val tested = candidates.take(1000)
-            val reflected = mutableListOf<JsonObject>()
+
+            val useDiff = mode == "diff" || mode == "both"
+            val useReflection = mode == "reflection" || mode == "both"
+            val resolvedMethod = method ?: if (injectIn == "body" || injectIn == "json_body") "POST" else "GET"
+
+            val source = candidates ?: ParamMinerWordlists.load(wordlist ?: ParamMinerWordlists.DEFAULT)
+            // Caller-supplied lists get the existing generous cap; an auto-loaded dictionary is capped
+            // tighter by default so a bare call doesn't silently fire ~1000 requests at the target.
+            val tested = source.take(if (candidates != null) 1000 else 300)
+
+            val baseRequest = HttpRequest.httpRequestFromUrl(url).withMethod(resolvedMethod)
+            val baseline = if (useDiff) sendProbe(baseRequest) else null
+
+            val interesting = mutableListOf<JsonObject>()
             for (cand in tested) {
-                val testUrl = "$url$sep$cand=$MARKER"
-                val body = try {
-                    BoundedHttp.send(api, HttpRequest.httpRequestFromUrl(testUrl))?.response()?.bodyToString() ?: ""
-                } catch (_: Exception) { "" }
-                if (ReconHeuristics.reflects(body, MARKER)) {
-                    reflected.add(buildJsonObject { put("param", cand); put("reflected", true); put("url", testUrl) })
+                val mutated = injectCandidate(baseRequest, injectIn, cand, MARKER)
+                val resp = try {
+                    BoundedHttp.send(api, mutated)
+                } catch (_: Exception) {
+                    null
+                }
+                val body = try { resp?.response()?.bodyToString() ?: "" } catch (_: Exception) { "" }
+                val status = try { resp?.response()?.statusCode()?.toInt() ?: 0 } catch (_: Exception) { 0 }
+
+                val reflects = useReflection && ReconHeuristics.reflects(body, MARKER)
+                val diffFlag = useDiff && baseline != null && status != 0 &&
+                    BehavioralDiff.changed(baseline, ProbeResult(status, body))
+
+                if (reflects || diffFlag) {
+                    interesting.add(buildJsonObject {
+                        put("param", cand)
+                        put("inject_in", injectIn)
+                        if (useReflection) put("reflected", reflects)
+                        if (useDiff) put("behavior_diff", diffFlag)
+                    })
                 }
             }
             buildJsonObject {
                 put("url", url)
                 check.warning?.let { put("scope_warning", it) }
+                put("mode", mode)
+                put("inject_in", injectIn)
                 put("marker", MARKER)
+                put("wordlist_used", if (candidates == null) (wordlist ?: ParamMinerWordlists.DEFAULT) else null)
                 put("tested", tested.size)
-                put("reflected_count", reflected.size)
-                put("reflected_params", buildJsonArray { reflected.forEach { add(it) } })
-                put("note", "Reflected params are candidate injection points (XSS/SSRF/IDOR). Behavioral-diff mining (params that change the response without reflecting) is a follow-up.")
+                put("interesting_count", interesting.size)
+                put("interesting_params", buildJsonArray { interesting.forEach { add(it) } })
+                put(
+                    "note",
+                    "Reflected params are candidate injection points (XSS/SSRF/IDOR). " +
+                        "behavior_diff params changed status/body without reflecting — worth manual follow-up.",
+                )
             }
         } catch (e: Exception) {
             buildJsonObject { put("error", "Param mining failed: ${e.message}") }
+        }
+    }
+
+    private fun sendProbe(request: HttpRequest): ProbeResult? {
+        val resp = try {
+            BoundedHttp.send(api, request)
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        return try {
+            ProbeResult(resp.response().statusCode().toInt(), resp.response().bodyToString())
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun injectCandidate(request: HttpRequest, injectIn: String, name: String, value: String): HttpRequest =
+        when (injectIn) {
+            "body" -> upsertParam(request, HttpParameter.bodyParameter(name, value))
+            "json_body" -> injectJsonBody(request, name, value)
+            "cookie" -> upsertParam(request, HttpParameter.cookieParameter(name, value))
+            "header" -> request.withAddedHeader(name, value)
+            else -> upsertParam(request, HttpParameter.urlParameter(name, value))
+        }
+
+    private fun upsertParam(request: HttpRequest, param: HttpParameter): HttpRequest =
+        if (request.hasParameter(param.name(), param.type())) request.withUpdatedParameters(param)
+        else request.withAddedParameters(param)
+
+    /** Adds [name]:[value] as a top-level key to a JSON object body; leaves the request untouched if the body isn't a JSON object. */
+    private fun injectJsonBody(request: HttpRequest, name: String, value: String): HttpRequest {
+        val bodyText = try { request.body().toString() } catch (_: Exception) { "" }.trim()
+        if (!bodyText.startsWith("{")) return request
+        return try {
+            val parsed = kotlinx.serialization.json.Json.parseToJsonElement(bodyText)
+            if (parsed !is JsonObject) return request
+            val merged = buildJsonObject {
+                parsed.forEach { (k, v) -> put(k, v) }
+                put(name, value)
+            }
+            request.withBody(merged.toString()).withHeader("Content-Type", "application/json")
+        } catch (_: Exception) {
+            request
         }
     }
 }

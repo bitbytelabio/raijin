@@ -8,7 +8,7 @@ description: Reading and shaping proxy traffic: history, search, intercept, rule
 - Annotate: `proxy_annotate` to mark items worth returning to; `sitemap(action=annotate)` does the same for site map entries, `organizer(action=annotate)` for Organizer items. Burp's Montoya API has no way to annotate Repeater tabs, Intruder attacks, or the Logger tool from an extension.
 - Intercept: `proxy_intercept(action=status)`, `proxy_intercept(action=enable)`, `proxy_intercept(action=disable)`. Turn it back off when finished or the browser hangs.
 - Rules: `proxy_rule(action=set_request_rule)`, `proxy_rule(action=set_response_rule)`, `proxy_rule(action=list)`, `proxy_rule(action=remove)`. Config-level equivalents: `config_match_replace_*`.
-- Auth: `proxy_auto_auth` for automatic auth handling.
+- Auth: `proxy_auto_auth` for automatic auth handling. For live broken-access-control detection, `autorize(action=set_rule)` taps proxy traffic and replays matching requests under a second identity in the background, diffing responses and pushing mismatches to `findings(action=add)` — browse the app as normal afterward, no need to resend anything. Use `auth_diff`/`probe(action=access_control)` instead for a one-off check against a request (or list of requests) you already have.
 - Mining: `recon(action=js_endpoints)` (scope-gated) and `analyze(action=passive_intel)` summarise what traffic already revealed.
 - WebSockets: `websocket(action=create)`, `websocket(action=send_text)`, `websocket(action=send_binary)`, `websocket(action=get_messages)`, `websocket(action=close)`.
 

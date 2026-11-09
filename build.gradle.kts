@@ -59,6 +59,11 @@ dependencies {
     // Nimbus X25519 JWE calls Tink. 1.6.1 is the version nimbus-jose-jwt 9.21 was built against.
     implementation("com.google.crypto.tink:tink:1.6.1")
 
+    // GraphQL schema modeling (introspection JSON/SDL -> GraphQLSchema, query generation, SDL
+    // printing). Plain JVM library, not sensitive to the Kotlin/Ktor pins above. Version matches
+    // what InQL (the reference extension this ports from) uses.
+    implementation("com.graphql-java:graphql-java:21.5")
+
     // --- Tests ---
     testImplementation(kotlin("test-junit5"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")

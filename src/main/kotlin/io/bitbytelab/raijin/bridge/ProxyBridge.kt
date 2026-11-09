@@ -24,13 +24,19 @@ import burp.api.montoya.proxy.http.ProxyResponseHandler
 import burp.api.montoya.proxy.http.ProxyResponseReceivedAction
 import burp.api.montoya.proxy.http.ProxyResponseToBeSentAction
 import burp.api.montoya.websocket.Direction
+import io.bitbytelab.raijin.core.TextSimilarity
 import io.bitbytelab.raijin.events.EventBus
+import io.bitbytelab.raijin.safety.BoundedHttp
 import io.bitbytelab.raijin.safety.HeaderSafety
 import io.bitbytelab.raijin.safety.SafeRegex
+import io.bitbytelab.raijin.safety.ScopeGate
+import io.bitbytelab.raijin.state.AutorizeRule
 import io.bitbytelab.raijin.state.ProxyRule
 import io.bitbytelab.raijin.state.StateManager
 import kotlinx.serialization.json.*
 import java.time.Instant
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.regex.Pattern
 
 /**
@@ -44,8 +50,17 @@ import java.util.regex.Pattern
 class ProxyBridge(
     private val api: MontoyaApi,
     private val eventBus: EventBus,
-    private val stateManager: StateManager
+    private val stateManager: StateManager,
+    private val findings: FindingsBridge
 ) {
+    private val scopeGate = ScopeGate(api)
+
+    /**
+     * Runs live Autorize-style replays off the proxy handler thread. A dedicated pool (rather
+     * than a shared one) keeps this background work from ever competing with/blocking other
+     * Montoya callback dispatch; its futures are intentionally never awaited (see [maybeAutorize]).
+     */
+    private val autorizeExecutor: ExecutorService = Executors.newVirtualThreadPerTaskExecutor()
 
     // ---------------------------------------------------------------
     // History retrieval
@@ -462,6 +477,9 @@ class ProxyBridge(
                 // Emit event for every response passing through the proxy
                 emitResponseEvent(interceptedResponse)
 
+                // Live Autorize-style tap: fire-and-forget, never blocks this handler.
+                maybeAutorize(interceptedResponse)
+
                 // Find matching response rules
                 val matchingRules = stateManager.proxyRules.filter { rule ->
                     rule.enabled && rule.type.equals("response", ignoreCase = true) &&
@@ -527,6 +545,145 @@ class ProxyBridge(
             override fun handleResponseToBeSent(interceptedResponse: InterceptedResponse): ProxyResponseToBeSentAction {
                 return ProxyResponseToBeSentAction.continueWith(interceptedResponse)
             }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Live Autorize-style tap: clone matching traffic, replay under a second identity in the
+    // background, diff against the already-captured response. See AutorizeBridge for rule CRUD.
+    // ---------------------------------------------------------------
+
+    /**
+     * Checks [response] against every enabled [io.bitbytelab.raijin.state.AutorizeRule], and for each
+     * match, submits a background replay+diff to [autorizeExecutor]. Never blocks or throws into the
+     * caller — this runs on Burp's proxy handler thread for every single response.
+     */
+    private fun maybeAutorize(response: InterceptedResponse) {
+        if (stateManager.autorizeRules.none { it.enabled }) return
+        try {
+            val request = response.request() ?: return
+            val url = request.url()
+            val method = request.method()
+            val originalStatus = response.statusCode().toInt()
+            val originalBody = response.bodyToString()
+            val originalContentType = try { response.headerValue("Content-Type") } catch (_: Exception) { null }
+            val rawRequest = request.toString()
+            val rawResponse = response.toString()
+
+            for (rule in stateManager.autorizeRules) {
+                if (!rule.enabled || !autorizeRuleMatches(rule, request, method, url, originalContentType)) continue
+                val seenKey = "${rule.ruleId}|$method|${url.substringBefore('?')}"
+                if (!stateManager.autorizeSeenOnce(seenKey)) continue
+
+                autorizeExecutor.submit {
+                    try {
+                        autorizeReplayAndAssess(
+                            rule, request, method, url, originalStatus, originalBody, originalContentType,
+                            rawRequest, rawResponse,
+                        )
+                    } catch (_: Exception) {
+                        // Best-effort background check; a failure here must never surface as a proxy error.
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            // Same: tapping must never disrupt the live proxy flow.
+        }
+    }
+
+    /** Per-rule filters: method, URL exclude-regex, host include-glob, scope, and static-asset skip. */
+    private fun autorizeRuleMatches(rule: AutorizeRule, request: HttpRequest, method: String, url: String, contentType: String?): Boolean {
+        if (rule.methods != null && method.uppercase() !in rule.methods) return false
+        if (rule.excludeUrlRegex != null && SafeRegex.containsMatchIn(rule.excludeUrlRegex, url, ignoreCase = true)) return false
+        if (rule.includeHostPattern != null) {
+            val hostPattern = rule.includeHostPattern.replace("*", ".*")
+            val host = try { request.httpService().host() } catch (_: Exception) { "" }
+            if (!SafeRegex.matches(hostPattern, host, ignoreCase = true)) return false
+        }
+        if (rule.inScopeOnly) {
+            val inScope = try { api.scope().isInScope(url) } catch (_: Exception) { true }
+            if (!inScope) return false
+        }
+        if (rule.ignoreStaticAssets && StaticAssetHeuristic.looksStatic(contentType, url)) return false
+        return true
+    }
+
+    /**
+     * Replays [originalRequest] under each of [rule]'s identities (same mutation idiom as
+     * [AnalysisBridge.authDiff]: a named header override, or stripping common auth headers for
+     * none/unauth/anonymous), diffs against the already-captured response via [AuthDiffVerdict]
+     * (no need to resend the original — it's already in hand), and on a critical/high verdict
+     * records an [io.bitbytelab.raijin.state.AutorizeMatch] and pushes to [findings].
+     */
+    private fun autorizeReplayAndAssess(
+        rule: AutorizeRule,
+        originalRequest: HttpRequest,
+        method: String,
+        url: String,
+        originalStatus: Int,
+        originalBody: String,
+        originalContentType: String?,
+        rawRequest: String,
+        rawResponse: String,
+    ) {
+        // Hard safety backstop: respects the operator's global scope policy for this outbound
+        // replay send, independent of rule.inScopeOnly (which only filters which traffic is tapped).
+        if (scopeGate.deny(url) != null) return
+
+        val levels = mutableListOf(AuthDiffVerdict.LevelResult("captured", originalStatus, originalBody, originalContentType))
+        for (identity in rule.identities) {
+            val name = identity["name"]?.jsonPrimitive?.contentOrNull ?: "unknown"
+            val headerName = identity["header_name"]?.jsonPrimitive?.contentOrNull
+            val headerValue = identity["header_value"]?.jsonPrimitive?.contentOrNull
+
+            var mutated = originalRequest
+            if (headerName != null && headerValue != null) {
+                if (!HeaderSafety.isValidHeaderName(headerName) || !HeaderSafety.isValidHeaderValue(headerValue)) continue
+                mutated = mutated.withRemovedHeader(headerName).withHeader(headerName, headerValue)
+            } else if (name.equals("none", true) || name.equals("unauth", true) || name.equals("anonymous", true)) {
+                mutated = mutated
+                    .withRemovedHeader("Authorization")
+                    .withRemovedHeader("Cookie")
+                    .withRemovedHeader("X-API-Key")
+                    .withRemovedHeader("X-Auth-Token")
+            }
+
+            val sent = try { BoundedHttp.send(api, mutated) } catch (_: Exception) { null } ?: continue
+            val resp = sent.response() ?: continue
+            levels.add(
+                AuthDiffVerdict.LevelResult(
+                    name,
+                    try { resp.statusCode().toInt() } catch (_: Exception) { 0 },
+                    try { resp.bodyToString() } catch (_: Exception) { "" },
+                    try { resp.headerValue("Content-Type") } catch (_: Exception) { null },
+                )
+            )
+        }
+        if (levels.size < 2) return
+
+        val verdict = AuthDiffVerdict.assess(
+            levels,
+            similarity = { a, b -> TextSimilarity.dice(a, b) },
+            url = url,
+            allSimilarThreshold = (rule.similarityThreshold + 5.0).coerceAtMost(100.0),
+            unauthMatchThreshold = rule.similarityThreshold,
+        )
+        val actionable = verdict.filter { it.severity == "critical" || it.severity == "high" }
+        if (actionable.isEmpty()) return
+
+        val findingsJson = actionable.map { f -> buildJsonObject { put("severity", f.severity); put("id", f.id); put("detail", f.detail) } }
+        stateManager.addAutorizeMatch(rule.ruleId, method, url, originalStatus, findingsJson, rawRequest, rawResponse)
+        for (f in actionable) {
+            findings.add(
+                type = f.id,
+                severity = f.severity,
+                url = url,
+                location = "method:$method",
+                detail = f.detail,
+                evidence = rawResponse.take(2000),
+                request = rawRequest,
+                response = rawResponse,
+            )
         }
     }
 

@@ -46,7 +46,8 @@ class BridgeFactory {
         val webProbe: WebProbeBridge,
         val accessControl: AccessControlBridge,
         val injection: InjectionBridge,
-        val idorHunt: IdorHuntBridge
+        val idorHunt: IdorHuntBridge,
+        val autorize: AutorizeBridge
     )
 
     companion object {
@@ -62,8 +63,9 @@ class BridgeFactory {
             stateManager: StateManager
         ): Bridges {
             val persistence = PersistenceBridge(api)
+            val findings = FindingsBridge(stateManager)
             return Bridges(
-                proxy = ProxyBridge(api, eventBus, stateManager),
+                proxy = ProxyBridge(api, eventBus, stateManager, findings),
                 http = HttpBridge(api, eventBus, stateManager),
                 scanner = ScannerBridge(api, eventBus, stateManager),
                 collaborator = CollaboratorBridge(api, eventBus, stateManager),
@@ -97,13 +99,14 @@ class BridgeFactory {
                     },
                     save = { value -> persistence.store(JwtBridge.PERSIST_KEY, value) },
                 ),
-                findings = FindingsBridge(stateManager),
+                findings = findings,
                 recon = ReconBridge(api),
                 graphql = GraphQlBridge(api),
                 webProbe = WebProbeBridge(api),
                 accessControl = AccessControlBridge(api),
                 injection = InjectionBridge(api),
-                idorHunt = IdorHuntBridge(api)
+                idorHunt = IdorHuntBridge(api),
+                autorize = AutorizeBridge(stateManager)
             )
         }
     }

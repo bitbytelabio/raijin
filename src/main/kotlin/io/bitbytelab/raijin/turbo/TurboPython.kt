@@ -18,5 +18,8 @@ object TurboPython {
         HTTP3RequestEngine::class.java,
         ThreadedRequestEngine::class.java,
         Utils::class.java,
+        DesyncTechniques::class.java,
+        DesyncProbePayloads::class.java,
+        DesyncCanary::class.java,
     ).associate { it.simpleName to PyType.fromClass(it) }
 }
