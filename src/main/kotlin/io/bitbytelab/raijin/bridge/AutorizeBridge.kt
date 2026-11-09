@@ -10,6 +10,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import java.time.Instant
 
 /**
  * CRUD for live Autorize-style proxy taps and their flagged matches. Pure [StateManager]
@@ -63,6 +64,9 @@ class AutorizeBridge(private val stateManager: StateManager) {
             ignoreStaticAssets = ignoreStaticAssets ?: existing?.ignoreStaticAssets ?: true,
             similarityThreshold = similarityThreshold ?: existing?.similarityThreshold ?: 90.0,
             enabled = resolvedEnabled,
+            // Preserve the original creation time across updates — AutorizeRule's own default
+            // (Instant.now()) would otherwise stamp a fresh value on every single update.
+            createdAt = existing?.createdAt ?: Instant.now().toString(),
         )
         stateManager.autorizeRules.removeIf { it.ruleId == id }
         stateManager.autorizeRules.add(rule)

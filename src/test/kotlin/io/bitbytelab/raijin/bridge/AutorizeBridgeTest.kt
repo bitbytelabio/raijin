@@ -91,6 +91,20 @@ class AutorizeBridgeTest {
     }
 
     @Test
+    fun `updating a rule preserves its original created_at instead of stamping a new one`() {
+        val b = AutorizeBridge(StateManager())
+        val r1 = b.setRule(null, listOf(identity("admin"), identity("none")), true, null, null, null, true, 90.0, true)
+        val ruleId = r1["rule_id"]!!.jsonPrimitive.content
+        val createdAt = b.listRules()["rules"]!!.jsonArray[0].jsonObject["created_at"]!!.jsonPrimitive.content
+
+        Thread.sleep(5) // guarantee Instant.now() would differ from createdAt if the bug regressed
+        b.setRule(ruleId, null, null, null, null, null, null, 70.0, null)
+
+        val updatedCreatedAt = b.listRules()["rules"]!!.jsonArray[0].jsonObject["created_at"]!!.jsonPrimitive.content
+        assertEquals(createdAt, updatedCreatedAt)
+    }
+
+    @Test
     fun `omitting enabled on an update does not re-enable a disabled rule`() {
         val b = AutorizeBridge(StateManager())
         val r1 = b.setRule(null, listOf(identity("admin"), identity("none")), true, null, null, null, true, 90.0, false)
