@@ -2,7 +2,7 @@
 
 Raijin folds families of tools into one tool with an `action` parameter (see `tools/ToolConsolidation.kt`). Old names no longer exist. The Activity tab and audit log still report calls under the old name.
 
-Tools kept as they were: `http_send_request`, `http_send_requests_parallel`, `http_send_request_chain`, `http_send_raw_bytes`, `http_fuzz`, `http_race`, `proxy_history`, `proxy_history_search`, `proxy_annotate`, `proxy_auto_auth`, `auth_diff`, `api_import_openapi`, `bambda_import`.
+Tools kept as they were: `http_send_request`, `http_send_requests_parallel`, `http_send_request_chain`, `http_send_raw_bytes`, `http_fuzz`, `http_race`, `proxy_history`, `proxy_history_search`, `proxy_annotate`, `proxy_auto_auth`, `auth_diff`, `api_import_openapi`, `bambda_import`, `jwt_keys`.
 
 Parameters that were named `action` (proxy rules, WebSocket intercept rule) are called `rule_action` in the merged tools.
 

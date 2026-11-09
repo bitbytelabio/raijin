@@ -3,6 +3,8 @@ package io.bitbytelab.raijin.bridge
 import burp.api.montoya.MontoyaApi
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.state.StateManager
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
 
 class BridgeFactory {
 
@@ -59,6 +61,7 @@ class BridgeFactory {
             eventBus: EventBus,
             stateManager: StateManager
         ): Bridges {
+            val persistence = PersistenceBridge(api)
             return Bridges(
                 proxy = ProxyBridge(api, eventBus, stateManager),
                 http = HttpBridge(api, eventBus, stateManager),
@@ -77,7 +80,7 @@ class BridgeFactory {
                 utilities = UtilitiesBridge(api),
                 ai = AiBridge(api),
                 bambda = BambdaBridge(api),
-                persistence = PersistenceBridge(api),
+                persistence = persistence,
                 project = ProjectBridge(api),
                 logging = LoggingBridge(api),
                 extension = ExtensionBridge(api, stateManager),
@@ -86,7 +89,14 @@ class BridgeFactory {
                 apiImport = ApiImportBridge(api, stateManager),
                 passiveIntel = PassiveIntelBridge(api),
                 analysis = AnalysisBridge(api),
-                jwt = JwtBridge(),
+                jwt = JwtBridge(
+                    load = {
+                        val stored = persistence.get(JwtBridge.PERSIST_KEY)
+                        val found = stored["found"]?.jsonPrimitive?.contentOrNull == "true"
+                        if (found) stored["value"]?.jsonPrimitive?.contentOrNull else null
+                    },
+                    save = { value -> persistence.store(JwtBridge.PERSIST_KEY, value) },
+                ),
                 findings = FindingsBridge(stateManager),
                 recon = ReconBridge(api),
                 graphql = GraphQlBridge(api),

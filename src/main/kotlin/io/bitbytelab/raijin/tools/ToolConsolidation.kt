@@ -48,6 +48,7 @@ object ToolConsolidation {
         "http_send_raw_bytes", "http_fuzz", "http_race",
         "proxy_history", "proxy_history_search", "proxy_annotate", "proxy_auto_auth",
         "auth_diff", "api_import_openapi", "bambda_import",
+        "jwt_keys",
     )
 
     val GROUPS: List<Group> = listOf(

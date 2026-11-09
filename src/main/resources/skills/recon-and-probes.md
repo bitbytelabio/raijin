@@ -15,7 +15,8 @@ All of these refuse targets outside Burp's scope. Add the target with `scope(act
 - `probe(action=injection)`: guided SQLi / SSTI / LFI detection with confirmation oracles.
 - `probe(action=access_control)`: run the same requests as several identities and compare.
 - `probe(action=idor)`: swap object ids horizontally with canary confirmation.
-- `probe(action=jwt)`: JWT weakness checks (decode first with `util(action=jwt_decode)`).
+- `probe(action=jwt)`: JWT checks and token operations. Decode first with `util(action=jwt_decode)`. Modes: analyze, forge_none, alg_confusion, crack, sign (HMAC secret), sign_key, verify, encrypt, decrypt, embed_jwk, empty_hmac, psychic, header_url. Keys come from `jwt_keys`.
+- `jwt_keys`: generate, import, list, export, or delete a key (RSA, EC, OKP, oct, password). `list` and `export` omit private material unless `include_private` is true.
 - `auth_diff`, `api_import_openapi`: compare identities; import an OpenAPI spec as test requests.
 
 Workflow: fingerprint, discover, mine parameters, then probe. Treat a probe hit as a lead; confirm it manually with `http_send_request`, then record it with `findings(action=add)`.

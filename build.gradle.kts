@@ -51,6 +51,14 @@ dependencies {
     implementation("com.twitter:hpack:1.0.2")
     implementation("tech.kwik:kwik:0.10.3")
 
+    // JOSE key ring, JWS, and JWE. Versions match the jwt-editor 2.6.2 reference.
+    // BouncyCastle is required for secp256k1 (ES256K) and PEM encode/decode.
+    implementation("com.nimbusds:nimbus-jose-jwt:9.21")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.83")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.83")
+    // Nimbus X25519 JWE calls Tink. 1.6.1 is the version nimbus-jose-jwt 9.21 was built against.
+    implementation("com.google.crypto.tink:tink:1.6.1")
+
     // --- Tests ---
     testImplementation(kotlin("test-junit5"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
