@@ -1,6 +1,8 @@
 package io.bitbytelab.raijin.tools
 
+import io.bitbytelab.raijin.bridge.DecoderBridge
 import io.bitbytelab.raijin.testClientConnection
+import io.bitbytelab.raijin.tools.decoder.DecoderTools
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
@@ -133,6 +135,46 @@ class ToolConsolidationTest {
         assertTrue("rule_action" in props)
         val r = call(target, "proxy_rule", buildJsonObject { put("action", "set_request_rule"); put("rule_action", "drop") })
         assertEquals("""proxy_set_request_rule:{"action":"drop"}""", text(r))
+    }
+
+    @Test
+    fun `decoder action accepts the data array send_to_tool publishes`() {
+        val sent = mutableListOf<String>()
+        val legacy = server()
+        DecoderTools.register(legacy, DecoderBridge { sent += it })
+        ToolConsolidation.GROUPS.flatMap { it.actions.values }
+            .filter { it !in legacy.tools }
+            .forEach { fake(legacy, it) }
+        ToolConsolidation.KEEP.forEach { fake(legacy, it) }
+        val target = server()
+        ToolConsolidation.apply(legacy, target)
+
+        val dataType = target.tools.getValue("send_to_tool").tool.inputSchema.properties!!
+            .getValue("data").jsonObject.getValue("type").jsonPrimitive.content
+        assertEquals("array", dataType)
+
+        val ok = call(target, "send_to_tool", buildJsonObject {
+            put("action", "decoder")
+            put("data", buildJsonArray { add("raijin-smoke"); add("second") })
+        })
+        assertFalse(ok.isError == true, text(ok))
+        assertEquals(listOf("raijin-smoke", "second"), sent)
+        assertTrue("items_sent" in text(ok), text(ok))
+
+        val one = call(target, "send_to_tool", buildJsonObject {
+            put("action", "decoder")
+            put("data", "plain")
+        })
+        assertFalse(one.isError == true, text(one))
+        assertEquals(listOf("raijin-smoke", "second", "plain"), sent)
+
+        val empty = call(target, "send_to_tool", buildJsonObject {
+            put("action", "decoder")
+            put("data", buildJsonArray { })
+        })
+        assertEquals(true, empty.isError)
+        assertTrue("at least one item" in text(empty), text(empty))
+        assertEquals(3, sent.size)
     }
 
     @Test

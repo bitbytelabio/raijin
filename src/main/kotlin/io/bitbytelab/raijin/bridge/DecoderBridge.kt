@@ -4,20 +4,24 @@ import burp.api.montoya.MontoyaApi
 import burp.api.montoya.core.ByteArray as BurpByteArray
 import kotlinx.serialization.json.*
 
-class DecoderBridge(private val api: MontoyaApi) {
+class DecoderBridge(private val sendOne: (String) -> Unit) {
+
+    constructor(api: MontoyaApi) : this({ data ->
+        api.decoder().sendToDecoder(BurpByteArray.byteArray(data))
+    })
 
     /**
-     * Sends data to Burp Suite's Decoder tool for manual encoding,
-     * decoding, and hashing operations.
+     * Sends each string to Burp Suite's Decoder as its own item.
      *
-     * @param data The string data to send to the Decoder.
-     * @return JSON object confirming the data was sent.
+     * @param dataItems The strings to send. Each one opens a Decoder item.
+     * @return JSON object confirming how many items were sent.
      */
-    fun send(data: String): JsonObject {
-        api.decoder().sendToDecoder(BurpByteArray.byteArray(data))
+    fun send(dataItems: List<String>): JsonObject {
+        dataItems.forEach(sendOne)
         return buildJsonObject {
+            put("items_sent", dataItems.size)
             put("status", "sent_to_decoder")
-            put("data_length", data.length)
+            put("data_length", dataItems.sumOf { it.length })
         }
     }
 }
