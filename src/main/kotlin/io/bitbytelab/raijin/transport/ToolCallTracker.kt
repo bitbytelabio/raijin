@@ -53,12 +53,16 @@ object ToolCallTracker {
     private fun recordToolCall(
         eventBus: EventBus,
         stateManager: StateManager,
-        toolName: String,
+        mergedToolName: String,
         request: CallToolRequest,
         result: CallToolResult,
         elapsedMs: Long,
         timestamp: Instant
     ) {
+        // Grouped tools are reported under the member's original name (e.g. scope_include) so the
+        // Activity tab, audit log and destructive-action policy keep their granularity.
+        val action = request.params.arguments?.get("action")?.jsonPrimitive?.contentOrNull
+        val toolName = io.bitbytelab.raijin.tools.ToolConsolidation.legacyName(mergedToolName, action) ?: mergedToolName
         val argsJson = buildJsonObject {
             request.params.arguments?.forEach { (key, value) ->
                 val truncated = value.toString().let {

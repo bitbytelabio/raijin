@@ -2,6 +2,7 @@ package io.bitbytelab.raijin.transport
 
 import io.bitbytelab.raijin.bridge.BridgeFactory
 import io.bitbytelab.raijin.events.EventBus
+import io.bitbytelab.raijin.skills.SkillCatalog
 import io.bitbytelab.raijin.state.StateManager
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.types.ReadResourceResult
@@ -34,6 +35,7 @@ import kotlinx.serialization.json.put
 object ResourceRegistry {
 
     private const val JSON_MIME = "application/json"
+    private const val MARKDOWN_MIME = "text/markdown"
 
     /** Default page size for the proxy history snapshot resource. */
     private const val PROXY_HISTORY_COUNT = 100
@@ -189,6 +191,20 @@ object ResourceRegistry {
         ) {
             bridges.organizer.getItems(null, ORGANIZER_MAX_RESULTS).toString()
         }
+
+        // ---------------------------------------------------------------
+        // raijin://skills/<name>  (text/markdown)
+        // Usage guides, the same content as the skill_get tool.
+        // ---------------------------------------------------------------
+        SkillCatalog.list().forEach { skill ->
+            registerResource(
+                server,
+                uri = SkillCatalog.uri(skill.name),
+                name = "Skill: ${skill.name}",
+                description = skill.description,
+                mime = MARKDOWN_MIME
+            ) { skill.body }
+        }
     }
 
     /**
@@ -209,12 +225,21 @@ object ResourceRegistry {
         name: String,
         description: String,
         produce: () -> String
+    ) = registerResource(server, uri, name, description, JSON_MIME, produce)
+
+    private fun registerResource(
+        server: Server,
+        uri: String,
+        name: String,
+        description: String,
+        mime: String,
+        produce: () -> String
     ) {
         server.addResource(
             uri = uri,
             name = name,
             description = description,
-            mimeType = JSON_MIME
+            mimeType = mime
         ) { request ->
             val text = try {
                 produce()
@@ -230,7 +255,7 @@ object ResourceRegistry {
                     TextResourceContents(
                         text = text,
                         uri = request.uri,
-                        mimeType = JSON_MIME
+                        mimeType = mime
                     )
                 )
             )

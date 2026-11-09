@@ -70,6 +70,14 @@ class McpServerManager(
      */
     private val sendTimeoutMs: Long = 45_000L
 
+    /** Sent to every client on initialize; keep it short and point at the skills. */
+    private val SERVER_INSTRUCTIONS =
+        "Raijin drives Burp Suite (proxy, scanner, Repeater, Turbo scripting, recon). " +
+            "Most tools take an `action` parameter; the tool description lists the actions. " +
+            "New here? Call skill(action=list), then skill(action=get, name=\"raijin-overview\"). " +
+            "Check scope first (scope: get_config / check); the recon and probe tools " +
+            "only run against in-scope targets."
+
     /**
      * Creates a fresh MCP [Server] instance with all tools and resources
      * registered. Each transport gets its own server instance so they
@@ -89,7 +97,8 @@ class McpServerManager(
                         listChanged = true
                     )
                 )
-            )
+            ),
+            instructions = SERVER_INSTRUCTIONS
         )
 
         // Register all tools and resources on this server instance

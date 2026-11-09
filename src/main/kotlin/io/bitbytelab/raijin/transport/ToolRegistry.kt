@@ -41,7 +41,12 @@ import io.bitbytelab.raijin.tools.webprobe.WebProbeTools
 import io.bitbytelab.raijin.tools.accesscontrol.AccessControlTools
 import io.bitbytelab.raijin.tools.injection.InjectionTools
 import io.bitbytelab.raijin.tools.idor.IdorTools
+import io.bitbytelab.raijin.tools.skills.SkillTools
+import io.bitbytelab.raijin.tools.ToolConsolidation
 import io.modelcontextprotocol.kotlin.sdk.server.Server
+import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
+import io.modelcontextprotocol.kotlin.sdk.types.Implementation
+import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
 
 /**
  * Central registry that wires every MCP tool onto an MCP [Server].
@@ -61,6 +66,22 @@ object ToolRegistry {
      * Called once per server instance during [McpServerManager.createMcpServer].
      */
     fun registerAll(
+        server: Server,
+        bridges: BridgeFactory.Bridges,
+        eventBus: EventBus,
+        stateManager: StateManager
+    ) {
+        // Tools register one by one onto a scratch server; ToolConsolidation then publishes them
+        // on the real server with families folded into `action` tools (see its KDoc).
+        val scratch = Server(
+            Implementation(name = "raijin-scratch", version = "0"),
+            ServerOptions(ServerCapabilities(tools = ServerCapabilities.Tools(listChanged = false)))
+        )
+        registerMembers(scratch, bridges, eventBus, stateManager)
+        ToolConsolidation.apply(scratch, server)
+    }
+
+    private fun registerMembers(
         server: Server,
         bridges: BridgeFactory.Bridges,
         eventBus: EventBus,
@@ -179,5 +200,8 @@ object ToolRegistry {
 
         // IDOR hunt: horizontal object-id swap with canary confirmation (scope-gated)
         IdorTools.register(server, bridges.idorHunt)
+
+        // Skills: usage guides a client loads on demand (skill_list / skill_get)
+        SkillTools.register(server)
     }
 }

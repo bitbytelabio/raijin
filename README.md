@@ -37,6 +37,20 @@ or in a client config (`configs/` has ready-made files):
 
 The endpoint is the root path `/`, not `/sse`. The **Server** sub-tab shows the exact config for your bind address.
 
+### Tools and actions
+
+Raijin exposes about 40 tools. Families of operations are one tool with an `action` parameter (for example `scope(action=include)`, `custom_check(action=bcheck_list)`); the tool description lists each action and its parameters. The old per-operation names are mapped in [docs/dev/tool-consolidation.md](docs/dev/tool-consolidation.md).
+
+### Skills
+
+The server ships short usage guides ("skills") so a client can learn the tool groups and workflows on its own:
+
+- `skill(action=list)` lists them, `skill(action=get)` with a `name` loads one. Start with `raijin-overview`.
+- The same text is exposed as MCP resources at `raijin://skills/<name>` (`text/markdown`).
+- The server `instructions` sent on connect point clients at `skill(action=list)`.
+
+Skills live in `src/main/resources/skills/*.md` (frontmatter `name`, `description`); add a file and list its name in `SkillCatalog.NAMES`.
+
 ### Security model
 
 There is **no authentication token**. Protection is:
@@ -53,7 +67,7 @@ Ports can be changed with the JVM properties `raijin.ssePort`, `raijin.httpPort`
 Turbo drives a Python (Jython) script over its own request engine.
 
 - **From Burp:** right-click a request → **Send to Raijin Turbo** (or `Ctrl+Alt+T` in an editor). Select text first to turn it into the `%s` injection point.
-- **From an agent:** `turbo_start_run`, then `turbo_run_status`, `turbo_run_results`, `turbo_run_result`, `turbo_stop_run`, `turbo_search_responses`, `turbo_save_to_organizer`. Read `turbo_get_docs` and `turbo_list_examples` first.
+- **From an agent:** `turbo_run(action=start)`, then `turbo_run(action=status)`, `turbo_run(action=results)`, `turbo_run(action=result)`, `turbo_run(action=stop)`, `turbo_run(action=search_responses)`, `turbo_run(action=save_to_organizer)`. Read `turbo_docs(action=get_docs)` and `turbo_docs(action=list_examples)` first.
 - **Runs** from the dialog and from agents are listed together on the **Turbo** sub-tab.
 
 A run executes Python inside Burp's JVM, so only connect MCP clients you trust.
@@ -66,7 +80,7 @@ Scripts get the Montoya API as `api` (e.g. `api.siteMap().add(req.getMontoyaRequ
 
 ## Differences from the two projects it replaces
 
-- One extension, one server named `raijin`. Turbo's own MCP server (port 31337/31338) and its standalone `java -jar … --mcp` mode are gone; use the `turbo_*` tools.
+- One extension, one server named `raijin`. Turbo's own MCP server (port 31337/31338) and its standalone `java -jar … --mcp` mode are gone; use the `turbo_run` and `turbo_docs` tools.
 - No bearer token (BurpMCP-Ultra required one).
 - Turbo no longer bundles `albinowaxUtils-all.jar` or the legacy Burp extender API; it uses only the Montoya API. Turbo's old settings menu is now in Burp's Settings window, and previously saved Turbo settings are not migrated.
 - System properties renamed from `burpmcp.*` to `raijin.*`; the on-disk stores are `~/.raijin-*.jsonl`.

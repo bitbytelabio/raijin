@@ -17,7 +17,8 @@ Burp Suite extension: MCP server (`io.bitbytelab.raijin.{core,transport,bridge,t
 ```
 
 ## Layout
-- `bridge/*Bridge.kt` wrap Burp APIs; `tools/<area>/*Tools.kt` register MCP tools; `transport/ToolRegistry.kt` wires them.
+- `bridge/*Bridge.kt` wrap Burp APIs; `tools/<area>/*Tools.kt` register MCP tools one by one onto a scratch server, and `tools/ToolConsolidation.kt` (the group table) folds them into `action` tools on the real one (add a new tool there: `GROUPS` or `KEEP`; a test fails otherwise); `transport/ToolRegistry.kt` wires them.
+- Skills (usage guides served over MCP): markdown in `src/main/resources/skills/`, listed in `skills/SkillCatalog.kt`, exposed by `tools/skills/SkillTools.kt` (tool `skill`) and as `raijin://skills/<name>` resources.
 - Turbo MCP tools: `tools/turbo/TurboTools.kt` over `bridge/TurboBridge.kt`; runs are shared with the GUI via `TurboModule.runManager`.
 - Jython scripts reach engine classes through the injected `turbo` object (`turbo/TurboPython.kt`); `import io...` does not work in Jython (it resolves `io` to Python's stdlib).
 - Turbo user docs ship as resources in `src/main/resources/turbo-docs/`; dev notes are in `docs/dev/`.

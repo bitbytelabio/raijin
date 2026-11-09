@@ -965,7 +965,7 @@ function selectEvent(eid) {
         if (evt.host) {
             cmds.push({
                 label: 'Add Host to Scope',
-                cmd: '{"tool":"scope_include","arguments":{"prefix":"https://' + evt.host + '"}}'
+                cmd: '{"tool":"scope","arguments":{"action":"include","url":"https://' + evt.host + '"}}'
             });
         }
         cmds.push({
