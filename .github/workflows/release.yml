@@ -1,0 +1,96 @@
+name: release
+
+# Push a tag like v1.2.3 to build raijin.jar and publish a GitHub release.
+# The tag must match `version` in build.gradle.kts, and CHANGELOG.md should have a
+# `## 1.2.3` section: it becomes the release notes. Tags with a hyphen (v1.3.0-rc1)
+# are published as pre-releases.
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)publish, e.g. v1.0.0'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Check tag matches the Gradle version
+        run: |
+          chmod +x ./gradlew
+          version=$(./gradlew properties -q --no-daemon | sed -n 's/^version: //p')
+          echo "Gradle version: $version, tag: $TAG"
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match version $version in build.gradle.kts"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build + test
+        run: ./gradlew build --no-daemon --stacktrace
+
+      - name: Package assets
+        run: |
+          mkdir dist
+          cp build/libs/raijin.jar "dist/raijin-$VERSION.jar"
+          (cd dist && sha256sum "raijin-$VERSION.jar" > "raijin-$VERSION.jar.sha256")
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          awk -v v="$VERSION" '
+            $0 ~ "^## " { if (found) exit; if ($2 == v) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::warning::No '## $VERSION' section in CHANGELOG.md; using generated notes only"
+          fi
+          cat >> notes.md <<EOF
+
+          ## Install
+
+          1. Download \`raijin-$VERSION.jar\` below (check it against the \`.sha256\` file).
+          2. In Burp Suite 2026.2 or newer: **Extensions → Installed → Add → Java →** select the jar.
+          3. Connect your MCP client: \`claude mcp add --transport http burpsuite http://127.0.0.1:9876/mcp\`
+          EOF
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          [[ "$TAG" == *-* ]] && flags+=(--prerelease)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "Raijin $VERSION" \
+              --notes-file notes.md \
+              --generate-notes \
+              --verify-tag \
+              "${flags[@]}"
+          fi
