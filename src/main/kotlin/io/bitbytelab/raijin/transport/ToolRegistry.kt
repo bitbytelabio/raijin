@@ -41,7 +41,6 @@ import io.bitbytelab.raijin.tools.webprobe.WebProbeTools
 import io.bitbytelab.raijin.tools.accesscontrol.AccessControlTools
 import io.bitbytelab.raijin.tools.injection.InjectionTools
 import io.bitbytelab.raijin.tools.idor.IdorTools
-import io.bitbytelab.raijin.tools.skills.SkillTools
 import io.bitbytelab.raijin.tools.ToolConsolidation
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
@@ -200,8 +199,5 @@ object ToolRegistry {
 
         // IDOR hunt: horizontal object-id swap with canary confirmation (scope-gated)
         IdorTools.register(server, bridges.idorHunt)
-
-        // Skills: usage guides a client loads on demand (skill_list / skill_get)
-        SkillTools.register(server)
     }
 }

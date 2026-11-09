@@ -193,14 +193,14 @@ object ResourceRegistry {
         }
 
         // ---------------------------------------------------------------
-        // raijin://skills/<name>  (text/markdown)
-        // Usage guides, the same content as the skill_get tool.
+        // skill://burpsuite/<name>  (text/markdown)
+        // Usage guides, read by clients that load skills from MCP resources.
         // ---------------------------------------------------------------
         SkillCatalog.list().forEach { skill ->
             registerResource(
                 server,
                 uri = SkillCatalog.uri(skill.name),
-                name = "Skill: ${skill.name}",
+                name = skill.name,
                 description = skill.description,
                 mime = MARKDOWN_MIME
             ) { skill.body }

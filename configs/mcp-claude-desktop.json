@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "raijin": {
+    "burpsuite": {
       "command": "npx",
       "args": ["-y", "supergateway", "--sse", "http://127.0.0.1:9876/"]
     }

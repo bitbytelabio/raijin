@@ -223,7 +223,6 @@ object ToolConsolidation {
         ),
         Group("log", "Write to the Raijin log and activity feed.", mapOf("message" to "log_message", "event" to "log_event")),
         Group("ai", "Burp AI: status and prompts.", prefixed("ai_", "ai_status", "ai_prompt")),
-        Group("skill", "Usage guides for this server. Start with action list.", prefixed("skill_", "skill_list", "skill_get")),
     )
 
     private val byTool = GROUPS.associateBy { it.tool }

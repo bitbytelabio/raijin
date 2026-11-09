@@ -14,7 +14,7 @@ object ConnectionInfo {
     const val DASHBOARD_PORT = 9878
 
     /** MCP server name used in client configs. */
-    const val SERVER_NAME = "raijin"
+    const val SERVER_NAME = "burpsuite"
 
     /** The MCP SSE endpoint URL for [port] on [host] — the ROOT path `/`, never `/sse`. */
     fun sseUrl(port: Int, host: String = "127.0.0.1"): String = "http://$host:$port/"

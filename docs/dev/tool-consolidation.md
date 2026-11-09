@@ -126,8 +126,6 @@ Parameters that were named `action` (proxy rules, WebSocket intercept rule) are 
 | `sitemap_add_request` | `sitemap` | `add_request` |
 | `sitemap_get_issues` | `sitemap` | `get_issues` |
 | `sitemap_query` | `sitemap` | `query` |
-| `skill_get` | `skill` | `get` |
-| `skill_list` | `skill` | `list` |
 | `turbo_delete_run` | `turbo_run` | `delete` |
 | `turbo_get_docs` | `turbo_docs` | `get_docs` |
 | `turbo_get_example` | `turbo_docs` | `get_example` |

@@ -9,6 +9,10 @@ import java.io.File
  *
  * Jars cannot list a classpath directory, so [NAMES] is the authoritative list; the catalog test
  * checks every entry resolves and that its frontmatter name matches.
+ *
+ * Each skill is served two ways, both named after it: as an MCP prompt (`PromptRegistry`; this is
+ * what Claude Code and omp list as slash commands) and as a `skill://burpsuite/<name>` resource
+ * (`ResourceRegistry`; this is how a model reads one on its own).
  */
 object SkillCatalog {
 
@@ -16,7 +20,7 @@ object SkillCatalog {
 
     /** Every shipped skill, in the order [list] reports them. */
     val NAMES: List<String> = listOf(
-        "raijin-overview",
+        "burpsuite-overview",
         "http-testing",
         "proxy-traffic",
         "scanner-audit",
@@ -27,10 +31,10 @@ object SkillCatalog {
     )
 
     /** The skill clients should load first. */
-    const val ENTRY_SKILL = "raijin-overview"
+    const val ENTRY_SKILL = "burpsuite-overview"
 
     /** URI for the resource form of a skill. */
-    fun uri(name: String) = "raijin://skills/$name"
+    fun uri(name: String) = "skill://burpsuite/$name"
 
     /** All skills (parsed once, they are static resources). */
     val all: List<Skill> by lazy { NAMES.mapNotNull { load(it) } }

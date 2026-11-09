@@ -60,7 +60,7 @@ echo "    }"
 echo "  }"
 echo ""
 echo "  NOTE: the endpoint is the root path '/' (not /sse). No token is needed."
-echo "  Or, with Claude Code:  claude mcp add --transport sse raijin $MCP_URL"
+echo "  Or, with Claude Code:  claude mcp add --transport sse burpsuite $MCP_URL"
 echo ""
 
 # Step 4: Summary

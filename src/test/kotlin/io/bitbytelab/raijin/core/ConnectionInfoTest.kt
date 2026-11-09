@@ -17,7 +17,7 @@ class ConnectionInfoTest {
 
     @Test fun `client config is named raijin, uses the root url and carries no credentials`() {
         val c = ConnectionInfo.clientConfigJson()
-        assertEquals("""{"mcpServers":{"raijin":{"type":"sse","url":"http://127.0.0.1:9876/"}}}""", c)
+        assertEquals("""{"mcpServers":{"burpsuite":{"type":"sse","url":"http://127.0.0.1:9876/"}}}""", c)
         assertFalse(c.contains("Authorization"), c)
         assertFalse(c.contains("Bearer"), c)
         assertFalse(c.contains("headers"), c)
@@ -28,6 +28,6 @@ class ConnectionInfoTest {
     }
 
     @Test fun `claude code command points at the raijin server`() {
-        assertEquals("claude mcp add --transport sse raijin http://127.0.0.1:9876/", ConnectionInfo.claudeCodeCommand())
+        assertEquals("claude mcp add --transport sse burpsuite http://127.0.0.1:9876/", ConnectionInfo.claudeCodeCommand())
     }
 }

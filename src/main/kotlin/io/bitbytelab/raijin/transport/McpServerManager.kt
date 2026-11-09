@@ -4,6 +4,7 @@ import burp.api.montoya.logging.Logging
 import io.bitbytelab.raijin.bridge.BridgeFactory
 import io.bitbytelab.raijin.core.BuildInfo
 import io.bitbytelab.raijin.events.EventBus
+import io.bitbytelab.raijin.skills.SkillCatalog
 import io.bitbytelab.raijin.state.StateManager
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -70,40 +71,56 @@ class McpServerManager(
      */
     private val sendTimeoutMs: Long = 45_000L
 
-    /** Sent to every client on initialize; keep it short and point at the skills. */
-    private val SERVER_INSTRUCTIONS =
-        "Raijin drives Burp Suite (proxy, scanner, Repeater, Turbo scripting, recon). " +
-            "Most tools take an `action` parameter; the tool description lists the actions. " +
-            "New here? Call skill(action=list), then skill(action=get, name=\"raijin-overview\"). " +
-            "Check scope first (scope: get_config / check); the recon and probe tools " +
-            "only run against in-scope targets."
+    companion object {
+        /**
+         * Sent to every client on initialize. Keep it short (omp keeps only the first 4000
+         * characters) and point at the skills; the skills themselves carry the detail.
+         */
+        internal val SERVER_INSTRUCTIONS: String =
+            "Raijin drives Burp Suite (proxy, scanner, Repeater, Turbo scripting, recon). " +
+                "Most tools take an `action` parameter; the tool description lists the actions. " +
+                "New here? Read the resource ${SkillCatalog.uri(SkillCatalog.ENTRY_SKILL)} first; " +
+                "the other skills are at ${SkillCatalog.uri("<name>")}. " +
+                "Every skill is also an MCP prompt with the same name (clients list prompts as slash commands). " +
+                "Skills: ${SkillCatalog.NAMES.joinToString(", ")}. " +
+                "Check scope first (scope: get_config / check); the recon and probe tools " +
+                "only run against in-scope targets."
+
+        /**
+         * What the server advertises on initialize. Clients only ask for tools, resources or
+         * prompts that are declared here: without `prompts`, Claude Code and omp never call
+         * `prompts/list`, so no skill shows up (and the SDK refuses to register one).
+         */
+        internal fun serverCapabilities() = ServerCapabilities(
+            tools = ServerCapabilities.Tools(listChanged = true),
+            resources = ServerCapabilities.Resources(
+                subscribe = true,
+                listChanged = true
+            ),
+            // Skills are static, so the list never changes while a session is open.
+            prompts = ServerCapabilities.Prompts(listChanged = false)
+        )
+    }
 
     /**
-     * Creates a fresh MCP [Server] instance with all tools and resources
-     * registered. Each transport gets its own server instance so they
+     * Creates a fresh MCP [Server] instance with all tools, resources and
+     * prompts registered. Each transport gets its own server instance so they
      * maintain independent session state.
      */
     fun createMcpServer(): Server {
         val server = Server(
             serverInfo = Implementation(
-                name = "raijin",
+                name = "burpsuite",
                 version = BuildInfo.VERSION
             ),
-            options = ServerOptions(
-                capabilities = ServerCapabilities(
-                    tools = ServerCapabilities.Tools(listChanged = true),
-                    resources = ServerCapabilities.Resources(
-                        subscribe = true,
-                        listChanged = true
-                    )
-                )
-            ),
+            options = ServerOptions(capabilities = serverCapabilities()),
             instructions = SERVER_INSTRUCTIONS
         )
 
-        // Register all tools and resources on this server instance
+        // Register all tools, resources and prompts on this server instance
         ToolRegistry.registerAll(server, bridges, eventBus, stateManager)
         ResourceRegistry.registerAll(server, bridges, eventBus, stateManager)
+        PromptRegistry.registerAll(server)
 
         // Wrap all tools to emit tool.called events for dashboard + native UI visibility
         ToolCallTracker.wrapAll(server, eventBus, stateManager)
@@ -112,13 +129,13 @@ class McpServerManager(
     }
 
     /**
-     * Returns the REAL number of (tools, resources) actually registered, by
+     * Returns the REAL number of (tools, resources, prompts) actually registered, by
      * building a throwaway server and counting. Used for honest startup
      * reporting instead of a hardcoded count that drifts as tools change.
      */
-    fun registeredCounts(): Pair<Int, Int> {
+    fun registeredCounts(): Triple<Int, Int, Int> {
         val s = createMcpServer()
-        return s.tools.size to s.resources.size
+        return Triple(s.tools.size, s.resources.size, s.prompts.size)
     }
 
     /**

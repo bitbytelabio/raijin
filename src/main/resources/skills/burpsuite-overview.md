@@ -1,5 +1,5 @@
 ---
-name: raijin-overview
+name: burpsuite-overview
 description: Start here. How the Raijin MCP server is organised, the standard workflow, and the scope rules.
 ---
 # Raijin overview
@@ -31,4 +31,4 @@ Raijin exposes Burp Suite through MCP as about 40 tools. Most tools take an `act
 ## Rules
 - Only run against targets you are authorised to test.
 - Prefer one small request over a broad run; keep result sets small (most tools page or cap output).
-- Load other skills with `skill(action=get, name=...)`: `http-testing`, `proxy-traffic`, `scanner-audit`, `recon-and-probes`, `findings-reporting`, `collaborator-oob`, `turbo-scripting`. The same text is available as MCP resources at `raijin://skills/<name>`.
+- Other skills: `http-testing`, `proxy-traffic`, `scanner-audit`, `recon-and-probes`, `findings-reporting`, `collaborator-oob`, `turbo-scripting`. Read them as MCP resources at `skill://burpsuite/<name>`, or run them as MCP prompts with the same name.

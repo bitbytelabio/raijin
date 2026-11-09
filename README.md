@@ -26,13 +26,13 @@ Building needs a JDK 21 (a newer JDK on `PATH` is fine; `gradle/gradle-daemon-jv
 | Dashboard | `http://127.0.0.1:9878/` |
 
 ```bash
-claude mcp add --transport sse raijin http://127.0.0.1:9876/
+claude mcp add --transport sse burpsuite http://127.0.0.1:9876/
 ```
 
 or in a client config (`configs/` has ready-made files):
 
 ```json
-{ "mcpServers": { "raijin": { "type": "sse", "url": "http://127.0.0.1:9876/" } } }
+{ "mcpServers": { "burpsuite": { "type": "sse", "url": "http://127.0.0.1:9876/" } } }
 ```
 
 The endpoint is the root path `/`, not `/sse`. The **Server** sub-tab shows the exact config for your bind address.
@@ -43,11 +43,12 @@ Raijin exposes about 40 tools. Families of operations are one tool with an `acti
 
 ### Skills
 
-The server ships short usage guides ("skills") so a client can learn the tool groups and workflows on its own:
+The server ships short usage guides ("skills") so a client can learn the tool groups and workflows on its own. Each skill is served two ways, both named after the skill:
 
-- `skill(action=list)` lists them, `skill(action=get)` with a `name` loads one. Start with `raijin-overview`.
-- The same text is exposed as MCP resources at `raijin://skills/<name>` (`text/markdown`).
-- The server `instructions` sent on connect point clients at `skill(action=list)`.
+- **MCP prompts** (`prompts/list`, `prompts/get`, no arguments). Clients list prompts as slash commands: `/mcp__burpsuite__http-testing` in Claude Code, `/burpsuite:http-testing` in omp. Start with `burpsuite-overview`. The server declares the `prompts` capability; without it these clients never ask for prompts and no skill shows up.
+- **MCP resources** at `skill://burpsuite/<name>` (`text/markdown`), which a model can read on its own through the client's MCP resource reader (`ReadMcpResourceTool` in Claude Code).
+
+The server `instructions` sent on connect point clients at `skill://burpsuite/burpsuite-overview` and list the skill names. Clients read prompts and resources when they connect, so reconnect the MCP server (`/mcp`) after reloading the extension.
 
 Skills live in `src/main/resources/skills/*.md` (frontmatter `name`, `description`); add a file and list its name in `SkillCatalog.NAMES`.
 
