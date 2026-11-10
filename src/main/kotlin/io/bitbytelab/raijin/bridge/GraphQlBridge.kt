@@ -1,14 +1,20 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
+import burp.api.montoya.proxy.ProxyHistoryFilter
 import io.bitbytelab.raijin.safety.BoundedHttp
 import burp.api.montoya.http.message.requests.HttpRequest
 import io.bitbytelab.raijin.graphql.BatchAttack
+import io.bitbytelab.raijin.graphql.EngineFingerprinter
 import io.bitbytelab.raijin.graphql.GQLSchema
 import io.bitbytelab.raijin.graphql.GraphQl
+import io.bitbytelab.raijin.graphql.bruteforcer.SchemaBruteforcer
 import io.bitbytelab.raijin.graphql.scanners.CyclesScanner
 import io.bitbytelab.raijin.graphql.scanners.POIScanner
 import io.bitbytelab.raijin.safety.ScopeGate
+import java.time.Duration
+import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -31,11 +37,44 @@ class GraphQlBridge(private val api: MontoyaApi) {
 
     private data class ProbeResponse(val status: Int, val contentType: String?, val body: String)
 
-    fun probe(url: String): JsonObject {
+    private val schemaCache = ConcurrentHashMap<String, Pair<GQLSchema, Instant>>()
+
+    companion object {
+        private val SCHEMA_CACHE_TTL: Duration = Duration.ofMinutes(10)
+        private val AUTO_HEADER_NAMES = setOf("authorization", "cookie", "x-api-key", "x-auth-token")
+    }
+
+    /**
+     * Looks up the most recent Proxy-history request to [url]'s host and lifts its
+     * identity-bearing headers (auth/session), so a caller can opt into reusing
+     * credentials already observed on the wire instead of supplying them by hand.
+     */
+    private fun autoHeadersForHost(url: String): Map<String, String> {
+        val host = try { java.net.URI(url).host } catch (_: Exception) { null } ?: return emptyMap()
+        return try {
+            val filter = ProxyHistoryFilter { it.host().equals(host, ignoreCase = true) }
+            api.proxy().history(filter).lastOrNull()
+                ?.request()
+                ?.headers()
+                ?.filter { it.name().lowercase() in AUTO_HEADER_NAMES }
+                ?.associate { it.name() to it.value() }
+                ?: emptyMap()
+        } catch (_: Exception) { emptyMap() }
+    }
+
+    /** Explicit [headers] always win; auto-populated ones (when [autoHeaders]) only fill gaps. */
+    private fun resolveHeaders(url: String, headers: Map<String, String>?, autoHeaders: Boolean): Map<String, String> {
+        if (!autoHeaders) return headers ?: emptyMap()
+        val auto = autoHeadersForHost(url)
+        return if (headers.isNullOrEmpty()) auto else auto + headers
+    }
+
+    fun probe(url: String, headers: Map<String, String>? = null, autoHeaders: Boolean = false): JsonObject {
         val check = scopeGate.check(url)
         check.deny?.let { return it }
+        val effHeaders = resolveHeaders(url, headers, autoHeaders)
         val result: JsonObject = try {
-            val introResp = postQuery(url, GraphQl.INTROSPECTION_QUERY)
+            val introResp = postQuery(url, GraphQl.INTROSPECTION_QUERY, effHeaders)
             val introJson = try { Json.parseToJsonElement(introResp.body).jsonObject } catch (_: Exception) { null }
 
             // `as? JsonObject` returns null for JsonNull / non-objects, so error-only or
@@ -48,7 +87,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
                     put("note", "Introspection is ENABLED — full schema disclosed; enumerate mutations for high-impact operations.")
                 }
             } else {
-                val badResp = postQuery(url, "query { zzNonexistentField_mcp1234 }")
+                val badResp = postQuery(url, "query { zzNonexistentField_mcp1234 }", effHeaders)
                 val badJson = try { Json.parseToJsonElement(badResp.body).jsonObject } catch (_: Exception) { null }
 
                 // Neither POST parsed with the GraphQL response envelope (top-level data/errors)
@@ -98,11 +137,17 @@ class GraphQlBridge(private val api: MontoyaApi) {
      * full introspection fetch (not [probe]'s lightweight one, which lacks the field/argument
      * detail schema modeling needs).
      */
-    fun queryTemplates(url: String, maxDepth: Int): JsonObject {
+    fun queryTemplates(
+        url: String,
+        maxDepth: Int,
+        headers: Map<String, String>? = null,
+        autoHeaders: Boolean = false,
+        refreshSchema: Boolean = false,
+    ): JsonObject {
         val check = scopeGate.check(url)
         check.deny?.let { return it }
         val result = try {
-            val (schema, err) = fetchFullSchema(url)
+            val (schema, err) = fetchFullSchema(url, resolveHeaders(url, headers, autoHeaders), refreshSchema)
             if (schema == null) return buildJsonObject { put("error", err) }
             buildJsonObject {
                 put("endpoint", url)
@@ -121,11 +166,18 @@ class GraphQlBridge(private val api: MontoyaApi) {
      * Flags security-interesting fields by name (auth/privileged/pii/payment/database/debugging/
      * files), deprecated fields, and custom scalars — ported from InQL's `POIScanner`.
      */
-    fun poiScan(url: String, categories: Set<String>?, customKeywords: List<String>?): JsonObject {
+    fun poiScan(
+        url: String,
+        categories: Set<String>?,
+        customKeywords: List<String>?,
+        headers: Map<String, String>? = null,
+        autoHeaders: Boolean = false,
+        refreshSchema: Boolean = false,
+    ): JsonObject {
         val check = scopeGate.check(url)
         check.deny?.let { return it }
         val result = try {
-            val (schema, err) = fetchFullSchema(url)
+            val (schema, err) = fetchFullSchema(url, resolveHeaders(url, headers, autoHeaders), refreshSchema)
             if (schema == null) return buildJsonObject { put("error", err) }
             val scanner = POIScanner(schema, categories ?: POIScanner.DEFAULT_CATEGORIES, customKeywords ?: emptyList())
             val found = scanner.scan()
@@ -154,11 +206,16 @@ class GraphQlBridge(private val api: MontoyaApi) {
     }
 
     /** Flags types that can recurse into themselves (deep-nesting/DoS risk) — ported from InQL's `CyclesScanner`. */
-    fun cyclesScan(url: String): JsonObject {
+    fun cyclesScan(
+        url: String,
+        headers: Map<String, String>? = null,
+        autoHeaders: Boolean = false,
+        refreshSchema: Boolean = false,
+    ): JsonObject {
         val check = scopeGate.check(url)
         check.deny?.let { return it }
         val result = try {
-            val (schema, err) = fetchFullSchema(url)
+            val (schema, err) = fetchFullSchema(url, resolveHeaders(url, headers, autoHeaders), refreshSchema)
             if (schema == null) return buildJsonObject { put("error", err) }
             val cycles = CyclesScanner(schema).detect().cyclesAsStrings()
             buildJsonObject {
@@ -183,7 +240,14 @@ class GraphQlBridge(private val api: MontoyaApi) {
      * GraphQL query (see [BatchAttack]) — for 2FA brute force, IDOR enumeration, or rate-limit
      * bypass testing. Generates only by default; pass [send] to also fire it at [url].
      */
-    fun batchAttack(url: String, template: String, values: List<String>?, send: Boolean): JsonObject {
+    fun batchAttack(
+        url: String,
+        template: String,
+        values: List<String>?,
+        send: Boolean,
+        headers: Map<String, String>? = null,
+        autoHeaders: Boolean = false,
+    ): JsonObject {
         val expanded = BatchAttack.expand(template, values)
             ?: return buildJsonObject { put("error", "No \$[INT:first:last] or \$[LIST] placeholder found (immediately before a '{' selection set) in the template.") }
 
@@ -196,7 +260,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
 
         val check = scopeGate.check(url)
         check.deny?.let { return it }
-        val resp = postQuery(url, expanded.query)
+        val resp = postQuery(url, expanded.query, resolveHeaders(url, headers, autoHeaders))
         val result = buildJsonObject {
             put("endpoint", url)
             put("operations_generated", expanded.count)
@@ -208,14 +272,92 @@ class GraphQlBridge(private val api: MontoyaApi) {
     }
 
     /**
+     * Detects the GraphQL backend engine (Apollo, Hasura, graphql-java, ...) by sending a
+     * sequence of malformed/edge-case queries and matching each engine's distinctive error
+     * text — ported from InQL's `Fingerprinter`. Stops at the first match.
+     */
+    fun fingerprintEngine(url: String, headers: Map<String, String>? = null, autoHeaders: Boolean = false): JsonObject {
+        val check = scopeGate.check(url)
+        check.deny?.let { return it }
+        val effHeaders = resolveHeaders(url, headers, autoHeaders)
+        val result = try {
+            val outcome = EngineFingerprinter.detect { query -> postQuery(url, query, effHeaders).body }
+            buildJsonObject {
+                put("endpoint", url)
+                put("engine", outcome.engine)
+                put("checked", outcome.checked)
+                put(
+                    "note",
+                    if (outcome.engine != null) "Backend engine fingerprinted as '${outcome.engine}' from a distinctive error signature."
+                    else "No known engine signature matched after ${outcome.checked} checks."
+                )
+            }
+        } catch (e: Exception) {
+            buildJsonObject { put("error", "Engine fingerprinting failed: ${e.message}") }
+        }
+        return withScopeWarning(result, check.warning)
+    }
+
+    /**
+     * Reconstructs the schema by probing wordlists and parsing "did you mean"/type-mismatch
+     * error messages — for targets with introspection disabled. Ported from InQL's Clairvoyance-
+     * style `Bruteforcer`. Noisy and request-heavy: every field/type/arg guess is a live request.
+     */
+    fun bruteforceSchema(
+        url: String,
+        headers: Map<String, String>? = null,
+        autoHeaders: Boolean = false,
+        bucketSize: Int = 64,
+        depthLimit: Int = 2,
+        bruteforceArguments: Boolean = true,
+    ): JsonObject {
+        val check = scopeGate.check(url)
+        check.deny?.let { return it }
+        val effHeaders = resolveHeaders(url, headers, autoHeaders)
+        val result = try {
+            val reconstruction = SchemaBruteforcer(
+                sendQuery = { query -> postQuery(url, query, effHeaders).body },
+                bucketSize = bucketSize,
+                depthLimit = depthLimit,
+                bruteforceArguments = bruteforceArguments,
+            ).run()
+            buildJsonObject {
+                put("endpoint", url)
+                put("requests_sent", reconstruction.requestsSent)
+                put("types", reconstruction.typesAsJson())
+                put(
+                    "note",
+                    "Reconstructed ${reconstruction.types.size} type(s) from error-message analysis " +
+                        "(no introspection used). Field/type coverage depends on wordlist hits — treat this as a " +
+                        "lower bound on the real schema, not a complete one."
+                )
+            }
+        } catch (e: Exception) {
+            buildJsonObject { put("error", "Schema bruteforcing failed: ${e.message}") }
+        }
+        return withScopeWarning(result, check.warning)
+    }
+
+    /**
      * Fetches the FULL official introspection query (needed for schema modeling) and builds a
      * [GQLSchema]. The failure message distinguishes a connection failure (couldn't reach the
      * endpoint at all — `status == 0`) from a real HTTP response that just doesn't parse into a
      * schema (introspection genuinely disabled/malformed) — conflating the two previously made a
-     * bad URL/unreachable host look identical to "introspection may be disabled".
+     * bad URL/unreachable host look identical to "introspection may be disabled". Successful
+     * fetches are cached per (url, headers) for [SCHEMA_CACHE_TTL], bypassable via [refreshSchema].
      */
-    private fun fetchFullSchema(url: String): Pair<GQLSchema?, String?> {
-        val resp = postQuery(url, graphql.introspection.IntrospectionQuery.INTROSPECTION_QUERY)
+    private fun fetchFullSchema(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        refreshSchema: Boolean = false,
+    ): Pair<GQLSchema?, String?> {
+        val cacheKey = "$url|${headers.hashCode()}"
+        if (!refreshSchema) {
+            schemaCache[cacheKey]?.let { (schema, fetchedAt) ->
+                if (Duration.between(fetchedAt, Instant.now()) < SCHEMA_CACHE_TTL) return schema to null
+            }
+        }
+        val resp = postQuery(url, graphql.introspection.IntrospectionQuery.INTROSPECTION_QUERY, headers)
         if (resp.status == 0) {
             return null to "Could not reach $url (connection failed) — check the URL and that the target is reachable."
         }
@@ -223,6 +365,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
             return null to "Endpoint returned an empty response body (HTTP ${resp.status}); introspection may be disabled."
         }
         val schema = try { GQLSchema(resp.body) } catch (_: Exception) { null }
+        if (schema != null) schemaCache[cacheKey] = schema to Instant.now()
         return schema to (
             if (schema == null) "Could not build a schema from this endpoint's introspection response (HTTP ${resp.status}); introspection may be disabled."
             else null
@@ -232,13 +375,15 @@ class GraphQlBridge(private val api: MontoyaApi) {
     private fun withScopeWarning(result: JsonObject, warning: String?): JsonObject =
         if (warning != null) JsonObject(result + ("scope_warning" to JsonPrimitive(warning))) else result
 
-    private fun postQuery(url: String, query: String): ProbeResponse {
+    private fun postQuery(url: String, query: String, headers: Map<String, String> = emptyMap()): ProbeResponse {
         return try {
             val body = buildJsonObject { put("query", query) }.toString()
-            val req = HttpRequest.httpRequestFromUrl(url)
-                .withMethod("POST")
-                .withAddedHeader("Content-Type", "application/json")
-                .withBody(body)
+            val req = headers.entries.fold(
+                HttpRequest.httpRequestFromUrl(url)
+                    .withMethod("POST")
+                    .withAddedHeader("Content-Type", "application/json")
+                    .withBody(body)
+            ) { r, (name, value) -> r.withAddedHeader(name, value) }
             val resp = BoundedHttp.send(api, req)?.response()
             ProbeResponse(
                 status = resp?.statusCode()?.toInt() ?: 0,

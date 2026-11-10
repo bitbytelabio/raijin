@@ -295,6 +295,10 @@ Runs started from the dialog and from agents are listed together on the **Raijin
 | `poi_scan` | Fields that look security-relevant by name (auth, privileged, PII, payment, database, debugging, files), deprecated fields, custom scalars. |
 | `cycles_scan` | Types that can recurse into themselves (deep nesting, denial of service). |
 | `batch_attack` | Expand `$[INT:first:last]` or `$[LIST]` in `template` into aliased operations in one request (2FA brute force, IDOR enumeration, rate limits). Generates only unless `send=true`. |
+| `fingerprint_engine` | Detect the backend engine (Apollo, Hasura, graphql-java, ...) from malformed-query error signatures. |
+| `bruteforce_schema` | Reconstruct the schema from "did you mean"/type-mismatch error messages when introspection is disabled. Noisy and request-heavy: every field/type/arg guess is a live request (`bucket_size`, `depth_limit`, `bruteforce_arguments`). |
+
+Every mode accepts `headers` and `auto_headers` (reuse the most recent Proxy-history request's `Authorization`/`Cookie`/`X-Api-Key`/`X-Auth-Token` for this host); `query_templates`/`poi_scan`/`cycles_scan` also cache the fetched schema for 10 minutes, bypassable with `refresh_schema`.
 
 ---
 

@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "io.bitbytelab"
-version = "1.0.0"
+version = "1.1.0"
 
 // Build JDK: gradle/gradle-daemon-jvm.properties pins the Gradle daemon to JDK 21, so
 // `./gradlew` relaunches the build under JDK 21 even when started from a newer JVM (e.g.

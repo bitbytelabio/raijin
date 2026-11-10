@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0
+
+- GraphQL: `fingerprint_engine` mode detects the backend engine (Apollo, Hasura, graphql-java, and 25+ others) from malformed-query error signatures.
+- GraphQL: `bruteforce_schema` mode reconstructs the schema from "did you mean"/type-mismatch error messages when introspection is disabled, via wordlist-driven probing (`bucket_size`, `depth_limit`, `bruteforce_arguments`).
+- GraphQL: every mode accepts `headers` and `auto_headers` (reuse identity headers from the most recent Proxy-history request to the target host).
+- GraphQL: `query_templates`/`poi_scan`/`cycles_scan` cache the fetched schema for 10 minutes, bypassable with `refresh_schema`.
+
 ## 1.0.0
 
 First release of Raijin: BurpMCP-Ultra 2.3.2 and Turbo Intruder 2.0.1 merged into one extension.
