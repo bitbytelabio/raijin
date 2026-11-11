@@ -100,10 +100,12 @@ class HttpBridge(
         autoFixContentLength: Boolean = true
     ): JsonObject {
         return try {
+            val fixReport = mutableMapOf<String, JsonElement>()
             val httpRequest = buildRequest(
                 url, method, headers, body, rawRequest, host, port, useTls,
                 preserveHeaders = preserveHeaders,
-                autoFixContentLength = autoFixContentLength
+                autoFixContentLength = autoFixContentLength,
+                fixReport = fixReport
             )
             val mode = resolveHttpMode(httpMode)
 
@@ -125,11 +127,12 @@ class HttpBridge(
             ToolCallTracker.lastSentResult.set(result)
 
             val hygiene = RequestHygiene.scan(method, url, headers)
-            withScopeWarning(withRequestWarnings(serializeRequestResponse(result, elapsedMs, maxBodyLength), hygiene), scope.warning)
+            withFixReport(withScopeWarning(withRequestWarnings(serializeRequestResponse(result, elapsedMs, maxBodyLength), hygiene), scope.warning), fixReport)
         } catch (e: Exception) {
             buildJsonObject {
                 put("error", "Failed to send request: ${e.message}")
-                put("is_timeout", (e.message ?: "").contains("timed out", ignoreCase = true))
+                put("is_timeout", e is HttpRequestTimeoutException)
+                put("close_reason", if (e is HttpRequestTimeoutException) "timeout" else "error")
             }
         }
     }
@@ -253,7 +256,8 @@ class HttpBridge(
         } catch (e: Exception) {
             buildJsonObject {
                 put("error", "Failed to send parallel requests: ${e.message}")
-                put("is_timeout", (e.message ?: "").contains("timed out", ignoreCase = true))
+                put("is_timeout", e is HttpRequestTimeoutException)
+                put("close_reason", if (e is HttpRequestTimeoutException) "timeout" else "error")
             }
         }
     }
@@ -277,7 +281,8 @@ class HttpBridge(
     fun sendRequestChain(
         steps: List<JsonObject>,
         httpMode: String?,
-        stopOnError: Boolean
+        stopOnError: Boolean,
+        connectionId: String? = null
     ): JsonObject {
         val mode = resolveHttpMode(httpMode)
         val variables = mutableMapOf<String, String>()
@@ -297,7 +302,8 @@ class HttpBridge(
                 val reqTls = substitutedStep["use_tls"]?.jsonPrimitive?.booleanOrNull
                 val reqHeaders = substitutedStep["headers"].asStringMap()
 
-                val httpRequest = buildRequest(reqUrl, reqMethod, reqHeaders, reqBody, rawReq, reqHost, reqPort, reqTls)
+                val fixReport = mutableMapOf<String, JsonElement>()
+                val httpRequest = buildRequest(reqUrl, reqMethod, reqHeaders, reqBody, rawReq, reqHost, reqPort, reqTls, fixReport = fixReport)
 
                 val scopeDeny = scopeGate.deny(httpRequest.url())
                 if (scopeDeny != null) {
@@ -311,7 +317,11 @@ class HttpBridge(
                 }
 
                 val startTime = System.nanoTime()
-                val result = api.http().sendRequest(httpRequest, mode)
+                val result = if (connectionId != null) {
+                    api.http().sendRequest(httpRequest, mode, connectionId)
+                } else {
+                    api.http().sendRequest(httpRequest, mode)
+                }
                 val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
 
                 addToSitemap(result, "[MCP] Chain step $index via Raijin")
@@ -367,6 +377,11 @@ class HttpBridge(
                     put("step", index)
                     put("success", true)
                     serializedResult.forEach { (k, v) -> put(k, v) }
+                    fixReport.forEach { (k, v) -> put(k, v) }
+                    if (connectionId != null) {
+                        put("connection_id", connectionId)
+                        put("connection_reused", index > 0)
+                    }
                     if (extractedInStep.isNotEmpty()) {
                         put("extracted", buildJsonObject {
                             extractedInStep.forEach { (k, v) -> put(k, v) }
@@ -985,7 +1000,8 @@ class HttpBridge(
         port: Int?,
         useTls: Boolean?,
         preserveHeaders: Boolean = true,
-        autoFixContentLength: Boolean = true
+        autoFixContentLength: Boolean = true,
+        fixReport: MutableMap<String, JsonElement>? = null
     ): HttpRequest {
         // Issue #7 (reopened): strip raw CR/LF (and other C0 control chars) from the STRUCTURED
         // inputs so a stray newline — commonly emitted by an LLM — can't reach the HTTP/2 :path or
@@ -1001,7 +1017,7 @@ class HttpBridge(
         }
 
         var request: HttpRequest = if (rawRequest != null) {
-            buildFromRawRequest(rawRequest, host, port, useTls, autoFixContentLength)
+            buildFromRawRequest(rawRequest, host, port, useTls, autoFixContentLength, fixReport)
         } else if (cUrl != null) {
             if (preserveHeaders && !cHeaders.isNullOrEmpty()) {
                 buildFromUrlPreservingHeaders(cUrl, cMethod, cHeaders, body, host, port, useTls)
@@ -1031,7 +1047,8 @@ class HttpBridge(
         host: String?,
         port: Int?,
         useTls: Boolean?,
-        autoFixContentLength: Boolean
+        autoFixContentLength: Boolean,
+        fixReport: MutableMap<String, JsonElement>? = null
     ): HttpRequest {
         // Issue #7 (request-line variant): LLMs commonly emit raw requests with bare-LF line
         // endings. Montoya cannot delimit the request line then, so the whole message folds
@@ -1041,7 +1058,18 @@ class HttpBridge(
         // BEFORE fixContentLength — that helper keys on "\r\n\r\n" and silently no-ops on
         // bare-LF input.
         val normalized = RequestHygiene.normalizeCrlf(rawRequest)
-        val cleaned = if (autoFixContentLength) fixContentLength(normalized) else normalized
+        val cleaned = if (autoFixContentLength) {
+            val fix = fixContentLength(normalized)
+            if (fix.rewrittenFrom != null && fixReport != null) {
+                fixReport["content_length_rewritten"] = buildJsonObject {
+                    put("from", fix.rewrittenFrom)
+                    put("to", fix.rewrittenTo)
+                }
+            }
+            fix.request
+        } else {
+            normalized
+        }
 
         val resolvedHost = host ?: Regex("(?i)^Host:\\s*([^:\\r\\n]+)", RegexOption.MULTILINE)
             .find(cleaned)?.groupValues?.get(1)?.trim()
@@ -1178,22 +1206,24 @@ class HttpBridge(
      *
      * Fixes the silent status_code:0 ghost response when caller-computed CL is wrong.
      */
-    private fun fixContentLength(rawRequest: String): String {
+    private data class ContentLengthFix(val request: String, val rewrittenFrom: Int? = null, val rewrittenTo: Int? = null)
+
+    private fun fixContentLength(rawRequest: String): ContentLengthFix {
         val boundary = rawRequest.indexOf("\r\n\r\n")
-        if (boundary < 0) return rawRequest
+        if (boundary < 0) return ContentLengthFix(rawRequest)
 
         val headerSection = rawRequest.substring(0, boundary)
         val bodySection = rawRequest.substring(boundary + 4)
 
         val clRegex = Regex("(?im)^Content-Length:\\s*(\\d+)\\s*$")
-        val clMatch = clRegex.find(headerSection) ?: return rawRequest
+        val clMatch = clRegex.find(headerSection) ?: return ContentLengthFix(rawRequest)
 
-        val declaredLength = clMatch.groupValues[1].toIntOrNull() ?: return rawRequest
+        val declaredLength = clMatch.groupValues[1].toIntOrNull() ?: return ContentLengthFix(rawRequest)
         val actualLength = bodySection.toByteArray(Charsets.ISO_8859_1).size
-        if (declaredLength == actualLength) return rawRequest
+        if (declaredLength == actualLength) return ContentLengthFix(rawRequest)
 
         val fixedHeader = clRegex.replaceFirst(headerSection, "Content-Length: $actualLength")
-        return "$fixedHeader\r\n\r\n$bodySection"
+        return ContentLengthFix("$fixedHeader\r\n\r\n$bodySection", declaredLength, actualLength)
     }
 
     // ---------------------------------------------------------------
@@ -1203,6 +1233,10 @@ class HttpBridge(
     private val httpExecutor = Executors.newCachedThreadPool { r ->
         Thread(r, "raijin-http-${System.nanoTime()}").apply { isDaemon = true }
     }
+
+    /** Thrown by [executeWithTimeout] on expiry, so callers can detect a timeout structurally
+     * instead of string-matching the exception message. */
+    private class HttpRequestTimeoutException(message: String) : RuntimeException(message)
 
     /**
      * Runs [action] on a daemon thread with a hard timeout. On timeout, cancels the
@@ -1216,7 +1250,7 @@ class HttpBridge(
             future.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (e: TimeoutException) {
             future.cancel(true)
-            throw RuntimeException("Request timed out after ${timeoutMs}ms")
+            throw HttpRequestTimeoutException("Request timed out after ${timeoutMs}ms")
         }
     }
 
@@ -1237,6 +1271,31 @@ class HttpBridge(
      * @param maxBodyLength Optional response body truncation length.
      * @return JSON object with serialized request/response.
      */
+    private val pipelineBridge = HttpPipelineBridge(api)
+
+    /**
+     * Sends multiple raw requests over ONE socket and reads back multiple responses in order —
+     * see [HttpPipelineBridge] for why this cannot be done through Montoya's `api.http()`.
+     */
+    fun sendPipeline(
+        host: String,
+        port: Int,
+        useTls: Boolean,
+        httpMode: String?,
+        requests: List<JsonObject>,
+        writeMode: String,
+        writePauseMs: Long,
+        maxResponses: Int?,
+        idleTimeoutMs: Long,
+        totalTimeoutMs: Long,
+        keepOpen: Boolean,
+        connectionId: String?,
+        maxResponseLength: Int?,
+    ): JsonObject = pipelineBridge.send(
+        host, port, useTls, httpMode, requests, writeMode, writePauseMs,
+        maxResponses, idleTimeoutMs, totalTimeoutMs, keepOpen, connectionId, maxResponseLength
+    )
+
     fun sendRawBytes(
         rawHex: String?,
         rawString: String?,
@@ -1275,7 +1334,8 @@ class HttpBridge(
         } catch (e: Exception) {
             buildJsonObject {
                 put("error", "Failed to send raw bytes: ${e.message}")
-                put("is_timeout", (e.message ?: "").contains("timed out", ignoreCase = true))
+                put("is_timeout", e is HttpRequestTimeoutException)
+                put("close_reason", if (e is HttpRequestTimeoutException) "timeout" else "error")
             }
         }
     }
@@ -1290,6 +1350,12 @@ class HttpBridge(
     /** Returns [base] with a `scope_warning` field appended when [warning] is non-null. */
     private fun withScopeWarning(base: JsonObject, warning: String?): JsonObject =
         if (warning == null) base else JsonObject(base + ("scope_warning" to JsonPrimitive(warning)))
+
+    /** Merges in any out-of-band fields [buildRequest] recorded via its `fixReport` parameter
+     * (currently just `content_length_rewritten`), so a silent Content-Length rewrite is visible
+     * to the caller instead of only being observable by diffing bytes on the wire. */
+    private fun withFixReport(base: JsonObject, fixReport: Map<String, JsonElement>): JsonObject =
+        if (fixReport.isEmpty()) base else JsonObject(base + fixReport)
 
     /**
      * Attaches advisory request-hygiene warnings (raw CR/LF in method/url/headers — the cause of
@@ -1336,7 +1402,9 @@ class HttpBridge(
         payloads: List<String>,
         httpMode: String?,
         maxBodyLength: Int?,
-        marker: String?
+        marker: String?,
+        stopOnStatusCodes: List<Int>? = null,
+        stopOnBodyRegex: String? = null
     ): JsonObject {
         return try {
             val service = HttpService.httpService(host, port, useTls)
@@ -1358,6 +1426,7 @@ class HttpBridge(
                 is HttpFuzzPlan.Result.Ok -> p
             }
 
+            var stoppedEarly = false
             for (planned in plan.requests) {
                 // Encode the substituted request with an EXPLICIT UTF-8 charset so astral /
                 // multi-byte payloads (emoji, non-Latin scripts) survive intact. Handing the
@@ -1369,17 +1438,29 @@ class HttpBridge(
                 val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
                 addToSitemap(result, "[MCP] Fuzz ${plan.mode} pos=${planned.position} payload=${planned.payload}")
 
+                val serialized = serializeRequestResponse(result, elapsedMs, maxBodyLength)
                 results.add(buildJsonObject {
                     put("payload", planned.payload)
                     put("position", planned.position)
-                    serializeRequestResponse(result, elapsedMs, maxBodyLength).forEach { (k, v) -> put(k, v) }
+                    serialized.forEach { (k, v) -> put(k, v) }
                 })
+
+                if (result.hasResponse()) {
+                    val statusCode = result.response().statusCode().toInt()
+                    val statusMatch = stopOnStatusCodes != null && statusCode in stopOnStatusCodes
+                    val bodyMatch = stopOnBodyRegex != null && SafeRegex.find(stopOnBodyRegex, result.response().bodyToString()) != null
+                    if (statusMatch || bodyMatch) {
+                        stoppedEarly = true
+                        break
+                    }
+                }
             }
 
             buildJsonObject {
                 put("total_requests", results.size)
                 put("payloads_count", payloads.size)
                 put("mode", plan.mode)
+                put("stopped_early", stoppedEarly)
                 put("results", buildJsonArray { results.forEach { add(it) } })
             }
         } catch (e: Exception) {

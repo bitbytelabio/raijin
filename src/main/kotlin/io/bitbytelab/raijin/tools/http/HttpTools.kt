@@ -16,7 +16,7 @@ import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
 /**
- * Registers all 13 HTTP MCP tools onto the given [Server].
+ * Registers all 15 HTTP MCP tools onto the given [Server].
  *
  * Each tool delegates to the [HttpBridge] and catches exceptions so
  * that errors are returned as structured JSON inside a [CallToolResult]
@@ -30,7 +30,7 @@ object HttpTools {
      * with the RAIJIN_DEFAULT_TIMEOUT_MS env var at extension load time.
      */
     private val DEFAULT_TIMEOUT_MS: Long =
-        System.getenv("RAIJIN_DEFAULT_TIMEOUT_MS")?.toLongOrNull() ?: 30_000L
+        System.getenv("RAIJIN_DEFAULT_TIMEOUT_MS")?.toLongOrNull() ?: 25_000L
 
     fun register(server: Server, bridge: HttpBridge, stateManager: StateManager) {
 
@@ -48,12 +48,12 @@ Parameters:
 - body (string OR object/array): request body. If object/array, it is serialized to compact JSON automatically.
 - raw_request (string): raw HTTP request text. When supplied without explicit port/use_tls, defaults to TLS:443 (modern web default). Content-Length is auto-recomputed if it does not match body bytes.
 - host, port (int), use_tls (bool): explicit service overrides
-- http_mode (string): "AUTO" | "HTTP_1" | "HTTP_2" | "HTTP_2_IGNORE_ALPN"
-- connection_id (string): reuse a prior connection
+- http_mode (string): "AUTO" | "HTTP_1" | "HTTP_2" | "HTTP_2_IGNORE_ALPN". HTTP/3 is not available here or anywhere through Montoya — use Turbo (turbo_start_run with Engine.HTTP3) for HTTP/3.
+- connection_id (string): pins/reuses one Montoya connection, but the request still fully completes (response received) before this call returns — no pipelining. For multi-request-per-socket pipelining use http_send_pipeline.
 - max_response_length (int): truncate response body in result
-- timeout_ms (number): hard timeout. Returns is_timeout=true on expiry.
+- timeout_ms (number): hard timeout. Returns is_timeout=true and close_reason="timeout" on expiry. Montoya has no partial-read API, so a failed/timed-out send cannot report bytes_received or distinguish fin/rst — use http_send_pipeline when that detail matters.
 - preserve_headers (bool, default true): when false, falls back to Burp's httpRequestFromUrl which adds default headers
-- auto_fix_content_length (bool, default true): when false, uses raw_request CL as-is
+- auto_fix_content_length (bool, default true): when false, uses raw_request CL as-is. When true and the declared Content-Length didn't match the body, the result includes content_length_rewritten:{from,to}.
 
 Returns full response with headers, body, status code, and timing.""",
             inputSchema = ToolSchema(
@@ -196,12 +196,13 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
         // ---------------------------------------------------------------
         server.addTool(
             name = "http_send_request_chain",
-            description = "Send a chain of HTTP requests sequentially with variable extraction between steps. Each step can extract values from the response using regex (capture groups) and inject them into subsequent steps via {{variable}} placeholders. Useful for CSRF tokens, session tokens, and multi-step workflows.",
+            description = "Send a chain of HTTP requests sequentially with variable extraction between steps. Each step can extract values from the response using regex (capture groups) and inject them into subsequent steps via {{variable}} placeholders. Useful for CSRF tokens, session tokens, and multi-step workflows. Optional connection_id pins/reuses one Montoya connection across every step — steps stay fully sequential either way (no pipelining); for genuine multi-request-per-socket pipelining use http_send_pipeline instead.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("steps") { put("type", "array"); putJsonObject("items") { put("type", "object") }; put("description", "Array of step objects with url/raw_request and an optional 'extract' key. 'extract' MUST be an ARRAY of {name,pattern,from} objects (from = \"body\" or \"header\"), e.g. extract:[{\"name\":\"csrf\",\"pattern\":\"name=csrf value=([^ ]+)\",\"from\":\"body\"}]. Passing a single object instead of an array is rejected with a validation error.") }
                     putJsonObject("http_mode") { put("type", "string"); put("description", "AUTO | HTTP_1 | HTTP_2 | HTTP_2_IGNORE_ALPN") }
                     putJsonObject("stop_on_error") { put("type", "boolean"); put("description", "Stop the chain on the first error (default true)") }
+                    putJsonObject("connection_id") { put("type", "string"); put("description", "Pin/reuse one connection across every step (sequential, not pipelined)") }
                 },
                 required = listOf("steps")
             )
@@ -219,8 +220,9 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
 
                 val httpMode = args["http_mode"]?.jsonPrimitive?.contentOrNull
                 val stopOnError = args["stop_on_error"]?.jsonPrimitive?.booleanOrNull ?: true
+                val connectionId = args["connection_id"]?.jsonPrimitive?.contentOrNull
 
-                val result = bridge.sendRequestChain(steps, httpMode, stopOnError)
+                val result = bridge.sendRequestChain(steps, httpMode, stopOnError, connectionId)
                 CallToolResult(content = listOf(TextContent(result.toString())))
             } catch (e: Exception) {
                 CallToolResult(
@@ -638,7 +640,7 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
         // ---------------------------------------------------------------
         server.addTool(
             name = "http_send_raw_bytes",
-            description = "Send a raw byte-level HTTP request for HTTP request smuggling and CRLF injection testing. Accepts either hex-encoded bytes (raw_request_hex) or a string with literal \\r\\n sequences (raw_request). Preserves exact byte sequences without normalization. Requires host, port, and use_tls parameters.",
+            description = "Send a raw byte-level HTTP request for HTTP request smuggling and CRLF injection testing. Accepts either hex-encoded bytes (raw_request_hex) or a string with literal \\r\\n sequences (raw_request). Preserves exact byte sequences without normalization. Requires host, port, and use_tls parameters. Sends ONE request and reads ONE response (Montoya's api.http().sendRequest has no partial-read API, so a failed/timed-out send cannot report bytes_received or distinguish fin/rst — it only returns is_timeout and close_reason=\"timeout\"|\"error\"). HTTP/2/3 and kettled H2-smuggling escape fields (^~, ^xNN, ...) are not available here — this is HTTP/1 only; for those, or for sending several requests over one socket and reading back several responses, use http_send_pipeline (HTTP/1.1 pipelining) or Turbo (turbo_start_run with Engine.HTTP2/HTTP3, kettled=True).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("raw_request_hex") { put("type", "string"); put("description", "Hex-encoded request bytes (use this OR raw_request)") }
@@ -694,7 +696,92 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
         }
 
         // ---------------------------------------------------------------
-        // 12. http_fuzz
+        // 12. http_send_pipeline
+        // ---------------------------------------------------------------
+        server.addTool(
+            name = "http_send_pipeline",
+            description = """Send multiple raw HTTP/1.1 requests over ONE socket connection and read back multiple responses in order. Unlike every other http_* tool (which goes through Burp's Montoya API, strictly one request in / one response out), this opens its own raw socket — needed for HTTP desync / request-smuggling research (0.CL, stage1+stage2 probes) where a server may respond to one request with two responses, or where you need to observe exactly what came back before a connection died.
+
+HTTP/1.1 only — http_mode must be omitted or "HTTP_1". HTTP/2, HTTP/3 and kettled H2-smuggling escape fields are Turbo-only: use turbo_start_run with Engine.HTTP2 / Engine.HTTP3 / kettled=True for those.
+
+Never auto-fixes Content-Length — a deliberately wrong declared length is the point of this tool. If you want byte-exact control without a wrong Content-Length tripping you up, compute it yourself.
+
+Parameters:
+- host, port, use_tls/tls/https (alias): target. use_tls defaults to true when port is 443.
+- requests (array, required): each item has raw_request (literal \r\n) or raw_request_hex (hex-encoded bytes), same convention as http_send_raw_bytes.
+- write_mode: "concat" (default; all requests written in one burst) or "single_write" (one write+flush per request, with write_pause_ms between them).
+- max_responses (int): how many responses to read before stopping (default: number of requests sent — but a 0.CL probe may produce MORE responses than requests, or fewer; set this explicitly for that case).
+- idle_timeout_ms (default 2000): abort if no bytes arrive for this long.
+- total_timeout_ms (default 15000): hard cap for the whole call.
+- keep_open (bool, default false): keep the socket open after this call so a LATER http_send_pipeline call can reuse it via connection_id. Only honored when every requested response framed cleanly — a broken/ambiguous read always closes the socket.
+- connection_id (string): reuse a socket kept open by a prior keep_open=true call. This registry is separate from Montoya's own connection_id on http_send_request — different transport layers, not interchangeable. If the id is unknown (evicted after 120s idle, or never existed) a fresh connection is opened and connection_reused:false is reported, rather than erroring.
+- max_response_length (int): truncate each response body in the result.
+
+Returns: connection_id, connection_reused, bytes_sent, bytes_received, responses (array of {index, status_code, headers, body, framing, warnings}), responses_received, close_reason ("max_responses"|"idle"|"total_timeout"|"fin"|"rst"|"error"), connection_open.""",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    putJsonObject("host") { put("type", "string"); put("description", "Target hostname") }
+                    putJsonObject("port") { put("type", "integer"); put("description", "Target port number (default 443)") }
+                    putJsonObject("use_tls") { put("type", "boolean"); put("description", "Whether to use HTTPS (TLS)") }
+                    putJsonObject("tls") { put("type", "boolean"); put("description", "Alias for use_tls") }
+                    putJsonObject("https") { put("type", "boolean"); put("description", "Alias for use_tls") }
+                    putJsonObject("http_mode") { put("type", "string"); put("description", "Must be omitted or \"HTTP_1\" — HTTP/2 and HTTP/3 are Turbo-only") }
+                    putJsonObject("requests") {
+                        put("type", "array")
+                        putJsonObject("items") { put("type", "object") }
+                        put("description", "Array of {raw_request} or {raw_request_hex} items, sent over one connection")
+                    }
+                    putJsonObject("write_mode") { put("type", "string"); put("description", "\"concat\" (default) or \"single_write\"") }
+                    putJsonObject("write_pause_ms") { put("type", "number"); put("description", "Pause between writes in single_write mode") }
+                    putJsonObject("max_responses") { put("type", "integer"); put("description", "How many responses to read (default: number of requests)") }
+                    putJsonObject("idle_timeout_ms") { put("type", "number"); put("description", "Abort if no bytes arrive for this long (default 2000)") }
+                    putJsonObject("total_timeout_ms") { put("type", "number"); put("description", "Hard cap for the whole call (default 15000)") }
+                    putJsonObject("keep_open") { put("type", "boolean"); put("description", "Keep the socket open for a later call to reuse via connection_id (default false)") }
+                    putJsonObject("connection_id") { put("type", "string"); put("description", "Reuse a socket kept open by a prior keep_open=true call") }
+                    putJsonObject("max_response_length") { put("type", "integer"); put("description", "Truncate each response body in the result") }
+                },
+                required = listOf("host", "requests")
+            )
+        ) { request ->
+            try {
+                val args = request.params.arguments ?: emptyMap()
+
+                val host = args["host"]?.jsonPrimitive?.contentOrNull
+                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Parameter 'host' is required"}""")), isError = true)
+                val requests = args["requests"].asJsonObjectList()
+                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Parameter 'requests' is required (array of {raw_request} or {raw_request_hex} objects)"}""")), isError = true)
+                val port = args["port"]?.jsonPrimitive?.intOrNull ?: 443
+                val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull
+                    ?: args["tls"]?.jsonPrimitive?.booleanOrNull
+                    ?: args["https"]?.jsonPrimitive?.booleanOrNull
+                    ?: (port == 443)
+                val httpMode = args["http_mode"]?.jsonPrimitive?.contentOrNull
+                val writeMode = args["write_mode"]?.jsonPrimitive?.contentOrNull ?: "concat"
+                val writePauseMs = args["write_pause_ms"].asLongSafe() ?: 0L
+                val maxResponses = args["max_responses"]?.jsonPrimitive?.intOrNull
+                val idleTimeoutMs = args["idle_timeout_ms"].asLongSafe() ?: 2000L
+                val totalTimeoutMs = args["total_timeout_ms"].asLongSafe() ?: 15000L
+                val keepOpen = args["keep_open"]?.jsonPrimitive?.booleanOrNull ?: false
+                val connectionId = args["connection_id"]?.jsonPrimitive?.contentOrNull
+                val maxResponseLength = args["max_response_length"]?.jsonPrimitive?.intOrNull
+
+                val result = bridge.sendPipeline(
+                    host, port, useTls, httpMode, requests, writeMode, writePauseMs,
+                    maxResponses, idleTimeoutMs, totalTimeoutMs, keepOpen, connectionId, maxResponseLength
+                )
+                CallToolResult(content = listOf(TextContent(result.toString())))
+            } catch (e: Exception) {
+                CallToolResult(
+                    content = listOf(TextContent(buildJsonObject {
+                        put("error", e.message ?: "Unknown error")
+                    }.toString())),
+                    isError = true
+                )
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // 13. http_fuzz
         // ---------------------------------------------------------------
         server.addTool(
             name = "http_fuzz",
@@ -704,7 +791,7 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
 2. Marker pairs (like Burp Intruder): Wrap values with § markers. Example: GET /api?id=§1§&name=§test§ HTTP/1.1\r\n... Each §value§ pair is an injection point.
 3. Offset pairs (legacy): Provide positions array of [start, end] byte offsets.
 
-Use \r\n for line endings in the request string. Returns all responses with payload metadata.""",
+Use \r\n for line endings in the request string. Runs sequentially (one request at a time); for concurrent fuzzing, build the payload variants yourself and use http_send_requests_parallel instead. Optional stop_on_match ({status_codes: [int], body_regex: string}) stops after the first response matching either condition (stopped_early:true in the result). Returns all responses with payload metadata.""",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("request") { put("type", "string"); put("description", "Request string with FUZZ keyword or § markers") }
@@ -719,6 +806,10 @@ Use \r\n for line endings in the request string. Returns all responses with payl
                     putJsonObject("positions") { put("type", "array"); putJsonObject("items") { put("type", "array") }; put("description", "Optional [start, end] byte offset pairs") }
                     putJsonObject("payloads") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Array of payload strings") }
                     putJsonObject("payload_library") { put("type", "string"); put("description", "Built-in payload set merged with 'payloads': xss | sqli | traversal | ssti | cmdi") }
+                    putJsonObject("stop_on_match") {
+                        put("type", "object")
+                        put("description", "Stop after the first matching response: {status_codes: [int], body_regex: string}")
+                    }
                 },
                 required = listOf("request", "host")
             )
@@ -744,6 +835,9 @@ Use \r\n for line endings in the request string. Returns all responses with payl
                 val httpMode = args["http_mode"]?.jsonPrimitive?.contentOrNull
                 val maxResponseLength = args["max_response_length"]?.jsonPrimitive?.intOrNull
                 val marker = args["marker"]?.jsonPrimitive?.contentOrNull
+                val stopOnMatch = args["stop_on_match"]?.jsonObject
+                val stopOnStatusCodes = stopOnMatch?.get("status_codes")?.jsonArray?.map { it.jsonPrimitive.int }
+                val stopOnBodyRegex = stopOnMatch?.get("body_regex")?.jsonPrimitive?.contentOrNull
 
                 // Positions are optional now — FUZZ keyword and §marker§ modes auto-detect
                 val positions = args["positions"]?.let { posEl ->
@@ -773,7 +867,7 @@ Use \r\n for line endings in the request string. Returns all responses with payl
                     )
                 }
 
-                val result = bridge.fuzz(reqStr, host, port, useTls, positions, payloads, httpMode, maxResponseLength, marker)
+                val result = bridge.fuzz(reqStr, host, port, useTls, positions, payloads, httpMode, maxResponseLength, marker, stopOnStatusCodes, stopOnBodyRegex)
                 CallToolResult(content = listOf(TextContent(result.toString())))
             } catch (e: Exception) {
                 CallToolResult(
@@ -786,7 +880,7 @@ Use \r\n for line endings in the request string. Returns all responses with payl
         }
 
         // ---------------------------------------------------------------
-        // 13. http_race
+        // 14. http_race
         // ---------------------------------------------------------------
         server.addTool(
             name = "http_race",

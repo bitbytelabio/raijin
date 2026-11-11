@@ -95,6 +95,43 @@ object TurboTools {
         }
 
         server.addTool(
+            name = "turbo_start_run_async",
+            description = "Start a Turbo run and return immediately with a run_id, without blocking. Use this instead " +
+                "of turbo_start_run when the run may take longer than your own call timeout. Poll with " +
+                "turbo_run_status (optionally wait=true) or turbo_list_runs to recover the run_id later.",
+            inputSchema = ToolSchema(
+                properties = obj(
+                    "script" to ("string" to "Python script code that controls the run (defines queueRequests(target, wordlists))"),
+                    "base_request" to ("string" to "Base HTTP request template; mark injection points with %s"),
+                    "endpoint" to ("string" to "Target endpoint URL, e.g. https://example.com"),
+                    "base_input" to ("string" to "Input data fed to the script (e.g. wordlist content)"),
+                    "normalize_line_endings" to ("boolean" to "Normalize mixed \\n and \\r\\n to \\r\\n. Default true."),
+                ),
+                required = listOf("script", "base_request", "endpoint")
+            )
+        ) { req ->
+            guarded {
+                bridge.tools.startRunAsync(
+                    script = req.str("script") ?: "",
+                    baseRequest = req.str("base_request") ?: "",
+                    endpoint = req.str("endpoint") ?: "",
+                    baseInput = req.str("base_input") ?: "",
+                    normalizeLineEndings = req.bool("normalize_line_endings") ?: true
+                )
+            }
+        }
+
+        server.addTool(
+            name = "turbo_list_runs",
+            description = "List all known Turbo runs (this MCP session and the GUI), newest first, with " +
+                "status/result_count/fails/created_at/source. Use this to recover a run_id you lost track of, " +
+                "e.g. after turbo_start_run's blocking window elapsed, or to find and stop an orphaned run.",
+            inputSchema = ToolSchema(properties = obj(), required = emptyList())
+        ) { _ ->
+            guarded { bridge.tools.listRuns() }
+        }
+
+        server.addTool(
             name = "turbo_run_status",
             description = "Status of a Turbo run: running state, result count, fails (requests that got no response) and " +
                 "status message. Set wait=true to long-poll until the run completes (up to 50 s).",

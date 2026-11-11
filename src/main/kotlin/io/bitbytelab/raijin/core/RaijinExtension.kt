@@ -12,6 +12,7 @@ import io.bitbytelab.raijin.transport.PortPolicy
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.bridge.BridgeFactory
+import io.bitbytelab.raijin.bridge.HttpPipelineConnectionRegistry
 import io.bitbytelab.raijin.turbo.TurboModule
 import io.bitbytelab.raijin.ui.RaijinTab
 import io.bitbytelab.raijin.ui.RaijinTheme
@@ -49,6 +50,7 @@ class RaijinExtension : BurpExtension {
             try { if (::dashboardServer.isInitialized) dashboardServer.stop() } catch (e: Exception) { api.logging().logToError("Raijin: dashboard stop failed: ${e.message}") }
             try { if (::serverManager.isInitialized) serverManager.stop() } catch (e: Exception) { api.logging().logToError("Raijin: server stop failed: ${e.message}") }
             try { TurboModule.uninstall() } catch (e: Exception) { api.logging().logToError("Raijin: turbo shutdown failed: ${e.message}") }
+            try { HttpPipelineConnectionRegistry.shutdownAll() } catch (e: Exception) { api.logging().logToError("Raijin: pipeline registry shutdown failed: ${e.message}") }
             try { eventBus.clear() } catch (_: Exception) {}
             try { stateManager.cleanup() } catch (_: Exception) {}
             api.logging().logToOutput("Raijin: Extension unloaded")

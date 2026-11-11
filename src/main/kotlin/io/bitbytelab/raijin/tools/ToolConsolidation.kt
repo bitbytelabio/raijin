@@ -45,7 +45,7 @@ object ToolConsolidation {
     /** Tools that stay individual: frequent, or with a schema too specific to share. */
     val KEEP: Set<String> = setOf(
         "http_send_request", "http_send_requests_parallel", "http_send_request_chain",
-        "http_send_raw_bytes", "http_fuzz", "http_race",
+        "http_send_raw_bytes", "http_send_pipeline", "http_fuzz", "http_race",
         "proxy_history", "proxy_history_search", "proxy_annotate", "proxy_auto_auth",
         "auth_diff", "api_import_openapi", "bambda_import",
         "jwt_keys",
@@ -171,6 +171,7 @@ object ToolConsolidation {
                 "status" to "turbo_run_status", "results" to "turbo_run_results", "result" to "turbo_run_result",
                 "script" to "turbo_run_script", "search_responses" to "turbo_search_responses",
                 "save_to_organizer" to "turbo_save_to_organizer",
+                "start_async" to "turbo_start_run_async", "list" to "turbo_list_runs",
             ),
         ),
         Group(

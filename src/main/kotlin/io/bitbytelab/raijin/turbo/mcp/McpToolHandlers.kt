@@ -170,6 +170,20 @@ class McpToolHandlers(
         return mapOf("status" to manager.deleteRun(runId))
     }
 
+    /** All known runs (this MCP session and the GUI), newest first — recovers a run_id lost
+     * after `turbo_start_run`'s blocking window elapsed, or lets an orphaned run be found and stopped. */
+    fun listRuns(): List<Map<String, Any?>> = manager.listRuns().map { run ->
+        mapOf(
+            "run_id" to run.id,
+            "status" to run.handler.status(),
+            "status_message" to run.handler.statusString(),
+            "result_count" to run.store.count(),
+            "fails" to run.handler.failCount(),
+            "created_at" to run.createdAt,
+            "source" to run.source,
+        )
+    }
+
     fun searchResponses(runId: String, query: String, searchIn: String = "all"): Map<String, Any> {
         val run = manager.getRun(runId)
             ?: return mapOf("error" to runNotFoundMessage(runId))
