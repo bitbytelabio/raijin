@@ -8,7 +8,6 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.thread
 import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.HttpRequestResponse
@@ -41,10 +40,7 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
         private const val UNRANKED = -1
     }
 
-    private val threadPool = Collections.synchronizedList(ArrayList<Thread>())
-    private val workerRegistry = DynamicWorkerRegistry()
-    private val adaptiveWorkerStarter = AdaptiveWorkerStarterConstructionContext.current()
-    private val adaptiveWorkersReady = CountDownLatch(if (adaptive) 1 else 0)
+    private val workers = AdaptiveWorkerLifecycle(this, adaptive, threads) { handle -> sendRequests(service, handle) }
     // ConcurrentHashMap with synchronised lists: every worker thread parks gated requests here
     // while the sending side iterates and removes, and a plain HashMap + LinkedList loses or
     // duplicates parked requests under that race.
@@ -80,22 +76,9 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
             val port = if (target.port == -1) target.defaultPort else target.port
             service = buildService(target, port)
 
-            if (adaptive) {
-                workerRegistry.resizeTo(threads, ::startWorker)
-                adaptiveWorkersReady.countDown()
-            } else {
-                repeat(threads) { startFixedWorker() }
-            }
+            workers.startInitial(awaitRunning = false)
         } catch (failure: Throwable) {
-            if (adaptive) {
-                runState.set(3)
-                workerRegistry.abort()
-                adaptiveWorkersReady.countDown()
-                val partialWorkers = synchronized(threadPool) {
-                    threadPool.toList().also { threadPool.clear() }
-                }
-                partialWorkers.forEach(Thread::interrupt)
-            }
+            workers.abortStart()
             Utils.unregisterEngine(this)
             throw failure
         }
@@ -111,47 +94,31 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
 
     override fun defaultAdaptiveLimits() = AdaptiveLimits(50, null)
 
-    override fun currentAdaptiveLimits() = AdaptiveLimits(workerRegistry.desiredSize(), null)
+    override fun currentAdaptiveLimits() = AdaptiveLimits(workers.targetSize(), null)
 
     override fun adaptiveMetrics(): AdaptiveMetrics {
         val limits = currentAdaptiveLimits()
         val saturated = requestQueue.isNotEmpty() || activeRequests.get() >= limits.concurrency
         return baseAdaptiveMetrics(limits, saturated).copy(
-            safeToMeasure = !adaptive || workerRegistry.isConverged(),
+            safeToMeasure = workers.converged(),
         )
     }
 
     override fun resizeConcurrency(newLimit: Int) {
         require(adaptive) { "Live resize is available only to adaptive Burp engines" }
-        require(newLimit > 0) { "Adaptive worker count must be positive" }
-        workerRegistry.resizeTo(
-            target = newLimit,
-            start = ::startWorker,
-            onStartFailure = ::handleAdaptiveWorkerStartFailure,
-        )
-    }
-
-    private fun handleAdaptiveWorkerStartFailure(failure: Throwable) {
-        if (isRecoverableAdaptiveCapacityFailure(failure)) recordTransportFailure(failure)
-        else throw failure
+        workers.resize(newLimit)
     }
 
     override fun resizeRequestsPerConnection(newLimit: Int) = false
 
-    internal fun awaitAdaptiveWorkerCount(target: Int, timeout: Long, unit: TimeUnit): Int {
-        require(adaptive)
-        workerRegistry.awaitCount(target, timeout, unit)
-        return workerRegistry.size()
-    }
+    internal fun awaitAdaptiveWorkerCount(target: Int, timeout: Long, unit: TimeUnit): Int =
+        workers.awaitWorkerCount(target, timeout, unit)
 
-    override fun completionInitialized(): Boolean = if (adaptive) true else super.completionInitialized()
+    override fun completionInitialized(): Boolean = adaptive || super.completionInitialized()
 
-    override fun awaitCompletion(timeout: Long, unit: TimeUnit): Boolean =
-        if (adaptive) workerRegistry.awaitEmptyAndSeal(timeout, unit) else super.awaitCompletion(timeout, unit)
+    override fun awaitCompletion(timeout: Long, unit: TimeUnit): Boolean = workers.awaitCompletion(timeout, unit)
 
-    override fun sealCompletion() {
-        if (adaptive) workerRegistry.seal() else super.sealCompletion()
-    }
+    override fun sealCompletion() = workers.sealCompletion()
 
 
     override fun buildRequest(template: String, payloads: List<String?>, learnBoring: Int?, label: String): Request {
@@ -259,29 +226,6 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
         return Utils.montoyaApi!!.http().sendRequests(batch, protocolVersion)
     }
 
-    private fun startFixedWorker() = launchWorker(null)
-
-    private fun startWorker(handle: DynamicWorkerRegistry.Handle) {
-        adaptiveWorkerStarter?.start(handle) ?: launchWorker(handle)
-    }
-
-    private fun launchWorker(handle: DynamicWorkerRegistry.Handle?) {
-        val worker = thread(start = false) {
-            handle?.markStarted()
-            try {
-                if (handle != null) adaptiveWorkersReady.await()
-                sendRequests(service, handle)
-            } finally {
-                threadPool.remove(Thread.currentThread())
-            }
-        }
-        startTrackedWorker(worker, threadPool)
-    }
-
-    private fun shouldRetire(handle: DynamicWorkerRegistry.Handle?): Boolean =
-        handle != null && workerRegistry.claimRetirement(handle)
-
-
     // this will return null unless there's an open gate with pending requests
     private fun getGatedRequests(): List<Request>? {
         for (gate in gatedRequests.keys) {
@@ -294,17 +238,16 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
     }
 
     private fun sendRequests(service: TurboService, handle: DynamicWorkerRegistry.Handle?) {
-        try {
-            while (runState.get() < 1 && !shouldAbandonRun()) {
-                Thread.sleep(10)
-            }
+        while (runState.get() < 1 && !shouldAbandonRun()) {
+            Thread.sleep(10)
+        }
 
-            // shouldAbandonRun() also applies idleTimeout, which this engine used to ignore.
-            while (!shouldAbandonRun()) {
+        // shouldAbandonRun() also applies idleTimeout, which this engine used to ignore.
+        while (!shouldAbandonRun()) {
 
-                if (shouldRetire(handle)) return
+            if (workers.shouldRetire(handle)) return
 
-                try {
+            try {
                 val requestGroup = getGatedRequests()
                 if (requestGroup != null) {
                     busyWorkers.incrementAndGet()
@@ -345,10 +288,7 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
                 permaFails.getAndIncrement()
                 // todo add null response to table
                 continue
-                }
             }
-        } finally {
-            if (handle == null) completedLatch.countDown() else handle.close()
         }
     }
 

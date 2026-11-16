@@ -1,10 +1,8 @@
 package io.bitbytelab.raijin.turbo
 
-//import jdk.net.ExtendedSocketOptions
 import burp.api.montoya.utilities.CompressionType
 import java.io.*
 import java.net.*
-import java.security.cert.X509Certificate
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -14,20 +12,18 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.GZIPInputStream
 import javax.net.ssl.*
 import kotlin.IllegalStateException
-import kotlin.concurrent.thread
 
 open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val threads: Int, maxQueueSize: Int, val readFreq: Int, requestsPerConnection: Int, override val maxRetriesPerRequest: Int, override var idleTimeout: Long = 0, override val callback: (Request, Boolean) -> Boolean, var timeout: Int, override var readCallback: ((String) -> Boolean)?, val readSize: Int, val resumeSSL: Boolean, var explodeOnEarlyRead: Boolean = false, private val adaptive: Boolean = false): RequestEngine(), AdaptiveTransport {
 
     private val connectedLatch = CountDownLatch(threads)
-    private val threadPool = Collections.synchronizedList(ArrayList<Thread>())
-    private val workerRegistry = DynamicWorkerRegistry()
-    private val adaptiveWorkerStarter = AdaptiveWorkerStarterConstructionContext.current()
-    private val adaptiveWorkersReady = CountDownLatch(if (adaptive) 1 else 0)
+    // A fixed worker pipelines up to readFreq requests before it reads; an adaptive one reads each
+    // response before it sends again.
+    private val workers = AdaptiveWorkerLifecycle(this, adaptive, threads) { handle ->
+        sendRequests(handle, if (handle == null) readFreq else 1)
+    }
     private val requestLimit = AtomicInteger(requestsPerConnection)
     private val retryQueue = LinkedBlockingQueue<Request>()
-    private lateinit var ipAddress: InetAddress
-    private var port: Int = 0
-    private lateinit var trustingSslSocketFactory: SSLSocketFactory
+    private lateinit var connector: Http1Connector
 
     val requestsPerConnection: Int
         get() = requestLimit.get()
@@ -62,30 +58,13 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
             }
 
             completedLatch = CountDownLatch(threads)
-            ipAddress = InetAddress.getByName(target.host)
-            port = if (target.port == -1) { target.defaultPort } else { target.port }
-
-            trustingSslSocketFactory = createSSLSocketFactory()
+            connector = Http1Connector(target, domains)
 
             Utils.err("Establishing $threads connection to $url ...");
-            if (adaptive) {
-                workerRegistry.resizeTo(threads, ::startAdaptiveWorker)
-                // Gate admission counts only workers that have actually entered their run loop.
-                workerRegistry.awaitLiveSize(threads)
-                adaptiveWorkersReady.countDown()
-            } else {
-                repeat(threads) { startFixedWorker() }
-            }
+            // Gate admission counts only workers that have actually entered their run loop.
+            workers.startInitial(awaitRunning = true)
         } catch(failure: Throwable) {
-            if (adaptive) {
-                runState.set(3)
-                workerRegistry.abort()
-                adaptiveWorkersReady.countDown()
-                val partialWorkers = synchronized(threadPool) {
-                    threadPool.toList().also { threadPool.clear() }
-                }
-                partialWorkers.forEach(Thread::interrupt)
-            }
+            workers.abortStart()
             Utils.unregisterEngine(this)
             throw failure
         }
@@ -186,11 +165,9 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
 
 
     }
-    fun createSSLSocketFactory(): SSLSocketFactory {
-        val trustingSslContext = SSLContext.getInstance("TLS")
-        trustingSslContext.init(null, arrayOf<TrustManager>(TrustingTrustManager(this)), null)
-        return trustingSslContext.socketFactory
-    }
+
+    /** A TLS socket factory that trusts every certificate, collecting the names they carry in [domains]. */
+    fun createSSLSocketFactory(): SSLSocketFactory = Http1Connector.trustingTlsFactory(domains)
 
     // val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("localhost", 6574))
 
@@ -209,7 +186,7 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
     override fun defaultAdaptiveLimits() = AdaptiveLimits(50, 100)
 
     override fun currentAdaptiveLimits() = AdaptiveLimits(
-        if (adaptive) workerRegistry.desiredSize() else threads,
+        workers.targetSize(),
         requestLimit.get(),
     )
 
@@ -217,23 +194,13 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
         val limits = currentAdaptiveLimits()
         val saturated = requestQueue.isNotEmpty() || retryQueue.isNotEmpty() || activeRequests.get() >= limits.concurrency
         return baseAdaptiveMetrics(limits, saturated).copy(
-            safeToMeasure = !adaptive || workerRegistry.isConverged(),
+            safeToMeasure = workers.converged(),
         )
     }
 
     override fun resizeConcurrency(newLimit: Int) {
         require(adaptive) { "Live resize is available only to adaptive threaded engines" }
-        require(newLimit > 0) { "Adaptive worker count must be positive" }
-        workerRegistry.resizeTo(
-            target = newLimit,
-            start = ::startAdaptiveWorker,
-            onStartFailure = ::handleAdaptiveWorkerStartFailure,
-        )
-    }
-
-    private fun handleAdaptiveWorkerStartFailure(failure: Throwable) {
-        if (isRecoverableAdaptiveCapacityFailure(failure)) recordTransportFailure(failure)
-        else throw failure
+        workers.resize(newLimit)
     }
 
     override fun resizeRequestsPerConnection(newLimit: Int): Boolean {
@@ -242,44 +209,16 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
         return true
     }
 
-    internal fun currentWorkerCapacity(): Int = if (adaptive) workerRegistry.liveSize() else threads
+    internal fun currentWorkerCapacity(): Int = workers.liveSize()
 
-    internal fun awaitAdaptiveWorkerCount(target: Int, timeout: Long, unit: TimeUnit): Int {
-        require(adaptive)
-        workerRegistry.awaitCount(target, timeout, unit)
-        return workerRegistry.size()
-    }
+    internal fun awaitAdaptiveWorkerCount(target: Int, timeout: Long, unit: TimeUnit): Int =
+        workers.awaitWorkerCount(target, timeout, unit)
 
-    override fun completionInitialized(): Boolean = if (adaptive) true else super.completionInitialized()
+    override fun completionInitialized(): Boolean = adaptive || super.completionInitialized()
 
-    override fun awaitCompletion(timeout: Long, unit: TimeUnit): Boolean =
-        if (adaptive) workerRegistry.awaitEmptyAndSeal(timeout, unit) else super.awaitCompletion(timeout, unit)
+    override fun awaitCompletion(timeout: Long, unit: TimeUnit): Boolean = workers.awaitCompletion(timeout, unit)
 
-    override fun sealCompletion() {
-        if (adaptive) workerRegistry.seal() else super.sealCompletion()
-    }
-
-    private fun startFixedWorker() = launchWorker(null, readFreq)
-
-    private fun startAdaptiveWorker(handle: DynamicWorkerRegistry.Handle) {
-        adaptiveWorkerStarter?.start(handle) ?: launchWorker(handle, 1)
-    }
-
-    private fun launchWorker(handle: DynamicWorkerRegistry.Handle?, workerReadFreq: Int) {
-        val worker = thread(start = false) {
-            handle?.markStarted()
-            try {
-                if (handle != null) adaptiveWorkersReady.await()
-                sendRequests(handle, workerReadFreq)
-            } finally {
-                threadPool.remove(Thread.currentThread())
-            }
-        }
-        startTrackedWorker(worker, threadPool)
-    }
-
-    private fun shouldRetire(handle: DynamicWorkerRegistry.Handle?): Boolean =
-        handle != null && workerRegistry.claimRetirement(handle)
+    override fun sealCompletion() = workers.sealCompletion()
 
     override fun buildRequest(template: String, payloads: List<String?>, learnBoring: Int?, label: String): Request {
         var prepared = template
@@ -295,29 +234,6 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
         return Request(prepared, payloads, learnBoring?: 0, label)
     }
 
-    /**
-     * Connects within the run's timeout and, for HTTPS, layers TLS over the connected socket under
-     * the target's host name. That sends SNI, which a TLS socket opened straight to the resolved
-     * address never did, so name-based virtual hosts and CDNs answered as their default site.
-     */
-    private fun openConnection(reuseSSL: Boolean): Socket {
-        val plain = Socket()
-        try {
-            plain.connect(InetSocketAddress(ipAddress, port), (timeout * 1000).coerceAtLeast(0))
-            if (target.protocol != "https") {
-                return plain
-            }
-            val factory = if (reuseSSL) trustingSslSocketFactory else createSSLSocketFactory()
-            // An IPv6 literal keeps its brackets in URL.host; without them it is recognised as an
-            // address, for which no SNI is sent.
-            val serverName = target.host.removePrefix("[").removeSuffix("]")
-            return factory.createSocket(plain, serverName, port, true)
-        } catch (failure: Throwable) {
-            runCatching { plain.close() }
-            throw failure
-        }
-    }
-
     private fun sendRequests(handle: DynamicWorkerRegistry.Handle?, baseReadFreq: Int) {
         val readFreq = baseReadFreq
         val inflight = ArrayDeque<Request>()
@@ -330,14 +246,14 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
 
         try {
             while (!shouldAbandonRun()) {
-                if (shouldRetire(handle)) return
+                if (workers.shouldRetire(handle)) return
                 if (adaptive && runState.get() >= 1 && requestReservedForSetup == null) {
-                    while (!shouldAbandonRun() && !shouldRetire(handle)) {
+                    while (!shouldAbandonRun() && !workers.shouldRetire(handle)) {
                         requestReservedForSetup = retryQueue.poll() ?: requestQueue.poll(100, TimeUnit.MILLISECONDS)
                         if (requestReservedForSetup != null || runState.get() >= 2) break
                     }
                     if (requestReservedForSetup == null) {
-                        if (runState.get() >= 2 || shouldAbandonRun() || shouldRetire(handle)) return
+                        if (runState.get() >= 2 || shouldAbandonRun() || workers.shouldRetire(handle)) return
                         continue
                     }
                     activeRequests.incrementAndGet()
@@ -345,7 +261,7 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                 try {
 
                 val socket = try {
-                    openConnection(reuseSSL)
+                    connector.open(reuseSSL, timeout * 1000)
                 }
                 catch (ex: Exception) {
                     recordTransportFailure(ex)
@@ -371,14 +287,7 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                 }
                 val connectionIdAuto = connections.incrementAndGet().toString()
                 try {
-                //(socket as SSLSocket).session.peerCertificates
-                socket.soTimeout = timeout * 1000
-                socket.tcpNoDelay = true
-                socket.receiveBufferSize = readSize
-                socket.keepAlive = true
-                // socket.setOption(ExtendedSocketOptions.TCP_KEEPIDLE, 30)
-                // todo tweak other TCP options for max performance
-                val reader = Http1ResponseReader(SocketHttp1Source(socket), readSize, ::triggerReadCallback, ::shouldAbandonRun)
+                val connection = Http1Connection(socket, timeout * 1000, readSize, ::triggerReadCallback, ::shouldAbandonRun)
 
                 if(!connected) {
                     connected = true
@@ -393,22 +302,22 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                 var requestsSent = 0
                 answeredRequests = 0
                 while (requestsSent < requestLimit.get() && !shouldAbandonRun()) {
-                    if (shouldRetire(handle)) return
+                    if (workers.shouldRetire(handle)) return
                     val ignoreLength = internalSettings["ignoreLength"] == true
                     var ditchConnection = false
                     var readCount = 0
                     // Every batch starts on a clean buffer: bytes left over from the last are dropped.
-                    reader.discard()
+                    connection.discard()
 
                     for (j in 1..readFreq) {
-                        if (requestsSent >= requestLimit.get() || shouldRetire(handle)) {
+                        if (requestsSent >= requestLimit.get() || workers.shouldRetire(handle)) {
                             break
                         }
 
                         val wasReservedForSetup = requestReservedForSetup != null
                         var req = requestReservedForSetup.also { requestReservedForSetup = null }
                             ?: retryQueue.poll()
-                        while (req == null && !shouldAbandonRun() && !shouldRetire(handle) && requestsSent < requestLimit.get()) {
+                        while (req == null && !shouldAbandonRun() && !workers.shouldRetire(handle) && requestsSent < requestLimit.get()) {
                             req = requestQueue.poll(100, TimeUnit.MILLISECONDS)
 
                             if (req == null) {
@@ -422,7 +331,7 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                         }
 
                         if (req == null) break
-                        if (requestsSent >= requestLimit.get() || shouldRetire(handle)) {
+                        if (requestsSent >= requestLimit.get() || workers.shouldRetire(handle)) {
                             // The bounded request queue may refill after poll returns. The retry
                             // queue is unbounded and checked first by every worker, so this stays
                             // non-blocking without dropping the request during shrink or shutdown.
@@ -433,64 +342,7 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
 
                         inflight.addLast(req)
                         if (!wasReservedForSetup) activeRequests.incrementAndGet()
-                        val byteReq = req.getRequestAsBytes()
-                        val outputstream = socket.getOutputStream()
-                        // Each request carries its own send time, so every response in a pipelined
-                        // batch is timed from its own request, not from the last one written.
-                        req.sent = 0L
-                        if (req.gate != null) {
-                            val withHold = 1
-                            outputstream.write(byteReq, 0, byteReq.size-withHold)
-                            req.gate!!.waitForGo()
-                            req.sent = System.nanoTime()
-                            outputstream.write(byteReq, byteReq.size-withHold, withHold)
-                        }
-                        else if (req.pauseBefore != 0) {
-                            val end: Int
-                            if (req.pauseBefore < 0) {
-                                end = byteReq.size + req.pauseBefore
-                            } else {
-                                end = req.pauseBefore - 1 // since it's 0-indexed
-                            }
-                            val part1 = byteReq.sliceArray(0 until end)
-                            //Utils.out("'"+Utilities.helpers.bytesToString(part1)+"'")
-                            outputstream.write(part1)
-                            req.sent = System.nanoTime()
-
-                            waitForData(reader, req.pauseTime)
-
-                            val part2 = byteReq.sliceArray(end until byteReq.size)
-                            outputstream.write(part2)
-                            //Utils.out("'"+Utilities.helpers.bytesToString(part2)+"'")
-                        } else if (!req.pauseMarkers.isEmpty()) {
-                            var i = 0
-                            req.sent = System.nanoTime()
-                            // pauses *after* sending the pauseMarker
-                            while (i < byteReq.size && !shouldAbandonRun()) {
-                                var pausePoint = -1
-                                //val z: ByteArray = req.pauseMarkers.get(0)
-                                for (pauseMarker in req.pauseMarkers) {
-                                    val pauseBytes = pauseMarker.toByteArray(Charsets.ISO_8859_1)
-                                    pausePoint = Utils.indexOf(byteReq, pauseBytes, i, byteReq.size)
-                                    if (pausePoint != -1) {
-                                        outputstream.write(byteReq.sliceArray(i until (pausePoint+pauseBytes.size)))
-                                        waitForData(reader, req.pauseTime)
-                                        i = pausePoint + pauseBytes.size
-                                        break
-                                    }
-                                }
-
-                                if (pausePoint == -1) {
-                                    outputstream.write(byteReq.sliceArray(i until byteReq.size))
-                                    break
-                                }
-
-                            }
-                        }
-                        else {
-                            outputstream.write(byteReq)
-                            req.sent = System.nanoTime()
-                        }
+                        connection.write(req, explodeOnEarlyRead)
 
                         readCount++
                         requestsSent++
@@ -498,7 +350,7 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                     }
 
                     for (k in 1..readCount) {
-                        val response = reader.readResponse(ignoreLength) ?: break
+                        val response = connection.readResponse(ignoreLength) ?: break
                         if (response.closeConnection) {
                             ditchConnection = true
                         }
@@ -611,7 +463,6 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
             }
             activeRequests.addAndGet(-inflight.size)
             inflight.clear()
-            if (handle == null) completedLatch.countDown() else handle.close()
         }
     }
 
@@ -635,7 +486,7 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
     ): Boolean {
         var remainingMillis = connectionBackoffMillis(consecutiveFailures, adaptive = true)
         while (remainingMillis > 0) {
-            if (shouldAbandonRun() || shouldRetire(handle)) return false
+            if (shouldAbandonRun() || workers.shouldRetire(handle)) return false
             val pause = minOf(remainingMillis, 50L)
             try {
                 Thread.sleep(pause)
@@ -645,55 +496,15 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
             }
             remainingMillis -= pause
         }
-        return !shouldAbandonRun() && !shouldRetire(handle)
-    }
-
-    /**
-     * Holds a part-sent request for up to [pauseTime] ms, ending early if the server answers. What
-     * arrives joins the reader's buffer: it is the start of a response, and replacing it at each
-     * pause lost an early response when a later pause heard nothing.
-     */
-    private fun waitForData(reader: Http1ResponseReader, pauseTime: Int) {
-        val received = reader.readWithin(pauseTime)
-        if (explodeOnEarlyRead && received > 0) {
-            throw IllegalStateException()
-        }
-    }
-
-    private class TrustingTrustManager(val engine: ThreadedRequestEngine) : X509TrustManager {
-
-        override fun getAcceptedIssuers(): Array<X509Certificate>? {
-            return null
-        }
-
-        override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
-
-        override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {
-            val altNames = chain.get(0).subjectAlternativeNames ?: return
-            for (x in altNames) {
-                engine.domains.add(x.get(1).toString())
-            }
-        }
+        return !shouldAbandonRun() && !workers.shouldRetire(handle)
     }
 
     override fun cleanup() {
         // Clean up thread-specific resources first
         domains.clear()
 
-        // Interrupt and clean up threads (copy to avoid ConcurrentModificationException)
-        val workers = synchronized(threadPool) { threadPool.toList() }
-        for (thread in workers) {
-            try {
-                if (thread.isAlive) {
-                    thread.interrupt()
-                    // Give thread a brief moment to stop gracefully
-                    thread.join(1000)
-                }
-            } catch (e: Exception) {
-                // Ignore exceptions during cleanup
-            }
-        }
-        threadPool.clear()
+        // Interrupt the workers still running, giving each a moment to stop
+        workers.stopAll()
 
         // Call parent cleanup for shared resources
         super.cleanup()
