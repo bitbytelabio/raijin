@@ -45,6 +45,7 @@ object TurboModule {
     }
 
     fun uninstall() {
+        TurboIntruderFrame.closeAll()
         runManager.stopMemoryMonitor()
         registrations.forEach { runCatching { it.deregister() } }
         registrations.clear()
