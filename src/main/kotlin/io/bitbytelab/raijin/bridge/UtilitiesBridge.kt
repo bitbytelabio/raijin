@@ -72,7 +72,7 @@ class UtilitiesBridge(private val api: MontoyaApi) {
             decoded.toString()
         } catch (e: Exception) {
             // Try URL-safe decoding as fallback
-            String(Base64.getUrlDecoder().decode(data))
+            String(Base64.getUrlDecoder().decode(data), Charsets.UTF_8)
         }
     }
 

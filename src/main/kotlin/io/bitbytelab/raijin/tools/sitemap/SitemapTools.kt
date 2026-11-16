@@ -1,6 +1,10 @@
 package io.bitbytelab.raijin.tools.sitemap
 
+import burp.api.montoya.core.HighlightColor
 import io.bitbytelab.raijin.bridge.SitemapBridge
+import io.bitbytelab.raijin.core.EnumValidation
+import io.bitbytelab.raijin.core.asBooleanSafe
+import io.bitbytelab.raijin.core.asBoundedInt
 import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
@@ -9,6 +13,11 @@ import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
 object SitemapTools {
+
+    private val SEARCH_IN = listOf("url", "request", "response", "all")
+    private val SEVERITIES = listOf("HIGH", "MEDIUM", "LOW", "INFORMATION")
+    private val CONFIDENCES = listOf("CERTAIN", "FIRM", "TENTATIVE")
+    private const val MAX_RESULTS = 10_000
 
     fun register(server: Server, bridge: SitemapBridge) {
 
@@ -24,9 +33,16 @@ object SitemapTools {
                 properties = buildJsonObject {
                     putJsonObject("url_prefix") { put("type", "string"); put("description", "Filter entries whose URL starts with this prefix") }
                     putJsonObject("search_pattern") { put("type", "string"); put("description", "Regex pattern to match (see search_in for where)") }
-                    putJsonObject("search_in") { put("type", "string"); put("description", "Where search_pattern matches: url (default) | request | response | all") }
+                    putJsonObject("search_in") {
+                        put("type", "string")
+                        putJsonArray("enum") { SEARCH_IN.forEach { add(it) } }
+                        put("description", "Where search_pattern matches (default url; all = url, request and response)")
+                    }
                     putJsonObject("note_contains") { put("type", "string"); put("description", "Substring match against the entry's annotation notes, e.g. '[MCP]' to find http_send_* traffic") }
-                    putJsonObject("max_results") { put("type", "integer"); put("description", "Maximum entries to return, default 100 (see 'matched' in the response for the true total)") }
+                    putJsonObject("max_results") {
+                        put("type", "integer"); put("minimum", 0); put("maximum", MAX_RESULTS)
+                        put("description", "Maximum entries to return, default 100 (see 'matched' in the response for the true total)")
+                    }
                     putJsonObject("include_request") { put("type", "boolean"); put("description", "Include full request text, default false") }
                     putJsonObject("include_response") { put("type", "boolean"); put("description", "Include full response text, default false") }
                     putJsonObject("only_with_response") { put("type", "boolean"); put("description", "Exclude entries with no response yet, default false") }
@@ -43,16 +59,18 @@ object SitemapTools {
                 val args = request.params.arguments ?: emptyMap()
                 val urlPrefix = args["url_prefix"]?.jsonPrimitive?.contentOrNull
                 val searchPattern = args["search_pattern"]?.jsonPrimitive?.contentOrNull
-                val maxResults = args["max_results"]?.jsonPrimitive?.intOrNull ?: 100
-                val includeRequest = args["include_request"]?.jsonPrimitive?.booleanOrNull ?: false
-                val includeResponse = args["include_response"]?.jsonPrimitive?.booleanOrNull ?: false
-                val onlyWithResponse = args["only_with_response"]?.jsonPrimitive?.booleanOrNull ?: false
+                val maxResults = args["max_results"].asBoundedInt("max_results", 0, MAX_RESULTS)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid max_results") } ?: 100
+                val includeRequest = args["include_request"].asBooleanSafe() ?: false
+                val includeResponse = args["include_response"].asBooleanSafe() ?: false
+                val onlyWithResponse = args["only_with_response"].asBooleanSafe() ?: false
                 val statusCodeRange = args["status_code_range"]?.jsonPrimitive?.contentOrNull
                 val mime = args["mime"].asStringList()
-                val excludeNoise = args["exclude_noise"]?.jsonPrimitive?.booleanOrNull ?: true
+                val excludeNoise = args["exclude_noise"].asBooleanSafe() ?: true
                 val excludePattern = args["exclude_pattern"]?.jsonPrimitive?.contentOrNull
-                val inScopeOnly = args["in_scope_only"]?.jsonPrimitive?.booleanOrNull ?: false
+                val inScopeOnly = args["in_scope_only"].asBooleanSafe() ?: false
                 val searchIn = args["search_in"]?.jsonPrimitive?.contentOrNull
+                EnumValidation.error(searchIn, SEARCH_IN.toSet() + "both", "search_in")?.let { return@addTool toolJsonResult(it) }
                 val noteContains = args["note_contains"]?.jsonPrimitive?.contentOrNull
 
                 toolJsonResult(bridge.query(
@@ -75,7 +93,11 @@ object SitemapTools {
                 properties = buildJsonObject {
                     putJsonObject("url") { put("type", "string"); put("description", "Exact site map entry URL to annotate") }
                     putJsonObject("notes") { put("type", "string"); put("description", "Note text to set") }
-                    putJsonObject("highlight") { put("type", "string"); put("description", "RED|ORANGE|YELLOW|GREEN|CYAN|BLUE|PINK|MAGENTA|GRAY|NONE (NONE clears it)") }
+                    putJsonObject("highlight") {
+                        put("type", "string")
+                        putJsonArray("enum") { HighlightColor.entries.forEach { add(it.name) } }
+                        put("description", "Highlight color; NONE clears it")
+                    }
                 },
                 required = listOf("url")
             )
@@ -101,7 +123,11 @@ object SitemapTools {
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("url_prefix") { put("type", "string"); put("description", "Filter issues by URL prefix") }
-                    putJsonObject("severity") { put("type", "string"); put("description", "Filter by severity: HIGH, MEDIUM, LOW, INFORMATION") }
+                    putJsonObject("severity") {
+                        put("type", "string")
+                        putJsonArray("enum") { SEVERITIES.forEach { add(it) } }
+                        put("description", "Filter by severity")
+                    }
                 },
                 required = emptyList()
             )
@@ -110,6 +136,7 @@ object SitemapTools {
                 val args = request.params.arguments ?: emptyMap()
                 val urlPrefix = args["url_prefix"]?.jsonPrimitive?.contentOrNull
                 val severity = args["severity"]?.jsonPrimitive?.contentOrNull
+                EnumValidation.error(severity, SEVERITIES.toSet(), "severity")?.let { return@addTool toolJsonResult(it) }
 
                 toolJsonResult(bridge.getIssues(urlPrefix, severity))
             } catch (e: Exception) {
@@ -128,7 +155,10 @@ object SitemapTools {
                     putJsonObject("request") { put("type", "string"); put("description", "Raw HTTP request string") }
                     putJsonObject("response") { put("type", "string"); put("description", "Raw HTTP response string") }
                     putJsonObject("host") { put("type", "string"); put("description", "Target hostname") }
-                    putJsonObject("port") { put("type", "integer"); put("description", "Target port") }
+                    putJsonObject("port") {
+                        put("type", "integer"); put("minimum", 1); put("maximum", 65535)
+                        put("description", "Target port")
+                    }
                     putJsonObject("use_tls") { put("type", "boolean"); put("description", "Whether to use TLS, default false") }
                 },
                 required = listOf("request", "host", "port")
@@ -141,9 +171,10 @@ object SitemapTools {
                 val rawResponse = args["response"]?.jsonPrimitive?.contentOrNull
                 val host = args["host"]?.jsonPrimitive?.contentOrNull
                     ?: return@addTool toolError("Missing required parameter: host")
-                val port = args["port"]?.jsonPrimitive?.intOrNull
+                val port = args["port"].asBoundedInt("port", 1, 65535)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid port") }
                     ?: return@addTool toolError("Missing required parameter: port")
-                val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull ?: false
+                val useTls = args["use_tls"].asBooleanSafe() ?: false
 
                 toolJsonResult(bridge.addRequest(rawRequest, rawResponse, host, port, useTls))
             } catch (e: Exception) {
@@ -165,8 +196,16 @@ object SitemapTools {
                     putJsonObject("name") { put("type", "string"); put("description", "Issue title") }
                     putJsonObject("detail") { put("type", "string"); put("description", "HTML description of the issue") }
                     putJsonObject("remediation") { put("type", "string"); put("description", "HTML remediation advice") }
-                    putJsonObject("severity") { put("type", "string"); put("description", "Severity: HIGH, MEDIUM, LOW, or INFORMATION") }
-                    putJsonObject("confidence") { put("type", "string"); put("description", "Confidence: CERTAIN, FIRM, or TENTATIVE") }
+                    putJsonObject("severity") {
+                        put("type", "string")
+                        putJsonArray("enum") { SEVERITIES.forEach { add(it) } }
+                        put("description", "Issue severity")
+                    }
+                    putJsonObject("confidence") {
+                        put("type", "string")
+                        putJsonArray("enum") { CONFIDENCES.forEach { add(it) } }
+                        put("description", "Issue confidence")
+                    }
                     putJsonObject("url") { put("type", "string"); put("description", "Affected URL") }
                     putJsonObject("request") { put("type", "string"); put("description", "Raw HTTP request demonstrating the issue") }
                     putJsonObject("response") { put("type", "string"); put("description", "Raw HTTP response demonstrating the issue") }

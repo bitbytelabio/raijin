@@ -12,8 +12,11 @@ import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
@@ -106,5 +109,73 @@ class ToolResultHelpersTest {
         assertFalse(urlRes.isError == true)
         val urlJson = Json.parseToJsonElement((urlRes.content.first() as TextContent).text).jsonObject
         assertEquals("\"hello\\\nworld\"", urlJson["decoded"]?.jsonPrimitive?.content)
+    }
+
+    private fun utilitiesServer(): Server {
+        val server = Server(
+            Implementation("test", "0"),
+            ServerOptions(ServerCapabilities(tools = ServerCapabilities.Tools(listChanged = false)))
+        )
+        UtilitiesTools.register(server, UtilitiesBridge(stubUtilitiesApi()))
+        return server
+    }
+
+    private fun callUtil(server: Server, tool: String, args: JsonObject) = runBlocking {
+        server.tools.getValue(tool).handler(testClientConnection, CallToolRequest(CallToolRequestParams(tool, args)))
+    }
+
+    private fun parsed(r: io.modelcontextprotocol.kotlin.sdk.types.CallToolResult) =
+        Json.parseToJsonElement((r.content.first() as TextContent).text).jsonObject
+
+    @Test
+    fun `util_decode_smart emits valid JSON and fully_decoded for output with quotes, backslashes and newlines`() {
+        val server = utilitiesServer()
+        val plain = "say \"hi\"\n\\path\\"
+        val b64 = Base64.getEncoder().encodeToString(plain.toByteArray(Charsets.UTF_8))
+
+        val res = callUtil(server, "util_decode_smart", buildJsonObject { put("data", b64) })
+        assertFalse(res.isError == true)
+        val json = parsed(res)
+        assertEquals(plain, json["decoded"]?.jsonPrimitive?.content)
+        assertEquals(1, json["layers"]?.jsonPrimitive?.int)
+        assertEquals(true, json["fully_decoded"]?.jsonPrimitive?.boolean)
+
+        val capped = callUtil(server, "util_decode_smart", buildJsonObject {
+            put("data", Base64.getEncoder().encodeToString(b64.toByteArray()))
+            put("max_depth", 1)
+        })
+        assertEquals(false, parsed(capped)["fully_decoded"]?.jsonPrimitive?.boolean)
+    }
+
+    @Test
+    fun `util_jwt_decode keeps claims with quotes, backslashes and newlines intact`() {
+        val server = utilitiesServer()
+        val enc = Base64.getUrlEncoder().withoutPadding()
+        val note = "a \"quoted\" \\ back\nslash"
+        val payload = buildJsonObject { put("sub", "alice"); put("note", note) }.toString()
+        val token = enc.encodeToString("""{"alg":"HS256"}""".toByteArray()) + "." +
+            enc.encodeToString(payload.toByteArray()) + ".sig"
+
+        val res = callUtil(server, "util_jwt_decode", buildJsonObject { put("token", token) })
+        assertFalse(res.isError == true)
+        assertEquals(note, parsed(res)["payload"]?.jsonObject?.get("note")?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `utilities errors are flagged isError with valid JSON`() {
+        val server = utilitiesServer()
+        val cases = listOf(
+            "util_random_string" to buildJsonObject { put("length", 0) },
+            "util_random_bytes" to buildJsonObject { put("length", "many") },
+            "util_random_bytes" to buildJsonObject { },
+            "util_decode_smart" to buildJsonObject { put("data", "x"); put("max_depth", 1000) },
+            "util_jwt_decode" to buildJsonObject { put("token", "not\"a\\jwt") },
+            "util_base64_decode" to buildJsonObject { },
+        )
+        for ((tool, args) in cases) {
+            val res = callUtil(server, tool, args)
+            assertEquals(true, res.isError, "$tool $args")
+            assertTrue(parsed(res)["error"]?.jsonPrimitive?.content?.isNotBlank() == true, "$tool $args")
+        }
     }
 }

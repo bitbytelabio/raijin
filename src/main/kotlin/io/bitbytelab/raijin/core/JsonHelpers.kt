@@ -256,3 +256,43 @@ fun JsonElement?.asLongSafe(): Long? {
         else -> null
     }
 }
+
+/**
+ * Extract an Int from a JsonElement that might be:
+ * - A JsonPrimitive integral number
+ * - A JsonPrimitive numeric string
+ * Returns null when absent, JSON null, fractional, non-numeric or outside the Int range.
+ */
+fun JsonElement?.asIntSafe(): Int? =
+    asLongSafe()?.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }?.toInt()
+
+/**
+ * Reads an integer tool argument [name] bounded to [min]..[max]. Success holds null when the
+ * argument is absent or JSON null (the caller applies its default or reports it missing); failure
+ * carries a caller-facing [IllegalArgumentException] for a non-integer or out-of-range value.
+ */
+fun JsonElement?.asBoundedInt(name: String, min: Int, max: Int): Result<Int?> {
+    if (this == null || this is JsonNull) return Result.success(null)
+    val n = asIntSafe()
+        ?: return Result.failure(IllegalArgumentException("Parameter '$name' must be an integer (got $this)"))
+    if (n !in min..max) {
+        return Result.failure(IllegalArgumentException("Parameter '$name' must be between $min and $max (got $n)"))
+    }
+    return Result.success(n)
+}
+
+/**
+ * Extract a Boolean from a JsonElement that might be:
+ * - A JsonPrimitive boolean
+ * - A JsonPrimitive string "true"/"false" (case-insensitive)
+ * Returns null when absent, JSON null or anything else.
+ */
+fun JsonElement?.asBooleanSafe(): Boolean? {
+    val p = this as? JsonPrimitive ?: return null
+    if (p is JsonNull) return null
+    return when (p.content.trim().lowercase()) {
+        "true" -> true
+        "false" -> false
+        else -> null
+    }
+}

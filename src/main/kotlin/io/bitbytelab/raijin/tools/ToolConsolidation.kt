@@ -5,7 +5,6 @@ import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequestParams
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.serialization.json.*
@@ -283,15 +282,15 @@ object ToolConsolidation {
         g: Group,
         members: Map<String, io.modelcontextprotocol.kotlin.sdk.server.RegisteredTool>,
     ): ToolSchema {
-        // public param -> (definition of the first member that declares it, actions using it)
-        val params = LinkedHashMap<String, Pair<JsonObject, MutableList<String>>>()
+        // public param -> (action, member definition) for every action declaring it
+        val params = LinkedHashMap<String, MutableList<Pair<String, JsonObject>>>()
         members.forEach { (action, rt) ->
             rt.tool.inputSchema.properties?.forEach { (name, def) ->
                 val pub = publicParam(g, action, name)
                 if (pub == "action") {
                     error("Tool group '${g.tool}', action '$action' declares parameter '$name' that collides with dispatch parameter 'action'; add a rename.")
                 }
-                params.getOrPut(pub) { (def as? JsonObject ?: JsonObject(emptyMap())) to mutableListOf() }.second += action
+                params.getOrPut(pub) { mutableListOf() } += action to (def as? JsonObject ?: JsonObject(emptyMap()))
             }
         }
         val props = buildJsonObject {
@@ -300,18 +299,88 @@ object ToolConsolidation {
                 putJsonArray("enum") { g.actions.keys.forEach { add(it) } }
                 put("description", "Operation to run; see the tool description for each action's parameters.")
             }
-            params.forEach { (name, v) ->
-                val (def, actions) = v
-                putJsonObject(name) {
-                    def.forEach { (k, value) -> if (k != "description") put(k, value) }
-                    val base = def["description"]?.jsonPrimitive?.contentOrNull.orEmpty()
-                    val scope = if (actions.size == members.size) "" else " [actions: ${actions.joinToString(", ")}]"
-                    put("description", (base + scope).trim())
-                }
-            }
+            params.forEach { (name, uses) -> put(name, mergeParam(uses, members.size)) }
         }
         return ToolSchema(properties = props, required = listOf("action"))
     }
+
+    /**
+     * Merges the definitions of one public parameter declared by several actions of a group.
+     *
+     * Structure (`type`, `enum`, `items`, ...) is merged by [mergeStructure]: enums are united, and a
+     * type the actions disagree on drops the parameter to a permissive schema. The description keeps
+     * every action's own text plus whatever constraint the merged schema no longer carries for it
+     * (its own enum, type, default, ...), so no action's documentation is lost.
+     *
+     * @param uses (action, member definition) pairs, in action order.
+     * @param groupSize number of actions in the group, to tell when a parameter applies to all of them.
+     */
+    internal fun mergeParam(uses: List<Pair<String, JsonObject>>, groupSize: Int): JsonObject {
+        val merged = mergeStructure(uses.map { it.second })
+        val typeConflict = uses.map { it.second["type"] }.distinct().size > 1
+        val byText = LinkedHashMap<String, MutableList<String>>()
+        uses.forEach { (action, def) -> byText.getOrPut(actionText(def, merged)) { mutableListOf() } += action }
+        val text = if (byText.size == 1) {
+            val (t, actions) = byText.entries.first()
+            val scope = if (actions.size == groupSize) "" else " [actions: ${actions.joinToString(", ")}]"
+            (t + scope).trim()
+        } else {
+            byText.entries.joinToString("\n") { (t, actions) -> "[${actions.joinToString(", ")}] $t".trimEnd() }
+        }
+        val description = if (typeConflict) "Type depends on the action, so any JSON value is accepted here.\n$text" else text
+        return JsonObject(merged - "description" + ("description" to JsonPrimitive(description)))
+    }
+
+    /**
+     * Structural union of several JSON schemas for the same value. Enums are united (kept only when
+     * every definition has one, since a definition without an enum accepts anything), `items` and
+     * `properties` are merged recursively, and any other key survives only when all definitions agree.
+     * Definitions whose `type` differs (including one with and one without a type) merge to `{}`.
+     */
+    private fun mergeStructure(defs: List<JsonObject>): JsonObject {
+        if (defs.size == 1) return defs[0]
+        if (defs.map { it["type"] }.distinct().size > 1) return JsonObject(emptyMap())
+        val out = LinkedHashMap<String, JsonElement>()
+        for (key in defs.flatMap { it.keys }.distinct()) {
+            val values = defs.map { it[key] }
+            when (key) {
+                "enum" -> if (values.all { it is JsonArray }) {
+                    out[key] = JsonArray(values.flatMap { it as JsonArray }.distinct())
+                }
+                "items" -> if (values.all { it is JsonObject }) {
+                    out[key] = mergeStructure(values.map { it as JsonObject })
+                }
+                "properties" -> if (values.all { it is JsonObject }) {
+                    val objects = values.map { it as JsonObject }
+                    out[key] = JsonObject(objects.flatMap { it.keys }.distinct().associateWith { name ->
+                        mergeStructure(objects.mapNotNull { it[name] as? JsonObject })
+                    })
+                }
+                else -> if (values.all { it != null && it == values[0] }) out[key] = values[0]!!
+            }
+        }
+        return JsonObject(out)
+    }
+
+    /** One action's description of a parameter, plus the constraints [merged] no longer states for it. */
+    private fun actionText(def: JsonObject, merged: JsonObject): String {
+        val base = (def["description"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+        val notes = mutableListOf<String>()
+        def["type"]?.let { if (merged["type"] != it) notes += "type: ${it.text()}" }
+        (def["enum"] as? JsonArray)?.let { if (merged["enum"] != it) notes += "one of: ${it.joinToString(", ") { v -> v.text() }}" }
+        val items = def["items"] as? JsonObject
+        (items?.get("enum") as? JsonArray)?.let {
+            if ((merged["items"] as? JsonObject)?.get("enum") != it) notes += "items one of: ${it.joinToString(", ") { v -> v.text() }}"
+        }
+        def.forEach { (k, v) ->
+            if (k !in STRUCTURAL_KEYS && merged[k] != v) notes += "$k: ${v.text()}"
+        }
+        return if (notes.isEmpty()) base else "$base (${notes.joinToString("; ")})".trim()
+    }
+
+    private val STRUCTURAL_KEYS = setOf("description", "type", "enum", "items", "properties")
+
+    private fun JsonElement.text(): String = (this as? JsonPrimitive)?.contentOrNull ?: toString()
 
     private fun describe(
         g: Group,
@@ -328,13 +397,24 @@ object ToolConsolidation {
         }
     }.trimEnd()
 
-    /** First sentence of a member description, capped, so the merged description stays compact. */
-    private fun summary(description: String?): String {
+    /**
+     * First sentence of a member description, capped, so the merged description stays compact.
+     * A sentence ends at `.`, `!` or `?` followed by whitespace or the end, unless the period closes
+     * an abbreviation such as `e.g.`.
+     */
+    internal fun summary(description: String?): String {
         val text = description.orEmpty().replace(Regex("\\s+"), " ").trim()
-        val end = Regex("[.!?](\\s|$)").find(text)?.range?.first ?: text.length
+        val end = SENTENCE_END.findAll(text).firstOrNull { m ->
+            val i = m.range.first
+            text[i] != '.' ||
+                text.substring(text.lastIndexOf(' ', i) + 1, i + 1).trimStart('(', '[', '"', '\'').lowercase() !in ABBREVIATIONS
+        }?.range?.first ?: text.length
         val sentence = text.substring(0, minOf(end + 1, text.length)).trim()
         return if (sentence.length <= 160) sentence else sentence.take(157).trimEnd() + "..."
     }
+
+    private val SENTENCE_END = Regex("[.!?](?=\\s|$)")
+    private val ABBREVIATIONS = setOf("e.g.", "i.e.", "vs.", "cf.", "approx.", "incl.", "a.k.a.", "resp.")
 
     private suspend fun ClientConnection.dispatch(
         g: Group,
@@ -345,7 +425,7 @@ object ToolConsolidation {
         val action = (args["action"] as? JsonPrimitive)?.contentOrNull
         val member = action?.let { members[it] }
         if (action == null || member == null) {
-            return error(buildJsonObject {
+            return toolJsonResult(buildJsonObject {
                 put("error", "unknown_action")
                 put("message", if (action == null) "Missing required parameter: action" else "Unknown action '$action' for tool '${g.tool}'")
                 putJsonArray("available") { g.actions.keys.forEach { add(it) } }
@@ -357,7 +437,7 @@ object ToolConsolidation {
             .map { renames[it] ?: it }
             .filter { args[it] == null || args[it] is JsonNull }
         if (missing.isNotEmpty()) {
-            return error(buildJsonObject {
+            return toolJsonResult(buildJsonObject {
                 put("error", "missing_parameter")
                 put("message", "action '$action' requires ${missing.joinToString(", ") { "'$it'" }}")
             })
@@ -372,6 +452,4 @@ object ToolConsolidation {
             CallToolRequest(CallToolRequestParams(name = member.tool.name, arguments = forwarded, meta = request.params.meta))
         )
     }
-
-    private fun error(body: JsonObject) = CallToolResult(content = listOf(TextContent(body.toString())), isError = true)
 }

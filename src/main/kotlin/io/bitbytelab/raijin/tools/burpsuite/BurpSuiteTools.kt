@@ -1,6 +1,9 @@
 package io.bitbytelab.raijin.tools.burpsuite
 
 import io.bitbytelab.raijin.bridge.BurpSuiteBridge
+import io.bitbytelab.raijin.core.EnumValidation
+import io.bitbytelab.raijin.core.asBooleanSafe
+import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
@@ -50,9 +53,7 @@ object BurpSuiteTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val paths = args["paths"]?.jsonArray
-                    ?.map { it.jsonPrimitive.content }
-                    ?: emptyList()
+                val paths = args["paths"].asStringList() ?: emptyList()
 
                 val configJson = bridge.exportProjectConfig(paths)
                 CallToolResult(content = listOf(TextContent(configJson)))
@@ -80,9 +81,7 @@ object BurpSuiteTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val paths = args["paths"]?.jsonArray
-                    ?.map { it.jsonPrimitive.content }
-                    ?: emptyList()
+                val paths = args["paths"].asStringList() ?: emptyList()
 
                 val configJson = bridge.exportUserConfig(paths)
                 CallToolResult(content = listOf(TextContent(configJson)))
@@ -167,7 +166,11 @@ object BurpSuiteTools {
                 "Pausing the engine suspends all background tasks (scans, crawls).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("state") { put("type", "string"); put("description", "Engine state: 'running' or 'paused'") }
+                    putJsonObject("state") {
+                        put("type", "string")
+                        putJsonArray("enum") { TASK_ENGINE_STATES.forEach { add(it) } }
+                        put("description", "Engine state")
+                    }
                 },
                 required = listOf("state")
             )
@@ -176,6 +179,7 @@ object BurpSuiteTools {
                 val args = request.params.arguments ?: emptyMap()
                 val state = args["state"]?.jsonPrimitive?.contentOrNull
                     ?: return@addTool toolError("Missing required parameter: state")
+                EnumValidation.error(state, TASK_ENGINE_STATES.toSet(), "state")?.let { return@addTool toolJsonResult(it) }
 
                 toolJsonResult(bridge.setTaskEngineState(state))
             } catch (e: Exception) {
@@ -215,7 +219,7 @@ object BurpSuiteTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val promptUser = args["prompt_user"]?.jsonPrimitive?.booleanOrNull ?: false
+                val promptUser = args["prompt_user"].asBooleanSafe() ?: false
 
                 destructiveBlocked("burp_shutdown", bridge.destructiveAllowed())?.let { return@addTool it }
                 toolJsonResult(bridge.shutdown(promptUser))
@@ -232,13 +236,12 @@ object BurpSuiteTools {
      */
     private fun destructiveBlocked(toolName: String, allowed: Boolean): CallToolResult? {
         if (io.bitbytelab.raijin.safety.ActionPolicy.isAllowed(toolName, allowed)) return null
-        return CallToolResult(
-            content = listOf(TextContent(buildJsonObject {
-                put("error", "Blocked: '$toolName' is a destructive action disabled by policy. " +
-                    "An operator must enable it by setting Burp preference mcp_allow_destructive=true.")
-                put("blocked_by", "mcp_allow_destructive")
-            }.toString())),
-            isError = true
-        )
+        return toolJsonResult(buildJsonObject {
+            put("error", "Blocked: '$toolName' is a destructive action disabled by policy. " +
+                "An operator must enable it by setting Burp preference mcp_allow_destructive=true.")
+            put("blocked_by", "mcp_allow_destructive")
+        })
     }
+
+    private val TASK_ENGINE_STATES = listOf("running", "paused")
 }

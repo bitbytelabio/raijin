@@ -2,9 +2,10 @@ package io.bitbytelab.raijin.tools.findings
 
 import io.bitbytelab.raijin.bridge.FindingsBridge
 import io.bitbytelab.raijin.bridge.Owasp2021
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.core.EnumValidation
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -14,6 +15,9 @@ import kotlinx.serialization.json.*
  * issues across a session for triage and reporting.
  */
 object FindingsTools {
+
+    private val SEVERITIES = listOf("critical", "high", "medium", "low", "info")
+
     fun register(server: Server, bridge: FindingsBridge) {
         server.addTool(
             name = "findings_add",
@@ -24,7 +28,11 @@ object FindingsTools {
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("type") { put("type", "string"); put("description", "Vulnerability type, e.g. xss, sqli, idor, ssrf, info_leak") }
-                    putJsonObject("severity") { put("type", "string"); put("description", "critical|high|medium|low|info (default info)") }
+                    putJsonObject("severity") {
+                        put("type", "string")
+                        putJsonArray("enum") { SEVERITIES.forEach { add(it) } }
+                        put("description", "Severity (default info)")
+                    }
                     putJsonObject("url") { put("type", "string"); put("description", "Affected URL") }
                     putJsonObject("location") { put("type", "string"); put("description", "Where it lives: param:name, header:name, body, path") }
                     putJsonObject("detail") { put("type", "string"); put("description", "Description of the issue") }
@@ -44,11 +52,13 @@ object FindingsTools {
         ) { request ->
             try {
                 val a = request.params.arguments ?: emptyMap()
-                val type = a["type"]?.jsonPrimitive?.contentOrNull ?: return@addTool err("Parameter 'type' is required")
-                val url = a["url"]?.jsonPrimitive?.contentOrNull ?: return@addTool err("Parameter 'url' is required")
+                val type = a["type"]?.jsonPrimitive?.contentOrNull ?: return@addTool toolError("Parameter 'type' is required")
+                val url = a["url"]?.jsonPrimitive?.contentOrNull ?: return@addTool toolError("Parameter 'url' is required")
+                val severity = a["severity"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() } ?: "info"
+                EnumValidation.error(severity, SEVERITIES.toSet(), "severity")?.let { return@addTool toolJsonResult(it) }
                 val result = bridge.add(
                     type,
-                    a["severity"]?.jsonPrimitive?.contentOrNull ?: "info",
+                    severity.trim().lowercase(),
                     url,
                     a["location"]?.jsonPrimitive?.contentOrNull ?: "",
                     a["detail"]?.jsonPrimitive?.contentOrNull ?: "",
@@ -60,9 +70,9 @@ object FindingsTools {
                     a["request"]?.jsonPrimitive?.contentOrNull ?: "",
                     a["response"]?.jsonPrimitive?.contentOrNull ?: ""
                 )
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(result)
             } catch (e: Exception) {
-                err(e.message ?: "Unknown error")
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -71,7 +81,11 @@ object FindingsTools {
             description = "List the recorded findings, optionally filtered by severity and/or type.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("severity") { put("type", "string"); put("description", "Filter by severity") }
+                    putJsonObject("severity") {
+                        put("type", "string")
+                        putJsonArray("enum") { SEVERITIES.forEach { add(it) } }
+                        put("description", "Filter by severity")
+                    }
                     putJsonObject("type") { put("type", "string"); put("description", "Filter by type") }
                 },
                 required = emptyList()
@@ -79,10 +93,11 @@ object FindingsTools {
         ) { request ->
             try {
                 val a = request.params.arguments ?: emptyMap()
-                val result = bridge.list(a["severity"]?.jsonPrimitive?.contentOrNull, a["type"]?.jsonPrimitive?.contentOrNull)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                val severity = a["severity"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+                EnumValidation.error(severity, SEVERITIES.toSet(), "severity")?.let { return@addTool toolJsonResult(it) }
+                toolJsonResult(bridge.list(severity, a["type"]?.jsonPrimitive?.contentOrNull))
             } catch (e: Exception) {
-                err(e.message ?: "Unknown error")
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -98,15 +113,11 @@ object FindingsTools {
         ) { request ->
             try {
                 val a = request.params.arguments ?: emptyMap()
-                val id = a["id"]?.jsonPrimitive?.contentOrNull ?: return@addTool err("Parameter 'id' is required")
-                val result = bridge.remove(id)
-                CallToolResult(content = listOf(TextContent(result.toString())), isError = result["error"] != null)
+                val id = a["id"]?.jsonPrimitive?.contentOrNull ?: return@addTool toolError("Parameter 'id' is required")
+                toolJsonResult(bridge.remove(id))
             } catch (e: Exception) {
-                err(e.message ?: "Unknown error")
+                toolError(e.message ?: "Unknown error")
             }
         }
     }
-
-    private fun err(msg: String): CallToolResult =
-        CallToolResult(content = listOf(TextContent(buildJsonObject { put("error", msg) }.toString())), isError = true)
 }

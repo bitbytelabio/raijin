@@ -1,6 +1,12 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.utilities.CompressionType
+import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import java.util.Base64
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -106,5 +112,41 @@ class UtilitiesBridgeTest {
     fun `isEchoedDecompression treats two empty arrays as echoed`() {
         // Defensive: empty in / empty out is a degenerate no-op, still an echo.
         assertEquals(true, UtilitiesBridge.isEchoedDecompression(ByteArray(0), ByteArray(0)))
+    }
+
+    // --- decodeSmartPure: fully_decoded flag ----------------------------------
+
+    private fun b64(s: String) = Base64.getEncoder().encodeToString(s.toByteArray(Charsets.UTF_8))
+
+    @Test
+    fun `decodeSmart reports fully_decoded true once every layer is decoded`() {
+        val plain = "{\"q\":\"a b\"}"
+        val r = UtilitiesBridge.decodeSmartPure(b64(b64(plain)), maxDepth = 10)
+        assertEquals(plain, r["decoded"]?.jsonPrimitive?.content)
+        assertEquals(2, r["layers"]?.jsonPrimitive?.int)
+        assertEquals(true, r["fully_decoded"]?.jsonPrimitive?.boolean)
+        assertEquals(listOf("base64", "base64"),
+            r["steps"]!!.jsonArray.map { it.jsonObject["encoding"]!!.jsonPrimitive.content })
+    }
+
+    @Test
+    fun `decodeSmart reports fully_decoded true for input with nothing to decode`() {
+        val r = UtilitiesBridge.decodeSmartPure("plain text!", maxDepth = 10)
+        assertEquals(0, r["layers"]?.jsonPrimitive?.int)
+        assertEquals(true, r["fully_decoded"]?.jsonPrimitive?.boolean)
+    }
+
+    @Test
+    fun `decodeSmart reports fully_decoded false when max_depth stops it early`() {
+        val r = UtilitiesBridge.decodeSmartPure(b64(b64("hello world")), maxDepth = 1)
+        assertEquals(1, r["layers"]?.jsonPrimitive?.int)
+        assertEquals(false, r["fully_decoded"]?.jsonPrimitive?.boolean)
+    }
+
+    @Test
+    fun `decodeSmart handles url encoded quotes, backslashes and newlines`() {
+        val r = UtilitiesBridge.decodeSmartPure("%22a%5Cb%0Ac%22", maxDepth = 10)
+        assertEquals("\"a\\b\nc\"", r["decoded"]?.jsonPrimitive?.content)
+        assertEquals(true, r["fully_decoded"]?.jsonPrimitive?.boolean)
     }
 }

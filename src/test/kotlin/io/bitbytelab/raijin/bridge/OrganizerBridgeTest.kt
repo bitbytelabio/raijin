@@ -1,5 +1,15 @@
 package io.bitbytelab.raijin.bridge
 
+import burp.api.montoya.MontoyaApi
+import burp.api.montoya.core.Annotations
+import burp.api.montoya.core.HighlightColor
+import burp.api.montoya.organizer.Organizer
+import burp.api.montoya.organizer.OrganizerItem
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import java.lang.reflect.Proxy
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -14,9 +24,7 @@ import kotlin.test.assertTrue
  *  - a negative `max_results` that used to leak the raw [IllegalArgumentException]
  *    thrown by [List.take].
  *
- * The item-reading path itself needs a live Montoya `OrganizerItem`, so it is not
- * exercised here; the defensive per-field reads are validated by construction in
- * the bridge (each accessor is wrapped in `runCatching`).
+ * The item-reading path runs against proxy stubs of the Montoya interfaces ([OrganizerBridgeItemsTest]).
  */
 class OrganizerBridgeTest {
 
@@ -51,5 +59,65 @@ class OrganizerBridgeTest {
         // Negative limits collapse to zero rather than throwing (mirrors the
         // guard that getItems applies before ever calling List.take).
         assertEquals(0, OrganizerBridge.effectiveReturnCount(available = 5, maxResults = -3))
+    }
+}
+
+private inline fun <reified T> stub(crossinline answer: (String) -> Any?): T =
+    Proxy.newProxyInstance(T::class.java.classLoader, arrayOf(T::class.java)) { _, m, _ -> answer(m.name) } as T
+
+class OrganizerBridgeItemsTest {
+
+    private fun item(id: Int, url: String, notes: String?, color: HighlightColor?): OrganizerItem {
+        val annotations = stub<Annotations> { name ->
+            when (name) {
+                "hasNotes" -> notes != null
+                "notes" -> notes
+                "hasHighlightColor" -> color != null
+                "highlightColor" -> color
+                else -> null
+            }
+        }
+        return stub<OrganizerItem> { name ->
+            when (name) {
+                "id" -> id
+                "url" -> url
+                "annotations" -> annotations
+                "hasResponse" -> false
+                else -> null
+            }
+        }
+    }
+
+    private fun api(items: List<OrganizerItem>): MontoyaApi {
+        val organizer = stub<Organizer> { name -> if (name == "items") items else null }
+        return stub<MontoyaApi> { name -> if (name == "organizer") organizer else null }
+    }
+
+    @Test
+    fun `getItems returns the id annotate needs plus notes and highlight`() {
+        val bridge = OrganizerBridge(api(listOf(
+            item(7, "https://a.test/x", "checked", HighlightColor.RED),
+            item(9, "https://b.test/y", null, null),
+        )))
+        val result = bridge.getItems(urlPrefix = "a.test", maxResults = 10)
+        assertEquals(2, result["total_items"]?.jsonPrimitive?.int)
+        val items = result.getValue("items").jsonArray
+        assertEquals(1, items.size)
+        val first = items[0].jsonObject
+        assertEquals(7, first["id"]?.jsonPrimitive?.int)
+        assertEquals("https://a.test/x", first["url"]?.jsonPrimitive?.content)
+        assertEquals("checked", first["notes"]?.jsonPrimitive?.content)
+        assertEquals("RED", first["highlight"]?.jsonPrimitive?.content)
+
+        val all = bridge.getItems(urlPrefix = null, maxResults = 10).getValue("items").jsonArray
+        val second = all[1].jsonObject
+        assertEquals(9, second["id"]?.jsonPrimitive?.int)
+        assertFalse("notes" in second || "highlight" in second)
+    }
+
+    @Test
+    fun `getItems rejects a negative limit with an error object`() {
+        val result = OrganizerBridge(api(emptyList())).getItems(urlPrefix = null, maxResults = -1)
+        assertTrue(result["error"]?.jsonPrimitive?.content?.contains("max_results") == true)
     }
 }

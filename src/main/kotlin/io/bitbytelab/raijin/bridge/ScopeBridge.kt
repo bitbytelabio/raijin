@@ -48,7 +48,7 @@ class ScopeBridge(private val api: MontoyaApi, private val eventBus: EventBus) {
         } catch (e: Exception) {
             buildJsonObject {
                 put("status", "error")
-                put("message", e.message ?: "Failed to export scope configuration")
+                put("error", e.message ?: "Failed to export scope configuration")
             }
         }
     }

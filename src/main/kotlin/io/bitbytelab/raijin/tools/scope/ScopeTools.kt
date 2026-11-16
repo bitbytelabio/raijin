@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.tools.scope
 
 import io.bitbytelab.raijin.bridge.ScopeBridge
+import io.bitbytelab.raijin.core.asBoundedInt
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
@@ -124,8 +125,15 @@ object ScopeTools {
                 "then reading it back to confirm Burp actually accepted the change.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("list") { put("type", "string"); put("description", "'include' or 'exclude'") }
-                    putJsonObject("index") { put("type", "integer"); put("description", "Index of the rule to remove, from scope_list") }
+                    putJsonObject("list") {
+                        put("type", "string")
+                        putJsonArray("enum") { add("include"); add("exclude") }
+                        put("description", "Which rule list the index refers to")
+                    }
+                    putJsonObject("index") {
+                        put("type", "integer"); put("minimum", 0)
+                        put("description", "Index of the rule to remove, from scope_list")
+                    }
                 },
                 required = listOf("list", "index")
             )
@@ -134,7 +142,8 @@ object ScopeTools {
                 val args = request.params.arguments ?: emptyMap()
                 val list = args["list"]?.jsonPrimitive?.contentOrNull
                     ?: return@addTool toolError("Missing required parameter: list")
-                val index = args["index"]?.jsonPrimitive?.intOrNull
+                val index = args["index"].asBoundedInt("index", 0, Int.MAX_VALUE)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid index") }
                     ?: return@addTool toolError("Missing required parameter: index")
                 toolJsonResult(bridge.remove(list, index))
             } catch (e: Exception) {

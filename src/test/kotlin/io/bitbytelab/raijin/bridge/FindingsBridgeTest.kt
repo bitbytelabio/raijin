@@ -81,4 +81,32 @@ class FindingsBridgeTest {
         assertEquals("A01:2021 - Broken Access Control", b.list(null, null)["findings"]!!
             .jsonArray[0].jsonObject["owasp_category"]?.jsonPrimitive?.contentOrNull)
     }
+
+    @Test
+    fun `remove notifies the durable store listeners and drops the finding`() {
+        val sm = StateManager()
+        val removed = mutableListOf<String>()
+        sm.findingsRemoveListeners.add { removed += it }
+        val b = FindingsBridge(sm)
+        val id = b.add("xss", "high", "http://x/p", "param:q", "", "")["id"]!!.jsonPrimitive.content
+
+        val r = b.remove(id)
+        assertEquals(true, r["removed"]?.jsonPrimitive?.boolean)
+        assertEquals(listOf(id), removed)
+        assertEquals(0, b.list(null, null)["count"]?.jsonPrimitive?.int)
+
+        val missing = b.remove(id)
+        assertEquals(false, missing["removed"]?.jsonPrimitive?.boolean)
+        assertEquals(true, missing["error"] != null)
+        assertEquals(listOf(id), removed, "a failed remove must not touch the store")
+    }
+
+    @Test
+    fun `cvss_score rejects NaN and infinity`() {
+        val b = FindingsBridge(StateManager())
+        listOf("NaN", "Infinity", "-0.1").forEach { score ->
+            assertEquals(true, b.add("xss", "high", "http://x/$score", "", "", "", cvssScore = score)["error"] != null, score)
+        }
+        assertEquals(0, b.list(null, null)["count"]?.jsonPrimitive?.int)
+    }
 }

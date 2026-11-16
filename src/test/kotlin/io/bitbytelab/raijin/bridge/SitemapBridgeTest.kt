@@ -1,7 +1,15 @@
 package io.bitbytelab.raijin.bridge
 
+import burp.api.montoya.MontoyaApi
+import burp.api.montoya.http.message.HttpRequestResponse
+import burp.api.montoya.http.message.requests.HttpRequest
+import burp.api.montoya.sitemap.SiteMap
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonPrimitive
+import java.lang.reflect.Proxy
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
+import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
@@ -62,5 +70,59 @@ class SitemapBridgeTest {
             request.toByteArray(Charsets.UTF_8),
             SitemapBridge.encodeRequestBytes(request)
         )
+    }
+}
+
+/** [SitemapBridge.query] filtering against proxy stubs of the Montoya site map. */
+class SitemapBridgeQueryTest {
+
+    private inline fun <reified T> stub(crossinline answer: (String) -> Any?): T =
+        Proxy.newProxyInstance(T::class.java.classLoader, arrayOf(T::class.java)) { _, m, _ -> answer(m.name) } as T
+
+    private fun bridge(): SitemapBridge {
+        val request = stub<HttpRequest> { name ->
+            when (name) {
+                "url" -> "https://t.test/a"
+                "method" -> "GET"
+                "toString" -> "GET /a HTTP/1.1\r\nHost: t.test\r\nX-Secret: token123\r\n\r\n"
+                else -> null
+            }
+        }
+        val entry = stub<HttpRequestResponse> { name ->
+            when (name) {
+                "request" -> request
+                "hasResponse" -> false
+                else -> null
+            }
+        }
+        val siteMap = stub<SiteMap> { name -> if (name == "requestResponses") listOf(entry) else null }
+        return SitemapBridge(stub<MontoyaApi> { name -> if (name == "siteMap") siteMap else null })
+    }
+
+    private fun matched(searchIn: String?, pattern: String) = bridge().query(
+        urlPrefix = null, searchPattern = pattern, maxResults = 10,
+        includeRequest = false, includeResponse = false, searchIn = searchIn,
+    )["matched"]?.jsonPrimitive?.int
+
+    @Test
+    fun `search_pattern matches the URL by default and the request only when asked`() {
+        assertEquals(1, matched(null, "t\\.test/a"))
+        assertEquals(0, matched(null, "token123"))
+        assertEquals(1, matched("request", "token123"))
+        assertEquals(1, matched("all", "token123"))
+    }
+
+    @Test
+    fun `invalid regexes are reported as errors instead of thrown`() {
+        val bad = bridge().query(
+            urlPrefix = null, searchPattern = "(", maxResults = 10,
+            includeRequest = false, includeResponse = false,
+        )
+        assertTrue(bad["error"]?.jsonPrimitive?.content?.startsWith("Invalid search_pattern regex") == true, bad.toString())
+        val badExclude = bridge().query(
+            urlPrefix = null, searchPattern = null, maxResults = 10,
+            includeRequest = false, includeResponse = false, excludePattern = "[",
+        )
+        assertTrue(badExclude["error"]?.jsonPrimitive?.content?.startsWith("Invalid exclude_pattern regex") == true)
     }
 }

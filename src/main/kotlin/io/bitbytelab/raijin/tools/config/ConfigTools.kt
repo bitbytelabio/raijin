@@ -2,6 +2,9 @@ package io.bitbytelab.raijin.tools.config
 
 import io.bitbytelab.raijin.bridge.BurpSuiteBridge
 import io.bitbytelab.raijin.bridge.ConfigBridge
+import io.bitbytelab.raijin.core.EnumValidation
+import io.bitbytelab.raijin.core.asBooleanSafe
+import io.bitbytelab.raijin.core.asBoundedInt
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
@@ -18,6 +21,13 @@ import kotlinx.serialization.json.*
  * with the ToolRegistry call signature.
  */
 object ConfigTools {
+
+    /** Burp's `rule_type` values for proxy match/replace rules. */
+    private val MATCH_REPLACE_TYPES = listOf(
+        "request_header", "request_body", "request_param_name", "request_param_value",
+        "request_first_line", "response_header", "response_body",
+    )
+    private val UPSTREAM_PROXY_TYPES = listOf("HTTP", "SOCKS4", "SOCKS5")
 
     fun register(server: Server, burpSuiteBridge: BurpSuiteBridge) {
 
@@ -59,7 +69,10 @@ object ConfigTools {
                     putJsonObject("interface") { put("type", "string"); put("description", "Interface binding, e.g. '127.0.0.1:8081'") }
                     putJsonObject("tls") { put("type", "boolean"); put("description", "Enable TLS termination (default false)") }
                     putJsonObject("redirect_host") { put("type", "string"); put("description", "Hostname to redirect to (optional)") }
-                    putJsonObject("redirect_port") { put("type", "integer"); put("description", "Port to redirect to (optional)") }
+                    putJsonObject("redirect_port") {
+                        put("type", "integer"); put("minimum", 1); put("maximum", 65535)
+                        put("description", "Port to redirect to (optional, default 80 when redirect_host is set)")
+                    }
                     putJsonObject("certificate") { put("type", "string"); put("description", "Certificate mode, e.g. 'per_host', 'self_signed' (optional)") }
                 },
                 required = listOf("interface")
@@ -69,9 +82,10 @@ object ConfigTools {
                 val args = request.params.arguments ?: emptyMap()
                 val listenerInterface = args["interface"]?.jsonPrimitive?.contentOrNull
                     ?: return@addTool toolError("Missing required parameter: interface")
-                val tls = args["tls"]?.jsonPrimitive?.booleanOrNull ?: false
+                val tls = args["tls"].asBooleanSafe() ?: false
                 val redirectHost = args["redirect_host"]?.jsonPrimitive?.contentOrNull
-                val redirectPort = args["redirect_port"]?.jsonPrimitive?.intOrNull
+                val redirectPort = args["redirect_port"].asBoundedInt("redirect_port", 1, 65535)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid redirect_port") }
                 val certificate = args["certificate"]?.jsonPrimitive?.contentOrNull
 
                 toolJsonResult(bridge.addProxyListener(listenerInterface, tls, redirectHost, redirectPort, certificate))
@@ -114,7 +128,11 @@ object ConfigTools {
                 "enabled (boolean, whether the rule is active; defaults to true).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("type") { put("type", "string"); put("description", "Rule type, e.g. 'request_header', 'response_body'") }
+                    putJsonObject("type") {
+                        put("type", "string")
+                        putJsonArray("enum") { MATCH_REPLACE_TYPES.forEach { add(it) } }
+                        put("description", "Rule type: which part of the message the rule rewrites")
+                    }
                     putJsonObject("match") { put("type", "string"); put("description", "Text or regex to match") }
                     putJsonObject("replace") { put("type", "string"); put("description", "Replacement text") }
                     putJsonObject("comment") { put("type", "string"); put("description", "Rule description (optional)") }
@@ -127,14 +145,15 @@ object ConfigTools {
                 val args = request.params.arguments ?: emptyMap()
                 val type = args["type"]?.jsonPrimitive?.contentOrNull
                     ?: return@addTool toolError("Missing required parameter: type")
+                EnumValidation.error(type, MATCH_REPLACE_TYPES.toSet(), "type")?.let { return@addTool toolJsonResult(it) }
                 val match = args["match"]?.jsonPrimitive?.contentOrNull
                     ?: return@addTool toolError("Missing required parameter: match")
                 val replace = args["replace"]?.jsonPrimitive?.contentOrNull
                     ?: return@addTool toolError("Missing required parameter: replace")
                 val comment = args["comment"]?.jsonPrimitive?.contentOrNull
-                val enabled = args["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
+                val enabled = args["enabled"].asBooleanSafe() ?: true
 
-                toolJsonResult(bridge.addMatchReplaceRule(type, match, replace, comment, enabled))
+                toolJsonResult(bridge.addMatchReplaceRule(type.trim().lowercase(), match, replace, comment, enabled))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -166,14 +185,18 @@ object ConfigTools {
                 "Parameters: rule_index (number, zero-based index of the rule to remove).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("rule_index") { put("type", "integer"); put("description", "Zero-based index of the rule to remove") }
+                    putJsonObject("rule_index") {
+                        put("type", "integer"); put("minimum", 0)
+                        put("description", "Zero-based index of the rule to remove")
+                    }
                 },
                 required = listOf("rule_index")
             )
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val ruleIndex = args["rule_index"]?.jsonPrimitive?.intOrNull
+                val ruleIndex = args["rule_index"].asBoundedInt("rule_index", 0, Int.MAX_VALUE)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid rule_index") }
                     ?: return@addTool toolError("Missing required parameter: rule_index")
                 toolJsonResult(bridge.removeMatchReplaceRule(ruleIndex))
             } catch (e: Exception) {
@@ -195,8 +218,15 @@ object ConfigTools {
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("host") { put("type", "string"); put("description", "Upstream proxy hostname") }
-                    putJsonObject("port") { put("type", "integer"); put("description", "Upstream proxy port") }
-                    putJsonObject("type") { put("type", "string"); put("description", "Proxy type: 'HTTP', 'SOCKS4', 'SOCKS5' (default 'HTTP')") }
+                    putJsonObject("port") {
+                        put("type", "integer"); put("minimum", 1); put("maximum", 65535)
+                        put("description", "Upstream proxy port")
+                    }
+                    putJsonObject("type") {
+                        put("type", "string")
+                        putJsonArray("enum") { UPSTREAM_PROXY_TYPES.forEach { add(it) } }
+                        put("description", "Proxy type (default 'HTTP')")
+                    }
                     putJsonObject("auth_user") { put("type", "string"); put("description", "Proxy authentication username (optional)") }
                     putJsonObject("auth_pass") { put("type", "string"); put("description", "Proxy authentication password (optional)") }
                     putJsonObject("destination_host") { put("type", "string"); put("description", "Destination host filter pattern (default '*')") }
@@ -208,9 +238,11 @@ object ConfigTools {
                 val args = request.params.arguments ?: emptyMap()
                 val host = args["host"]?.jsonPrimitive?.contentOrNull
                     ?: return@addTool toolError("Missing required parameter: host")
-                val port = args["port"]?.jsonPrimitive?.intOrNull
+                val port = args["port"].asBoundedInt("port", 1, 65535)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid port") }
                     ?: return@addTool toolError("Missing required parameter: port")
                 val proxyType = args["type"]?.jsonPrimitive?.contentOrNull ?: "HTTP"
+                EnumValidation.error(proxyType, UPSTREAM_PROXY_TYPES.toSet(), "type")?.let { return@addTool toolJsonResult(it) }
                 val authUser = args["auth_user"]?.jsonPrimitive?.contentOrNull
                 val authPass = args["auth_pass"]?.jsonPrimitive?.contentOrNull
                 val destinationHost = args["destination_host"]?.jsonPrimitive?.contentOrNull

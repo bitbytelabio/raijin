@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.tools.logging
 
 import io.bitbytelab.raijin.bridge.LoggingBridge
+import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
@@ -8,6 +9,9 @@ import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
 object LoggingTools {
+
+    private val MESSAGE_LEVELS = listOf("output", "error")
+    private val EVENT_LEVELS = listOf("debug", "info", "error", "critical")
 
     fun register(server: Server, bridge: LoggingBridge) {
 
@@ -21,7 +25,11 @@ object LoggingTools {
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("message") { put("type", "string"); put("description", "The text to log") }
-                    putJsonObject("level") { put("type", "string"); put("description", "'output' for normal output or 'error' for error stream, default 'output'") }
+                    putJsonObject("level") {
+                        put("type", "string")
+                        putJsonArray("enum") { MESSAGE_LEVELS.forEach { add(it) } }
+                        put("description", "'output' for normal output or 'error' for error stream, default 'output'")
+                    }
                 },
                 required = listOf("message")
             )
@@ -31,6 +39,7 @@ object LoggingTools {
                 val message = args["message"]?.jsonPrimitive?.contentOrNull
                     ?: return@addTool toolError("Missing required parameter: message")
                 val level = args["level"]?.jsonPrimitive?.contentOrNull ?: "output"
+                EnumValidation.error(level, MESSAGE_LEVELS.toSet(), "level")?.let { return@addTool toolJsonResult(it) }
 
                 toolJsonResult(bridge.logMessage(message, level))
             } catch (e: Exception) {
@@ -48,7 +57,11 @@ object LoggingTools {
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("message") { put("type", "string"); put("description", "The event message") }
-                    putJsonObject("level") { put("type", "string"); put("description", "One of 'debug', 'info', 'error', 'critical', default 'info'") }
+                    putJsonObject("level") {
+                        put("type", "string")
+                        putJsonArray("enum") { EVENT_LEVELS.forEach { add(it) } }
+                        put("description", "One of 'debug', 'info', 'error', 'critical', default 'info'")
+                    }
                 },
                 required = listOf("message")
             )
@@ -59,10 +72,7 @@ object LoggingTools {
                     ?: return@addTool toolError("Missing required parameter: message")
                 val level = args["level"]?.jsonPrimitive?.contentOrNull ?: "info"
 
-                val validLevels = listOf("debug", "info", "error", "critical")
-                if (level.lowercase() !in validLevels) {
-                    return@addTool toolError("Invalid level: $level. Valid levels: ${validLevels.joinToString(", ")}")
-                }
+                EnumValidation.error(level, EVENT_LEVELS.toSet(), "level")?.let { return@addTool toolJsonResult(it) }
 
                 toolJsonResult(bridge.logEvent(message, level))
             } catch (e: Exception) {

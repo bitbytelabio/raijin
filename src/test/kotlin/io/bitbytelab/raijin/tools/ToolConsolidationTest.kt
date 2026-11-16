@@ -1,8 +1,36 @@
 package io.bitbytelab.raijin.tools
 
+import burp.api.montoya.MontoyaApi
+import io.bitbytelab.raijin.bridge.AiBridge
+import io.bitbytelab.raijin.bridge.BurpSuiteBridge
+import io.bitbytelab.raijin.bridge.ComparerBridge
 import io.bitbytelab.raijin.bridge.DecoderBridge
+import io.bitbytelab.raijin.bridge.FindingsBridge
+import io.bitbytelab.raijin.bridge.LoggingBridge
+import io.bitbytelab.raijin.bridge.OrganizerBridge
+import io.bitbytelab.raijin.bridge.PersistenceBridge
+import io.bitbytelab.raijin.bridge.ProjectBridge
+import io.bitbytelab.raijin.bridge.RepeaterBridge
+import io.bitbytelab.raijin.bridge.ScopeBridge
+import io.bitbytelab.raijin.bridge.SitemapBridge
+import io.bitbytelab.raijin.bridge.UtilitiesBridge
+import io.bitbytelab.raijin.events.EventBus
+import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.testClientConnection
+import io.bitbytelab.raijin.tools.ai.AiTools
+import io.bitbytelab.raijin.tools.burpsuite.BurpSuiteTools
+import io.bitbytelab.raijin.tools.comparer.ComparerTools
+import io.bitbytelab.raijin.tools.config.ConfigTools
 import io.bitbytelab.raijin.tools.decoder.DecoderTools
+import io.bitbytelab.raijin.tools.findings.FindingsTools
+import io.bitbytelab.raijin.tools.logging.LoggingTools
+import io.bitbytelab.raijin.tools.organizer.OrganizerTools
+import io.bitbytelab.raijin.tools.persistence.PersistenceTools
+import io.bitbytelab.raijin.tools.project.ProjectTools
+import io.bitbytelab.raijin.tools.repeater.RepeaterTools
+import io.bitbytelab.raijin.tools.scope.ScopeTools
+import io.bitbytelab.raijin.tools.sitemap.SitemapTools
+import io.bitbytelab.raijin.tools.utilities.UtilitiesTools
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
@@ -15,9 +43,12 @@ import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.*
 import java.io.File
+import java.lang.reflect.Proxy
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class ToolConsolidationTest {
@@ -214,5 +245,163 @@ class ToolConsolidationTest {
     fun `legacyName maps tool and action back to the member`() {
         assertEquals("burp_shutdown", ToolConsolidation.legacyName("burp", "shutdown"))
         assertEquals(null, ToolConsolidation.legacyName("http_fuzz", null))
+    }
+
+    /** Montoya API whose every call returns null: enough to construct bridges and register their tools. */
+    private fun nullApi(): MontoyaApi =
+        Proxy.newProxyInstance(MontoyaApi::class.java.classLoader, arrayOf(MontoyaApi::class.java)) { _, _, _ -> null } as MontoyaApi
+
+    /** Registers the real tools whose bridges need no live Burp, so their actual schemas get merged. */
+    private fun registerRealTools(s: Server) {
+        val api = nullApi()
+        UtilitiesTools.register(s, UtilitiesBridge(api))
+        LoggingTools.register(s, LoggingBridge(api))
+        ConfigTools.register(s, BurpSuiteBridge(api))
+        BurpSuiteTools.register(s, BurpSuiteBridge(api))
+        ProjectTools.register(s, ProjectBridge(api))
+        PersistenceTools.register(s, PersistenceBridge(api))
+        SitemapTools.register(s, SitemapBridge(api))
+        ScopeTools.register(s, ScopeBridge(api, EventBus()))
+        OrganizerTools.register(s, OrganizerBridge(api))
+        FindingsTools.register(s, FindingsBridge(StateManager()))
+        AiTools.register(s, AiBridge(api))
+        RepeaterTools.register(s, RepeaterBridge(api))
+        ComparerTools.register(s, ComparerBridge(api))
+        DecoderTools.register(s, DecoderBridge { })
+    }
+
+    private fun consolidatedWithRealTools(): Pair<Server, Server> {
+        val legacy = server()
+        registerRealTools(legacy)
+        ToolConsolidation.GROUPS.flatMap { it.actions.values }.filter { it !in legacy.tools }.forEach { fake(legacy, it) }
+        ToolConsolidation.KEEP.filter { it !in legacy.tools }.forEach { fake(legacy, it) }
+        val target = server()
+        ToolConsolidation.apply(legacy, target)
+        return legacy to target
+    }
+
+    private fun JsonObject.str(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull
+
+    @Test
+    fun `merged group schemas keep every action's parameter description and enum values`() {
+        val (legacy, target) = consolidatedWithRealTools()
+        for (g in ToolConsolidation.GROUPS) {
+            val props = target.tools.getValue(g.tool).tool.inputSchema.properties!!
+            assertEquals(g.actions.keys.toList(),
+                props.getValue("action").jsonObject.getValue("enum").jsonArray.map { it.jsonPrimitive.content })
+            for ((action, member) in g.actions) {
+                val memberProps = legacy.tools.getValue(member).tool.inputSchema.properties ?: continue
+                val sameName = memberProps.keys.associateWith { g.renames[action]?.get(it) ?: it }
+                for ((name, rawDef) in memberProps) {
+                    val pub = sameName.getValue(name)
+                    assertTrue(pub != "action", "${g.tool}.$action publishes '$name' as 'action'")
+                    val def = rawDef.jsonObject
+                    val merged = props.getValue(pub).jsonObject
+                    val desc = merged.str("description").orEmpty()
+                    val own = def.str("description").orEmpty().trim()
+                    assertTrue(own in desc, "${g.tool}.$pub lost $action's description '$own': $desc")
+                    val mergedEnum = merged["enum"]?.jsonArray
+                    def["enum"]?.jsonArray?.forEach { v ->
+                        assertTrue(mergedEnum?.contains(v) == true || v.jsonPrimitive.content in desc,
+                            "${g.tool}.$pub lost $action's enum value $v")
+                    }
+                    if (mergedEnum != null) {
+                        assertNotNull(def["enum"], "${g.tool}.$pub enum would reject values $action accepts")
+                    }
+                    def["type"]?.let { t -> merged["type"]?.let { assertEquals(t, it, "${g.tool}.$pub type") } }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `shared closed parameters unite their enums and keep per-action allowed values`() {
+        val (_, target) = consolidatedWithRealTools()
+        fun param(tool: String, name: String) =
+            target.tools.getValue(tool).tool.inputSchema.properties!!.getValue(name).jsonObject
+        fun enumOf(p: JsonObject) = p.getValue("enum").jsonArray.map { it.jsonPrimitive.content }.toSet()
+
+        val algorithm = param("util", "algorithm")
+        assertEquals(setOf("MD5", "SHA_1", "SHA_256", "SHA_384", "SHA_512", "GZIP", "DEFLATE", "BROTLI"), enumOf(algorithm))
+        val algDesc = algorithm.str("description")!!
+        assertTrue("[hash]" in algDesc && "[compress]" in algDesc && "[decompress]" in algDesc, algDesc)
+
+        val level = param("log", "level")
+        assertEquals(setOf("output", "error", "debug", "info", "critical"), enumOf(level))
+        assertTrue("[message]" in level.str("description")!! && "[event]" in level.str("description")!!)
+
+        val type = param("config", "type")
+        assertTrue(setOf("request_header", "response_body", "HTTP", "SOCKS5").all { it in enumOf(type) })
+        assertTrue("[match_replace_add]" in type.str("description")!! && "[upstream_proxy_set]" in type.str("description")!!)
+
+        val data = param("util", "data")
+        assertEquals("string", data.str("type"))
+        assertTrue("Base64-encoded compressed data" in data.str("description")!!)
+        assertTrue("The URL-encoded string to decode" in data.str("description")!!)
+    }
+
+    @Test
+    fun `mergeParam keeps a free-form action's values and every mode of an enum action`() {
+        val jwtModes = listOf(
+            "analyze", "forge_none", "alg_confusion", "crack", "sign", "sign_key", "verify",
+            "encrypt", "decrypt", "embed_jwk", "empty_hmac", "psychic", "header_url",
+        )
+        val graphql = buildJsonObject { put("type", "string"); put("description", "probe (default) | query_templates | poi_scan") }
+        val jwt = buildJsonObject {
+            put("type", "string")
+            putJsonArray("enum") { jwtModes.forEach { add(it) } }
+            put("description", "JWT operation (default analyze)")
+        }
+        val merged = ToolConsolidation.mergeParam(listOf("graphql" to graphql, "jwt" to jwt), groupSize = 6)
+
+        assertNull(merged["enum"], "graphql accepts values outside jwt's enum")
+        assertEquals("string", merged.str("type"))
+        val desc = merged.str("description")!!
+        assertTrue("[graphql] probe (default) | query_templates | poi_scan" in desc, desc)
+        assertTrue("[jwt] JWT operation (default analyze)" in desc, desc)
+        jwtModes.forEach { assertTrue(it in desc, "mode $it missing: $desc") }
+    }
+
+    @Test
+    fun `mergeParam unites enums, keeps agreed keys and drops conflicting types`() {
+        val a = buildJsonObject { put("type", "string"); putJsonArray("enum") { add("x"); add("y") }; put("description", "first") }
+        val b = buildJsonObject { put("type", "string"); putJsonArray("enum") { add("y"); add("z") }; put("description", "second") }
+        val united = ToolConsolidation.mergeParam(listOf("a" to a, "b" to b), groupSize = 3)
+        assertEquals(listOf("x", "y", "z"), united.getValue("enum").jsonArray.map { it.jsonPrimitive.content })
+        assertTrue("[a] first (one of: x, y)" in united.str("description")!!, united.toString())
+        assertTrue("[b] second (one of: y, z)" in united.str("description")!!, united.toString())
+
+        val same = buildJsonObject { put("type", "integer"); put("minimum", 1); put("description", "count") }
+        val shared = ToolConsolidation.mergeParam(listOf("a" to same, "b" to same), groupSize = 3)
+        assertEquals(1, shared.getValue("minimum").jsonPrimitive.int)
+        assertEquals("count [actions: a, b]", shared.str("description"))
+        assertEquals("count", ToolConsolidation.mergeParam(listOf("a" to same, "b" to same), groupSize = 2).str("description"))
+
+        val scalar = buildJsonObject { put("type", "string"); put("description", "one item") }
+        val list = buildJsonObject { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "many items") }
+        val conflict = ToolConsolidation.mergeParam(listOf("a" to scalar, "b" to list), groupSize = 2)
+        assertNull(conflict["type"])
+        assertNull(conflict["items"])
+        val desc = conflict.str("description")!!
+        assertTrue("any JSON value" in desc && "one item (type: string)" in desc && "many items (type: array)" in desc, desc)
+
+        val d1 = buildJsonObject { put("type", "integer"); put("default", 10); put("description", "depth") }
+        val d2 = buildJsonObject { put("type", "integer"); put("default", 5); put("description", "depth") }
+        val defaults = ToolConsolidation.mergeParam(listOf("a" to d1, "b" to d2), groupSize = 2)
+        assertNull(defaults["default"])
+        assertTrue("[a] depth (default: 10)" in defaults.str("description")!! && "[b] depth (default: 5)" in defaults.str("description")!!)
+    }
+
+    @Test
+    fun `summary does not cut at abbreviations`() {
+        assertEquals("Send it to a tool (e.g. Repeater) for replay.",
+            ToolConsolidation.summary("Send it to a tool (e.g. Repeater) for replay. More text."))
+        assertEquals("Pick an encoding, i.e. base64 or hex, and decode.",
+            ToolConsolidation.summary("Pick an encoding, i.e. base64 or hex, and decode. Then stop."))
+        assertEquals("Does it.", ToolConsolidation.summary("Does it. Next sentence."))
+        assertEquals("Version 1.2 is fine!", ToolConsolidation.summary("Version 1.2 is fine! Really."))
+        assertEquals("No terminator", ToolConsolidation.summary("No terminator"))
+        val long = "word ".repeat(60)
+        assertTrue(ToolConsolidation.summary(long).endsWith("...") && ToolConsolidation.summary(long).length == 160)
     }
 }

@@ -73,7 +73,7 @@ class SitemapBridge(private val api: MontoyaApi) {
                 return buildJsonObject { put("error", "Invalid exclude_pattern regex: $err") }
             }
         }
-        val targets = ProxyHistorySearch.targets(searchIn)
+        val targets = ProxyHistorySearch.targets(searchIn?.takeIf { it.isNotBlank() } ?: "url")
         if (searchPattern != null) {
             SafeRegex.validate(searchPattern, ignoreCase = true)?.let { err ->
                 return buildJsonObject { put("error", "Invalid search_pattern regex: $err") }
