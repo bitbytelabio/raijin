@@ -14,7 +14,8 @@ import io.bitbytelab.raijin.state.ProxyRule
  *
  * The edits apply in a fixed order: remove header, add header, replace header, set header, body
  * regex, then the method and the path (request rules) or the status code (response rules). Header
- * names are compared ignoring case.
+ * names are compared ignoring case, and a remove, replace or set edit reaches every occurrence
+ * ([HeaderModifier]).
  */
 internal object ProxyRuleEdits {
 
@@ -95,15 +96,12 @@ internal object ProxyRuleEdits {
     /** [request] with every modification of [rule]; the original is not changed. */
     fun applyTo(rule: ProxyRule, request: HttpRequest): HttpRequest {
         var modified = request
-        rule.modifyRemoveHeader?.let { modified = removeHeader(modified, headerName(it)) }
+        rule.modifyRemoveHeader?.let { modified = HeaderModifier.remove(modified, headerName(it)) }
         rule.modifyAddHeader?.let { line ->
             parseHeaderLine(line)?.let { (name, value) -> modified = modified.withAddedHeader(name, value) }
         }
-        rule.modifyReplaceHeader?.forEach { (name, value) ->
-            val key = headerName(name)
-            if (count(modified.headers().map { it.name() }, key) > 0) modified = setHeader(modified, key, value)
-        }
-        rule.modifySetHeader?.forEach { (name, value) -> modified = setHeader(modified, headerName(name), value) }
+        rule.modifyReplaceHeader?.forEach { (name, value) -> modified = HeaderModifier.replace(modified, headerName(name), value) }
+        rule.modifySetHeader?.forEach { (name, value) -> modified = HeaderModifier.set(modified, headerName(name), value) }
         if (rule.modifyBodyRegex != null) replacedBody(rule, modified.bodyToString())?.let { modified = modified.withBody(it) }
         rule.modifyMethod?.let { modified = modified.withMethod(it) }
         if (rule.modifyPath != null) rewrittenPath(rule, modified.path())?.let { modified = modified.withPath(it) }
@@ -113,60 +111,16 @@ internal object ProxyRuleEdits {
     /** [response] with every modification of [rule]; the original is not changed. */
     fun applyTo(rule: ProxyRule, response: HttpResponse): HttpResponse {
         var modified = response
-        rule.modifyRemoveHeader?.let { modified = removeHeader(modified, headerName(it)) }
+        rule.modifyRemoveHeader?.let { modified = HeaderModifier.remove(modified, headerName(it)) }
         rule.modifyAddHeader?.let { line ->
             parseHeaderLine(line)?.let { (name, value) -> modified = modified.withAddedHeader(name, value) }
         }
-        rule.modifyReplaceHeader?.forEach { (name, value) ->
-            val key = headerName(name)
-            if (count(modified.headers().map { it.name() }, key) > 0) modified = setHeader(modified, key, value)
-        }
-        rule.modifySetHeader?.forEach { (name, value) -> modified = setHeader(modified, headerName(name), value) }
+        rule.modifyReplaceHeader?.forEach { (name, value) -> modified = HeaderModifier.replace(modified, headerName(name), value) }
+        rule.modifySetHeader?.forEach { (name, value) -> modified = HeaderModifier.set(modified, headerName(name), value) }
         if (rule.modifyBodyRegex != null) replacedBody(rule, modified.bodyToString())?.let { modified = modified.withBody(it) }
         rule.modifyStatus?.let { modified = modified.withStatusCode(it.toShort()) }
         return modified
     }
-
-    /**
-     * [request] with exactly one [name] header carrying [value]: a single existing one is updated
-     * in place, none is added, and several are replaced by one, so the header is never sent twice.
-     */
-    fun setHeader(request: HttpRequest, name: String, value: String): HttpRequest {
-        val existing = request.headers().map { it.name() }.filter { it.equals(name, ignoreCase = true) }
-        return when (existing.size) {
-            0 -> request.withAddedHeader(name, value)
-            1 -> request.withUpdatedHeader(existing.single(), value)
-            else -> removeHeader(request, name).withAddedHeader(name, value)
-        }
-    }
-
-    /** [setHeader] for a response. */
-    fun setHeader(response: HttpResponse, name: String, value: String): HttpResponse {
-        val existing = response.headers().map { it.name() }.filter { it.equals(name, ignoreCase = true) }
-        return when (existing.size) {
-            0 -> response.withAddedHeader(name, value)
-            1 -> response.withUpdatedHeader(existing.single(), value)
-            else -> removeHeader(response, name).withAddedHeader(name, value)
-        }
-    }
-
-    /** [request] without any [name] header: one removal per occurrence, each by the name it is written with. */
-    fun removeHeader(request: HttpRequest, name: String): HttpRequest {
-        var modified = request
-        request.headers().map { it.name() }.filter { it.equals(name, ignoreCase = true) }
-            .forEach { written -> modified = modified.withRemovedHeader(written) }
-        return modified
-    }
-
-    /** [removeHeader] for a response. */
-    fun removeHeader(response: HttpResponse, name: String): HttpResponse {
-        var modified = response
-        response.headers().map { it.name() }.filter { it.equals(name, ignoreCase = true) }
-            .forEach { written -> modified = modified.withRemovedHeader(written) }
-        return modified
-    }
-
-    private fun count(names: List<String>, name: String): Int = names.count { it.equals(name, ignoreCase = true) }
 
     /** The body after [rule]'s body regex, or null when the rule has none or it changes nothing. */
     private fun replacedBody(rule: ProxyRule, body: String): String? {

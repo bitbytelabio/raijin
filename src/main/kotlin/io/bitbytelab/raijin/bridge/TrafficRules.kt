@@ -8,7 +8,6 @@ import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.safety.RequestHygiene
-import io.bitbytelab.raijin.safety.SafeRegex
 import io.bitbytelab.raijin.state.TrafficRule
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -108,28 +107,22 @@ internal class TrafficRuleApplier(private val eventBus: EventBus) {
     }
 
     private fun matchesRequest(rule: TrafficRule, request: HttpRequest): Boolean {
-        if (rule.matchUrl != null && !SafeRegex.containsMatchIn(rule.matchUrl, request.url(), ignoreCase = true)) return false
-        if (rule.matchHost != null && !SafeRegex.matchesHostPattern(rule.matchHost, request.httpService().host())) return false
-        if (rule.matchHeader != null) {
-            val headerLines = request.headers().joinToString("\r\n") { "${it.name()}: ${it.value()}" }
-            if (!SafeRegex.containsMatchIn(rule.matchHeader, headerLines, ignoreCase = true)) return false
-        }
+        if (rule.matchUrl != null && !RuleMatcher.url(rule.matchUrl, request.url())) return false
+        if (rule.matchHost != null && !RuleMatcher.host(rule.matchHost, request.httpService().host())) return false
+        if (rule.matchHeader != null && !RuleMatcher.headers(rule.matchHeader, request.headers())) return false
         return true
     }
 
     private fun matchesResponse(rule: TrafficRule, response: HttpResponseReceived): Boolean {
         if (rule.matchUrl != null) {
-            val url = try { response.initiatingRequest()?.url() } catch (_: Exception) { null } ?: return false
-            if (!SafeRegex.containsMatchIn(rule.matchUrl, url, ignoreCase = true)) return false
+            val url = try { response.initiatingRequest()?.url() } catch (_: Exception) { null }
+            if (!RuleMatcher.url(rule.matchUrl, url)) return false
         }
         if (rule.matchHost != null) {
-            val host = try { response.initiatingRequest()?.httpService()?.host() } catch (_: Exception) { null } ?: return false
-            if (!SafeRegex.matchesHostPattern(rule.matchHost, host)) return false
+            val host = try { response.initiatingRequest()?.httpService()?.host() } catch (_: Exception) { null }
+            if (!RuleMatcher.host(rule.matchHost, host)) return false
         }
-        if (rule.matchHeader != null) {
-            val headerLines = response.headers().joinToString("\r\n") { "${it.name()}: ${it.value()}" }
-            if (!SafeRegex.containsMatchIn(rule.matchHeader, headerLines, ignoreCase = true)) return false
-        }
+        if (rule.matchHeader != null && !RuleMatcher.headers(rule.matchHeader, response.headers())) return false
         return true
     }
 
