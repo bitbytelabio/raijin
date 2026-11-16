@@ -132,7 +132,7 @@ function addEvent(type, data, timestamp) {
         url = data.url || '';
         method = data.method || '';
         host = data.host || '';
-        statusCode = data.status_code || 0;
+        statusCode = data.status_code || (type === 'autorize.match' ? data.original_status : 0) || 0;
         contentType = data.content_type || data.mime_type || mimeType || '';
         inScope = data.in_scope || false;
         messageId = data.message_id || 0;
@@ -167,7 +167,9 @@ function addEvent(type, data, timestamp) {
     // Build label for non-proxy events
     var label = '';
     if (cat === 'scanner') {
-        label = (data && data.name) ? data.name : type;
+        label = type === 'autorize.match'
+            ? 'Autorize' + (data.soft_denial ? ' (soft denial)' : '')
+            : ((data && data.name) ? data.name : type);
         if (data && data.severity) label += ' [' + data.severity.toUpperCase() + ']';
         vectors = ['scanner'];
     } else if (cat === 'scope') {
@@ -235,6 +237,7 @@ function addEvent(type, data, timestamp) {
 
 function mapTypeToCategory(type) {
     if (type === 'tool.called') return 'tool';
+    if (type === 'autorize.match') return 'scanner';
     if (type.indexOf('proxy') !== -1) return 'proxy';
     if (type.indexOf('scanner') !== -1) return 'scanner';
     if (type.indexOf('scope') !== -1) return 'scope';
@@ -325,6 +328,13 @@ function buildEventRow(evt) {
     // URL/label area
     var urlArea = document.createElement('span');
     urlArea.className = 'activity-url';
+    if (evt.type === 'autorize.match' && evt.method && evt.url) {
+        var verdictBadge = document.createElement('span');
+        verdictBadge.className = 'badge badge-scanner';
+        verdictBadge.textContent = evt.label;
+        urlArea.appendChild(verdictBadge);
+        urlArea.appendChild(document.createTextNode(' '));
+    }
     if (evt.method && (evt.url || evt.category === 'tool')) {
         // Method badge — for tool events, show tool name
         var mb = document.createElement('span');
@@ -450,6 +460,16 @@ function selectEvent(eid) {
     if (evt.vectors.length) rows.push(['Vectors', evt.vectors.map(function(v){return v.toUpperCase();}).join(', ')]);
     rows.push(['Time', evt.time]);
     if (evt.inScope) rows.push(['Scope', 'In-scope']);
+    if (evt.type === 'autorize.match' && evt.raw) {
+        rows.push(['Match', String(evt.raw.match_id)]);
+        rows.push(['Rule', evt.raw.rule_id || '']);
+        rows.push(['Verdict', evt.label]);
+        if (Array.isArray(evt.raw.identities)) {
+            rows.push(['Replays', evt.raw.identities.map(function(identity) {
+                return identity.name + ': ' + identity.status;
+            }).join(', ')]);
+        }
+    }
 
     rows.forEach(function(r) {
         var dr = document.createElement('div');
@@ -509,7 +529,12 @@ function selectEvent(eid) {
             })
         });
     }
-    if (evt.category === 'scanner' && evt.raw) {
+    if (evt.type === 'autorize.match' && evt.raw) {
+        cmds.push({
+            label: 'View Autorize Match',
+            cmd: mcpCommand('autorize', {action: 'list_matches', match_id: evt.raw.match_id, include_replays: true})
+        });
+    } else if (evt.category === 'scanner' && evt.raw) {
         var issueArgs = {action: 'get_all_issues'};
         if (evt.url) issueArgs.url_prefix = evt.url;
         cmds.push({label: 'View Issue Detail', cmd: mcpCommand('scanner', issueArgs)});
@@ -593,6 +618,7 @@ function clearAll() {
 var EVENT_TYPES = ['proxy.request','proxy.response','scanner.issue','scanner.task.status',
     'scope.changed','collaborator.interaction','websocket.created','websocket.message',
     'websocket.closed','http.request','http.response','proxy.intercept','proxy.rule.applied',
+    'autorize.match','proxy.intercept.held','proxy.intercept.released','proxy.intercept.hold',
     'tool.called'];
 var HISTORY_EVENT_LIMIT = 300;
 var HISTORY_PROXY_LIMIT = 100;

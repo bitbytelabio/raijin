@@ -156,8 +156,14 @@ object ToolConsolidation {
             renames = mapOf("set_request_rule" to RULE_ACTION, "set_response_rule" to RULE_ACTION),
         ),
         Group(
-            "proxy_intercept", "Proxy interception switch.",
-            prefixed("proxy_intercept_", "proxy_intercept_enable", "proxy_intercept_disable", "proxy_intercept_status"),
+            "proxy_intercept",
+            "Proxy interception: Burp's Intercept switch and a bounded hold queue for inspecting, editing, " +
+                "forwarding or dropping messages. An unanswered hold forwards itself.",
+            prefixed(
+                "proxy_intercept_", "proxy_intercept_enable", "proxy_intercept_disable", "proxy_intercept_status",
+                "proxy_intercept_hold", "proxy_intercept_list_held", "proxy_intercept_forward",
+                "proxy_intercept_drop", "proxy_intercept_release",
+            ),
         ),
         Group(
             "burp", "Burp Suite itself: version, project and extension info, config import/export, task engine, shutdown.",
