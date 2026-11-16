@@ -1,8 +1,10 @@
 package io.bitbytelab.raijin.tools.scanner
 
 import io.bitbytelab.raijin.bridge.ScannerBridge
+import io.bitbytelab.raijin.core.asClampedInt
 import io.bitbytelab.raijin.core.asLongSafe
 import io.bitbytelab.raijin.core.asStringList
+import io.bitbytelab.raijin.core.withClampReport
 import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
@@ -36,7 +38,7 @@ object ScannerTools {
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("urls") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Target URLs to crawl") }
-                    putJsonObject("max_depth") { put("type", "integer"); put("minimum", 0); put("description", "Not supported by Montoya's CrawlConfiguration — accepted but always ignored") }
+                    putJsonObject("max_depth") { put("type", "integer"); put("minimum", 0); put("description", "Not supported by Montoya's CrawlConfiguration — accepted but always ignored; a negative value is clamped to 0 and reported as max_depth_clamped_to") }
                     putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Restrict crawl to in-scope URLs (enforced by filtering seeds before crawling)") }
                 },
                 required = listOf("urls")
@@ -46,10 +48,11 @@ object ScannerTools {
                 val args = request.params.arguments ?: emptyMap()
                 val urls = args["urls"].asStringList()
                     ?: return@addTool toolError("Parameter 'urls' is required (array of URL strings)")
-                val maxDepth = args.int("max_depth", 0..Int.MAX_VALUE)
+                val maxDepth = args["max_depth"].asClampedInt("max_depth", 0, Int.MAX_VALUE)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid max_depth") }
                 val inScopeOnly = args.flag("in_scope_only") ?: false
 
-                toolJsonResult(bridge.startCrawl(urls, maxDepth, inScopeOnly))
+                toolJsonResult(bridge.startCrawl(urls, maxDepth?.value, inScopeOnly).withClampReport("max_depth", maxDepth))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -68,7 +71,8 @@ object ScannerTools {
                 "Montoya has no crawl-then-audit pipe, so the crawl's discoveries are not auto-added to this audit (see 'crawl_note'). " +
                 "auth_header_name + auth_header_value set one header on the audit's requests: only on Scanner traffic to the hosts in " +
                 "'urls' / the Host headers of 'requests', replacing a value the request already has, and only until the audit ends " +
-                "or is deleted.",
+                "or is deleted. A Cookie header sets only the cookies it names; the request's other cookies (the Scanner's cookie " +
+                "payloads, CSRF and load balancer cookies) stay.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("urls") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Target URLs to audit (resolved to requests and added directly)") }
@@ -77,7 +81,7 @@ object ScannerTools {
                     putJsonObject("crawl_first") { put("type", "boolean"); put("description", "Default true. When true and urls is non-empty, starts a real crawl on those urls alongside the audit — the two tasks run independently, see 'crawl_note' in the response") }
                     putJsonObject("insertion_point_types") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Not enforced — Montoya's built-in audit cannot be restricted by insertion point type") }
                     putJsonObject("auth_header_name") { put("type", "string"); put("description", "Name of a header to set on the audit's requests, e.g. Authorization or Cookie. Needs auth_header_value") }
-                    putJsonObject("auth_header_value") { put("type", "string"); put("description", "Value of that header") }
+                    putJsonObject("auth_header_value") { put("type", "string"); put("description", "Value of that header. For Cookie, name=value pairs separated by ';': each replaces that cookie and the rest of the request's Cookie header stays") }
                 },
                 required = emptyList()
             )
@@ -246,19 +250,20 @@ object ScannerTools {
                     putJsonObject("url_prefix") { put("type", "string"); put("description", "URL prefix filter") }
                     enumProperty("severity", SEVERITIES, "Issue severity")
                     enumProperty("confidence", CONFIDENCES, "Issue confidence")
-                    putJsonObject("max_results") { put("type", "integer"); put("minimum", 1); put("description", "Maximum number of issues to return (default: all)") }
+                    putJsonObject("max_results") { put("type", "integer"); put("minimum", 1); put("description", "Maximum number of issues to return (default: all); a value below 1 is clamped to 1 and reported as max_results_clamped_to") }
                 },
                 required = emptyList()
             )
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
+                val maxResults = args["max_results"].asClampedInt("max_results", 1, Int.MAX_VALUE)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid max_results") }
 
                 toolJsonResult(
                     bridge.getAllIssues(
-                        args.text("url_prefix"), args.text("severity"), args.text("confidence"),
-                        args.int("max_results", 1..Int.MAX_VALUE)
-                    )
+                        args.text("url_prefix"), args.text("severity"), args.text("confidence"), maxResults?.value
+                    ).withClampReport("max_results", maxResults)
                 )
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
@@ -466,8 +471,7 @@ private fun Map<String, JsonElement>.int(name: String, range: IntRange): Int? {
     val raw = this[name]?.takeUnless { it is JsonNull } ?: return null
     val value = raw.asLongSafe() ?: throw IllegalArgumentException("Parameter '$name' must be an integer")
     require(value in range.first.toLong()..range.last.toLong()) {
-        if (range.last == Int.MAX_VALUE) "Parameter '$name' must be at least ${range.first}"
-        else "Parameter '$name' must be between ${range.first} and ${range.last}"
+        "Parameter '$name' must be between ${range.first} and ${range.last}"
     }
     return value.toInt()
 }

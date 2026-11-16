@@ -74,10 +74,11 @@ class ScannerToolsTest {
 
     @Test
     fun `numbers outside their range are refused by name`() {
-        assertEquals("Parameter 'max_depth' must be at least 0", failure("scanner_start_crawl") {
-            putJsonArray("urls") { add("https://t/") }; put("max_depth", -1)
-        })
-        assertEquals("Parameter 'max_results' must be at least 1", failure("scanner_get_all_issues") { put("max_results", 0) })
+        // A limit past its range is clamped instead (ScannerToolLimitsTest); one that is not an integer is still refused.
+        assertTrue(failure("scanner_start_crawl") {
+            putJsonArray("urls") { add("https://t/") }; put("max_depth", "deep")
+        }.startsWith("Parameter 'max_depth' must be an integer"))
+        assertTrue(failure("scanner_get_all_issues") { put("max_results", 1.5) }.startsWith("Parameter 'max_results' must be an integer"))
         assertEquals("Parameter 'port' must be between 1 and 65535", failure("scanner_task_add_request") {
             put("task_id", "scan-001"); put("request", "R0VUIC8="); put("port", 70000)
         })

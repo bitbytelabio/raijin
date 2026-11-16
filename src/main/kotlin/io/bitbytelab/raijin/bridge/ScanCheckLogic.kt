@@ -53,13 +53,20 @@ internal data class CheckCondition(
     val onResponse: Boolean get() = location in ScanCheckLogic.RESPONSE_LOCATIONS
 }
 
-/** @property stopIfNoMatch true: the step is required and the chain ends without it; false: the step is optional. */
+/**
+ * @property conditions what the response to [payload] has to show. A step without any primes the
+ *   target (stores or sets up something a later step reads): being answered is all it has to do.
+ * @property stopIfNoMatch true: the step is required and the chain ends without it; false: the step is optional.
+ */
 internal data class ActiveStep(
     val payload: String,
     val conditions: List<CheckCondition>,
     val mode: MatchMode = MatchMode.ALL,
     val stopIfNoMatch: Boolean = true,
-)
+) {
+    /** Whether the step looks at the response at all: only such a step can be evidence. */
+    val judgesResponse: Boolean get() = conditions.any { it.onResponse }
+}
 
 internal data class PassiveRule(val conditions: List<CheckCondition>, val mode: MatchMode = MatchMode.ALL)
 
@@ -185,7 +192,7 @@ internal object ScanCheckLogic {
                 stopIfNoMatch = bool(s["stop_if_no_match"]) ?: true,
             )
         }
-        if (steps.none { step -> step.conditions.any { it.onResponse } }) {
+        if (steps.none { it.judgesResponse }) {
             throw InvalidCheckException(
                 "No step has a response_conditions entry on the response " +
                     "(${RESPONSE_LOCATIONS.joinToString(", ")}). An active check only reports what a payload " +
@@ -221,8 +228,15 @@ internal object ScanCheckLogic {
         return hit != condition.negate
     }
 
-    fun satisfied(conditions: List<CheckCondition>, mode: MatchMode, exchange: CheckExchange): Boolean =
-        if (mode == MatchMode.ANY) conditions.any { matches(it, exchange) } else conditions.all { matches(it, exchange) }
+    /**
+     * Whether [conditions] hold for [exchange] under [mode]. No conditions hold in either mode: a
+     * priming step without any has done its part once it is answered.
+     */
+    fun satisfied(conditions: List<CheckCondition>, mode: MatchMode, exchange: CheckExchange): Boolean = when {
+        conditions.isEmpty() -> true
+        mode == MatchMode.ANY -> conditions.any { matches(it, exchange) }
+        else -> conditions.all { matches(it, exchange) }
+    }
 
     /** The parts of a message [conditions] look at: all that has to be read to judge them. */
     fun locations(conditions: Collection<CheckCondition>): Set<String> = conditions.mapTo(HashSet()) { it.location }
@@ -233,19 +247,24 @@ internal object ScanCheckLogic {
      * It reports only when some step matched in a way the baseline response does not: the step's
      * conditions are evaluated again on the probe's own request paired with the baseline response,
      * so nothing but what the payload changed in the response counts as evidence. A step whose
-     * probe gets no response never matches.
+     * probe gets no response never matches. A step that does not look at the response (a priming
+     * step) matches once it is answered, but is never evidence itself.
      *
      * A match that passes that test is confirmed against [control] before it counts: a fresh
      * response to the unmodified request. A page that has changed since the baseline was recorded
      * (or answers the check's own requests differently from the scanner's) then does not pass for
      * something the payload did.
      *
+     * Both are taken before the first payload is sent. A payload can change what the unmodified
+     * request returns from then on (a stored comment, a saved profile field), and a control
+     * fetched after it would show the payload's own effect and explain the evidence away.
+     *
      * @param baseline the recorded response to the unmodified request, or null when there is none.
-     *   Called at most once.
+     *   Called once, before the first payload.
      * @param send sends one payload; returns what came back plus the caller's evidence object, or
      *   null when nothing did.
      * @param control fetches the unmodified request's response now, or null when that is not
-     *   possible. Called at most once, and only for a match the baseline does not explain.
+     *   possible. Called once, after [baseline] and before the first payload.
      */
     fun <T> runActive(
         steps: List<ActiveStep>,
@@ -253,11 +272,11 @@ internal object ScanCheckLogic {
         send: (payload: String) -> Pair<CheckExchange, T>?,
         control: () -> CheckExchange? = { null },
     ): ActiveResult<T> {
+        val base = baseline()?.takeIf { it.hasResponse }
+        val fresh = control()?.takeIf { it.hasResponse }
         val trace = ArrayList<StepTrace>(steps.size)
         val evidence = ArrayList<T>()
         val novelPayloads = ArrayList<String>()
-        val base by lazy(LazyThreadSafetyMode.NONE) { baseline()?.takeIf { it.hasResponse } }
-        val fresh by lazy(LazyThreadSafetyMode.NONE) { control()?.takeIf { it.hasResponse } }
 
         /** Whether [exchange]'s request would have matched [step] had it been answered with [response]. */
         fun explainedBy(response: CheckExchange, step: ActiveStep, exchange: CheckExchange): Boolean =
@@ -274,7 +293,7 @@ internal object ScanCheckLogic {
             }
             val (exchange, proof) = probe
             val matched = satisfied(step.conditions, step.mode, exchange)
-            val novel = matched && step.conditions.any { it.onResponse } &&
+            val novel = matched && step.judgesResponse &&
                 base?.let { !explainedBy(it, step, exchange) } == true &&
                 fresh?.let { explainedBy(it, step, exchange) } != true
             trace += StepTrace(i + 1, answered = true, matched = matched, novel = novel)
@@ -290,7 +309,7 @@ internal object ScanCheckLogic {
 
         val reason = when {
             novelPayloads.isNotEmpty() -> "a step matched and the unmodified request's response does not"
-            trace.none { it.matched } -> "no step matched"
+            trace.none { it.matched && steps[it.step - 1].judgesResponse } -> "no step that looks at the response matched"
             else -> "every match is also produced by the unmodified request, or there is no response to compare with"
         }
         return ActiveResult(novelPayloads.isNotEmpty(), reason, trace, evidence, novelPayloads)

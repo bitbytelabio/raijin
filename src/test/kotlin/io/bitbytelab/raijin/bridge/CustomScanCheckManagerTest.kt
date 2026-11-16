@@ -1,10 +1,20 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
+import burp.api.montoya.core.ByteArray as BurpByteArray
 import burp.api.montoya.core.Registration
+import burp.api.montoya.http.Http
+import burp.api.montoya.http.message.HttpRequestResponse
+import burp.api.montoya.http.message.requests.HttpRequest
+import burp.api.montoya.http.message.responses.HttpResponse
+import burp.api.montoya.internal.MontoyaObjectFactory
+import burp.api.montoya.internal.ObjectFactoryLocator
+import burp.api.montoya.scanner.AuditResult
 import burp.api.montoya.scanner.ConsolidationAction
 import burp.api.montoya.scanner.ScanCheck
 import burp.api.montoya.scanner.Scanner
+import burp.api.montoya.scanner.audit.insertionpoint.AuditInsertionPoint
+import burp.api.montoya.scanner.audit.insertionpoint.AuditInsertionPointType
 import burp.api.montoya.scanner.audit.issues.AuditIssue
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.state.StateManager
@@ -49,6 +59,9 @@ class CustomScanCheckManagerTest {
         var refusal: RuntimeException? = null
         var refuseToDeregister = false
 
+        /** Answers the requests a registered check sends; nothing is answered unless a test says how. */
+        var target: (HttpRequest) -> HttpRequestResponse? = { null }
+
         val api: MontoyaApi = run {
             val scanner = Proxy.newProxyInstance(Scanner::class.java.classLoader, arrayOf(Scanner::class.java)) { _, method, args ->
                 check(method.name == "registerScanCheck") { "unexpected Scanner.${method.name}" }
@@ -56,10 +69,123 @@ class CustomScanCheckManagerTest {
                 checks += args[0] as ScanCheck
                 FakeRegistration(refuseToDeregister).also { handles += it }
             } as Scanner
+            val http = Proxy.newProxyInstance(Http::class.java.classLoader, arrayOf(Http::class.java)) { _, method, args ->
+                check(method.name == "sendRequest" && args?.size == 1) { "unexpected Http.${method.name}" }
+                target(args[0] as HttpRequest)
+            } as Http
             Proxy.newProxyInstance(MontoyaApi::class.java.classLoader, arrayOf(MontoyaApi::class.java)) { _, method, _ ->
-                check(method.name == "scanner") { "unexpected MontoyaApi.${method.name}" }
-                scanner
+                when (method.name) {
+                    "scanner" -> scanner
+                    "http" -> http
+                    else -> error("unexpected MontoyaApi.${method.name}")
+                }
             } as MontoyaApi
+        }
+    }
+
+    /**
+     * A comment board: every request posts the `comment` in its body, and every response lists all
+     * the comments posted so far. What one payload stores, every later response shows, the
+     * unmodified request's included.
+     */
+    private class CommentBoard {
+        private val comments = mutableListOf("hello")
+
+        /** The comments the check's requests posted, in order; the unmodified request posts "hello". */
+        val posted = mutableListOf<String>()
+
+        val insertionPoint: AuditInsertionPoint = stubOf(AuditInsertionPoint::class.java) { m, a ->
+            when (m) {
+                "name" -> "comment"
+                "type" -> AuditInsertionPointType.PARAM_BODY
+                "buildHttpRequestWithPayload" -> request(a[0].toString())
+                else -> error("unexpected AuditInsertionPoint.$m")
+            }
+        }
+
+        /** The scanner's base request, with the response it recorded for it, or none when [recorded] is false. */
+        fun base(recorded: Boolean): HttpRequestResponse {
+            val request = request("hello")
+            val response = if (recorded) page() else null
+            return stubOf(HttpRequestResponse::class.java) { m, _ ->
+                when (m) {
+                    "request" -> request
+                    "response" -> response
+                    "httpService" -> fakeService("board.test")
+                    else -> error("unexpected HttpRequestResponse.$m")
+                }
+            }
+        }
+
+        fun answer(request: HttpRequest): HttpRequestResponse {
+            val comment = request.bodyToString().substringAfter("comment=")
+            posted += comment
+            comments += comment
+            val response = page()
+            return stubOf(HttpRequestResponse::class.java) { m, _ ->
+                when (m) {
+                    "request" -> request
+                    "response" -> response
+                    else -> error("unexpected HttpRequestResponse.$m")
+                }
+            }
+        }
+
+        private fun request(comment: String): HttpRequest = stubOf(HttpRequest::class.java) { m, _ ->
+            when (m) {
+                "withService" -> request(comment)
+                "bodyToString" -> "comment=$comment"
+                "url" -> "https://board.test/comment"
+                "toString" -> "POST /comment comment=$comment"
+                else -> error("unexpected HttpRequest.$m")
+            }
+        }
+
+        private fun page(): HttpResponse {
+            val body = comments.joinToString("\n")
+            return stubOf(HttpResponse::class.java) { m, _ ->
+                when (m) {
+                    "bodyToString" -> body
+                    "statusCode" -> 200.toShort()
+                    else -> error("unexpected HttpResponse.$m")
+                }
+            }
+        }
+    }
+
+    /** What Burp's factory builds while a check audits: payload bytes, the issue and the result holding it. */
+    private val factory: MontoyaObjectFactory = stubOf(MontoyaObjectFactory::class.java) { m, a ->
+        when (m) {
+            "byteArray" -> {
+                val text = a[0] as String
+                stubOf(BurpByteArray::class.java) { bm, _ -> if (bm == "toString") text else error("unexpected ByteArray.$bm") }
+            }
+            "auditIssue" -> {
+                val detail = a[1] as String
+                val evidence = a[9] as List<*>
+                stubOf(AuditIssue::class.java) { im, _ ->
+                    when (im) {
+                        "detail" -> detail
+                        "requestResponses" -> evidence
+                        else -> error("unexpected AuditIssue.$im")
+                    }
+                }
+            }
+            "auditResult" -> {
+                val issues = a[0] as List<*>
+                stubOf(AuditResult::class.java) { rm, _ -> if (rm == "auditIssues") issues else error("unexpected AuditResult.$rm") }
+            }
+            else -> error("MontoyaObjectFactory.$m is not available in this test")
+        }
+    }
+
+    private fun <T> withFactory(block: () -> T): T {
+        val previous = ObjectFactoryLocator.FACTORY
+        ObjectFactoryLocator.FACTORY = factory
+        try {
+            return block()
+        } finally {
+            ObjectFactoryLocator.FACTORY = previous
         }
     }
 
@@ -191,6 +317,30 @@ class CustomScanCheckManagerTest {
 
         assertEquals(ConsolidationAction.KEEP_BOTH, check.consolidateIssues(q, id))
         assertEquals(ConsolidationAction.KEEP_EXISTING, check.consolidateIssues(q, qAgain))
+    }
+
+    @Test
+    fun `an active check reports what the target stores, with one unmodified request sent before the payload`() {
+        val stored = CheckDefinition(
+            name = "Stored marker", issueName = "Stored marker", description = "", detail = "", remediation = "fix",
+            severity = "high", confidence = "firm",
+            active = listOf(ActiveStep("<raijin-77>", listOf(CheckCondition("response_body", "<raijin-77>", "contains")))),
+        )
+        for (recorded in listOf(true, false)) {
+            val label = if (recorded) "recorded baseline" else "no recorded baseline"
+            val board = CommentBoard()
+            val burp = FakeScanner().apply { target = board::answer }
+            CustomScanCheckManager(burp.api, StateManager()).register(stored)
+
+            val issues = withFactory { burp.checks.single().activeAudit(board.base(recorded), board.insertionPoint) }.auditIssues()
+
+            // The unmodified request went out once, before the payload was stored: the marker the
+            // board shows from then on cannot explain the finding away.
+            assertEquals(listOf("hello", "<raijin-77>"), board.posted, label)
+            val issue = assertNotNull(issues.singleOrNull(), label)
+            assertTrue("<code>&lt;raijin-77&gt;</code>" in issue.detail(), issue.detail())
+            assertEquals(2, issue.requestResponses().size, "the base request and the payload's exchange: $label")
+        }
     }
 
     // ---- both tools --------------------------------------------------------

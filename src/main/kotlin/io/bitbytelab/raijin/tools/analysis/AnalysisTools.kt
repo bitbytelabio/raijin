@@ -5,7 +5,9 @@ import io.bitbytelab.raijin.bridge.BridgeFactory
 import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.core.asBooleanSafe
 import io.bitbytelab.raijin.core.asBoundedInt
+import io.bitbytelab.raijin.core.asClampedInt
 import io.bitbytelab.raijin.core.asStringList
+import io.bitbytelab.raijin.core.withClampReport
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
@@ -208,14 +210,15 @@ object AnalysisTools {
                 "or patterns across all captured traffic. Matching is case-insensitive and time-bounded: " +
                 "a search that runs out of time returns what it found with incomplete=true. " +
                 "Parameters: pattern (string, regex pattern to search for), " +
-                "max_results (number, maximum matches to return; defaults to 50), " +
+                "max_results (number, maximum matches to return; defaults to 50, and a value outside " +
+                "1-${AnalysisBridge.SEARCH_MAX_RESULTS} is clamped and reported as max_results_clamped_to), " +
                 "in_scope_only (boolean, restrict to in-scope URLs; defaults to false).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("pattern") { put("type", "string"); put("description", "Regex pattern to search for") }
                     putJsonObject("max_results") {
                         put("type", "integer"); put("minimum", 1); put("maximum", AnalysisBridge.SEARCH_MAX_RESULTS)
-                        put("description", "Maximum matches to return (default 50, at most ${AnalysisBridge.SEARCH_MAX_RESULTS})")
+                        put("description", "Maximum matches to return (default 50, at most ${AnalysisBridge.SEARCH_MAX_RESULTS}; a value outside that range is clamped and reported as max_results_clamped_to)")
                     }
                     putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Restrict to in-scope URLs (default false)") }
                 },
@@ -227,11 +230,14 @@ object AnalysisTools {
                 val pattern = args.string("pattern")
                     ?: return@addTool toolError("Missing required parameter: pattern")
                 if (pattern.isEmpty()) return@addTool toolError("Parameter 'pattern' must not be empty")
-                val maxResults = args["max_results"].asBoundedInt("max_results", 1, AnalysisBridge.SEARCH_MAX_RESULTS)
-                    .getOrElse { return@addTool toolError(it.message ?: "Invalid max_results") } ?: 50
+                val maxResults = args["max_results"].asClampedInt("max_results", 1, AnalysisBridge.SEARCH_MAX_RESULTS)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid max_results") }
                 val inScopeOnly = args["in_scope_only"].asBooleanSafe() ?: false
 
-                toolJsonResult(analysis.searchResponseBodies(pattern, maxResults, inScopeOnly))
+                toolJsonResult(
+                    analysis.searchResponseBodies(pattern, maxResults?.value ?: 50, inScopeOnly)
+                        .withClampReport("max_results", maxResults)
+                )
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }

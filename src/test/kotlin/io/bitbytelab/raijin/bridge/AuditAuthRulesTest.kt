@@ -18,7 +18,7 @@ import kotlin.test.assertTrue
 
 /**
  * An audit's auth header rules (plan P0.3 item 4): limited to the audited hosts and to Scanner
- * traffic, and gone when the audit is.
+ * traffic, and gone when the audit is. A Cookie header changes only the cookies it names.
  */
 class AuditAuthRulesTest {
 
@@ -293,5 +293,107 @@ class AuditAuthRulesTest {
         state.trafficRules.add(TrafficRule(ruleId = "trule-1", direction = "request", modifyAddHeader = "X-Test: 1"))
         val audited = request("app.example.com", emptyList())
         assertSame(audited, AuditAuthRules.withAuditAuth(state, audited))
+    }
+
+    // ---- Cookie ------------------------------------------------------------
+
+    private fun cookiePlan(value: String) = AuditAuthRules.Plan("Cookie", value, setOf("app.example.com"))
+
+    @Test
+    fun `a Cookie header is one rule that sets its cookies, scoped and timed like the others`() {
+        audit("scan-1", cookiePlan("session=abc; uid=7"))
+        // No strip rule: removing the Cookie header would take the Scanner's cookie payloads with it.
+        val rule = state.trafficRules.single()
+        assertEquals(mapOf("session" to "abc", "uid" to "7"), rule.modifySetCookies)
+        assertNull(rule.modifyRemoveHeader)
+        assertNull(rule.modifyAddHeader)
+        assertTrue(appliesTo(rule, "SCANNER", "app.example.com"))
+        assertFalse(appliesTo(rule, "PROXY", "app.example.com"))
+        assertFalse(appliesTo(rule, "SCANNER", "other.example.com"))
+
+        rules.forget("scan-1")
+        assertTrue(state.trafficRules.isEmpty())
+    }
+
+    @Test
+    fun `only the named cookies change, so the Scanner's payloads and the CSRF and load balancer cookies still go out`() {
+        // The Scanner testing the `pref` cookie, with a CSRF cookie and a load balancer cookie alongside.
+        val scanned = fakeRequest(
+            FakeMessage(
+                headers = listOf(
+                    "Host" to "app.example.com",
+                    "Cookie" to "pref=1'\"><x>; csrf=t0k3n;session=stale; AWSALB=x1",
+                    "Accept" to "*/*",
+                )
+            )
+        )
+        val sent = AuditAuthRules.withCookies(scanned, mapOf("session" to "abc"))
+        assertEquals(
+            listOf("Host" to "app.example.com", "Cookie" to "pref=1'\"><x>; csrf=t0k3n;session=abc; AWSALB=x1", "Accept" to "*/*"),
+            sent.headerPairs(),
+        )
+        // Already set as asked: nothing is rewritten.
+        assertSame(sent, AuditAuthRules.withCookies(sent, mapOf("session" to "abc")))
+    }
+
+    @Test
+    fun `a set cookie goes out once, where it first appeared, and is appended when missing`() {
+        val cookies = mapOf("session" to "abc", "uid" to "7")
+        // Later copies of a set cookie are dropped, a header left with nothing goes, and a missing
+        // cookie joins the last header.
+        assertEquals(
+            listOf("a=1;session=abc; b=2", "c=3; uid=7"),
+            AuditAuthRules.setCookies(listOf("a=1;session=old; b=2; session=older", "session=dup", "c=3"), cookies),
+        )
+        assertEquals(listOf("session=abc; uid=7"), AuditAuthRules.setCookies(emptyList(), cookies))
+        assertEquals(listOf("a=1; session=abc; uid=7"), AuditAuthRules.setCookies(listOf("a=1;"), cookies))
+        assertEquals(listOf("a=1", ""), AuditAuthRules.setCookies(listOf("a=1", ""), emptyMap()))
+    }
+
+    @Test
+    fun `several Cookie headers are merged in order, whatever Burp's header edits touch`() {
+        // The fake request updates and removes only the first header written exactly as named.
+        val split = fakeRequest(
+            FakeMessage(headers = listOf("cookie" to "session=old; a=1", "accept" to "*/*", "cookie" to "b=2; session=dup"))
+        )
+        assertEquals(
+            listOf("accept" to "*/*", "cookie" to "session=abc; a=1", "cookie" to "b=2; uid=7"),
+            AuditAuthRules.withCookies(split, mapOf("session" to "abc", "uid" to "7")).headerPairs(),
+        )
+
+        val none = fakeRequest(FakeMessage(headers = listOf("Host" to "app.example.com")))
+        assertEquals(
+            listOf("Host" to "app.example.com", "Cookie" to "session=abc"),
+            AuditAuthRules.withCookies(none, mapOf("session" to "abc")).headerPairs(),
+        )
+    }
+
+    @Test
+    fun `cookie pairs are read the way a browser sends them`() {
+        assertEquals(mapOf("session" to "abc", "uid" to "7"), AuditAuthRules.cookiePairs("session=abc; uid=7"))
+        assertEquals(mapOf("jwt" to "a.b=="), AuditAuthRules.cookiePairs("jwt=a.b=="))
+        // A pair without '=' is the nameless cookie, and of two copies of a name the last wins.
+        assertEquals(mapOf("jwt" to "c", "" to "flag"), AuditAuthRules.cookiePairs(" jwt=a ;; flag ; jwt=c "))
+        assertTrue(AuditAuthRules.cookiePairs(" ; ").isEmpty())
+    }
+
+    @Test
+    fun `a Cookie value without a pair replaces the header as given`() {
+        // An empty value runs the audit without the cookies its requests carry.
+        rules.install(cookiePlan(""))
+        val (strip, add) = state.trafficRules.toList()
+        assertEquals("Cookie", strip.modifyRemoveHeader)
+        assertEquals("Cookie: ", add.modifyAddHeader)
+        assertNull(add.modifySetCookies)
+    }
+
+    @Test
+    fun `a custom check's probe gets the audit's cookies the same way`() {
+        rules.install(cookiePlan("session=abc"))
+        val probe = fakeRequest(FakeMessage(headers = listOf("Cookie" to "csrf=t; session=stale")), fakeService("app.example.com"))
+        assertEquals(listOf("Cookie" to "csrf=t; session=abc"), AuditAuthRules.withAuditAuth(state, probe).headerPairs())
+
+        val elsewhere = fakeRequest(FakeMessage(headers = listOf("Cookie" to "csrf=t")), fakeService("other.example.com"))
+        assertSame(elsewhere, AuditAuthRules.withAuditAuth(state, elsewhere))
     }
 }

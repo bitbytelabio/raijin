@@ -13,9 +13,11 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * An audit gets two rules, both limited to Scanner traffic to the audited hosts: one strips the
  * header and the next adds it, so a request that already carries the header leaves with exactly
- * one. The rules live only as long as the audit: [forget] removes them when it is deleted,
- * [sweep] when it has ended, and a watcher thread sweeps while any audit is tracked, so the
- * cleanup does not depend on anyone polling the task.
+ * one. A Cookie header is the exception. It gets one rule that sets the cookies it names and
+ * leaves the request's other cookies alone, so the Scanner's cookie payloads and the target's CSRF
+ * and load balancer cookies still go out. The rules live only as long as the audit: [forget]
+ * removes them when it is deleted, [sweep] when it has ended, and a watcher thread sweeps while
+ * any audit is tracked, so the cleanup does not depend on anyone polling the task.
  *
  * @param observe reads an audit's state from Burp.
  */
@@ -27,8 +29,16 @@ internal class AuditAuthRules(
     /** What Burp says about an audit. A null field means this Burp cannot tell. */
     class Observation(val status: String?, val requestCount: Int?)
 
-    /** A validated auth header and the hosts it may be sent to. */
-    class Plan(val headerName: String, val headerValue: String, val hosts: Set<String>)
+    /**
+     * A validated auth header and the hosts it may be sent to.
+     *
+     * @property cookies for a Cookie header, the cookies it sets ([cookiePairs]). Null for any other
+     *   header, and for a Cookie value without a single pair, which replaces the header as given.
+     */
+    class Plan(val headerName: String, val headerValue: String, val hosts: Set<String>) {
+        val cookies: Map<String, String>? =
+            if (headerName.equals(COOKIE, ignoreCase = true)) cookiePairs(headerValue).takeIf { it.isNotEmpty() } else null
+    }
 
     private class Tracked(val ruleId: String, var lastCount: Int?, var lastChangeAt: Long)
 
@@ -41,10 +51,23 @@ internal class AuditAuthRules(
     private val watchLock = Any()
     private var watcher: Thread? = null
 
-    /** Adds the rules for [plan]. Returns the id of the rule that adds the header. */
+    /** Adds the rules for [plan]. Returns the id of the rule that sets the header. */
     fun install(plan: Plan): String {
         val ruleId = stateManager.generateId(RULE_PREFIX)
         val scope = hostPattern(plan.hosts)
+        val cookies = plan.cookies
+        if (cookies != null) {
+            stateManager.trafficRules.add(
+                TrafficRule(
+                    ruleId = ruleId,
+                    direction = "request",
+                    matchHost = scope,
+                    modifySetCookies = cookies,
+                    toolFilter = SCANNER_ONLY,
+                )
+            )
+            return ruleId
+        }
         // One addAll: no request may see the strip rule without the rule that puts the header back.
         stateManager.trafficRules.addAll(
             listOf(
@@ -165,6 +188,7 @@ internal class AuditAuthRules(
         private val WHITESPACE = Regex("\\s+")
         private val PERCENT = Regex("(\\d{1,3})\\s*%")
         private val ENDED = listOf("finished", "cancelled", "canceled", "aborted", "abandoned")
+        private const val COOKIE = "Cookie"
 
         /**
          * Validates the header and works out which hosts it may be sent to.
@@ -258,26 +282,102 @@ internal class AuditAuthRules(
         }
 
         /**
-         * [request] carrying the header of every live audit auth rule that covers its host.
+         * [request] carrying the header of every live audit auth rule that covers its host, or for
+         * a Cookie rule its cookies.
          *
          * The rules are SCANNER-only. A custom scan check's probes leave Burp as extension traffic,
          * so the global handler would send them without the header the audit they run in is using,
          * and an unauthenticated probe compared with an authenticated baseline is a false finding.
          */
         fun withAuditAuth(stateManager: StateManager, request: HttpRequest): HttpRequest {
-            val rules = stateManager.trafficRules.filter { it.enabled && isAddRule(it) }
+            val rules = stateManager.trafficRules.filter { it.enabled && isAuthRule(it) }
             if (rules.isEmpty()) return request
             val host = runCatching { request.httpService().host() }.getOrNull() ?: return request
             var out = request
             for (rule in rules) {
                 if (rule.matchHost != null && !SafeRegex.matchesHostPattern(rule.matchHost, host)) continue
+                val cookies = rule.modifySetCookies
+                if (cookies != null) {
+                    out = withCookies(out, cookies)
+                    continue
+                }
                 val (name, value) = HeaderSafety.parseHeaderLine(rule.modifyAddHeader ?: continue) ?: continue
                 out = out.withRemovedHeader(name).withAddedHeader(name, value)
             }
             return out
         }
 
-        private fun isAddRule(rule: TrafficRule): Boolean =
-            rule.ruleId.startsWith("$RULE_PREFIX-") && !rule.ruleId.endsWith(STRIP_SUFFIX) && rule.modifyAddHeader != null
+        /** The rule that sets an audit's header or cookies, not the strip rule that goes with a header. */
+        private fun isAuthRule(rule: TrafficRule): Boolean =
+            rule.ruleId.startsWith("$RULE_PREFIX-") && !rule.ruleId.endsWith(STRIP_SUFFIX) &&
+                (rule.modifyAddHeader != null || rule.modifySetCookies != null)
+
+        /**
+         * The pairs of a Cookie header value by name, in order. A pair without `=` is the nameless
+         * cookie, kept under "". A name given twice keeps its last value.
+         */
+        fun cookiePairs(value: String): Map<String, String> {
+            val pairs = LinkedHashMap<String, String>()
+            for (segment in value.split(';')) {
+                val pair = segment.trim()
+                if (pair.isNotEmpty()) pairs[cookieName(pair)] = if ('=' in pair) pair.substringAfter('=').trim() else pair
+            }
+            return pairs
+        }
+
+        /**
+         * [request] with [cookies] set in its Cookie header ([setCookies]); every other cookie pair it
+         * carries stays as it is. A request that already carries exactly these values is returned as is.
+         */
+        fun withCookies(request: HttpRequest, cookies: Map<String, String>): HttpRequest {
+            if (cookies.isEmpty()) return request
+            val current = request.headers().filter { it.name().equals(COOKIE, ignoreCase = true) }
+            val values = current.map { it.value() }
+            val merged = setCookies(values, cookies)
+            if (merged == values) return request
+            if (current.size == 1 && merged.size == 1) return request.withUpdatedHeader(current[0].name(), merged[0])
+            // None yet, or several: written back in order, under the name the first one was written with.
+            val name = current.firstOrNull()?.name() ?: COOKIE
+            return merged.fold(ProxyRuleEdits.removeHeader(request, COOKIE)) { out, value -> out.withAddedHeader(name, value) }
+        }
+
+        /**
+         * The values of a request's Cookie headers, [headers] in order, with [cookies] set. A named
+         * cookie takes its value where it first appears and is dropped where it appears again, so it
+         * goes out once; one the request lacks is appended to the last header, or makes up a header
+         * of its own. Every other pair stays as written, separators included, and a header left
+         * without a pair is dropped.
+         */
+        fun setCookies(headers: List<String>, cookies: Map<String, String>): List<String> {
+            if (cookies.isEmpty()) return headers
+            val placed = HashSet<String>()
+            val out = ArrayList<String>(headers.size + 1)
+            for (header in headers) {
+                val kept = header.split(';').mapNotNull { segment ->
+                    val pair = segment.trim()
+                    val name = cookieName(pair)
+                    when {
+                        pair.isEmpty() || name !in cookies -> segment
+                        placed.add(name) -> segment.takeWhile(Char::isWhitespace) + cookiePair(name, cookies.getValue(name))
+                        else -> null
+                    }
+                }
+                if (kept.any { it.isNotBlank() }) out += kept.joinToString(";").trimStart()
+            }
+            val missing = cookies.filterKeys { it !in placed }.map { (name, value) -> cookiePair(name, value) }
+            if (missing.isEmpty()) return out
+            val added = missing.joinToString("; ")
+            val last = out.removeLastOrNull()?.trimEnd()
+            out += when {
+                last.isNullOrEmpty() -> added
+                last.endsWith(';') -> "$last $added"
+                else -> "$last; $added"
+            }
+            return out
+        }
+
+        private fun cookieName(pair: String): String = if ('=' in pair) pair.substringBefore('=').trim() else ""
+
+        private fun cookiePair(name: String, value: String): String = if (name.isEmpty()) value else "$name=$value"
     }
 }

@@ -126,16 +126,17 @@ internal class CustomScanCheckManager(
             val steps = definition.active ?: return@issues emptyList()
             val service = baseRequestResponse.httpService() ?: return@issues emptyList()
             val baseRequest = baseRequestResponse.request()
-            val unmodified = { send { baseRequest.withService(service) }?.first }
+            val recorded = baseRequestResponse.response()?.let { exchangeOf(baseRequest, it, activeParts) }
+            // One unmodified request, which runActive asks for before the first payload: the control,
+            // and the baseline as well when the scanner recorded no response.
+            val unmodified by lazy(LazyThreadSafetyMode.NONE) { send { baseRequest.withService(service) }?.first }
             val result = ScanCheckLogic.runActive(
                 steps,
-                baseline = {
-                    baseRequestResponse.response()?.let { exchangeOf(baseRequest, it, activeParts) } ?: unmodified()
-                },
+                baseline = { recorded ?: unmodified },
                 send = { payload ->
                     send { insertionPoint.buildHttpRequestWithPayload(BurpByteArray.byteArray(payload)).withService(service) }
                 },
-                control = unmodified,
+                control = { unmodified },
             )
             if (!result.report) return@issues emptyList()
             // type() is newer than the rest of the interface; an older Burp fails with an Error, not an Exception.

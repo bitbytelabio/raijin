@@ -114,6 +114,14 @@ class ScanCheckLogicTest {
         assertFalse(ScanCheckLogic.satisfied(listOf(body("beta"), body("gamma")), MatchMode.ANY, page))
     }
 
+    @Test
+    fun `no conditions are satisfied in either match mode`() {
+        // A priming step has none. `any` of nothing used to be false, which stopped every chain there.
+        for (mode in MatchMode.entries) {
+            assertTrue(ScanCheckLogic.satisfied(emptyList(), mode, response("anything")), mode.name)
+        }
+    }
+
     // ---- definition parsing -----------------------------------------------
 
     @Test
@@ -321,23 +329,82 @@ class ScanCheckLogicTest {
     }
 
     @Test
-    fun `the baseline and the control are fetched at most once and only when needed`() {
-        var baselines = 0
-        var controls = 0
-        fun runCounting(answer: CheckExchange) = ScanCheckLogic.runActive(
+    fun `the baseline and the control are each taken once, before the first payload`() {
+        val calls = mutableListOf<String>()
+        val result = ScanCheckLogic.runActive(
             listOf(step("a", body("hit"), required = false), step("b", body("hit"), required = false)),
-            baseline = { baselines++; response("page") },
-            send = { payload -> answer to payload },
-            control = { controls++; response("page") },
+            baseline = { calls += "baseline"; response("page") },
+            send = { payload -> calls += "send $payload"; response("hit") to payload },
+            control = { calls += "control"; response("page") },
         )
+        assertTrue(result.report, result.reason)
+        assertEquals(listOf("baseline", "control", "send a", "send b"), calls)
+    }
 
-        runCounting(response("nothing"))
-        assertEquals(0, baselines, "no step matched, so nothing needed comparing")
-        assertEquals(0, controls)
+    @Test
+    fun `a payload the target stores is not explained away by its own effect on the unmodified request`() {
+        // A comment endpoint that lists every stored comment: once the probe is stored, the unmodified
+        // request shows the marker too. Compared after the probe, the finding would cancel itself.
+        val stored = mutableListOf("hello")
+        fun page() = response(stored.joinToString("\n"))
+        val steps = listOf(step("<raijin-77>", body("<raijin-77>")))
+        val storing = { payload: String -> stored += payload; page() to payload }
 
-        assertTrue(runCounting(response("hit")).report)
-        assertEquals(1, baselines)
-        assertEquals(1, controls)
+        val recorded = ScanCheckLogic.runActive(steps, baseline = { response("hello") }, send = storing, control = { page() })
+        assertTrue(recorded.report, recorded.reason)
+        assertEquals(listOf("<raijin-77>"), recorded.novelPayloads)
+
+        // Nothing recorded: the baseline is a fresh request as well, and it too has to precede the probe.
+        stored.clear()
+        stored += "hello"
+        val unrecorded = ScanCheckLogic.runActive(steps, baseline = { page() }, send = storing, control = { page() })
+        assertTrue(unrecorded.report, unrecorded.reason)
+        assertEquals(listOf("<raijin-77>"), unrecorded.novelPayloads)
+    }
+
+    @Test
+    fun `a priming step without conditions passes under match_mode any as it does under all`() {
+        // Step 1 stores the marker; step 2 sends anything and finds the marker on the page.
+        for (mode in listOf("any", "all")) {
+            val steps = ScanCheckLogic.steps(
+                listOf(stepJson("<raijin-77>"), stepJson("x", condition("response_body", "<raijin-77>", "contains"))),
+                ScanCheckLogic.matchMode(mode),
+            )
+            val stored = mutableListOf("hello")
+            val result = ScanCheckLogic.runActive(
+                steps,
+                baseline = { response("hello") },
+                send = { payload -> stored += payload; response(stored.joinToString("\n")) to payload },
+                control = { response(stored.joinToString("\n")) },
+            )
+            assertTrue(result.report, "$mode: ${result.reason}")
+            assertEquals(
+                listOf(StepTrace(1, answered = true, matched = true, novel = false), StepTrace(2, answered = true, matched = true, novel = true)),
+                result.trace,
+                mode,
+            )
+            assertEquals(listOf("x"), result.novelPayloads, mode)
+            assertEquals(listOf("<raijin-77>", "x"), result.evidence, mode)
+        }
+    }
+
+    @Test
+    fun `priming steps never raise an issue by themselves`() {
+        val alone = run(listOf(step("<raijin-77>", mode = MatchMode.ANY)), response("hello"), mapOf("<raijin-77>" to response("saved")))
+        assertFalse(alone.report)
+        assertEquals("no step that looks at the response matched", alone.reason)
+
+        val unmatched = run(
+            listOf(step("<raijin-77>", mode = MatchMode.ANY), step("x", body("<raijin-77>"), required = false)),
+            baseline = response("hello"),
+            answers = mapOf("<raijin-77>" to response("saved"), "x" to response("hello")),
+        )
+        assertFalse(unmatched.report)
+        assertEquals("no step that looks at the response matched", unmatched.reason)
+
+        // Unanswered, a required priming step still ends the chain.
+        val unanswered = run(listOf(step("<raijin-77>"), step("x", body("x"))), response("hello"), emptyMap())
+        assertEquals("step 1 got no response", unanswered.reason)
     }
 
     // ---- issue text and consolidation --------------------------------------

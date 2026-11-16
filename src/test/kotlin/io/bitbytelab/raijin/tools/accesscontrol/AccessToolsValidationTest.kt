@@ -208,8 +208,8 @@ class AccessToolsValidationTest {
         assertRejected("analyze_diff", diff, "'type'", "required")
 
         val search = buildJsonObject { put("pattern", "token") }
-        assertRejected("analyze_response_body_search", search.having("max_results", "0"), "'max_results'", "1 and 500")
-        assertRejected("analyze_response_body_search", search.having("max_results", "501"), "'max_results'")
+        // A max_results past its range is clamped (AnalysisToolsTest); one that is not an integer is refused.
+        assertRejected("analyze_response_body_search", search.having("max_results", "1.5"), "'max_results'", "integer")
         assertRejected("analyze_response_body_search", buildJsonObject { put("pattern", "[unclosed") }, "Invalid regex")
         assertRejected("analyze_response_body_search", buildJsonObject { put("pattern", "") }, "'pattern'")
 
