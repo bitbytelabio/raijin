@@ -17,9 +17,14 @@ import kotlinx.serialization.json.jsonPrimitive
  */
 object EngineFingerprinter {
 
-    data class Outcome(val engine: String?, val checked: Int)
+    /** [unreachable]: the sender gave up on the target (see [detect]) after [checked] checks, before any signature matched. */
+    data class Outcome(val engine: String?, val checked: Int, val unreachable: Boolean = false)
 
-    /** Runs every check via [sendQuery] (query text in, raw response body out) until one matches. */
+    /**
+     * Runs every check via [sendQuery] (query text in, raw response body out) until one matches.
+     * A sender that throws [TargetUnreachableException] ends the run at once: the remaining checks
+     * would each wait for a target that is not answering.
+     */
     fun detect(sendQuery: (String) -> String): Outcome {
         val order: List<Pair<String, ((String) -> String) -> Boolean>> = listOf(
             "inigo" to { s: (String) -> String -> engineInigo(s) },
@@ -59,7 +64,13 @@ object EngineFingerprinter {
         )
         for ((i, pair) in order.withIndex()) {
             val (name, check) = pair
-            val matched = try { check(sendQuery) } catch (_: Exception) { false }
+            val matched = try {
+                check(sendQuery)
+            } catch (_: TargetUnreachableException) {
+                return Outcome(null, i, unreachable = true)
+            } catch (_: Exception) {
+                false
+            }
             if (matched) return Outcome(name, i + 1)
         }
         return Outcome(null, order.size)

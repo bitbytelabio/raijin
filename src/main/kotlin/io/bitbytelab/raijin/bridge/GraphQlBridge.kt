@@ -1,20 +1,36 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
-import burp.api.montoya.proxy.ProxyHistoryFilter
-import io.bitbytelab.raijin.safety.BoundedHttp
+import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.requests.HttpRequest
+import burp.api.montoya.proxy.ProxyHistoryFilter
+import burp.api.montoya.websocket.BinaryMessage
+import burp.api.montoya.websocket.TextMessage
+import burp.api.montoya.websocket.extension.ExtensionWebSocket
+import burp.api.montoya.websocket.extension.ExtensionWebSocketMessageHandler
+import io.bitbytelab.raijin.core.BodyText
+import io.bitbytelab.raijin.core.SensitiveHeaders
 import io.bitbytelab.raijin.graphql.BatchAttack
 import io.bitbytelab.raijin.graphql.EngineFingerprinter
 import io.bitbytelab.raijin.graphql.GQLSchema
 import io.bitbytelab.raijin.graphql.GraphQl
+import io.bitbytelab.raijin.graphql.ReachabilityGuard
+import io.bitbytelab.raijin.graphql.SchemaCache
 import io.bitbytelab.raijin.graphql.bruteforcer.SchemaBruteforcer
 import io.bitbytelab.raijin.graphql.scanners.CyclesScanner
 import io.bitbytelab.raijin.graphql.scanners.POIScanner
+import io.bitbytelab.raijin.graphql.subscriptions.OpenResult
+import io.bitbytelab.raijin.graphql.subscriptions.ProbeEvent
+import io.bitbytelab.raijin.graphql.subscriptions.ProbeSocket
+import io.bitbytelab.raijin.graphql.subscriptions.SubscriptionEndpoint
+import io.bitbytelab.raijin.graphql.subscriptions.SubscriptionProbe
+import io.bitbytelab.raijin.graphql.subscriptions.SubscriptionProtocol
+import io.bitbytelab.raijin.safety.BoundedHttp
 import io.bitbytelab.raijin.safety.ScopeGate
-import java.time.Duration
-import java.time.Instant
-import java.util.concurrent.ConcurrentHashMap
+import java.security.SecureRandom
+import java.util.Base64
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -29,7 +45,9 @@ import kotlinx.serialization.json.put
 
 /**
  * GraphQL security recon: introspection enumeration and, when introspection is
- * disabled, "Did you mean" field-suggestion enumeration. Scope-gated.
+ * disabled, "Did you mean" field-suggestion enumeration; schema-driven scans, batched
+ * queries, engine fingerprinting, schema reconstruction and a WebSocket subscription probe.
+ * Scope-gated.
  */
 class GraphQlBridge(private val api: MontoyaApi) {
 
@@ -37,11 +55,16 @@ class GraphQlBridge(private val api: MontoyaApi) {
 
     private data class ProbeResponse(val status: Int, val contentType: String?, val body: String)
 
-    private val schemaCache = ConcurrentHashMap<String, Pair<GQLSchema, Instant>>()
+    private val schemaCache = SchemaCache<GQLSchema>()
 
     companion object {
-        private val SCHEMA_CACHE_TTL: Duration = Duration.ofMinutes(10)
         private val AUTO_HEADER_NAMES = setOf("authorization", "cookie", "x-api-key", "x-auth-token")
+
+        /** How much of a response body `batch_attack` echoes back. */
+        private const val MAX_RESPONSE_BODY_CHARS = 20_000
+
+        /** Upper bound on one WebSocket upgrade of the subscription probe. */
+        private const val WS_CONNECT_TIMEOUT_MS = 10_000L
     }
 
     /**
@@ -77,9 +100,13 @@ class GraphQlBridge(private val api: MontoyaApi) {
             val introResp = postQuery(url, GraphQl.INTROSPECTION_QUERY, effHeaders)
             val introJson = try { Json.parseToJsonElement(introResp.body).jsonObject } catch (_: Exception) { null }
 
-            // `as? JsonObject` returns null for JsonNull / non-objects, so error-only or
-            // null-valued introspection responses fall through to the suggestion path safely.
-            if ((introJson?.get("data") as? JsonObject)?.get("__schema") != null) {
+            if (introResp.status == 0) {
+                // No HTTP response at all says nothing about GraphQL: report that instead of sending
+                // the second probe and concluding "not_graphql" about a target that never answered.
+                unreachable(url)
+            } else if ((introJson?.get("data") as? JsonObject)?.get("__schema") != null) {
+                // `as? JsonObject` returns null for JsonNull / non-objects, so error-only or
+                // null-valued introspection responses fall through to the suggestion path safely.
                 buildJsonObject {
                     put("endpoint", url)
                     put("verdict", "introspection_enabled")
@@ -128,7 +155,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
         } catch (e: Exception) {
             buildJsonObject { put("error", "GraphQL probe failed: ${e.message}") }
         }
-        return if (check.warning != null) JsonObject(result + ("scope_warning" to JsonPrimitive(check.warning))) else result
+        return withScopeWarning(result, check.warning)
     }
 
     /**
@@ -205,7 +232,10 @@ class GraphQlBridge(private val api: MontoyaApi) {
         return withScopeWarning(result, check.warning)
     }
 
-    /** Flags types that can recurse into themselves (deep-nesting/DoS risk) — ported from InQL's `CyclesScanner`. */
+    /**
+     * Lists the cycles of the schema's type graph — types that can recurse into themselves
+     * (deep-nesting/DoS risk). See [CyclesScanner] for what counts as a cycle and how the list is bounded.
+     */
     fun cyclesScan(
         url: String,
         headers: Map<String, String>? = null,
@@ -217,16 +247,29 @@ class GraphQlBridge(private val api: MontoyaApi) {
         val result = try {
             val (schema, err) = fetchFullSchema(url, resolveHeaders(url, headers, autoHeaders), refreshSchema)
             if (schema == null) return buildJsonObject { put("error", err) }
-            val cycles = CyclesScanner(schema).detect().cyclesAsStrings()
+            val scanner = CyclesScanner(schema).detect()
+            val cycles = scanner.cyclesAsStrings()
+            val cyclicTypes = scanner.cyclicTypes()
             buildJsonObject {
                 put("endpoint", url)
                 put("cycle_count", cycles.size)
+                put("truncated", scanner.truncated)
+                put("cyclic_types", buildJsonArray { cyclicTypes.forEach { add(it) } })
                 put("cycles", buildJsonArray { cycles.forEach { add(it) } })
                 put(
                     "note",
-                    if (cycles.isNotEmpty())
-                        "These types can recurse into themselves — a deeply/recursively nested query against them is a DoS risk if the server doesn't cap query depth/complexity."
-                    else "No self-recursive type cycles found."
+                    when {
+                        cyclicTypes.isEmpty() -> "No self-recursive type cycles found."
+                        scanner.truncated ->
+                            "These types can recurse into themselves — a deeply/recursively nested query against them is a DoS " +
+                                "risk if the server doesn't cap query depth/complexity. Each cycle is a path from a root " +
+                                "operation type that ends on a type it already went through. The list was cut at " +
+                                "${cycles.size} cycles (shortest first); 'cyclic_types' is complete."
+                        else ->
+                            "These types can recurse into themselves — a deeply/recursively nested query against them is a DoS " +
+                                "risk if the server doesn't cap query depth/complexity. Each cycle is a path from a root " +
+                                "operation type that ends on a type it already went through."
+                    }
                 )
             }
         } catch (e: Exception) {
@@ -248,8 +291,20 @@ class GraphQlBridge(private val api: MontoyaApi) {
         headers: Map<String, String>? = null,
         autoHeaders: Boolean = false,
     ): JsonObject {
-        val expanded = BatchAttack.expand(template, values)
-            ?: return buildJsonObject { put("error", "No \$[INT:first:last] or \$[LIST] placeholder found (immediately before a '{' selection set) in the template.") }
+        val expanded = try {
+            BatchAttack.expand(template, values)
+        } catch (e: BatchAttack.ExpansionException) {
+            return buildJsonObject { put("error", e.message ?: "The template could not be expanded.") }
+        } ?: return buildJsonObject {
+            put(
+                "error",
+                if (values.isNullOrEmpty() && template.contains("\$[LIST]")) {
+                    "The template uses \$[LIST] but 'values' is empty: pass the values to substitute."
+                } else {
+                    "No \$[INT:first:last] or \$[LIST] placeholder found (immediately before a '{' selection set) in the template."
+                }
+            )
+        }
 
         if (!send) {
             return buildJsonObject {
@@ -265,8 +320,12 @@ class GraphQlBridge(private val api: MontoyaApi) {
             put("endpoint", url)
             put("operations_generated", expanded.count)
             put("query", expanded.query)
-            put("status", resp.status)
-            put("response_body", resp.body.take(20_000))
+            if (resp.status == 0) {
+                put("error", unreachableMessage(url))
+            } else {
+                put("status", resp.status)
+                put("response_body", BodyText.render(resp.body, MAX_RESPONSE_BODY_CHARS).text)
+            }
         }
         return withScopeWarning(result, check.warning)
     }
@@ -274,23 +333,28 @@ class GraphQlBridge(private val api: MontoyaApi) {
     /**
      * Detects the GraphQL backend engine (Apollo, Hasura, graphql-java, ...) by sending a
      * sequence of malformed/edge-case queries and matching each engine's distinctive error
-     * text — ported from InQL's `Fingerprinter`. Stops at the first match.
+     * text — ported from InQL's `Fingerprinter`. Stops at the first match, or as soon as the
+     * target turns out not to answer (see [guardedSender]).
      */
     fun fingerprintEngine(url: String, headers: Map<String, String>? = null, autoHeaders: Boolean = false): JsonObject {
         val check = scopeGate.check(url)
         check.deny?.let { return it }
         val effHeaders = resolveHeaders(url, headers, autoHeaders)
         val result = try {
-            val outcome = EngineFingerprinter.detect { query -> postQuery(url, query, effHeaders).body }
-            buildJsonObject {
-                put("endpoint", url)
-                put("engine", outcome.engine)
-                put("checked", outcome.checked)
-                put(
-                    "note",
-                    if (outcome.engine != null) "Backend engine fingerprinted as '${outcome.engine}' from a distinctive error signature."
-                    else "No known engine signature matched after ${outcome.checked} checks."
-                )
+            val outcome = EngineFingerprinter.detect(guardedSender(url, effHeaders))
+            if (outcome.unreachable) {
+                unreachable(url)
+            } else {
+                buildJsonObject {
+                    put("endpoint", url)
+                    put("engine", outcome.engine)
+                    put("checked", outcome.checked)
+                    put(
+                        "note",
+                        if (outcome.engine != null) "Backend engine fingerprinted as '${outcome.engine}' from a distinctive error signature."
+                        else "No known engine signature matched after ${outcome.checked} checks."
+                    )
+                }
             }
         } catch (e: Exception) {
             buildJsonObject { put("error", "Engine fingerprinting failed: ${e.message}") }
@@ -301,7 +365,8 @@ class GraphQlBridge(private val api: MontoyaApi) {
     /**
      * Reconstructs the schema by probing wordlists and parsing "did you mean"/type-mismatch
      * error messages — for targets with introspection disabled. Ported from InQL's Clairvoyance-
-     * style `Bruteforcer`. Noisy and request-heavy: every field/type/arg guess is a live request.
+     * style `Bruteforcer`. Noisy and request-heavy: every field/type/arg guess is a live request,
+     * so the run stops after [maxRequests] of them and returns the schema found so far.
      */
     fun bruteforceSchema(
         url: String,
@@ -310,27 +375,44 @@ class GraphQlBridge(private val api: MontoyaApi) {
         bucketSize: Int = 64,
         depthLimit: Int = 2,
         bruteforceArguments: Boolean = true,
+        maxRequests: Int = SchemaBruteforcer.DEFAULT_MAX_REQUESTS,
     ): JsonObject {
         val check = scopeGate.check(url)
         check.deny?.let { return it }
         val effHeaders = resolveHeaders(url, headers, autoHeaders)
         val result = try {
             val reconstruction = SchemaBruteforcer(
-                sendQuery = { query -> postQuery(url, query, effHeaders).body },
+                sendQuery = guardedSender(url, effHeaders),
                 bucketSize = bucketSize,
                 depthLimit = depthLimit,
                 bruteforceArguments = bruteforceArguments,
+                maxRequests = maxRequests,
             ).run()
-            buildJsonObject {
-                put("endpoint", url)
-                put("requests_sent", reconstruction.requestsSent)
-                put("types", reconstruction.typesAsJson())
-                put(
-                    "note",
-                    "Reconstructed ${reconstruction.types.size} type(s) from error-message analysis " +
-                        "(no introspection used). Field/type coverage depends on wordlist hits — treat this as a " +
-                        "lower bound on the real schema, not a complete one."
-                )
+            val stopped = reconstruction.stopped
+            if (stopped == SchemaBruteforcer.StopReason.UNREACHABLE && reconstruction.types.isEmpty()) {
+                unreachable(url)
+            } else {
+                buildJsonObject {
+                    put("endpoint", url)
+                    put("requests_sent", reconstruction.requestsSent)
+                    put("partial", stopped != null)
+                    if (stopped != null) put("stopped_by", stopped.name.lowercase())
+                    put("types", reconstruction.typesAsJson())
+                    put(
+                        "note",
+                        "Reconstructed ${reconstruction.types.size} type(s) from error-message analysis " +
+                            "(no introspection used). Field/type coverage depends on wordlist hits — treat this as a " +
+                            "lower bound on the real schema, not a complete one." +
+                            when (stopped) {
+                                SchemaBruteforcer.StopReason.REQUEST_BUDGET ->
+                                    " The run stopped at its budget of $maxRequests requests, so types and fields are " +
+                                        "missing: raise 'max_requests', or lower 'depth_limit', to go further."
+                                SchemaBruteforcer.StopReason.UNREACHABLE ->
+                                    " The target stopped answering during the run, so types and fields are missing."
+                                null -> ""
+                            }
+                    )
+                }
             }
         } catch (e: Exception) {
             buildJsonObject { put("error", "Schema bruteforcing failed: ${e.message}") }
@@ -339,33 +421,110 @@ class GraphQlBridge(private val api: MontoyaApi) {
     }
 
     /**
+     * Probes GraphQL subscriptions over WebSocket at [url] (`ws(s)://`, or the `http(s)://` URL of
+     * the GraphQL endpoint): which of the two protocols' handshakes the server acknowledges,
+     * whether `connection_init` needs credentials, and whether an operation can be started. See
+     * [SubscriptionProbe] for the sessions it runs.
+     *
+     * Credentials are the caller's identity headers ([SensitiveHeaders]) and [connectionPayload];
+     * the anonymous sessions are sent without either.
+     *
+     * @param subscriptionQuery operation to start after `connection_ack`; null lets the probe pick one.
+     * @param waitMs bound on each wait for a server message.
+     */
+    fun subscriptionProbe(
+        url: String,
+        headers: Map<String, String>? = null,
+        autoHeaders: Boolean = false,
+        subscriptionQuery: String? = null,
+        connectionPayload: JsonObject? = null,
+        waitMs: Long = SubscriptionProbe.DEFAULT_WAIT_MS,
+    ): JsonObject {
+        val endpoint = SubscriptionEndpoint.parse(url)
+            .getOrElse { return buildJsonObject { put("error", it.message ?: "Invalid URL '$url'") } }
+        val check = scopeGate.check(endpoint.httpUrl)
+        check.deny?.let { return it }
+        val identified = resolveHeaders(endpoint.httpUrl, headers, autoHeaders)
+        val anonymous = identified.filterKeys { !SensitiveHeaders.isSensitive(it) }
+        val result = try {
+            SubscriptionProbe(
+                open = { protocol, authenticated -> openSocket(endpoint, protocol, if (authenticated) identified else anonymous) },
+                operation = subscriptionQuery?.takeIf { it.isNotBlank() },
+                connectionPayload = connectionPayload,
+                hasCredentials = anonymous.size != identified.size || !connectionPayload.isNullOrEmpty(),
+                waitMs = waitMs,
+            ).run().toJson(endpoint.wsUrl)
+        } catch (e: Exception) {
+            buildJsonObject { put("error", "Subscription probe failed: ${e.message}") }
+        }
+        return withScopeWarning(result, check.warning)
+    }
+
+    /**
+     * Performs one WebSocket upgrade, bounded by [WS_CONNECT_TIMEOUT_MS]. The socket is handed to
+     * [MontoyaProbeSocket] on the thread that created it, so an upgrade that only completes after
+     * the timeout still gets its socket closed rather than leaked.
+     */
+    private fun openSocket(
+        endpoint: SubscriptionEndpoint,
+        protocol: SubscriptionProtocol,
+        headers: Map<String, String>,
+    ): OpenResult {
+        val socket = MontoyaProbeSocket()
+        val result = BoundedHttp.runBounded(WS_CONNECT_TIMEOUT_MS) { upgrade(endpoint, protocol, headers, socket) }
+        if (result !is OpenResult.Opened) socket.close()
+        return result ?: OpenResult.Refused.of(OpenResult.Refused.TIMEOUT, detail = "no answer within $WS_CONNECT_TIMEOUT_MS ms")
+    }
+
+    private fun upgrade(
+        endpoint: SubscriptionEndpoint,
+        protocol: SubscriptionProtocol,
+        headers: Map<String, String>,
+        socket: MontoyaProbeSocket,
+    ): OpenResult = try {
+        val key = Base64.getEncoder().encodeToString(ByteArray(16).also { SecureRandom().nextBytes(it) })
+        val request = HttpRequest.httpRequest(
+            HttpService.httpService(endpoint.host, endpoint.port, endpoint.secure),
+            endpoint.upgradeRequest(protocol.subprotocol, headers, key),
+        )
+        val creation = api.websockets().createWebSocket(request)
+        val response = creation.upgradeResponse().orElse(null)
+        val httpStatus = response?.statusCode()?.toInt()
+        val webSocket = creation.webSocket().orElse(null)
+        if (webSocket == null) {
+            OpenResult.Refused.of(creation.status()?.name ?: "UNKNOWN", httpStatus)
+        } else {
+            socket.attach(webSocket)
+            val selected = try { response?.headerValue("Sec-WebSocket-Protocol") } catch (_: Exception) { null }
+            OpenResult.Opened(socket, httpStatus, selected)
+        }
+    } catch (e: Exception) {
+        OpenResult.Refused.of(OpenResult.Refused.ERROR, detail = e.message ?: e.javaClass.simpleName)
+    }
+
+    /**
      * Fetches the FULL official introspection query (needed for schema modeling) and builds a
      * [GQLSchema]. The failure message distinguishes a connection failure (couldn't reach the
      * endpoint at all — `status == 0`) from a real HTTP response that just doesn't parse into a
      * schema (introspection genuinely disabled/malformed) — conflating the two previously made a
      * bad URL/unreachable host look identical to "introspection may be disabled". Successful
-     * fetches are cached per (url, headers) for [SCHEMA_CACHE_TTL], bypassable via [refreshSchema].
+     * fetches are cached per (url, headers) in [schemaCache], bypassable via [refreshSchema].
      */
     private fun fetchFullSchema(
         url: String,
         headers: Map<String, String> = emptyMap(),
         refreshSchema: Boolean = false,
     ): Pair<GQLSchema?, String?> {
-        val cacheKey = "$url|${headers.hashCode()}"
-        if (!refreshSchema) {
-            schemaCache[cacheKey]?.let { (schema, fetchedAt) ->
-                if (Duration.between(fetchedAt, Instant.now()) < SCHEMA_CACHE_TTL) return schema to null
-            }
-        }
+        if (!refreshSchema) schemaCache.get(url, headers)?.let { return it to null }
         val resp = postQuery(url, graphql.introspection.IntrospectionQuery.INTROSPECTION_QUERY, headers)
         if (resp.status == 0) {
-            return null to "Could not reach $url (connection failed) — check the URL and that the target is reachable."
+            return null to unreachableMessage(url)
         }
         if (resp.body.isBlank()) {
             return null to "Endpoint returned an empty response body (HTTP ${resp.status}); introspection may be disabled."
         }
         val schema = try { GQLSchema(resp.body) } catch (_: Exception) { null }
-        if (schema != null) schemaCache[cacheKey] = schema to Instant.now()
+        if (schema != null) schemaCache.put(url, headers, schema)
         return schema to (
             if (schema == null) "Could not build a schema from this endpoint's introspection response (HTTP ${resp.status}); introspection may be disabled."
             else null
@@ -374,6 +533,30 @@ class GraphQlBridge(private val api: MontoyaApi) {
 
     private fun withScopeWarning(result: JsonObject, warning: String?): JsonObject =
         if (warning != null) JsonObject(result + ("scope_warning" to JsonPrimitive(warning))) else result
+
+    private fun unreachableMessage(url: String): String =
+        "Could not reach $url (no HTTP response: the connection failed or timed out) — check the URL and that the target is reachable."
+
+    private fun unreachable(url: String): JsonObject = buildJsonObject {
+        put("error", unreachableMessage(url))
+        put("endpoint", url)
+        put("unreachable", true)
+    }
+
+    /**
+     * A query sender for the modes that send many requests. It throws
+     * [io.bitbytelab.raijin.graphql.TargetUnreachableException] once the target stops answering
+     * (see [ReachabilityGuard]), so those modes end with one error instead of waiting out a timeout
+     * for every request they still had to send.
+     */
+    private fun guardedSender(url: String, headers: Map<String, String>): (String) -> String {
+        val guard = ReachabilityGuard()
+        return { query ->
+            val response = postQuery(url, query, headers)
+            guard.record(response.status)
+            response.body
+        }
+    }
 
     private fun postQuery(url: String, query: String, headers: Map<String, String> = emptyMap()): ProbeResponse {
         return try {
@@ -397,4 +580,63 @@ class GraphQlBridge(private val api: MontoyaApi) {
         Json.parseToJsonElement(body).jsonObject["errors"]?.jsonArray
             ?.mapNotNull { it.jsonObject["message"]?.jsonPrimitive?.contentOrNull } ?: emptyList()
     } catch (_: Exception) { emptyList() }
+}
+
+/**
+ * [ProbeSocket] over a Montoya extension WebSocket: server frames and the close are queued for
+ * [receive]. [close] may come before [attach] (an upgrade abandoned at its timeout); the socket
+ * is then closed the moment it arrives.
+ */
+private class MontoyaProbeSocket : ProbeSocket {
+    private val events = LinkedBlockingQueue<ProbeEvent>()
+    private var webSocket: ExtensionWebSocket? = null
+    private var closed = false
+
+    @Synchronized
+    fun attach(ws: ExtensionWebSocket) {
+        if (closed) {
+            runCatching { ws.close() }
+            return
+        }
+        webSocket = ws
+        ws.registerMessageHandler(object : ExtensionWebSocketMessageHandler {
+            override fun textMessageReceived(textMessage: TextMessage) = enqueue(textMessage.payload())
+
+            // Both protocols are JSON text; a server that frames it as binary is still read.
+            override fun binaryMessageReceived(binaryMessage: BinaryMessage) =
+                enqueue(String(binaryMessage.payload().bytes, Charsets.UTF_8))
+
+            override fun onClose() {
+                events.offer(ProbeEvent.Closed)
+            }
+        })
+    }
+
+    /** Frames nobody reads are dropped past a bound, so a chatty stream cannot grow the queue without limit. */
+    private fun enqueue(text: String) {
+        if (events.size < MAX_QUEUED_FRAMES) events.offer(ProbeEvent.Text(text))
+    }
+
+    override fun send(text: String) {
+        val ws = synchronized(this) { webSocket } ?: throw IllegalStateException("WebSocket is closed")
+        ws.sendTextMessage(text)
+    }
+
+    override fun receive(timeoutMs: Long): ProbeEvent? = try {
+        events.poll(timeoutMs, TimeUnit.MILLISECONDS)
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        ProbeEvent.Closed
+    }
+
+    @Synchronized
+    override fun close() {
+        closed = true
+        webSocket?.let { ws -> runCatching { ws.close() } }
+        webSocket = null
+    }
+
+    private companion object {
+        const val MAX_QUEUED_FRAMES = 256
+    }
 }

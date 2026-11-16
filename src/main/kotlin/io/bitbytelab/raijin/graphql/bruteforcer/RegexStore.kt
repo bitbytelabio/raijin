@@ -14,12 +14,18 @@ object RegexStore {
         Regex("""Field ["'`]?(?<field>[_A-Za-z][_0-9A-Za-z]*)["'`]? doesn't exist on type ["'`]?(?<typename>[_A-Za-z][_0-9A-Za-z]*)["'`].*"""),
     )
 
+    /**
+     * "Did you mean" lists. graphql-js (and its ports) writes `"a"?`, `"a" or "b"?` and, for three
+     * to five names, `"a", "b", or "c"?`. The `\G` patterns walk the comma-separated names but stop
+     * at the word `or`, so the name after it is only ever captured by the last pattern, as
+     * `suggestion3`; its middle group repeats so that lists longer than three still match.
+     */
     val FIELD_SUGGESTIONS = listOf(
         Regex("""(?:Did you mean|\G(?!^))[^\w"'`]+["'`]?(?<suggestion>[_A-Za-z][_0-9A-Za-z]*)["'`]"""),
         Regex("""Did you mean["'`]? (?<suggestion1>[_A-Za-z][_0-9A-Za-z]*)["'`]? or ["'`]?(?<suggestion2>[_A-Za-z][_0-9A-Za-z]*)["'`]?\?"""),
         Regex("""Did you mean ["'`]?(?<suggestion>[_A-Za-z][_0-9A-Za-z]*)["'`]?\?"""),
         Regex("""(?:Did you mean|\G(?!^))[^\w`'"]+["'`]?(?<suggestion>[_A-Za-z][_0-9A-Za-z]*)["'`]"""),
-        Regex("""Did you mean(?:[^"'`]+)?(?:["'`])(?<suggestion1>[_A-Za-z][_0-9A-Za-z]*)(?:["'`])(?:,\s*(?:["'`])(?<suggestion2>[_A-Za-z][_0-9A-Za-z]*)(?:["'`]))?(?:\s*,?\s*or\s*(?:["'`])(?<suggestion3>[_A-Za-z][_0-9A-Za-z]*)(?:["'`]))?\?"""),
+        Regex("""Did you mean(?:[^"'`]+)?(?:["'`])(?<suggestion1>[_A-Za-z][_0-9A-Za-z]*)(?:["'`])(?:,\s*(?:["'`])(?<suggestion2>[_A-Za-z][_0-9A-Za-z]*)(?:["'`]))*(?:\s*,?\s*or\s*(?:["'`])(?<suggestion3>[_A-Za-z][_0-9A-Za-z]*)(?:["'`]))?\?"""),
     )
 
     val NO_SUBFIELDS =
@@ -50,8 +56,9 @@ object RegexStore {
     const val PROBE_FIELD = "____raijin_bruteforce_probe____"
     const val PROBE_ARG = "____raijin_bruteforce_probe_arg____"
 
+    /** Every name captured by a `suggestion`, `suggestion1`, `suggestion2` or `suggestion3` group of [regexList], in order, without duplicates. */
     fun getSuggestions(errorMessage: String, regexList: List<Regex>): List<String> {
-        val suggestionGroupNames = listOf("suggestion", "suggestion1", "suggestion2")
+        val suggestionGroupNames = listOf("suggestion", "suggestion1", "suggestion2", "suggestion3")
         return regexList.flatMap { regex ->
             regex.findAll(errorMessage).flatMap { matchResult ->
                 suggestionGroupNames.mapNotNull { groupName ->
