@@ -4,9 +4,7 @@ import io.bitbytelab.raijin.turbo.hp3.quic.ControlledKwikQuicTransport
 import io.bitbytelab.raijin.turbo.hp3.quic.KwikThreads
 import io.bitbytelab.raijin.turbo.hp3.quic.QuicConfig
 import io.bitbytelab.raijin.turbo.http3.FirstByteTimingInputStream
-import io.bitbytelab.raijin.turbo.http3.GateConnection
 import io.bitbytelab.raijin.turbo.http3.GateMode
-import io.bitbytelab.raijin.turbo.http3.QpackGateLimits
 import io.bitbytelab.raijin.turbo.http3.SdaBatch
 import io.bitbytelab.raijin.turbo.http3.SdaOptions
 import io.bitbytelab.raijin.turbo.http3.StageDrain
@@ -16,12 +14,9 @@ import java.net.URI
 import java.net.URL
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -29,103 +24,10 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * A thread for work that blocks inside Kwik: a handshake, or a response read. Virtual where the JVM
- * carries a blocked virtual thread without pinning a carrier, platform daemon where it does not; see
- * [KwikThreads].
+ * Engine.HTTP3. Runs the dispatcher, ordinary requests, gate releases, adaptive resizing and the
+ * run's lifecycle and metrics. The ordinary connections and their leases belong to
+ * [Http3ConnectionPool]; the connection each gate holds belongs to [Http3GateConnections].
  */
-internal fun kwikBlockingThread(name: String): Thread.Builder = KwikThreads.blockingThread(name)
-
-internal fun interface Http3AdaptiveTaskStarter {
-    fun start(name: String, task: () -> Unit)
-}
-
-internal object Http3AdaptiveTaskStarterConstructionContext {
-    private val currentStarter = ThreadLocal<Http3AdaptiveTaskStarter?>()
-
-    fun current(): Http3AdaptiveTaskStarter? = currentStarter.get()
-
-    fun <T> withStarter(starter: Http3AdaptiveTaskStarter?, construct: () -> T): T {
-        currentStarter.set(starter)
-        return try {
-            construct()
-        } finally {
-            currentStarter.remove()
-        }
-    }
-}
-
-internal inline fun tryAcquireAdaptiveTaskSlot(
-    isRunning: () -> Boolean,
-    acquire: () -> Boolean,
-    release: () -> Unit,
-): Boolean {
-    if (!isRunning() || !acquire()) return false
-    if (isRunning()) return true
-    release()
-    return false
-}
-
-/**
- * Whether a gated request may still be waiting in the dispatch queue, which is the only time
- * walking the queue for one is worth O(queue depth).
- *
- * <p>RequestEngine.queue() opens a gate's lifecycle and counts the request into the gate's
- * `remaining` before the request reaches the queue, and staging counts it back out, so a queued
- * gated request is always visible here first. A gate gets its batch when its first request is
- * staged and keeps it until its lifecycle ends. So an active gate without a batch still has its
- * requests queued, and one with a batch has requests queued exactly while some are unstaged.
- * Checking only the gates in [batchedGates] keeps the cost at the number of gates in flight rather
- * than every gate the run has ever registered.
- *
- * @param activeGateLifecycles gates queued and not yet finished
- * @param batchedGates names of the gates whose batch is open
- * @param unstagedRequests the requests a gate has queued and not yet staged
- */
-internal inline fun gatedRequestMayBeQueued(
-    activeGateLifecycles: Int,
-    batchedGates: Collection<String>,
-    unstagedRequests: (String) -> Int,
-): Boolean {
-    if (activeGateLifecycles == 0) return false
-    if (activeGateLifecycles > batchedGates.size) return true
-    return batchedGates.any { gateName -> unstagedRequests(gateName) > 0 }
-}
-
-/**
- * Atomically orders callback admission against terminal teardown. A callback that owns a token
- * was admitted before close; after close, no check-then-act window can admit another one.
- */
-internal class GateCallbackAdmissions {
-    private val state = AtomicLong(0)
-
-    fun tryEnter(): Boolean {
-        while (true) {
-            val current = state.get()
-            if (current < 0) return false
-            check(current < Long.MAX_VALUE) { "too many active gate callbacks" }
-            if (state.compareAndSet(current, current + 1)) return true
-        }
-    }
-
-    fun exit() {
-        while (true) {
-            val current = state.get()
-            val active = current and Long.MAX_VALUE
-            check(active > 0) { "gate callback admission released without an owner" }
-            if (state.compareAndSet(current, current - 1)) return
-        }
-    }
-
-    fun close() {
-        while (true) {
-            val current = state.get()
-            if (current < 0 || state.compareAndSet(current, current or Long.MIN_VALUE)) return
-        }
-    }
-
-    fun activeCount(): Long = state.get() and Long.MAX_VALUE
-}
-
 open class HTTP3RequestEngine @JvmOverloads constructor(
     url: String,
     private val threads: Int,
@@ -135,25 +37,19 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
     override var idleTimeout: Long = 0,
     override val callback: (Request, Boolean) -> Boolean,
     override var readCallback: ((String) -> Boolean)?,
-    private val verifyCertificates: Boolean = false,
-    private val connectionFactory: H3ConnectionFactory = defaultConnectionFactory(idleTimeout),
+    verifyCertificates: Boolean = false,
+    connectionFactory: H3ConnectionFactory = defaultConnectionFactory(idleTimeout),
     private val maxConcurrentStreams: Int = DEFAULT_MAX_CONCURRENT_STREAMS,
-    private val gateMode: GateMode = GateMode.AUTO,
+    gateMode: GateMode = GateMode.AUTO,
     private val adaptive: Boolean = false,
 ) : RequestEngine(requiresBurpProfessional = true), AdaptiveTransport {
     private val options = SdaOptions()
-    private var connectionSlots: Semaphore? = null
-    private var adaptiveConnectionSlots: ResizableLimit? = null
-    private var dispatchSlots: Semaphore? = null
-    private var adaptiveDispatchSlots: ResizableLimit? = null
+    private val connectionSlots: Http3SlotLimit
+    private val dispatchSlots: Http3SlotLimit
+    private val opener: Http3ConnectionOpener
+    private val pool: Http3ConnectionPool
+    private val gateConnections: Http3GateConnections
     private val batches = ConcurrentHashMap<String, SdaBatch>()
-    /**
-     * Membership is the exactly-once resource token for an active gate connection. The finisher
-     * normally removes it after probing connectivity; cancellation removes anything whose probe
-     * outlives the bounded drain and closes/releases it instead.
-     */
-    private val unsettledGateConnections = ConcurrentHashMap.newKeySet<GateConnection>()
-    private val gateSettlementLock = Object()
     private val activeJobs = AtomicInteger()
     private val gateCollectors = ConcurrentHashMap<String, GateCollector>()
     private val gateCallbackAdmissions = GateCallbackAdmissions()
@@ -162,50 +58,10 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
     private val terminalActionsLock = Object()
     private val cleanupRequested = AtomicBoolean()
     private val cleanupCompleted = AtomicBoolean()
-    private val connectionSetupsInFlight = AtomicInteger()
     private val started = AtomicBoolean(false)
+
+    /** Held through a live resize, and by the pool while it shrinks to the resized limit. */
     private val resizeLock = Object()
-    /**
-     * Never guards ordinary request leases. It is the rendezvous a request parks on when the pool
-     * has no lease to give, and serializes every publication into the pool with the dispatcher's
-     * final pool snapshot so a session cannot appear after teardown has passed it.
-     */
-    private val poolLock = Object()
-
-    /**
-     * Set under [poolLock] when the dispatcher takes the pool snapshot it closes, and checked under
-     * it by everything that publishes a connection. runState alone cannot say this: a run that
-     * completes rather than being cancelled is still in state 2 when that snapshot is taken, so a
-     * connection still opening at that moment would be pooled after the pool's last sweep and
-     * never closed.
-     */
-    private var ordinaryPoolClosed = false
-
-    /**
-     * Copy-on-write so a request can walk the pool without taking anything. Writes are connections
-     * opening and retiring, which happen [threads] times in a run rather than once per request.
-     */
-    private val ordinaryConnections = CopyOnWriteArrayList<OrdinaryConnection>()
-    private val waitingGates = AtomicInteger()
-    private val adaptiveTaskStarter = Http3AdaptiveTaskStarterConstructionContext.current()
-        ?: Http3AdaptiveTaskStarter { name, task -> kwikBlockingThread(name).start(task) }
-    private val retirementDrainScheduled = AtomicBoolean()
-
-    /**
-     * Where the next request starts looking for a lease. Requests would otherwise all walk the
-     * pool from the front and pile onto the same connection's counter, turning one connection's
-     * compare-and-set into the contention the monitor used to be.
-     */
-    private val leaseCursor = AtomicInteger()
-
-    /**
-     * Request threads parked in [acquireOrdinaryConnection], the only place that waits on
-     * [poolLock]. Measured rather than assumed: at full rate threads park constantly, because the
-     * pool hands out more leases than the transport can carry streams for, so wake-ups here are
-     * on the critical path and must not be skipped. Read before every wake-up so that a run whose
-     * pool always has room never touches the monitor at all.
-     */
-    private val poolWaiters = AtomicInteger()
 
     /** Requests the configuration asks to have in flight: one per stream on every connection. */
     private val targetConcurrency =
@@ -222,13 +78,7 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
     private val initialRequestsInFlightLimit = dispatchCapacity(threads)
 
     val requestsInFlightLimit: Int
-        get() = adaptiveDispatchSlots?.snapshot()?.limit ?: initialRequestsInFlightLimit
-
-    /** Names request threads in creation order, so a stack dump is readable. */
-    private val requestThreads = AtomicInteger()
-
-    /** Names managed gate collectors and keeps them independent of the ordinary request pool. */
-    private val gateThreads = AtomicInteger()
+        get() = dispatchSlots.snapshot()?.limit ?: initialRequestsInFlightLimit
 
     /**
      * Gates that were answered before they were released, and so raced nothing.
@@ -253,26 +103,10 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
      */
     val gateReleaseSendSpanNanos = AtomicLong()
 
-    /**
-     * Carries the ungated requests, one thread per request in flight.
-     *
-     * Which kind of thread depends on the JVM. Kwik reads a response inside
-     * `synchronized (addMonitor)` (`tech.kwik.core.stream.StreamInputStreamImpl`). Before JDK 24 a
-     * virtual thread that blocks inside a synchronized block pins its carrier without the scheduler
-     * compensating, so an in-flight request cost a whole carrier anyway and the run was capped at a
-     * pool size only a JVM option can raise — measured on 18 cores, a run configured for 800
-     * requests in flight carried 18. There, pooled platform threads are strictly better.
-     *
-     * JEP 491 removed that pinning in JDK 24, and Burp ships a JRE well past it, so in the case
-     * that matters most the threads can be virtual: a run holding 1200 requests costs 1200 cheap
-     * virtual threads instead of 1200 OS threads for the scheduler to move around.
-     *
-     * The platform pool is fixed rather than one thread per request because starting an OS thread
-     * costs tens of microseconds and the single dispatcher pays it per request. Either way
-     * [dispatchSlots] bounds submissions to [requestsInFlightLimit], so neither executor queues
-     * work behind a busy thread.
-     */
+    /** Carries the ungated requests, one thread per request in flight; see [newHttp3RequestExecutor]. */
     private lateinit var requestExecutor: ExecutorService
+
+    /** Carries the gate collectors, apart from the ordinary requests; see [newHttp3GateExecutor]. */
     private lateinit var gateExecutor: ExecutorService
 
     @JvmOverloads
@@ -318,40 +152,41 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
             requestQueue = if (maxQueueSize > 0) LinkedBlockingQueue(maxQueueSize) else LinkedBlockingQueue()
             completedLatch = CountDownLatch(1)
             if (adaptive) {
-                adaptiveConnectionSlots = ResizableLimit(threads)
-                adaptiveDispatchSlots = ResizableLimit(initialRequestsInFlightLimit)
+                val cancelled = { runState.get() >= 3 }
+                connectionSlots = Http3SlotLimit.resizable(threads, cancelled)
+                dispatchSlots = Http3SlotLimit.resizable(initialRequestsInFlightLimit, cancelled)
             } else {
-                // Unfair. A fair semaphore routes every acquire through the AQS wait queue even
-                // when a permit is free; neither fixed limit needs FIFO ordering to be correct.
-                connectionSlots = Semaphore(threads)
-                dispatchSlots = Semaphore(initialRequestsInFlightLimit)
+                connectionSlots = Http3SlotLimit.fixed(threads)
+                dispatchSlots = Http3SlotLimit.fixed(initialRequestsInFlightLimit)
             }
-            requestExecutor = if (useVirtualThreads) {
-                // Unnamed on purpose. A named virtual thread factory formats a fresh name string
-                // for every request on the hot path.
-                Executors.newThreadPerTaskExecutor(Thread.ofVirtual().factory())
-            } else {
-                // Adaptive execution is sized once for its immutable safety ceiling. Live work is
-                // controlled by adaptiveDispatchSlots rather than replacing this executor.
-                val executorCapacity = if (adaptive) {
-                    maxRequestsInFlight(useVirtualThreads)
-                } else {
-                    initialRequestsInFlightLimit
-                }
-                Executors.newFixedThreadPool(executorCapacity) { runnable ->
-                    Thread.ofPlatform()
-                        .daemon()
-                        .name("http3-request-${requestThreads.incrementAndGet()}")
-                        .unstarted(runnable)
-                }
-            }
-            // Gate collectors must not queue behind ordinary requests: on platform-thread JVMs
-            // every request-pool thread can be parked waiting for a connection held by a gate.
-            // A separately managed executor preserves that independent capacity while still
-            // giving teardown one owner that can interrupt and account for every collector.
-            gateExecutor = Executors.newThreadPerTaskExecutor { runnable ->
-                kwikBlockingThread("http3-gate-${gateThreads.incrementAndGet()}").unstarted(runnable)
-            }
+            opener = Http3ConnectionOpener(this, connectionFactory, verifyCertificates, adaptive)
+            pool = Http3ConnectionPool(
+                runState,
+                retiredConnections,
+                adaptive,
+                requestsPerConnection,
+                maxConcurrentStreams,
+                connectionSlots,
+                opener,
+                resizeLock,
+                Http3AdaptiveTaskStarterConstructionContext.current()
+                    ?: Http3AdaptiveTaskStarter { name, task -> kwikBlockingThread(name).start(task) },
+            )
+            gateConnections = Http3GateConnections(
+                pool,
+                runState,
+                activeJobs,
+                requestsPerConnection,
+                gateMode,
+                options,
+            )
+            // Adaptive execution is sized once for its immutable safety ceiling. Live work is
+            // controlled by the adaptive dispatch slots rather than replacing this executor.
+            requestExecutor = newHttp3RequestExecutor(
+                useVirtualThreads,
+                if (adaptive) maxRequestsInFlight(useVirtualThreads) else initialRequestsInFlightLimit,
+            )
+            gateExecutor = newHttp3GateExecutor()
             // Started here rather than in start() so that a run cancelled before it ever started
             // still has something to count the completion latch down.
             Thread.ofPlatform().daemon().name("http3-dispatcher").start(::dispatchForever)
@@ -365,7 +200,7 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
 
     override fun start(timeout: Int) {
         if (started.compareAndSet(false, true)) {
-            openInitialConnections(timeout)
+            pool.openInitialConnections(connectionSlots.snapshot()?.limit ?: threads, timeout)
             if (runState.get() >= 3) {
                 return
             }
@@ -377,15 +212,11 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
             // tolerance in openInitialConnections is still worth keeping for a target that refuses
             // part of the opening burst, which is why this asks whether any connection opened
             // rather than whether any failed.
-            if (connections.get() == 0 && connectionOpenFailures.get() > 0) {
+            if (connections.get() == 0 && opener.openFailures.get() > 0) {
                 // Leaves the dispatcher no run to wait for. It is parked on runState being 0.
                 finish(3)
                 throw Exception(failureSummary())
             }
-            // Stamped after the handshakes, the way ThreadedRequestEngine stamps it after its
-            // connected latch. A QUIC handshake can take seconds, and charging it to the run
-            // offsets every request's arrival and understates the reported RPS.
-            start = System.nanoTime()
             if (requestsInFlightLimit < targetConcurrency) {
                 Utils.out(
                     "HTTP/3: $threads connections x $maxConcurrentStreams streams would put " +
@@ -393,9 +224,13 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
                         "Capping at $requestsInFlightLimit."
                 )
             }
-            // The dispatcher is parked until this point, so nothing is sent over a pool that is
-            // still being filled.
-            runState.set(1)
+            // Stamped after the handshakes, the way ThreadedRequestEngine stamps it after its
+            // connected latch. A QUIC handshake can take seconds, and charging it to the run
+            // offsets every request's arrival and understates the reported RPS. The dispatcher is
+            // parked until the run goes live, so nothing is sent over a pool that is still being
+            // filled. goLive() stamps and goes live under the lock a stop ends the run under, so a
+            // stop that lands after the check above stands rather than being put back to live.
+            if (!goLive()) return
             startIdleTimeoutWatchdog()
             startResponseDeadlineWatchdog()
         }
@@ -412,14 +247,14 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
     override fun defaultAdaptiveLimits() = AdaptiveLimits(DEFAULT_ADAPTIVE_CONNECTIONS, null)
 
     override fun currentAdaptiveLimits() = AdaptiveLimits(
-        adaptiveConnectionSlots?.snapshot()?.limit ?: threads,
+        connectionSlots.snapshot()?.limit ?: threads,
         null,
     )
 
     override fun adaptiveMetrics(): AdaptiveMetrics {
         val limits = currentAdaptiveLimits()
         val saturated = requestQueue.isNotEmpty() ||
-            poolWaiters.get() > 0 ||
+            pool.parkedRequests > 0 ||
             activeRequests.get() >= requestsInFlightLimit
         return baseAdaptiveMetrics(limits, saturated).copy(
             safeToMeasure = adaptiveCapacityConverged(limits.concurrency, saturated),
@@ -428,12 +263,12 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
 
     private fun adaptiveCapacityConverged(desiredConnections: Int, saturated: Boolean): Boolean {
         if (!adaptive) return true
-        if (connectionSetupsInFlight.get() != 0 || waitingGates.get() != 0) return false
-        val connectionLimit = requireNotNull(adaptiveConnectionSlots).snapshot()
-        val dispatchLimit = requireNotNull(adaptiveDispatchSlots).snapshot()
+        if (opener.setupsInFlight.get() != 0 || pool.gatesWaiting != 0) return false
+        val connectionLimit = requireNotNull(connectionSlots.snapshot())
+        val dispatchLimit = requireNotNull(dispatchSlots.snapshot())
         if (connectionLimit.limit != desiredConnections || connectionLimit.acquired > connectionLimit.limit) return false
         if (dispatchLimit.limit != dispatchCapacity(desiredConnections) || dispatchLimit.acquired > dispatchLimit.limit) return false
-        val connections = ordinaryConnectionSnapshot()
+        val connections = pool.ordinaryConnectionSnapshot()
         if (connections.any { it.retired }) return false
         if (connections.size > desiredConnections) return false
         return !saturated || connections.size >= desiredConnections
@@ -443,72 +278,16 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
         require(adaptive) { "Live resize is available only to adaptive HTTP3 engines" }
         require(newLimit > 0) { "Adaptive concurrentConnections must be positive" }
         synchronized(resizeLock) {
-            val connectionLimit = requireNotNull(adaptiveConnectionSlots)
-            val dispatchLimit = requireNotNull(adaptiveDispatchSlots)
-            val previous = connectionLimit.snapshot().limit
-            connectionLimit.resize(newLimit)
-            dispatchLimit.resize(dispatchCapacity(newLimit))
+            val previous = requireNotNull(connectionSlots.snapshot()).limit
+            connectionSlots.resize(newLimit)
+            dispatchSlots.resize(dispatchCapacity(newLimit))
             if (newLimit > previous) {
-                replenishAdaptiveConnections()
+                pool.replenishAdaptiveConnections()
             } else if (newLimit < previous) {
-                retireExcessOrdinaryConnections()
+                pool.retireExcessOrdinaryConnections()
             }
         }
-        wakeAllPoolWaiters()
-    }
-
-    /**
-     * Fills a live adaptive pool independently of request dispatch. This runs while [resizeLock]
-     * is held, so every worker owns a slot before another resize can plan the same capacity.
-     */
-    private fun replenishAdaptiveConnections() {
-        val connectionLimit = requireNotNull(adaptiveConnectionSlots).snapshot()
-        val startBudget = (connectionLimit.limit - connectionLimit.acquired).coerceAtLeast(0)
-        repeat(startBudget) {
-            if (!tryAcquireAdaptiveTaskSlot(
-                isRunning = { runState.get() in 1..2 },
-                acquire = ::tryAcquireConnectionSlot,
-                release = ::releaseConnectionSlot,
-            )) return
-            try {
-                adaptiveTaskStarter.start("http3-connect-live", ::openReservedAdaptiveConnection)
-            } catch (exception: Throwable) {
-                releaseConnectionSlot()
-                recordConnectionOpenFailure(exception)
-                recordTransportFailure(exception)
-                wakeAllPoolWaiters()
-                return
-            }
-        }
-    }
-
-    /** Opens one ordinary connection against a slot reserved by [replenishAdaptiveConnections]. */
-    private fun openReservedAdaptiveConnection() {
-        var session: H3Session? = null
-        var handedOffSlot = false
-        try {
-            if (runState.get() >= 3) return
-            session = openConnection()
-            synchronized(poolLock) {
-                if (poolOpenForPublication()) {
-                    val id = connections.incrementAndGet().toString()
-                    ordinaryConnections.add(OrdinaryConnection(session, id))
-                    handedOffSlot = true
-                }
-            }
-            if (handedOffSlot) {
-                retireExcessOrdinaryConnections()
-            }
-        } catch (exception: Throwable) {
-            recordConnectionOpenFailure(exception)
-            recordTransportFailure(exception)
-        } finally {
-            if (!handedOffSlot) {
-                session?.let { opened -> runCatching { opened.close() } }
-                releaseConnectionSlot()
-            }
-            wakeAllPoolWaiters()
-        }
+        pool.wakeAllPoolWaiters()
     }
 
     override fun resizeRequestsPerConnection(newLimit: Int): Boolean {
@@ -520,125 +299,6 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
         (connections.toLong() * maxConcurrentStreams)
             .coerceAtMost(maxRequestsInFlight(useVirtualThreads).toLong())
             .toInt()
-
-    private fun tryAcquireConnectionSlot(): Boolean =
-        adaptiveConnectionSlots?.tryAcquire() ?: requireNotNull(connectionSlots).tryAcquire()
-
-    private fun tryAcquireConnectionSlot(timeout: Long, unit: TimeUnit): Boolean =
-        adaptiveConnectionSlots?.tryAcquire(timeout, unit) { runState.get() >= 3 }
-            ?: requireNotNull(connectionSlots).tryAcquire(timeout, unit)
-
-    private fun releaseConnectionSlot() {
-        adaptiveConnectionSlots?.release() ?: requireNotNull(connectionSlots).release()
-    }
-
-    private fun tryAcquireDispatchSlot(): Boolean =
-        adaptiveDispatchSlots?.tryAcquire() ?: requireNotNull(dispatchSlots).tryAcquire()
-
-    private fun tryAcquireDispatchSlot(timeout: Long, unit: TimeUnit): Boolean =
-        adaptiveDispatchSlots?.tryAcquire(timeout, unit) { runState.get() >= 3 }
-            ?: requireNotNull(dispatchSlots).tryAcquire(timeout, unit)
-
-    private fun releaseDispatchSlot() {
-        adaptiveDispatchSlots?.release() ?: requireNotNull(dispatchSlots).release()
-    }
-
-    private fun retireExcessOrdinaryConnections() {
-        if (!adaptive) return
-        synchronized(resizeLock) {
-            if (waitingGates.get() != 0) return
-            val desired = requireNotNull(adaptiveConnectionSlots).snapshot().limit
-            var remaining = (
-                ordinaryConnections.count { !it.retired } - desired
-            ).coerceAtLeast(0)
-            if (remaining == 0) return
-
-            var hasIdleRetirement = false
-            // Retire idle capacity first so shrink convergence does not wait for live requests. The
-            // copy-on-write iterator already owns a stable backing array; no filter/sort copies are
-            // needed, and one bulk drain removes every idle retiree with one pool-array rewrite.
-            for (connection in ordinaryConnections) {
-                if (remaining == 0) break
-                if (connection.inFlight != 0 || !connection.markRetiring()) continue
-                remaining -= 1
-                hasIdleRetirement = true
-            }
-            if (remaining > 0) {
-                for (connection in ordinaryConnections) {
-                    if (remaining == 0) break
-                    if (!connection.markRetiring()) continue
-                    remaining -= 1
-                    if (connection.inFlight == 0) hasIdleRetirement = true
-                }
-            }
-            if (hasIdleRetirement) scheduleRetirementDrain()
-        }
-    }
-
-    private fun scheduleRetirementDrain() {
-        if (!retirementDrainScheduled.compareAndSet(false, true)) return
-        try {
-            adaptiveTaskStarter.start("http3-retire-drain", ::drainRetiredOrdinaryConnections)
-        } catch (failure: Throwable) {
-            // Retirement is already irreversible. If the JVM cannot schedule the bounded drain,
-            // finish it here so no retired session or connection slot is stranded.
-            retirementDrainScheduled.set(false)
-            drainRetiredOrdinaryConnectionsSynchronously()
-            if (!isRecoverableAdaptiveCapacityFailure(failure)) throw failure
-        }
-    }
-
-    private fun drainRetiredOrdinaryConnections() {
-        var completed = false
-        try {
-            val removed = ArrayList<OrdinaryConnection>()
-            ordinaryConnections.removeIf { connection ->
-                (connection.retired && connection.inFlight == 0).also { ready ->
-                    if (ready) removed += connection
-                }
-            }
-            removed.forEach(::finishRemovedOrdinaryConnection)
-            completed = true
-        } catch (failure: Throwable) {
-            drainRetiredOrdinaryConnectionsSynchronously()
-            throw failure
-        } finally {
-            retirementDrainScheduled.set(false)
-            if (completed && ordinaryConnections.any { it.retired && it.inFlight == 0 }) {
-                scheduleRetirementDrain()
-            }
-        }
-    }
-
-    private fun drainRetiredOrdinaryConnectionsSynchronously() {
-        while (true) {
-            val connection = ordinaryConnections.firstOrNull {
-                it.retired && it.inFlight == 0
-            } ?: return
-            retireOrdinaryConnection(connection, forceClose = false)
-        }
-    }
-
-    private fun finishRemovedOrdinaryConnection(connection: OrdinaryConnection) {
-        if (connection.claimClose()) runCatching { connection.session.close() }
-        if (connection.claimSlot()) {
-            releaseConnectionSlot()
-            retiredConnections.incrementAndGet()
-        }
-        wakePoolWaiter()
-    }
-
-    private fun wakeAllPoolWaiters() {
-        synchronized(poolLock) {
-            poolLock.notifyAll()
-        }
-    }
-
-    /**
-     * Whether a connection may still join the pool. Asked, and acted on, only under [poolLock],
-     * which is what makes the answer hold until the connection is in.
-     */
-    private fun poolOpenForPublication(): Boolean = runState.get() < 3 && !ordinaryPoolClosed
 
     /**
      * Cancels a run whose responses have stopped arriving. This cannot live on the dispatcher
@@ -681,7 +341,7 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
         Thread.ofPlatform().daemon().name("http3-response-watchdog").start {
             while (runState.get() in 1..2) {
                 val now = System.nanoTime()
-                val ordinarySessions = ordinaryConnectionSnapshot().map { it.session }
+                val ordinarySessions = pool.ordinaryConnectionSnapshot().map { it.session }
                 val gateSessions = batches.values.mapNotNull { it.connection?.session }
                 (ordinarySessions + gateSessions).distinct().forEach { session ->
                     // A connection torn down between the snapshot and this is not a reason to
@@ -690,73 +350,6 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
                 }
                 Thread.sleep(RESPONSE_SWEEP_MILLIS)
             }
-        }
-    }
-
-    /**
-     * Opens the run's connections up front, the way the other engines do, rather than letting the
-     * dispatcher open them on demand. Two reasons. A QUIC handshake can be slow — on a path where a
-     * middlebox drops Initial packets it takes seconds — and opening one inside the dispatcher
-     * stalls every other request behind it. And a gate that inherits a connection the run has
-     * already used starts with a warm congestion window, where a freshly opened one does not.
-     */
-    private fun openInitialConnections(timeout: Int) {
-        val desiredConnections = adaptiveConnectionSlots?.snapshot()?.limit ?: threads
-        val ready = CountDownLatch(desiredConnections)
-        repeat(desiredConnections) { index ->
-            // A QUIC handshake blocks inside Kwik just as a response read does, so it needs the
-            // same thread choice: on a JDK that still pins, a pool larger than the carrier count
-            // would open in batches instead of at once.
-            kwikBlockingThread("http3-connect-$index").start {
-                var reservedSlot = false
-                try {
-                    if (runState.get() < 3 && tryAcquireConnectionSlot()) {
-                        reservedSlot = true
-                        val session = openConnection()
-                        // Checked and published under poolLock, which the dispatcher's final pool
-                        // snapshot also takes: either this connection is in that snapshot and is
-                        // closed with the pool, or the pool has closed and it is closed here.
-                        val published = synchronized(poolLock) {
-                            if (poolOpenForPublication()) {
-                                val id = connections.incrementAndGet().toString()
-                                ordinaryConnections.add(OrdinaryConnection(session, id))
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        if (published) {
-                            reservedSlot = false
-                            retireExcessOrdinaryConnections()
-                            wakeAllPoolWaiters()
-                        } else {
-                            runCatching { session.close() }
-                        }
-                    }
-                } catch (exception: Throwable) {
-                    // A connection that will not open is not fatal on its own: the dispatcher can
-                    // still open one on demand. It is still reportable straight away, which is why
-                    // it is counted rather than only remembered.
-                    recordConnectionOpenFailure(exception)
-                    if (adaptive) recordTransportFailure(exception)
-                } finally {
-                    if (reservedSlot) {
-                        releaseConnectionSlot()
-                    }
-                    ready.countDown()
-                }
-            }
-        }
-        // ScriptEnvironment starts the engine with a 5 second timeout, which is shorter than a
-        // QUIC handshake on any path that drops Initial packets. Giving up before the transport
-        // itself would guarantees an empty pool at the moment the dispatcher starts, which is the
-        // opposite of establishing connections up front.
-        val waitSeconds = maxOf(timeout.toLong(), HANDSHAKE_WAIT_SECONDS)
-        if (!ready.await(waitSeconds, TimeUnit.SECONDS)) {
-            Utils.out(
-                "HTTP/3: only ${desiredConnections - ready.count.toInt()} of $desiredConnections connections opened " +
-                    "within ${waitSeconds}s; the rest will be opened on demand"
-            )
         }
     }
 
@@ -968,19 +561,11 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
             batches.entries.toList().forEach { (gateName, batch) ->
                 if (!gateCollectors.containsKey(gateName)) finishBatch(gateName, batch)
             }
-            // Every publication into the pool is checked and made under the same monitor. Either
-            // it wins and appears in this snapshot, or it sees the pool closed and closes its own
-            // session. Closing the pool rather than relying on runState covers a run that completes
-            // as well as one that is cancelled: a completed run is still in state 2 here.
-            val pooledAtCancellation = synchronized(poolLock) {
-                ordinaryPoolClosed = true
-                ordinaryConnectionSnapshot()
-            }
-            pooledAtCancellation.forEach { connection ->
-                retireOrdinaryConnection(connection, forceClose = true)
-            }
+            // Closed under the monitor every publication into the pool checks, so a connection
+            // still opening is either in the pool's final sweep or closes its own session.
+            pool.close()
             awaitRequestsInFlight()
-            forceCloseUnsettledGateConnections()
+            gateConnections.forceCloseUnsettledGateConnections()
             // Safe after the drain above: dispatchSlots caps submissions at the pool size, so
             // every task that was handed to the executor already has a thread and none are sitting
             // in its queue waiting for one that shutdown would take away. Anything the drain gave
@@ -1062,9 +647,9 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
                 val translated = translate(request)
                 var attempt = 0
                 while (runState.get() < 3) {
-                    var connection: OrdinaryConnection? = null
+                    var connection: Http3ConnectionPool.OrdinaryConnection? = null
                     try {
-                        connection = acquireOrdinaryConnection()
+                        connection = pool.acquireOrdinaryConnection()
                         // Stamped once the connection is in hand. A connection carries one request
                         // at a time, so a request can wait for a free one, and charging that wait
                         // to the response would overstate every latency the run reports.
@@ -1072,7 +657,7 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
                         request.sent = startedAt
                         val response = connection.session.send(translated)
                         val connectionId = connection.id
-                        releaseOrdinaryConnection(connection, failed = false)
+                        pool.releaseOrdinaryConnection(connection, failed = false)
                         connection = null
                         try {
                             completeResponse(request, response, startedAt, connectionId)
@@ -1081,7 +666,7 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
                         }
                         return@execute
                     } catch (exception: Throwable) {
-                        connection?.let { releaseOrdinaryConnection(it, failed = true) }
+                        connection?.let { pool.releaseOrdinaryConnection(it, failed = true) }
                         if (adaptive && runState.get() < 3) recordTransportFailure(exception)
                         if (runState.get() < 3 && attempt < maxRetriesPerRequest) {
                             attempt += 1
@@ -1097,8 +682,8 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
             } finally {
                 if (adaptive) activeRequests.decrementAndGet()
                 activeJobs.decrementAndGet()
-                releaseDispatchSlot()
-                wakePoolWaiter()
+                dispatchSlots.release()
+                pool.wakePoolWaiter()
             }
         }
     }
@@ -1111,178 +696,15 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
     private fun acquireDispatchSlot(): Boolean {
         // Same reasoning as the queue poll: when the pool has capacity, which is the common case
         // while a run is ramping, the untimed acquire avoids arming a timer per request.
-        if (tryAcquireDispatchSlot()) {
+        if (dispatchSlots.tryAcquire()) {
             return true
         }
         while (runState.get() < 3) {
-            if (tryAcquireDispatchSlot(DISPATCH_POLL_MILLIS, TimeUnit.MILLISECONDS)) {
+            if (dispatchSlots.tryAcquire(DISPATCH_POLL_MILLIS, TimeUnit.MILLISECONDS)) {
                 return true
             }
         }
         return false
-    }
-
-    /**
-     * Walks the pool for a connection with room, taking nothing. Each request starts one place
-     * further along than the last, so requests spread across the pool instead of queueing on
-     * whichever connection happens to be first.
-     */
-    private fun leaseFromPool(): OrdinaryConnection? {
-        if (waitingGates.get() != 0) {
-            return null
-        }
-        val pool = ordinaryConnections
-        val size = pool.size
-        if (size == 0) {
-            return null
-        }
-        val from = Math.floorMod(leaseCursor.getAndIncrement(), size)
-        for (offset in 0 until size) {
-            // The pool can shrink underneath this walk, and a copy-on-write list throws rather
-            // than returning null for an index that was valid when the size was read.
-            val connection = pool.getOrNull((from + offset) % size) ?: continue
-            if (connection.tryLease(requestsPerConnection, maxConcurrentStreams)) {
-                // A pooled connection can reach its idle timeout while it waits for a request,
-                // exactly as it can while it waits for a gate. A retry covers this wherever the
-                // run allows one, but it costs a round trip to learn what the connection could
-                // have been asked, and a run with retries turned off fails the request instead.
-                if (!isStillConnected(connection)) {
-                    releaseOrdinaryConnection(connection, failed = true)
-                    continue
-                }
-                return connection
-            }
-        }
-        return null
-    }
-
-    private fun acquireOrdinaryConnection(): OrdinaryConnection {
-        while (runState.get() < 3) {
-            leaseFromPool()?.let { return it }
-
-            var reservedSlot = false
-            synchronized(poolLock) {
-                if (waitingGates.get() == 0) {
-                    // Between the lock-free walk above and this monitor a request may well have
-                    // finished, so look once more before deciding the pool is full and either
-                    // opening a connection or parking.
-                    leaseFromPool()?.let { return it }
-                    reservedSlot = tryAcquireConnectionSlot()
-                }
-                if (!reservedSlot) {
-                    poolWaiters.incrementAndGet()
-                    try {
-                        poolLock.wait(POOL_WAIT_MILLIS)
-                    } finally {
-                        poolWaiters.decrementAndGet()
-                    }
-                }
-            }
-
-            if (reservedSlot) {
-                val connection = try {
-                    val session = try {
-                        openConnection()
-                    } catch (exception: Throwable) {
-                        recordConnectionOpenFailure(exception)
-                        throw exception
-                    }
-                    val opened = OrdinaryConnection(session, connections.incrementAndGet().toString())
-                    opened.tryLease(requestsPerConnection, maxConcurrentStreams)
-                    // Checked and published under poolLock like every other publication, so a
-                    // connection opened while the pool closes is closed here rather than missed
-                    // by the final sweep.
-                    val published = synchronized(poolLock) {
-                        poolOpenForPublication().also { open ->
-                            if (open) ordinaryConnections.add(opened)
-                        }
-                    }
-                    if (!published) {
-                        runCatching { session.close() }
-                        throw IllegalStateException("HTTP/3 run was cancelled while opening a connection")
-                    }
-                    opened
-                } catch (exception: Throwable) {
-                    releaseConnectionSlot()
-                    wakeAllPoolWaiters()
-                    throw exception
-                }
-                // The pool owns the slot from here, so nothing below may hand it back.
-                retireExcessOrdinaryConnections()
-                wakeAllPoolWaiters()
-                return connection
-            }
-        }
-        throw IllegalStateException("HTTP/3 run is no longer accepting requests")
-    }
-
-    private fun releaseOrdinaryConnection(connection: OrdinaryConnection, failed: Boolean) {
-        val alive = isStillConnected(connection)
-        val cancelled = runState.get() >= 3
-        // A failed request retires the connection. That looks wasteful - a stream error says
-        // nothing about the other streams, and the pool pays a handshake to replace something
-        // isConnected() still calls up - but it was measured both ways and retiring wins by a
-        // wide margin: keeping the connection gave 26,175 and 47,784 rps on 500,000 requests
-        // where retiring gave 78,320-85,260. isConnected() is a poor health signal, and a
-        // connection that just lost a request is usually about to lose more, so retiring is
-        // really load shedding away from a sick connection.
-        //
-        // What is not justified is closing it under the requests already on it, which took up
-        // to maxConcurrentStreams - 1 live requests down per failure. Those close on the drain
-        // in retireOrdinaryConnection instead, when the last lease comes back.
-        val drop = failed || !alive || cancelled
-        val shouldRetire = connection.releaseLease(retiring = drop)
-        wakePoolWaiter()
-        if (shouldRetire) {
-            retireOrdinaryConnection(connection, forceClose = cancelled || !alive)
-        }
-    }
-
-    /**
-     * Wakes a request parked for a lease, and only then takes the monitor. A run whose pool has
-     * room never parks anything, so the common case is one volatile read rather than a monitor
-     * every request has to queue for.
-     */
-    private fun wakePoolWaiter() {
-        if (poolWaiters.get() == 0) {
-            return
-        }
-        synchronized(poolLock) {
-            poolLock.notifyAll()
-        }
-    }
-
-    /** Whether the session is usable, without allocating a Result on a path taken per request. */
-    private fun isStillConnected(connection: OrdinaryConnection): Boolean =
-        try {
-            connection.session.isConnected()
-        } catch (ignored: Throwable) {
-            false
-        }
-
-    private fun retireOrdinaryConnection(connection: OrdinaryConnection, forceClose: Boolean) {
-        // A delayed shrink runnable can arrive after a gate has claimed this object. It no longer
-        // owns either the session or its slot and therefore has nothing it is allowed to close.
-        if (!connection.retire()) return
-        var closeSession = forceClose && connection.claimClose()
-        var releaseSlot = false
-        // A connection still carrying requests stays in the pool until the last of them gives its
-        // lease back; whichever release takes it to zero is the one that takes it out.
-        if (connection.inFlight == 0) {
-            ordinaryConnections.remove(connection)
-            closeSession = closeSession || connection.claimClose()
-            releaseSlot = connection.claimSlot()
-        }
-        wakePoolWaiter()
-
-        if (closeSession) {
-            runCatching { connection.session.close() }
-        }
-        if (releaseSlot) {
-            releaseConnectionSlot()
-            if (adaptive) retiredConnections.incrementAndGet()
-            wakePoolWaiter()
-        }
     }
 
     private fun stageGated(request: Request) {
@@ -1290,7 +712,8 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
         var batch: SdaBatch? = null
         if (adaptive) activeRequests.incrementAndGet()
         try {
-            batch = batches[gate.name] ?: openBatch(gate.name).also { batches[gate.name] = it }
+            // Opened outside any lock on batches; see Http3GateConnections.openBatch.
+            batch = batches[gate.name] ?: gateConnections.openBatch(gate.name).also { batches[gate.name] = it }
             batch.throwIfFailed()
             validateRequestOptions(request)
             // The connection this gate claimed. Every bound a stage is charged against belongs
@@ -1319,243 +742,6 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
             if (adaptive) activeRequests.decrementAndGet()
         } finally {
             gate.reportReadyWithoutWaiting()
-        }
-    }
-
-    /**
-     * Opens a gate's exclusive connection, deliberately outside any lock on the batches map. The
-     * open blocks on a connection slot that finishBatch releases, and finishBatch has to reach the
-     * same map to do it — holding the map across the open deadlocks the two against each other.
-     * Only the dispatcher thread creates batches, so a get-then-put needs no atomicity beyond that.
-     */
-    private fun openBatch(gateName: String): SdaBatch {
-        var connection: GateConnection? = null
-        var lease: GateLease? = null
-        var jobStarted = false
-        return try {
-            lease = acquireGateConnection()
-            activeJobs.incrementAndGet()
-            jobStarted = true
-            val gate = resolveGate(lease.session, gateName)
-            connection = GateConnection(
-                gateName,
-                lease.session,
-                lease.id,
-                gate.mode,
-                gate.qpackLimits,
-                lease.requestsCarried,
-                gate.releaseBudgetBytes,
-            )
-            check(unsettledGateConnections.add(connection)) {
-                "Gate $gateName registered the same connection twice"
-            }
-            SdaBatch(gateName, connection)
-        } catch (exception: Throwable) {
-            if (connection == null && lease != null) {
-                try {
-                    returnGateLeaseAfterSetupFailure(lease)
-                } finally {
-                    if (jobStarted) activeJobs.decrementAndGet()
-                }
-            }
-            // Carrying the connection if it claimed one, so finishBatch hands it back rather than
-            // leaking the slot a half-opened gate was holding.
-            SdaBatch(gateName, connection).also { it.fail(exception) }
-        }
-    }
-
-    private fun returnGateLeaseAfterSetupFailure(lease: GateLease) {
-        val connected = lease.requestsCarried < requestsPerConnection &&
-            runCatching { lease.session.isConnected() }.getOrDefault(false)
-        val reusable = synchronized(poolLock) {
-            if (connected && poolOpenForPublication()) {
-                ordinaryConnections.add(OrdinaryConnection(lease.session, lease.id, lease.requestsCarried))
-                true
-            } else {
-                false
-            }
-        }
-        if (reusable) {
-            retireExcessOrdinaryConnections()
-        } else {
-            runCatching { lease.session.close() }
-            releaseConnectionSlot()
-            if (adaptive) retiredConnections.incrementAndGet()
-        }
-        wakeAllPoolWaiters()
-    }
-
-    /**
-     * How a gate will release, together with everything that decision was made from. A QPACK gate
-     * has to carry the peer's exact limits away with it, because they bound what it may stage.
-     */
-    private data class ResolvedGate(
-        val mode: GateMode,
-        val qpackLimits: QpackGateLimits? = null,
-        /**
-         * What one release datagram carries on this gate's connection. Only a datagram gate is
-         * bounded by it, so a QPACK gate leaves it unbounded.
-         */
-        val releaseBudgetBytes: Int = Int.MAX_VALUE,
-    )
-
-    /**
-     * Settles how this gate will release, before a single request is staged.
-     *
-     * <p>It cannot be settled any later: the two modes put different bytes on the wire, so by the
-     * time the batch is staged it is already committed to one of them.
-     *
-     * <p>A peer's SETTINGS arrive on a control stream it opens after the handshake, so a gate that
-     * has just opened a connection may reach here before they land. Waiting is nearly always free
-     * because a gate normally inherits a warm pooled connection whose SETTINGS arrived long ago.
-     */
-    private fun resolveGate(session: H3Session, gateName: String): ResolvedGate {
-        if (gateMode == GateMode.SDA) {
-            return ResolvedGate(GateMode.SDA, releaseBudgetBytes = releaseBudget(session))
-        }
-        if (gateMode == GateMode.QPACK) {
-            val limits = session.awaitQpackGateLimits(SETTINGS_WAIT_MILLIS)
-                ?: throw IllegalStateException(
-                    "Gate $gateName asked for the QPACK blocked-stream gate, but this server did " +
-                        "not advertise both QPACK_MAX_TABLE_CAPACITY and QPACK_BLOCKED_STREAMS, " +
-                        "so a blocked field section would be a connection error rather than " +
-                        "something it waits on. Use gateMode='auto' to fall back to the " +
-                        "single-datagram gate.",
-                )
-            return ResolvedGate(GateMode.QPACK, limits)
-        }
-        // Auto prefers the QPACK gate wherever the peer allows it, because it is the only one
-        // that cannot quietly fail to gate.
-        //
-        // The datagram gate holds only if the server actually reads the bytes it withheld. A
-        // server that answers without reading the body — a redirect, a static handler, a 405 —
-        // leaves the whole batch answered before the release, and the run reports a race as absent
-        // when it was never tested. Measured across 100 hosts with a body: the datagram gate held
-        // 243 of 294 runs and failed on every run against 16 of them, while the QPACK gate held
-        // 291 of 291. The QPACK gate withholds the header decode, which no HTTP/3 server can skip.
-        //
-        // Nothing is traded for that. Across the 80 hosts where both gates held every run the two
-        // were indistinguishable on how tightly responses clustered: 44 of 80 hosts and 127 of 240
-        // paired rounds to the datagram gate, p around 0.4 either way. An earlier reading of eight
-        // hosts had the datagram gate ahead and this preference reversed; it did not replicate.
-        //
-        // The QPACK gate's ceiling is also the peer's own SETTINGS_QPACK_BLOCKED_STREAMS rather
-        // than a datagram, which is a number the peer states rather than one the engine has to
-        // guess — and guessing is not available here anyway, since the dispatcher stages the first
-        // gated request while the script is still queueing the rest.
-        val limits = session.awaitQpackGateLimits(SETTINGS_WAIT_MILLIS)
-        return if (limits != null) {
-            ResolvedGate(GateMode.QPACK, limits)
-        } else {
-            ResolvedGate(GateMode.SDA, releaseBudgetBytes = releaseBudget(session))
-        }
-    }
-
-    /**
-     * What one release datagram carries on this connection, or unbounded where the session cannot
-     * say. Read once per gate, because it depends on the path the connection settled on.
-     */
-    private fun releaseBudget(session: H3Session): Int =
-        session.releaseDatagramBudget(options.maxDatagramSize)
-
-    /** A gate's exclusive connection together with the ID its requests table under. */
-    /**
-     * A gate's exclusive connection, and how many requests it had already carried when the gate
-     * took it. Carried rather than looked up later: the pooled connection object is retired the
-     * moment the gate claims it, and the count has to survive that or requestsPerConnection stops
-     * applying the first time a connection passes through a gate.
-     */
-    private class GateLease(val session: H3Session, val id: String, val requestsCarried: Int)
-
-    private fun acquireGateConnection(): GateLease {
-        waitingGates.incrementAndGet()
-        try {
-            claimPooledConnection()?.let { return it }
-            ordinaryConnectionSnapshot().forEach { connection ->
-                retireOrdinaryConnection(connection, forceClose = false)
-            }
-            // A connection can arrive either as a freed slot or as a gate handing one back to the
-            // pool. Waiting on the semaphore alone misses the second and deadlocks against a gate
-            // that returned its connection instead of closing it.
-            while (runState.get() < 3) {
-                claimPooledConnection()?.let { return it }
-                if (tryAcquireConnectionSlot(50, TimeUnit.MILLISECONDS)) {
-                    return openGateConnection()
-                }
-            }
-            throw IllegalStateException("HTTP/3 run was cancelled while opening a gate connection")
-        } finally {
-            waitingGates.decrementAndGet()
-            retireExcessOrdinaryConnections()
-            wakeAllPoolWaiters()
-        }
-    }
-
-    /**
-     * Takes an idle connection out of the pool for a gate's exclusive use. The gate inherits the
-     * connection's slot, so the connection is marked as having released it already and finishBatch
-     * becomes the one place that hands it back.
-     */
-    private fun claimPooledConnection(): GateLease? {
-        while (true) {
-            // Claiming exclusive gate ownership is one compare-and-set, so a request cannot be
-            // handed a lease on it between the two: either the gate wins and the request looks
-            // elsewhere, or the request wins and this connection is not idle for the gate to take.
-            val claimed = ordinaryConnections.firstOrNull { it.tryClaimIdle() } ?: return null
-            ordinaryConnections.remove(claimed)
-            // Asked on the way out as well as on the way in. Nothing keeps a pooled connection
-            // alive and the idle timeout is the smaller of what the two ends asked for, so a
-            // connection can reach it while it waits to be claimed. Staging is the first thing a
-            // gate does with the connection it takes, and a gate has no retry behind it: where an
-            // ordinary request survives a dead connection by asking for another one, a gate loses
-            // its whole batch to it.
-            if (!isStillConnected(claimed)) {
-                discardGateClaim(claimed)
-                continue
-            }
-            // The gate inherits the connection's slot, so nothing else may hand it back.
-            check(claimed.claimSlot()) { "gate claimed a connection whose slot was already released" }
-            synchronized(poolLock) {
-                poolLock.notifyAll()
-            }
-            // The gate inherits the connection's ID as well as its slot, so a connection that
-            // passes through a gate and back into the pool keeps tabling under the ID it started
-            // with.
-            return GateLease(claimed.session, claimed.id, claimed.requestsCarried)
-        }
-    }
-
-    /** Closes a dead connection after this gate, rather than a pool retiree, won ownership. */
-    private fun discardGateClaim(connection: OrdinaryConnection) {
-        if (connection.claimClose()) runCatching { connection.session.close() }
-        if (connection.claimSlot()) {
-            releaseConnectionSlot()
-            if (adaptive) retiredConnections.incrementAndGet()
-        }
-        wakeAllPoolWaiters()
-    }
-
-    /** Opens a connection against a slot the caller has already acquired. */
-    private fun openGateConnection(): GateLease {
-        var reservedSlot = true
-        try {
-            if (runState.get() >= 3) {
-                throw IllegalStateException("HTTP/3 run was cancelled while opening a gate connection")
-            }
-            val session = try {
-                openConnection()
-            } catch (exception: Throwable) {
-                recordConnectionOpenFailure(exception)
-                if (adaptive) recordTransportFailure(exception)
-                throw exception
-            }
-            val id = connections.incrementAndGet().toString()
-            reservedSlot = false
-            return GateLease(session, id, 0)
-        } finally {
-            if (reservedSlot) {
-                releaseConnectionSlot()
-            }
         }
     }
 
@@ -1624,7 +810,7 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
         // already-completed read is a no-op.
         failStagedResponses(batch, IOException("gate $gateName closed before its response arrived"))
         try {
-            batch.connection?.let { connection -> finishConnection(batch, connection) }
+            batch.connection?.let { connection -> gateConnections.finishConnection(batch, connection) }
         } finally {
             finishGateLifecycle(gateName)
         }
@@ -1697,79 +883,6 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
     }
 
     /**
-     * Hands a gate's connection back, or closes it.
-     *
-     * Every question here is asked of that one connection: what it has carried, whether it is
-     * still up, and whether its release got out.
-     */
-    private fun finishConnection(batch: SdaBatch, connection: GateConnection) {
-        val session = connection.session
-        try {
-            if (session == null) return
-            // Hand the connection back rather than closing it, so a later gate inherits its warm
-            // congestion window instead of paying for another handshake. Only a batch that
-            // released cleanly, had every response answered and could finish every stream it
-            // staged can be handed back: any other outcome leaves request streams dangling on the
-            // connection, along with reader threads still waiting.
-            val connectionId = connection.connectionId
-            // A gate's requests count against its connection like any other. Without this the same
-            // connection served every gate in a run however long it ran, and
-            // requestsPerConnection never reached a gate.
-            val carried = connection.requestsCarried + connection.staged().size
-            val connected = runState.get() < 3 &&
-                connectionId != null &&
-                batch.releasedCleanly() &&
-                carried < requestsPerConnection &&
-                runCatching { session.isConnected() }.getOrDefault(false) &&
-                // Last, because it writes: only a connection about to be handed back needs it.
-                connection.staged().all { staged -> staged.exchange.finishStream() }
-            synchronized(gateSettlementLock) {
-                // Cancellation may have taken this token after its bounded drain while the probe
-                // above was blocked. That path already closed the session and returned its slot.
-                if (!unsettledGateConnections.remove(connection)) return
-                // Publication and the dispatcher's final pool snapshot share poolLock, and whether
-                // the pool is still open is deliberately asked after the probe: either the returned
-                // session is swept, or this path closes it itself, exactly once.
-                val reusable = synchronized(poolLock) {
-                    if (connected && poolOpenForPublication()) {
-                        ordinaryConnections.add(OrdinaryConnection(session, connectionId!!, carried))
-                        true
-                    } else {
-                        false
-                    }
-                }
-                if (reusable) {
-                    retireExcessOrdinaryConnections()
-                    wakeAllPoolWaiters()
-                    return
-                }
-                runCatching { session.close() }
-                releaseConnectionSlot()
-                if (adaptive) retiredConnections.incrementAndGet()
-                wakeAllPoolWaiters()
-            }
-        } finally {
-            // Cancellation's drain must keep waiting until the session and slot have reached one
-            // of the two settled states above. Decrementing before isConnected created a window
-            // where completedLatch fired and this method then republished a live connection.
-            activeJobs.decrementAndGet()
-        }
-    }
-
-    /** Takes over gate resources whose finisher did not settle before the bounded drain expired. */
-    private fun forceCloseUnsettledGateConnections() {
-        synchronized(gateSettlementLock) {
-            unsettledGateConnections.toList().forEach { connection ->
-                if (!unsettledGateConnections.remove(connection)) return@forEach
-                connection.session?.let { session -> runCatching { session.close() } }
-                releaseConnectionSlot()
-                if (adaptive) retiredConnections.incrementAndGet()
-            }
-        }
-        wakeAllPoolWaiters()
-    }
-
-    /**
      * Names the missing HTTP/3 support when the transport never got off the ground.
      *
      * <p>This engine speaks only QUIC, so a run that finished with no connection ever opened got
@@ -1783,38 +896,11 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
      * whereas a rejected certificate says so in the error text.
      */
     override fun failureSummary(): String? {
-        if (connections.get() == 0 && connectionOpenFailures.get() > 0) {
+        if (connections.get() == 0 && opener.openFailures.get() > 0) {
             return "No HTTP/3 connection to ${authority(target)} was established: every QUIC handshake " +
                 "failed, and Engine.HTTP3 has no fallback to HTTP/2 or HTTP/1.1. Last error: $lastError"
         }
         return super.failureSummary()
-    }
-
-    /**
-     * How many attempts to open a QUIC connection have failed, as distinct from a request failing
-     * on one that did open.
-     *
-     * <p>[permaFails] cannot stand in for this. With retries on, and ScriptEnvironment defaults to
-     * three, one request has to lose four handshakes before it is counted, and the pool hands its
-     * slots to whichever request is waiting rather than to the one part way through its retries.
-     * Measured against a host with no HTTP/3 on the default settings, Fails was still 0 fifty
-     * seconds into the run while Retries climbed, so a status line waiting on permaFails stayed
-     * blank until the user halted the run, which failed every parked request at once.
-     */
-    private val connectionOpenFailures = AtomicInteger()
-
-    private fun recordConnectionOpenFailure(exception: Throwable) {
-        lastError = exception.toString()
-        connectionOpenFailures.incrementAndGet()
-    }
-
-    private fun openConnection(): H3Session {
-        connectionSetupsInFlight.incrementAndGet()
-        return try {
-            connectionFactory.open(target, verifyCertificates)
-        } finally {
-            connectionSetupsInFlight.decrementAndGet()
-        }
     }
 
     private fun recordPermanentFailure(exception: Throwable) {
@@ -1830,133 +916,6 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
         throw exception
     }
 
-    private fun ordinaryConnectionSnapshot(): List<OrdinaryConnection> = ordinaryConnections.toList()
-
-    /**
-     * A pooled connection whose whole lease state - how many requests it has carried, how many are
-     * on it now, and whether it is retired - lives in one long so that taking and giving back a
-     * lease is a single compare-and-set. It used to be three fields under the engine's pool
-     * monitor, which put every request through one monitor twice; measured in Burp against a live
-     * target, that left 4,094 of 5,226 threads blocked entering it and 455 requests on the wire out
-     * of the 4,800 the run had asked for.
-     */
-    private class OrdinaryConnection(
-        val session: H3Session,
-        val id: String,
-        requestsCarried: Int = 0,
-    ) {
-        private val state = AtomicLong(pack(requestsCarried, 0, false))
-        private val closing = AtomicBoolean(false)
-        private val slotHandedBack = AtomicBoolean(false)
-
-        val inFlight: Int get() = inFlightOf(state.get())
-        val retired: Boolean get() = isOwned(state.get())
-        val requestsCarried: Int get() = assignedOf(state.get())
-
-        /** Whether this caller is the one that gets to close the session. */
-        fun claimClose(): Boolean = closing.compareAndSet(false, true)
-
-        /** Whether this caller is the one that gets to hand the connection's pool slot back. */
-        fun claimSlot(): Boolean = slotHandedBack.compareAndSet(false, true)
-
-        fun tryLease(requestLimit: Int, streamLimit: Int): Boolean {
-            // Up to streamLimit requests in flight at once, matching HTTP2RequestEngine: a QUIC
-            // connection multiplexes, so requestsPerConnection counts the requests a connection
-            // carries over its lifetime and concurrentConnections bounds the pool, exactly as they
-            // do for HTTP/2. Kwik's own stream credit is the backstop when the server grants less.
-            while (true) {
-                val current = state.get()
-                if (isOwned(current)) {
-                    return false
-                }
-                val assigned = assignedOf(current)
-                val inFlight = inFlightOf(current)
-                if (inFlight >= streamLimit || assigned >= requestLimit) {
-                    return false
-                }
-                val next = pack(assigned + 1, inFlight + 1, assigned + 1 >= requestLimit)
-                if (state.compareAndSet(current, next)) {
-                    return true
-                }
-            }
-        }
-
-        /** Gives a lease back, and reports whether the connection is now retired. */
-        fun releaseLease(retiring: Boolean): Boolean {
-            while (true) {
-                val current = state.get()
-                val inFlight = inFlightOf(current)
-                check(inFlight > 0) { "HTTP/3 connection lease was released twice" }
-                val next = pack(assignedOf(current), inFlight - 1, retiring || isOwned(current))
-                if (state.compareAndSet(current, next)) {
-                    return isOwned(next)
-                }
-            }
-        }
-
-        /**
-         * Claims retirement, whether or not requests remain. False means a gate already owns the
-         * session and slot, so a delayed pool task must not touch either one.
-         */
-        fun retire(): Boolean {
-            while (true) {
-                val current = state.get()
-                when (ownerOf(current)) {
-                    GATE_OWNED -> return false
-                    RETIRING -> return true
-                }
-                if (state.compareAndSet(current, current or RETIRING)) {
-                    return true
-                }
-            }
-        }
-
-        /** Claims a new pool retirement; false if a gate or another shrink already owns it. */
-        fun markRetiring(): Boolean {
-            while (true) {
-                val current = state.get()
-                if (isOwned(current)) return false
-                if (state.compareAndSet(current, current or RETIRING)) return true
-            }
-        }
-
-        /** Takes exclusive gate ownership only while idle, atomically against ordinary leasing. */
-        fun tryClaimIdle(): Boolean {
-            while (true) {
-                val current = state.get()
-                if (isOwned(current) || inFlightOf(current) != 0) {
-                    return false
-                }
-                if (state.compareAndSet(current, current or GATE_OWNED)) {
-                    return true
-                }
-            }
-        }
-
-        private companion object {
-            // 31 bits each for requests carried and requests in flight, which is every value
-            // either can take: leasing stops at requestsPerConnection, itself an Int.
-            const val COUNTER_BITS = 31
-            const val COUNTER_MASK = (1L shl COUNTER_BITS) - 1
-            const val RETIRING = 1L shl 62
-            const val GATE_OWNED = 1L shl 63
-            const val OWNER_MASK = RETIRING or GATE_OWNED
-
-            fun inFlightOf(state: Long): Int = (state and COUNTER_MASK).toInt()
-
-            fun assignedOf(state: Long): Int = ((state ushr COUNTER_BITS) and COUNTER_MASK).toInt()
-
-            fun ownerOf(state: Long): Long = state and OWNER_MASK
-
-            fun isOwned(state: Long): Boolean = ownerOf(state) != 0L
-
-            fun pack(assigned: Int, inFlight: Int, retired: Boolean): Long =
-                (assigned.toLong() shl COUNTER_BITS) or
-                    inFlight.toLong() or
-                    (if (retired) RETIRING else 0L)
-        }
-    }
-
     companion object {
         private const val COLLECTOR_PENDING = 0
         private const val COLLECTOR_RUNNING = 1
@@ -1970,7 +929,8 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
         internal const val HANDSHAKE_TIMEOUT_SECONDS = 10L
 
         /**
-         * How long [openInitialConnections] waits for the opening connections to report.
+         * How long [Http3ConnectionPool.openInitialConnections] waits for the opening connections
+         * to report.
          *
          * <p>Strictly longer than [HANDSHAKE_TIMEOUT_SECONDS], because a wait that expires at the
          * same moment as the handshakes it is waiting on learns nothing from them. Both were 10s,
@@ -1979,13 +939,6 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
          * instead of stopping the way Engine.HTTP2 does.
          */
         internal const val HANDSHAKE_WAIT_SECONDS = HANDSHAKE_TIMEOUT_SECONDS + 2
-
-        /**
-         * How long a gate waits for the peer's SETTINGS before settling how it will release.
-         * Only reached by a gate that opened its own connection; an inherited one has them already.
-         */
-        private const val SETTINGS_WAIT_MILLIS = 1000L
-
 
         private const val RUN_START_POLL_MILLIS = 10L
 
@@ -2011,13 +964,6 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
 
         /** How long the dispatcher blocks for work once the queue has been found empty. */
         private const val QUEUE_POLL_MILLIS = 50L
-
-        /**
-         * How long a request thread parks when the pool has no free lease. Short because the
-         * wake-up that would end the wait early is skipped when no thread appears to be parked,
-         * and this timeout is what bounds that race.
-         */
-        private const val POOL_WAIT_MILLIS = 5L
 
         /**
          * Requests a single QUIC connection carries at once, and with `concurrentConnections` the
