@@ -103,7 +103,9 @@ Start with 20-50 and increase until RPS plateaus.
 
 ## Memory Management
 
-For million+ request runs, memory management is critical.
+For million+ request runs, memory management is critical. Each run keeps response bodies up to an
+eighth of Burp's heap; past that the oldest results keep their status, length, word count and timings
+but lose the body (the newest 256 always keep theirs), and `turbo_run(action=result)` says so.
 
 ### Filter Before Adding to Table
 

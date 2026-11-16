@@ -31,16 +31,16 @@ for high-speed work: single-packet race conditions, HTTP/2 and HTTP/3 gates, req
 
 | | |
 |---|---|
-| 🧰 **160+ operations, ~40 tools** | Proxy, Scanner, Repeater, Intruder, Collaborator, Organizer, site map, scope, WebSockets, cookies, config, Burp AI. Families of operations are grouped behind an `action` parameter so the client's tool list stays small. |
+| 🧰 **190+ operations, ~45 tools** | Proxy, Scanner, Repeater, Intruder, Collaborator, Organizer, site map, scope, WebSockets, cookies, config, Burp AI. Families of operations are grouped behind an `action` parameter so the client's tool list stays small. |
 | 🏎️ **Turbo engine** | Python (Jython) scripts on a custom request engine: single-packet attack, HTTP/2 and HTTP/3, pipelining, timing analysis. Runs from Burp's UI or from an agent. |
-| 🔎 **Recon and guided probes** | JS endpoint extraction, content discovery, parameter mining with Param Miner's wordlists, fingerprinting; CORS, GraphQL, injection, access control, IDOR and JWT probes, all limited to in-scope targets. |
-| 🛂 **Live access-control checks** | Autorize-style proxy tap: matching traffic is replayed in the background under lower-privilege identities and mismatches land in findings. |
-| 🕸️ **GraphQL toolkit** | Ported from InQL: query templates per field, points-of-interest and cycle scans, batched alias queries for brute force and rate-limit testing. |
-| 🧬 **Request smuggling** | HTTP Request Smuggler's desync technique catalog, probe payloads and canaries, available to Turbo scripts. |
-| 🔑 **JWT toolkit** | Key ring (RSA, EC, OKP, oct, password), sign, verify, JWE encrypt/decrypt, and the usual JWT test cases (`alg:none`, algorithm confusion, embedded JWK, psychic signatures, `jku`/`x5u`, secret cracking). |
+| 🔎 **Recon and guided probes** | JS endpoints and source maps, calibrated content discovery, Param Miner-style parameter mining with its wordlists, fingerprinting; CORS, web cache poisoning and deception, GraphQL, injection (ten classes, out-of-band confirmation through Collaborator), access control, IDOR and JWT probes. Findings carry the evidence to re-check them. |
+| 🛂 **Live access-control checks** | Autorize-style proxy tap: matching traffic is replayed in the background under lower-privilege identities; mismatches, with what each identity received, land in findings and on the Autorize tab and survive a reload. |
+| 🕸️ **GraphQL toolkit** | Ported from InQL: query templates per field, points-of-interest and cycle scans, batched alias queries for brute force and rate-limit testing; plus engine fingerprinting, schema brute force without introspection and a subscription probe over WebSocket. |
+| 🧬 **Request smuggling** | HTTP Request Smuggler's desync technique catalog, probe payloads and canaries for Turbo scripts, and `http_send_pipeline` for raw requests over one socket. |
+| 🔑 **JWT toolkit** | Key ring (RSA, EC, OKP, oct, password), sign, verify, JWE encrypt/decrypt, and the usual JWT test cases (`alg:none`, algorithm confusion, embedded JWK, psychic signatures, `jku`/`x5u` with the document to host, secret cracking). |
 | 📚 **Built-in skills** | Eight usage guides served as MCP prompts and resources, so an agent learns the tools and workflows on its own. |
-| 🖥️ **Native UI** | A **Raijin** tab that follows Burp's theme (dark or light): MCP activity, proxy explorer, scanner, findings, Collaborator, rules, JWT, Turbo runs, server info. |
-| 🔒 **No token to manage** | Loopback bind plus Host and Origin checks. Point your client at a URL and go. |
+| 🖥️ **Native UI** | A **Raijin** tab that follows Burp's theme (dark or light): MCP activity, proxy explorer, scanner, findings, Autorize, Collaborator, rules (traffic, WebSocket, scope), JWT, Turbo runs, server settings with remote access. |
+| 🔒 **No token on loopback** | Loopback bind plus Host and Origin checks. Remote/VM mode adds a bearer token and source-IP and host allowlists. |
 
 > Raijin merges [BurpMCP-Ultra](docs/dev/ultra/README-burpmcp-ultra.md) and [Turbo Intruder](docs/dev/turbo/readme-turbo-intruder.md),
 > and ports parts of [InQL](https://github.com/doyensec/inql), [HTTP Request Smuggler](https://github.com/PortSwigger/http-request-smuggler)
@@ -85,12 +85,12 @@ claude mcp add --transport http burpsuite http://127.0.0.1:9876/mcp
 }
 ```
 
-**Clients that only speak stdio** (Claude Desktop): bridge with [supergateway](https://github.com/supercorp-ai/supergateway), see [`configs/mcp-claude-desktop.json`](configs/mcp-claude-desktop.json).
+**Clients that only speak stdio** (Claude Desktop): bridge to the Streamable HTTP endpoint with [supergateway](https://github.com/supercorp-ai/supergateway), see [`configs/mcp-claude-desktop.json`](configs/mcp-claude-desktop.json).
 
 Then ask your agent something like *"Use the burpsuite_overview_skill, check the scope, and summarise the proxy history for example.com"*.
 
 > [!TIP]
-> The **Raijin → Server** sub-tab shows the exact client config for your current bind address and ports.
+> The **Raijin → Server** sub-tab shows the exact client config for your current bind address and ports; **Copy MCP Config** includes the bearer token when the listeners require one.
 
 ### Endpoints
 
@@ -100,41 +100,44 @@ Then ask your agent something like *"Use the burpsuite_overview_skill, check the
 | MCP, legacy SSE | `http://127.0.0.1:9876/` | Root path, not `/sse`. Deprecated by the MCP spec; kept for old `"type": "sse"` configs. |
 | Dashboard | `http://127.0.0.1:9878/` | Live web view of activity, stats, proxy traffic and rules. |
 
+With remote access on, every endpoint needs the bearer token; see [Security model](#-security-model).
+
 ### Ready-made configs
 
 | File | Purpose |
 |---|---|
 | [`configs/mcp-claude-code-direct.json`](configs/mcp-claude-code-direct.json) | Claude Code, direct to Burp. |
 | [`configs/mcp-claude-code-caddy.json`](configs/mcp-claude-code-caddy.json) | Claude Code through the Caddy proxy on `:9900`. |
-| [`configs/mcp-claude-desktop.json`](configs/mcp-claude-desktop.json) | Claude Desktop via supergateway. |
-| [`configs/Caddyfile`](configs/Caddyfile) | Optional Caddy reverse proxy with unbuffered, no-timeout streaming. |
-| [`configs/setup.sh`](configs/setup.sh) | Builds the jar, optionally installs the Caddyfile, prints the client config. |
+| [`configs/mcp-claude-desktop.json`](configs/mcp-claude-desktop.json) | Claude Desktop via supergateway (Streamable HTTP `/mcp`). |
+| [`configs/Caddyfile`](configs/Caddyfile) | Caddy profiles: a local streaming proxy on `127.0.0.1:9900`–`9902` that checks the Host itself, and a remote-VM profile with TLS and a bearer check. |
+| [`configs/setup.sh`](configs/setup.sh) | Builds the jar (`./gradlew build`), optionally installs the Caddyfile, prints the client config. |
 
 ---
 
 ## 🧰 Tools
 
-Raijin exposes about **40 MCP tools**. Frequently used tools stay individual; families of operations are one tool with a required `action` parameter, for example `scope(action=include)` or `scanner(action=start_audit)`. Each tool's description lists its actions and the parameters each one needs (required ones are marked `*`). The old per-operation names are mapped in [docs/dev/tool-consolidation.md](docs/dev/tool-consolidation.md).
+Raijin exposes about **45 MCP tools** over 190+ operations. Frequently used tools stay individual; families of operations are one tool with a required `action` parameter, for example `scope(action=include)` or `scanner(action=start_audit)`. Each tool's description lists its actions and the parameters each one needs (required ones are marked `*`); a parameter several actions share keeps every action's description and allowed values. The member tools behind each action are mapped in [docs/dev/tool-consolidation.md](docs/dev/tool-consolidation.md).
 
 <details open>
 <summary><b>HTTP and proxy</b></summary>
 
 | Tool | What it does |
 |---|---|
-| `http_send_request` | Send one HTTP request through Burp. |
-| `http_send_requests_parallel` | Send many requests concurrently. |
+| `http_send_request` | Send one HTTP request through Burp, from a URL or raw text; HTTP/1.1 or HTTP/2. |
+| `http_send_requests_parallel` | Send many requests concurrently, across hosts. |
 | `http_send_request_chain` | Send a sequence, extracting values from each response (regex) into the next request. |
-| `http_send_raw_bytes` | Send exact bytes (malformed or smuggling-style requests). |
-| `http_fuzz` | Inject payloads at marked positions (sniper mode). |
-| `http_race` | Fire requests together to test race conditions. |
-| `http_rule` | Outgoing traffic rules and session token rules. |
+| `http_send_raw_bytes` | Send exact bytes (hex or text) for smuggling and CRLF cases; one request, one response. |
+| `http_send_pipeline` | Several raw HTTP/1.1 requests over one socket; every response read back in order with its framing, trailers and close reason (desync and 0.CL work). |
+| `http_fuzz` | Inject payloads at marked positions (sniper mode; `FUZZ` or `§` markers; built-in payload libraries). |
+| `http_race` | Fire requests together to test race conditions (best effort; use Turbo for single-packet timing). |
+| `http_rule` | Outgoing traffic rules (`rule_action`: modify, drop, spoof a response; `tool_filter` by Burp tool) and session token rules. |
 | `http_state` | Burp cookie jar: get, set, delete. |
-| `proxy_history`, `proxy_history_search` | Read and search Proxy HTTP history. |
+| `proxy_history`, `proxy_history_search` | Read and search Proxy HTTP history (sensitive request headers masked unless the full request is asked for). |
 | `proxy_annotate` | Highlight and comment history items. |
-| `proxy_auto_auth` | Add an auth header to every proxied request for a host pattern. |
-| `proxy_rule` | Proxy request/response rules (modify, drop, tag). |
-| `proxy_intercept` | Turn interception on or off, read its state. |
-| `websocket` | Open connections, send, read messages, intercept rules, WebSocket history. |
+| `proxy_auto_auth` | Set an auth header (replacing any existing one) on every proxied request for a host pattern. |
+| `proxy_rule` | Proxy request/response rules: modify (headers, body, method, path, status), drop, tag. |
+| `proxy_intercept` | Burp's Intercept switch, plus a hold queue: park matching proxied messages, list them, forward them edited or as they are, drop them (unanswered holds are forwarded by themselves). |
+| `websocket` | Open connections, send text or binary, wait for a reply, fuzz an endpoint, read messages, intercept rules (set, list, remove), WebSocket history. |
 
 </details>
 
@@ -143,17 +146,17 @@ Raijin exposes about **40 MCP tools**. Frequently used tools stay individual; fa
 
 | Tool | What it does |
 |---|---|
-| `scanner` | Start crawls and audits, read issues, generate reports, register checks. |
+| `scanner` | Start crawls and audits (an optional auth header applies to the audited hosts only, until the audit ends), read issues, generate reports, register checks. |
 | `scanner_task` | Status, list, delete running scan tasks; add requests; read their issues. |
-| `custom_check` | BChecks and passive/active scan checks: create from a template, import, list, remove. |
-| `recon` | JS endpoints, content discovery, fingerprinting, parameter mining (in scope only). `param_mine` checks reflection or behaviour changes (`mode=diff`) in the query, body, JSON body, cookies or headers, with Param Miner's wordlists when no candidates are given. |
-| `probe` | Guided probes: `cors`, `graphql`, `injection`, `access_control`, `idor`, `jwt` (in scope only). See [GraphQL](#graphql) for the GraphQL modes. |
-| `auth_diff` | Send the same request at different auth levels (admin, user, none) and compare responses. |
+| `custom_check` | BChecks and passive/active scan checks: create from a template, import, dry-run against proxy history, list, remove. |
+| `recon` | JS endpoints and source maps, calibrated content discovery, fingerprinting, parameter mining. `param_mine` checks reflection or behaviour changes (`mode=diff`) in the query, body, JSON body, cookies or headers, many names per request, with Param Miner's wordlists when no candidates are given. |
+| `probe` | Guided probes: `cors`, `cache` (web cache poisoning and deception), `graphql`, `injection`, `access_control`, `idor`, `jwt`. See [GraphQL](#graphql) for the GraphQL modes. |
+| `auth_diff` | Send the same request at different auth levels (admin, user, none) and compare responses; each level reports the headers it sent. |
 | `autorize` | Live access-control tap: replay matching proxied requests under other identities and flag mismatches (`set_rule`, `list_rules`, `remove_rule`, `list_matches`, `clear_matches`). |
 | `analyze` | Offline analysis: parse requests/responses, reflections, parameters, insertion points, diffs, keywords, passive intel. |
-| `api_import_openapi` | Import an OpenAPI 3 / Swagger 2 spec: build sample requests, optionally send them and add them to scope and the site map. |
-| `bambda_import` | Import a `.bambda` file into Burp. |
-| `collaborator` | Collaborator clients, payloads, polling. |
+| `api_import_openapi` | Import an OpenAPI 3.0/3.1 or Swagger 2.0 document (JSON or YAML): build example requests (parameters, JSON/form/multipart/XML bodies), optionally send them and add them to scope and the site map; reports the security schemes each operation expects. |
+| `bambda_import`, `bambda_templates` | Import a `.bambda` file into Burp; the envelope format, known functions and starting templates. |
+| `collaborator` | Collaborator clients (kept across reloads), payloads, polling with a `since` cursor. |
 
 </details>
 
@@ -166,9 +169,9 @@ Raijin exposes about **40 MCP tools**. Frequently used tools stay individual; fa
 | `sitemap` | Query the site map, read issues, add requests or issues, annotate. |
 | `send_to_tool` | Send a request to Repeater, Intruder (with positions), Comparer or Decoder. |
 | `organizer` | Send items to Organizer, read them back, annotate. |
-| `findings` | Record, list and remove findings during testing. |
+| `findings` | Record, list and remove findings during testing (kept per Burp project). |
 | `config` | Proxy listeners, match/replace rules, upstream proxy, Intruder payload processors. |
-| `persistence` | Key/value storage in the Burp project and user preferences. |
+| `persistence` | Key/value storage in the Burp project, plus string user preferences. |
 | `events` | Subscribe to and read the event feed. |
 | `burp` | Version, project and extension info, config import/export, task engine, shutdown. |
 | `ai` | Burp AI status and prompts. |
@@ -182,8 +185,8 @@ Raijin exposes about **40 MCP tools**. Frequently used tools stay individual; fa
 
 | Tool | What it does |
 |---|---|
-| `turbo_run` | Start, poll, read, stop and delete Turbo runs; search responses; save to Organizer. |
-| `turbo_docs` | Turbo documentation and example scripts. Read before `turbo_run`. |
+| `turbo_run` | Start (blocking or `start_async`), list, poll, read, stop and delete Turbo runs; search responses; save to Organizer. |
+| `turbo_docs` | Turbo documentation (12 topics) and example scripts. Read before `turbo_run`. |
 | `jwt_keys` | JWK key ring: generate, import, list, export, delete. |
 | `search_skills`, `load_skill`, `read_skill_file` | Find and read the built-in skills from a tool call. |
 
@@ -255,10 +258,10 @@ Turbo runs a Python (Jython) script over its own request engine. Use it when you
 **From an agent**
 
 ```text
-turbo_docs(action=get_docs)          # read the docs first
+turbo_docs(action=get_docs)          # topics; start with api-quickstart
 turbo_docs(action=list_examples)     # then pick an example
-turbo_run(action=start, ...)         # start a run
-turbo_run(action=status | results | result | search_responses)
+turbo_run(action=start, ...)         # waits up to timeout_ms (55 s), or start_async to return at once
+turbo_run(action=status | results | result | search_responses | list)
 turbo_run(action=stop | delete | save_to_organizer)
 ```
 
@@ -268,10 +271,10 @@ Runs started from the dialog and from agents are listed together on the **Raijin
 
 | | |
 |---|---|
-| Docs | [`src/main/resources/turbo-docs/`](src/main/resources/turbo-docs/): quick start, engines, decorators, race conditions, performance, settings |
+| Docs | [`src/main/resources/turbo-docs/`](src/main/resources/turbo-docs/), also served by `turbo_docs(action=get_docs, topic=...)`: quick start, engines, settings, race conditions, response processing, decorators, performance, desync techniques, wordlists and utilities, Montoya API patterns |
 | Examples | [`src/main/resources/examples/`](src/main/resources/examples/): single-packet races (H1, H2, H3), multi-endpoint races, 0.CL desync, desync technique sweeps (`desync-smuggler`, `desync-h2-downgrade`), rate limits, timing, crawling and more |
 
-**Request smuggling.** `turbo.DesyncTechniques` (obfuscated `Content-Length`/`Transfer-Encoding` variants, H1 and H2), `turbo.DesyncProbePayloads` and `turbo.DesyncCanary` are ported from [HTTP Request Smuggler](https://github.com/PortSwigger/http-request-smuggler). They only build and match bytes; Turbo's engine does the timing and connection pinning. Read `turbo_docs(action=get_docs, topic=desync-techniques)` first.
+**Request smuggling.** `turbo.DesyncTechniques` (obfuscated `Content-Length`/`Transfer-Encoding` variants, H1 and H2), `turbo.DesyncProbePayloads` and `turbo.DesyncCanary` are ported from [HTTP Request Smuggler](https://github.com/PortSwigger/http-request-smuggler). They only build and match bytes; Turbo's engine does the timing and connection pinning. Read `turbo_docs(action=get_docs, topic=desync-techniques)` first. To send a few raw requests over one socket without a script, use `http_send_pipeline`.
 
 > [!WARNING]
 > A Turbo run executes Python inside Burp's JVM. Only connect MCP clients you trust.
@@ -282,7 +285,13 @@ Runs started from the dialog and from agents are listed together on the **Raijin
 
 ### Autorize-style tap
 
-`autorize(action=set_rule, identities=[...])` starts a background tap on Proxy traffic, the idea behind the [Autorize](https://github.com/PortSwigger/autorize) extension. Every proxied request that matches the rule (scope, host glob, methods, URL exclusions, static assets skipped) is replayed once per endpoint under each identity, for example `{"name":"none"}` for unauthenticated or `{"name":"low_priv","header_name":"Cookie","header_value":"session=..."}`. Responses are compared with the original by status and body similarity (`similarity_threshold`, default 90). Mismatches are listed by `autorize(action=list_matches)` and also recorded as findings. Replays never block the proxy.
+`autorize(action=set_rule, identities=[...])` starts a background tap on Proxy traffic, the idea behind the [Autorize](https://github.com/PortSwigger/autorize) extension. Every proxied request that matches the rule (scope, host glob or regex, methods, URL exclusions, static assets skipped) is replayed under each identity, for example `{"name":"none"}` for unauthenticated or `{"name":"low_priv","header_name":"Cookie","header_value":"session=..."}`; identities take `headers` and `remove_headers` as in `auth_diff`. Only authenticated originals are replayed: requests without credentials or answered 401 or 404 are skipped, and `POST`, `PUT`, `DELETE` and `PATCH` are replayed only with `include_mutating=true`, since each replay repeats the action. Each endpoint is tested once per query string (`?id=1` and `?id=2` separately, at most 50 variants per endpoint). Responses are compared with the original by status and body similarity (`similarity_threshold`, default 90); refusals that look alike (the same 401/403/404, a redirect to a login page) stay informational, and a match the denial-wording check turned informational is kept with `soft_denial: true`. Matches are saved per Burp project (`~/.raijin-autorize.jsonl`) with what every identity sent and received: `autorize(action=list_matches)` pages through them (`start_index`, `count`, `include_replays`, or `match_id` for one in full), the **Raijin → Autorize** tab shows the original next to each replay, each match is an `autorize.match` event, and critical or high ones are recorded as findings. Replays never block the proxy: at most 10 are sent at once and 100 wait, and an endpoint skipped while the queue is full is tried again later. Setting a rule re-tests the endpoints it already replayed.
+
+### One-off checks
+
+`auth_diff` sends one request per auth level; `probe(action=access_control)` does the same for many requests and identities. A level's headers (`header_name`/`header_value`, or `headers` for several, `remove_headers` to drop some) replace the request's own instead of adding a second `Cookie` or `Authorization`; a level named `none`, `unauth` or `anonymous` is sent without any credential header; Content-Length is fixed for every level. Each level reports what it sent (`headers_set`, `headers_removed`, `credential_headers_kept`), and findings carry an id and severity (`all_identical`, `unauth_accessible`, `unauth_reads_protected`, ...). Uniform refusals, a 200 login or denial page, or a body matching `denied_regex` are informational, never high or critical; a level that gets no response is listed under `errors`.
+
+`probe(action=idor)` swaps the object id at its parameter boundary (one path segment, one query/form/cookie/header value, one JSON value, so `/v1/users/1` never becomes `/v2/users/2`), replays it under every other identity, and confirms a cross-user read only when the owner's `canary` appears in the reader's response. Pin the id with `id_value`, `id_location` and `id_name` when auto-detection picks the wrong one.
 
 ### GraphQL
 
@@ -292,47 +301,50 @@ Runs started from the dialog and from agents are listed together on the **Raijin
 |---|---|
 | `probe` (default) | Introspection enabled, disabled (falls back to "Did you mean" suggestions), or not GraphQL. |
 | `query_templates` | A runnable example query, mutation or subscription for each schema field (`max_depth`, default 6). Needs introspection. |
-| `poi_scan` | Fields that look security-relevant by name (auth, privileged, PII, payment, database, debugging, files), deprecated fields, custom scalars. |
-| `cycles_scan` | Types that can recurse into themselves (deep nesting, denial of service). |
-| `batch_attack` | Expand `$[INT:first:last]` or `$[LIST]` in `template` into aliased operations in one request (2FA brute force, IDOR enumeration, rate limits). Generates only unless `send=true`. |
+| `poi_scan` | Fields that look security-relevant by name (auth, privileged, PII, payment, database, debugging, files), deprecated fields, custom scalars; each at its shortest path, through interfaces and unions. `custom_keywords` are matched literally. |
+| `cycles_scan` | Every cycle in the type graph (deep nesting, denial of service), shortest first, plus `cyclic_types`; `truncated` when the search hits its cap. |
+| `batch_attack` | Expand `$[INT:first:last]` or `$[LIST]` in `template` into aliased operations in one request (2FA brute force, IDOR enumeration, rate limits); at most 10,000. Generates only unless `send=true`. |
 | `fingerprint_engine` | Detect the backend engine (Apollo, Hasura, graphql-java, ...) from malformed-query error signatures. |
-| `bruteforce_schema` | Reconstruct the schema from "did you mean"/type-mismatch error messages when introspection is disabled. Noisy and request-heavy: every field/type/arg guess is a live request (`bucket_size`, `depth_limit`, `bruteforce_arguments`). |
+| `bruteforce_schema` | Reconstruct the schema from "did you mean"/type-mismatch error messages when introspection is disabled. Request-heavy: guesses go out in buckets (`bucket_size`, `depth_limit`, `bruteforce_arguments`), every document built to fail validation so a compliant server executes none, and the run stops at `max_requests` (default 2000) with the partial schema. |
+| `subscription_probe` | Subscriptions over WebSocket (`ws(s)://` or the HTTP endpoint), with both the `graphql-transport-ws` and the legacy `subscriptions-transport-ws` protocols: per protocol `handshake_accepted`, `init_requires_auth`, `subscription_accepted` and `subscription_requires_auth`, comparing an anonymous session with one carrying your `headers` and `connection_payload` (`subscription_query`, `wait_ms`). |
 
-Every mode accepts `headers` and `auto_headers` (reuse the most recent Proxy-history request's `Authorization`/`Cookie`/`X-Api-Key`/`X-Auth-Token` for this host); `query_templates`/`poi_scan`/`cycles_scan` also cache the fetched schema for 10 minutes, bypassable with `refresh_schema`.
+Every mode accepts `headers` and `auto_headers` (reuse the most recent Proxy-history request's `Authorization`/`Cookie`/`X-Api-Key`/`X-Auth-Token` for this host); `query_templates`/`poi_scan`/`cycles_scan` also cache the fetched schema for 10 minutes, bypassable with `refresh_schema`. An unreachable target is reported as one error instead of a verdict.
 
 ---
 
 ## 🔑 JWT toolkit
 
-- **Key ring** (`jwt_keys` tool, **Raijin → JWT** tab): generate RSA, EC, OKP (Ed25519/X25519), symmetric (`oct`) and password keys; import PEM or JWK; export as JWK or PEM. Private material is never listed, and is exported only when asked.
-- **Token operations** (`probe(action=jwt, mode=...)`):
+- **Key ring** (`jwt_keys` tool, **Raijin → JWT** tab): generate RSA, EC, OKP (Ed25519, Ed448, X25519, X448), symmetric (`oct`) and password keys; import PEM or JWK; export as JWK or PEM. Private material is never listed, and is exported only when asked. Every key lists the modes it can serve (X25519 and X448 keys encrypt and decrypt; they do not sign).
+- **Token operations** (`probe(action=jwt, mode=...)`). Signing modes keep the token's payload byte for byte unless `payload_overrides` names claims, and keep its header apart from `alg`, `kid` and the key they embed or point to:
 
 | Mode | Purpose |
 |---|---|
-| `analyze` | Flag `alg:none`, HMAC, asymmetric algorithms, `kid`/`jku`, missing `exp`. |
-| `sign`, `sign_key`, `verify` | Sign with a secret or ring key; verify against one key or all of them. |
+| `analyze` | Flag `alg:none`, HMAC, asymmetric algorithms, `kid`/`jku`, missing or malformed `exp`, repeated claims. |
+| `sign`, `sign_key`, `verify` | Sign with a secret or ring key; verify against one key or all of them, with the reason a key does not verify. |
 | `encrypt`, `decrypt` | JWE with a ring key. |
 | `forge_none` | Unsigned tokens, with case variants of `none`. |
 | `alg_confusion` | RS→HS confusion using the server's public key (PEM, JWK or a ring key). |
 | `embed_jwk` | Sign and embed the public key in the header. |
 | `empty_hmac`, `psychic` | Empty HMAC key; ECDSA psychic signatures (ES256/384/512). |
-| `header_url` | Point `jku` or `x5u` at a URL you control. |
+| `header_url` | Point `jku` or `x5u` at a URL you control; with `key_id` the token is signed with that ring key and the result holds the JWK set or certificate chain to host there. |
 | `crack` | Recover an HMAC secret from a wordlist or the built-in list. |
 
 ---
 
 ## 🔒 Security model
 
-There is **no authentication token**. Protection is:
+On loopback (the default) there is **no token to manage**. Protection is:
 
-- **Loopback only.** The servers bind to `127.0.0.1`. Remote binding needs `-Draijin.allowRemoteBind=true`, and then nothing protects them but your network.
+- **Loopback bind.** The servers bind to `127.0.0.1`.
 - **Host-header allowlist** against DNS rebinding.
 - **Origin lockdown** so web pages in your browser cannot call localhost.
 
-> [!CAUTION]
-> Any local process can call the tools, and the tools drive your Burp (including running Python through Turbo). Do not run Raijin on a shared machine.
+**Remote / VM mode.** Another bind address (`mcp_bind_host`) needs the operator opt-in `mcp_allow_remote_bind`. Every listener then requires `Authorization: Bearer <token>` (generated and shown on the **Server** tab; **Copy MCP Config** includes it), optionally narrowed by a source IP/CIDR allowlist (`mcp_allowed_ips`) and extra allowed host names (`mcp_allowed_hosts`). `mcp_require_auth` turns the token on for loopback too. SSH port forwarding, a VPN address or the Caddy profile keep Raijin itself on loopback. Details, including the browser cookie and the Caddy setup: [SECURITY.md](docs/dev/ultra/SECURITY.md).
 
-The recon and probe tools refuse targets that are not in Burp's scope; set it with `scope(action=include)` first.
+> [!CAUTION]
+> On loopback any local process can call the tools, and the tools drive your Burp (including running Python through Turbo). Do not run Raijin on a shared machine.
+
+Outbound requests from the `http_*`, recon and probe tools are checked against Burp's target scope by `mcp_scope_mode`: `warn` (default) sends them and flags out-of-scope targets, `enforce` refuses them, `off` skips the check. Set the scope with `scope(action=include)` first.
 
 ---
 
@@ -343,18 +355,26 @@ The recon and probe tools refuse targets that are not in Burp's scope; set it wi
 | MCP port (SSE + Streamable HTTP) | `raijin.ssePort` | `mcp_sse_port` | `9876` |
 | Second MCP port | `raijin.httpPort` | `mcp_http_port` | `9877` |
 | Dashboard port | `raijin.dashboardPort` | `mcp_dashboard_port` | `9878` |
-| Allow non-loopback bind | `raijin.allowRemoteBind` | | `false` |
+| Bind address | `raijin.bindHost` | `mcp_bind_host` | `127.0.0.1` |
+| Allow a non-loopback bind | `raijin.allowRemoteBind` | `mcp_allow_remote_bind` | `false` |
+| Require the token on loopback too | `raijin.requireAuth` | `mcp_require_auth` | `false` |
+| Bearer token | `raijin.authToken` | `mcp_auth_token` | generated when needed |
+| Source IP/CIDR allowlist | `raijin.allowedIps` | `mcp_allowed_ips` | empty: any source |
+| Extra allowed host names | `raijin.allowedHosts` | `mcp_allowed_hosts` | none |
+| Scope policy for outbound requests | | `mcp_scope_mode` | `warn` |
+| Allow shutdown and config import | | `mcp_allow_destructive` | `false` |
+| Save the MCP activity log | | `mcp_persist_activity` | `true` |
 
-PortSwigger's own MCP Server extension also defaults to `9876`; change one of them if you run both.
+PortSwigger's own MCP Server extension also defaults to `9876`; change one of them if you run both. When two listeners are configured on one port, the later one moves for the session (to its default or the next free port, never one another listener is configured for) and the log names the preference to fix.
 
-JVM properties go in Burp's launcher, e.g. `java -Draijin.ssePort=9976 -jar burpsuite_pro.jar`. Activity, audit log and findings are stored in `~/.raijin-{activity,audit,findings}.jsonl`.
+JVM properties go in Burp's launcher, e.g. `java -Draijin.ssePort=9976 -jar burpsuite_pro.jar`, and win over the preference. The **Server** tab edits the bind and remote-access settings and rebinds without a reload. Activity, audit log, findings and Autorize matches are stored in `~/.raijin-{activity,audit,findings,autorize}.jsonl`.
 
 ---
 
 ## 🔄 Coming from BurpMCP-Ultra or Turbo Intruder
 
 - **One extension, one server** named `burpsuite`. Turbo's own MCP server (ports 31337/31338) and its standalone `java -jar … --mcp` mode are gone; use `turbo_run` and `turbo_docs`.
-- **No bearer token** (BurpMCP-Ultra required one).
+- **No bearer token on loopback** (BurpMCP-Ultra always required one); a remote bind requires one.
 - **Montoya API only.** Turbo no longer bundles `albinowaxUtils-all.jar` or the legacy extender API.
 - **Settings.** Turbo's old settings menu is now in Burp's Settings window; previously saved Turbo settings are not migrated.
 - **Renames.** System properties moved from `burpmcp.*` to `raijin.*`. Per-operation tool names were folded into `action` tools ([mapping](docs/dev/tool-consolidation.md)).
@@ -372,11 +392,17 @@ All source is Kotlin, Montoya API only (`compileOnly`), namespace `io.bitbytelab
 
 ```text
 src/main/kotlin/io/bitbytelab/raijin/
-├── core/        shared helpers (JSON truncation, payload libraries, wordlists, similarity)
-├── transport/   MCP server, Streamable HTTP + SSE, security checks, prompts, resources, dashboard
+├── core/        shared helpers (JSON arguments and truncation, payload libraries, wordlists, similarity)
+├── transport/   MCP server, Streamable HTTP + SSE, security and remote access, prompts, resources, dashboard, JSONL stores
+├── safety/      scope gate, request hygiene (wire encoding, Content-Length), regex and send time limits
 ├── bridge/      *Bridge.kt wrappers over Burp APIs
-├── graphql/     schema model, query printer, scanners, batch queries (ported from InQL)
-├── state/       shared state (Autorize-style rules and matches)
+├── recon/       param mining, content discovery, JS endpoints and source maps
+├── webprobe/    CORS, web cache poisoning/deception, fingerprinting
+├── injection/   injection probe: payloads, oracles, Collaborator confirmation
+├── openapi/     OpenAPI/Swagger parsing (JSON and YAML) and request building
+├── graphql/     schema model, query printer, scanners, batch queries (ported from InQL), subscriptions
+├── events/      event bus behind the event feed and the dashboard
+├── state/       shared state (rules, Autorize matches, WebSocket connections)
 ├── tools/       <area>/*Tools.kt MCP tools; ToolConsolidation.kt groups them into action tools
 ├── skills/      SkillCatalog (skill markdown lives in src/main/resources/skills/)
 ├── jwt/         JOSE operations and the key ring
@@ -389,7 +415,7 @@ src/main/kotlin/io/bitbytelab/raijin/
 
 - **A tool:** register it in `tools/<area>/*Tools.kt`, then add it to `ToolConsolidation.GROUPS` (as an action) or `KEEP` (as its own tool). A test fails if you forget.
 - **A skill:** add `src/main/resources/skills/<name>.md` with `name` and `description` frontmatter and list it in `SkillCatalog.NAMES`.
-- **Turbo docs or examples:** drop files in `src/main/resources/turbo-docs/` or `src/main/resources/examples/`.
+- **Turbo docs or examples:** add the file under `src/main/resources/turbo-docs/` or `src/main/resources/examples/`, and list it in `McpResourceHandlers` (`docTopics`, or the example set the MCP tools serve). A test fails when a doc file and the topic list differ.
 
 MCP SDK: `io.modelcontextprotocol:kotlin-sdk-server` 0.16, which pins Kotlin 2.4 and Ktor 3.5; bump them together. Developer notes are in [`docs/dev/`](docs/dev/).
 

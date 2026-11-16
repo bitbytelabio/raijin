@@ -226,10 +226,20 @@ You can also add the binary representation of characters that cannot be expresse
 | `^s` | Space |
 | `^xNN` | Byte `0xNN` |
 | `^^` | Literal `^` |
+| `` ` `` (in a field name) | `:`, since a header line splits at its first colon; `^x60` writes a literal backtick |
+
+Escapes are decoded in the method, the path, field names and values. Anything else after a `^` is an
+error, never a silent literal. A field can be written `Name:value` without a space; with
+`kettled=True` a value loses only the single space after the colon, so any further spaces or tabs at
+the start of the value are sent. Values keep a backtick as written.
+
+The deprecated `Engine.HTTP2` always turns `^` into CR, `~` into LF and a backtick in a field name
+into `:`, whether or not the request is kettled.
 
 ## Example Scripts
 
-- [default.py](../resources/examples/default.py) - Basic edition-dependent default usage
-- [burpIntegration.py](../resources/examples/burpIntegration.py) - BURP engine with Collaborator
-- [race-single-packet-attack.py](../resources/examples/race-single-packet-attack.py) - BURP2 for races
-- [race-http3.py](../resources/examples/race-http3.py) - Single Datagram Attack
+- [default.py](../examples/default.py) - Basic edition-dependent default usage
+- [burpIntegration.py](../examples/burpIntegration.py) - BURP engine with Collaborator
+- [race-single-packet-attack.py](../examples/race-single-packet-attack.py) - BURP2 for races
+- [race-http3.py](../examples/race-http3.py) - Single Datagram Attack
+- [desync-h2-downgrade.py](../examples/desync-h2-downgrade.py) - Kettled BURP2 requests for an HTTP/2-downgrade sweep

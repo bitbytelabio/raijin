@@ -1,12 +1,40 @@
 # Tool consolidation
 
-Raijin folds families of tools into one tool with an `action` parameter (see `tools/ToolConsolidation.kt`). Old names no longer exist. The Activity tab and audit log still report calls under the old name.
+Raijin folds families of tools into one tool with an `action` parameter (`tools/ToolConsolidation.kt`): 27 grouped tools and 19 tools kept as they are, 46 in all, over 196 operations. The old per-operation names are not on the server any more, but the Activity tab and the audit log still record each call under its member name (the left column below), so this table also reads those records.
 
-Tools kept as they were: `http_send_request`, `http_send_requests_parallel`, `http_send_request_chain`, `http_send_raw_bytes`, `http_fuzz`, `http_race`, `proxy_history`, `proxy_history_search`, `proxy_annotate`, `proxy_auto_auth`, `auth_diff`, `api_import_openapi`, `bambda_import`, `jwt_keys`.
+Tools kept as they are: `http_send_request`, `http_send_requests_parallel`, `http_send_request_chain`, `http_send_raw_bytes`, `http_send_pipeline`, `http_fuzz`, `http_race`, `proxy_history`, `proxy_history_search`, `proxy_annotate`, `proxy_auto_auth`, `auth_diff`, `api_import_openapi`, `bambda_import`, `bambda_templates`, `jwt_keys`, `search_skills`, `load_skill`, `read_skill_file`.
 
-Parameters that were named `action` (proxy rules, WebSocket intercept rule) are called `rule_action` in the merged tools.
+Adding a tool: register it in its `tools/<area>/*Tools.kt`, then list it in a group of `ToolConsolidation.GROUPS` (as an action) or in `KEEP`. `ToolConsolidationTest` fails for a tool that is in neither.
 
-| Old tool | New tool | `action` |
+## Calling a grouped tool
+
+`tool(action=<action>, ...)` with the member's parameters. The tool description lists every action as `action(param*, param): first sentence of the member's description`, `*` marking the parameters that action requires. Dispatch checks those before calling the member: a missing one returns `missing_parameter`, an unknown or missing action returns `unknown_action` with the list of actions. The member then receives its own parameter names and validates exactly as it does on its own.
+
+## Renamed parameters
+
+A member parameter named `action` would collide with the dispatch parameter, so its group publishes it as `rule_action`:
+
+| Tool | Action | `rule_action` values |
+|---|---|---|
+| `http_rule` | `traffic_rule_set` | `modify` (default), `drop`, `spoof_response` |
+| `proxy_rule` | `set_request_rule`, `set_response_rule` | `modify`, `drop`, `tag` |
+| `websocket` | `set_intercept_rule` | `modify`, `drop`, `tag` |
+
+A group whose member declares `action` without a rename fails when the tools are published (and in `ToolConsolidationTest`), so a new collision cannot slip through. `jwt_keys` keeps its own `action` parameter (`generate`, `import`, `list`, `export`, `delete`): it is a kept tool, not a group.
+
+## Parameters shared by several actions
+
+When actions of one group declare the same parameter name, the group's schema merges their definitions instead of keeping the first:
+
+- **Enums** are united, but only when every action declares one. If any action takes free text, the merged parameter has no enum, so that action's values still validate; the other actions' allowed values move into the description.
+- **Structure**: `items` and `properties` merge recursively, and any other key (`minimum`, `default`, ...) stays only when every action agrees. When the actions disagree on the type, the parameter accepts any JSON value (`{}`) and its description starts with "Type depends on the action, so any JSON value is accepted here."
+- **Descriptions**: a text every action shares reads `text [actions: a, b]` (no suffix when all actions use it). Different texts become one line per set of actions, `[a, b] text (one of: ...; type: ...; default: ...)`, so each action keeps its own wording plus the constraints the merged schema no longer states for it.
+
+For example `probe.mode` unites the GraphQL and JWT modes into one enum, and its description has a `[graphql]` line and a `[jwt]` line, each listing that action's own modes.
+
+## Mapping
+
+| Member tool | Tool | `action` |
 |---|---|---|
 | `access_control_sweep` | `probe` | `access_control` |
 | `ai_prompt` | `ai` | `prompt` |
@@ -18,7 +46,13 @@ Parameters that were named `action` (proxy rules, WebSocket intercept rule) are 
 | `analyze_request` | `analyze` | `request` |
 | `analyze_response` | `analyze` | `response` |
 | `analyze_response_body_search` | `analyze` | `response_body_search` |
+| `autorize_clear_matches` | `autorize` | `clear_matches` |
+| `autorize_list_matches` | `autorize` | `list_matches` |
+| `autorize_list_rules` | `autorize` | `list_rules` |
+| `autorize_remove_rule` | `autorize` | `remove_rule` |
+| `autorize_set_rule` | `autorize` | `set_rule` |
 | `bcheck_create` | `custom_check` | `bcheck_create` |
+| `bcheck_dry_run` | `custom_check` | `bcheck_dry_run` |
 | `bcheck_import` | `custom_check` | `bcheck_import` |
 | `bcheck_list` | `custom_check` | `bcheck_list` |
 | `bcheck_remove` | `custom_check` | `bcheck_remove` |
@@ -32,11 +66,14 @@ Parameters that were named `action` (proxy rules, WebSocket intercept rule) are 
 | `burp_task_engine_set` | `burp` | `task_engine_set` |
 | `burp_task_engine_state` | `burp` | `task_engine_state` |
 | `burp_version` | `burp` | `version` |
+| `cache_probe` | `probe` | `cache` |
 | `collaborator_create_client` | `collaborator` | `create_client` |
 | `collaborator_default_payload` | `collaborator` | `default_payload` |
 | `collaborator_generate_payload` | `collaborator` | `generate_payload` |
 | `collaborator_get_secret` | `collaborator` | `get_secret` |
+| `collaborator_list_clients` | `collaborator` | `list_clients` |
 | `collaborator_poll` | `collaborator` | `poll` |
+| `collaborator_remove_client` | `collaborator` | `remove_client` |
 | `collaborator_restore_client` | `collaborator` | `restore_client` |
 | `collaborator_server_info` | `collaborator` | `server_info` |
 | `comparer_send` | `send_to_tool` | `comparer` |
@@ -57,9 +94,11 @@ Parameters that were named `action` (proxy rules, WebSocket intercept rule) are 
 | `extension_info` | `burp` | `extension_info` |
 | `findings_add` | `findings` | `add` |
 | `findings_list` | `findings` | `list` |
+| `findings_remove` | `findings` | `remove` |
 | `graphql_probe` | `probe` | `graphql` |
 | `http_analyze_keywords` | `analyze` | `http_keywords` |
 | `http_analyze_variations` | `analyze` | `http_variations` |
+| `http_cookie_jar_delete` | `http_state` | `cookie_jar_delete` |
 | `http_cookie_jar_get` | `http_state` | `cookie_jar_get` |
 | `http_cookie_jar_set` | `http_state` | `cookie_jar_set` |
 | `http_list_traffic_rules` | `http_rule` | `traffic_rule_list` |
@@ -73,6 +112,7 @@ Parameters that were named `action` (proxy rules, WebSocket intercept rule) are 
 | `jwt_attack` | `probe` | `jwt` |
 | `log_event` | `log` | `event` |
 | `log_message` | `log` | `message` |
+| `organizer_annotate` | `organizer` | `annotate` |
 | `organizer_get_items` | `organizer` | `get_items` |
 | `organizer_send` | `organizer` | `send` |
 | `passive_intel` | `analyze` | `passive_intel` |
@@ -80,11 +120,17 @@ Parameters that were named `action` (proxy rules, WebSocket intercept rule) are 
 | `persistence_get` | `persistence` | `get` |
 | `persistence_list` | `persistence` | `list` |
 | `persistence_store` | `persistence` | `store` |
-| `preference_get` | `persistence` | `et` |
-| `preference_store` | `persistence` | `tore` |
+| `preference_delete` | `persistence` | `preference_delete` |
+| `preference_get` | `persistence` | `preference_get` |
+| `preference_store` | `persistence` | `preference_store` |
 | `project_info` | `burp` | `project_info` |
 | `proxy_intercept_disable` | `proxy_intercept` | `disable` |
+| `proxy_intercept_drop` | `proxy_intercept` | `drop` |
 | `proxy_intercept_enable` | `proxy_intercept` | `enable` |
+| `proxy_intercept_forward` | `proxy_intercept` | `forward` |
+| `proxy_intercept_hold` | `proxy_intercept` | `hold` |
+| `proxy_intercept_list_held` | `proxy_intercept` | `list_held` |
+| `proxy_intercept_release` | `proxy_intercept` | `release` |
 | `proxy_intercept_status` | `proxy_intercept` | `status` |
 | `proxy_list_rules` | `proxy_rule` | `list` |
 | `proxy_remove_rule` | `proxy_rule` | `remove` |
@@ -99,6 +145,7 @@ Parameters that were named `action` (proxy rules, WebSocket intercept rule) are 
 | `repeater_send` | `send_to_tool` | `repeater` |
 | `scancheck_create_active` | `custom_check` | `scancheck_create_active` |
 | `scancheck_create_passive` | `custom_check` | `scancheck_create_passive` |
+| `scancheck_dry_run` | `custom_check` | `scancheck_dry_run` |
 | `scancheck_list` | `custom_check` | `scancheck_list` |
 | `scancheck_remove` | `custom_check` | `scancheck_remove` |
 | `scancheck_templates` | `custom_check` | `scancheck_templates` |
@@ -119,17 +166,21 @@ Parameters that were named `action` (proxy rules, WebSocket intercept rule) are 
 | `scope_exclude` | `scope` | `exclude` |
 | `scope_get_config` | `scope` | `get_config` |
 | `scope_include` | `scope` | `include` |
+| `scope_list` | `scope` | `list` |
+| `scope_remove` | `scope` | `remove` |
 | `session_create_token_rule` | `http_rule` | `token_rule_create` |
 | `session_list_rules` | `http_rule` | `token_rule_list` |
 | `session_remove_rule` | `http_rule` | `token_rule_remove` |
 | `sitemap_add_issue` | `sitemap` | `add_issue` |
 | `sitemap_add_request` | `sitemap` | `add_request` |
+| `sitemap_annotate` | `sitemap` | `annotate` |
 | `sitemap_get_issues` | `sitemap` | `get_issues` |
 | `sitemap_query` | `sitemap` | `query` |
 | `turbo_delete_run` | `turbo_run` | `delete` |
 | `turbo_get_docs` | `turbo_docs` | `get_docs` |
 | `turbo_get_example` | `turbo_docs` | `get_example` |
 | `turbo_list_examples` | `turbo_docs` | `list_examples` |
+| `turbo_list_runs` | `turbo_run` | `list` |
 | `turbo_run_result` | `turbo_run` | `result` |
 | `turbo_run_results` | `turbo_run` | `results` |
 | `turbo_run_script` | `turbo_run` | `script` |
@@ -137,6 +188,7 @@ Parameters that were named `action` (proxy rules, WebSocket intercept rule) are 
 | `turbo_save_to_organizer` | `turbo_run` | `save_to_organizer` |
 | `turbo_search_responses` | `turbo_run` | `search_responses` |
 | `turbo_start_run` | `turbo_run` | `start` |
+| `turbo_start_run_async` | `turbo_run` | `start_async` |
 | `turbo_stop_run` | `turbo_run` | `stop` |
 | `util_base64_decode` | `util` | `base64_decode` |
 | `util_base64_encode` | `util` | `base64_encode` |
@@ -152,8 +204,12 @@ Parameters that were named `action` (proxy rules, WebSocket intercept rule) are 
 | `util_url_encode` | `util` | `url_encode` |
 | `websocket_close` | `websocket` | `close` |
 | `websocket_create` | `websocket` | `create` |
+| `websocket_fuzz` | `websocket` | `fuzz` |
 | `websocket_get_messages` | `websocket` | `get_messages` |
 | `websocket_list` | `websocket` | `list` |
+| `websocket_list_intercept_rules` | `websocket` | `list_intercept_rules` |
+| `websocket_remove_intercept_rule` | `websocket` | `remove_intercept_rule` |
 | `websocket_send_binary` | `websocket` | `send_binary` |
 | `websocket_send_text` | `websocket` | `send_text` |
 | `websocket_set_intercept_rule` | `websocket` | `set_intercept_rule` |
+| `websocket_wait_message` | `websocket` | `wait_message` |

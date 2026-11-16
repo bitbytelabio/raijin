@@ -16,8 +16,9 @@ trust boundary and the operator controls.
 | Dashboard | `9878` | `/`, `/events` (SSE), `/api/*` | `mcp_dashboard_port` / `-Draijin.dashboardPort` |
 
 All three install the same checks (`transport/SecurityConfig.kt`, `installLocalhostSecurity`), so
-everything below applies to every route of every listener. If two listeners are configured on
-the same port, the later one moves to a free port for the session and the clash is logged.
+everything below applies to every route of every listener. If two listeners are configured on the
+same port, the later one moves for the session to its default port, or else the next free one, and
+never to a port another listener is configured for; the log names the preference to fix.
 
 ## Default: loopback, no token
 
@@ -59,6 +60,13 @@ Show/Hide, Regenerate and Copy Token, and the Allowed IPs/CIDR and Allowed Hosts
 without reloading the extension; **Copy MCP Config**, **Copy Command** and the dashboard
 **Copy Link** include the token only while the listeners require it.
 
+A rebind (**Save & Rebind Now**, or a reload with new settings) never leaves a listener less
+protected than it was. A listener keeps answering until it has stopped, so while the three move the
+stricter settings apply: moving to an exposed address installs the new token and allowlists before
+any exposed listener opens, and moving back to loopback keeps the old token until every exposed
+listener has closed. The resolved settings are installed only after the MCP and dashboard listeners
+have rebound; if a rebind fails, the stricter settings stay.
+
 ### Binding to a network interface
 
 A non-loopback bind (a concrete address, or `0.0.0.0` / `::`) is honored **only** with the operator
@@ -80,14 +88,19 @@ opt-in `mcp_allow_remote_bind=true`; without it the request is refused and the l
 - Clients send `Authorization: Bearer <token>` on every request (Claude Code, Cursor, Codex and omp
   accept a `headers` entry; the Server tab's **Copy MCP Config** includes it). The comparison is
   constant-time over SHA-256 digests.
-- A missing or wrong token gets `401` with `WWW-Authenticate: Bearer`. CORS preflights
-  (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) pass without it, because browsers
-  never attach credentials to them; any other `OPTIONS` needs the token.
+- A missing or wrong token gets `401` with `WWW-Authenticate: Bearer`. A CORS preflight passes
+  without it (browsers never attach credentials to one) only when the CORS plugin answers it before
+  any route runs: `OPTIONS` with `Access-Control-Request-Method` and exactly one well-formed `Origin`
+  that passed the Origin check. Any other `OPTIONS` (no `Origin`, two of them, a `%` or junk after
+  the port) needs the token like every other request.
 - **Browsers**: open the dashboard once as `http://<host>:9878/?token=<token>`. Raijin sets an
-  `HttpOnly; SameSite=Strict` cookie `raijin_auth` (a digest of the token, not the token) and
-  redirects to the same page without the token, so it leaves the address bar. The page's
-  `EventSource` and `fetch` calls then authenticate with the cookie. Cookies are per host, so the
-  cookie also works on the MCP ports of the same host.
+  `HttpOnly; SameSite=Strict` cookie `raijin_auth` and redirects to the same page without the token,
+  so it leaves the address bar. The page's `EventSource` and `fetch` calls then authenticate with
+  the cookie. The cookie holds a digest of the token **and of the listener's ports**, never the token,
+  so it opens only the listener that set it: a browser sends a host's cookies to every port on it,
+  and the cookie reaching another service on the same machine (a lab app on `:8080`) or another
+  Raijin listener is refused there. It expires after 12 hours (`Max-Age`); visit the `?token=` link
+  again after that. A leaked cookie still works on its own listener until the token changes.
 - **URL-only MCP clients**: a Streamable HTTP client can use `http://<host>:9876/mcp?token=<token>`,
   because every request goes to that URL. The legacy SSE transport cannot: its back-channel is the
   relative reference `?sessionId=…`, which drops the query, so legacy SSE clients must send the header.
@@ -118,7 +131,7 @@ is accepted without a port (a proxy on 443 forwards `Host: name`) and on every l
 1. Source address not allowed: `403`.
 2. Host not allowed: `403`.
 3. Origin present and not allowed: `403`.
-4. Token required and missing or wrong (CORS preflights excepted): `401`.
+4. Token required and missing or wrong (a well-formed CORS preflight excepted, see above): `401`.
 
 ## Recommended setups
 
@@ -148,39 +161,65 @@ Bind to the VPN address only, never `0.0.0.0`:
 The same applies to a host-only VM network: bind the VM's host-only address (VirtualBox default
 `192.168.56.x`) and allow only the host (`192.168.56.1`).
 
-### Caddy with TLS (`configs/Caddyfile`)
+### Caddy (`configs/Caddyfile`)
 
-Profile B of `configs/Caddyfile` keeps Raijin on loopback and puts Caddy on the VM address with
-HTTPS from Caddy's internal CA (`tls internal`), a bearer check at Caddy for MCP and basic auth for
-the dashboard. Caddy rewrites `Host` to `127.0.0.1:<port>` (`header_up Host`), which Raijin's Host
-allowlist requires. Raijin sees Caddy as a loopback peer, so source allowlisting belongs in Caddy or
-the firewall. Using Raijin's token as Caddy's `RAIJIN_TOKEN` lets you also enable
-`mcp_require_auth`, so both layers check the same header.
+Both profiles keep Raijin on loopback, with Caddy the only listener clients reach. Caddy rewrites
+`Host` to `127.0.0.1:<port>` (`header_up Host`), which Raijin's Host allowlist requires. That rewrite
+hides the Host the client sent, so Raijin's own check can no longer stop a DNS-rebound page, and
+Caddy checks the Host instead: every site address names its hosts, and a request for any other name
+never reaches Raijin. Never proxy from a host-less address such as `http://:9902`; it accepts every
+Host, so a rebound page in your browser could read the dashboard's proxy history through Caddy.
+
+- **Profile A**, a local streaming proxy: `http://127.0.0.1:9900, http://localhost:9900` (and 9901,
+  9902) bound to `127.0.0.1`; a host-less catch-all on the same ports answers every other Host with
+  `403 invalid Host header`.
+- **Profile B**, Burp in a VM (commented out until you fill it in): Caddy on the VM address with
+  HTTPS from Caddy's internal CA (`tls internal`), a bearer check at Caddy for MCP that refuses
+  everything while `RAIJIN_TOKEN` is unset, and basic auth for the dashboard. Raijin sees Caddy as a
+  loopback peer, so source allowlisting belongs in Caddy or the firewall. Using Raijin's token as
+  Caddy's `RAIJIN_TOKEN` lets you also enable `mcp_require_auth`, so both layers check the same header.
 
 ## Operator controls and what an agent can change
 
 | Preference | Type | Default | Effect |
 |---|---|---|---|
 | `mcp_scope_mode` | string | `warn` | Gates outbound HTTP against Burp's target scope (`off` / `warn` / `enforce`). |
-| `mcp_allow_destructive` | boolean | `false` | Blocks `burp_shutdown` and project/user config import until enabled. |
+| `mcp_allow_destructive` | boolean | `false` | Blocks `burp(action=shutdown)`, `burp(action=import_project_config)` and `burp(action=import_user_config)` until enabled. |
 | `mcp_allow_remote_bind` | boolean | `false` | Required for any non-loopback bind. |
 | `mcp_require_auth` | boolean | `false` | Requires the bearer token on loopback too. |
 | `mcp_persist_activity` | boolean | `true` | Saves the MCP activity log to disk. |
 
-The `persistence` tool (`preference_get` / `preference_store`) reads and writes **string**
-preferences only. The boolean gates above can be changed only by the operator (Server tab, Burp
-preferences, `-D` properties). A connected agent can read and change the string settings
-(`mcp_scope_mode`, `mcp_bind_host`, `mcp_auth_token`, `mcp_allowed_ips`, `mcp_allowed_hosts`, the
-ports): a connected agent already drives Burp. A changed bind host still needs the boolean opt-in,
-and network settings apply on the next rebind or reload.
+The `persistence` tool's `preference_get`, `preference_store` and `preference_delete` actions read
+and write **string** preferences only. The boolean gates above can be changed only by the operator
+(Server tab, Burp preferences, `-D` properties). A connected agent can read and change the string
+settings (`mcp_scope_mode`, `mcp_bind_host`, `mcp_auth_token`, `mcp_allowed_ips`,
+`mcp_allowed_hosts`, the ports): a connected agent already drives Burp. A changed bind host still
+needs the boolean opt-in, and network settings apply on the next rebind or reload.
+
+## Hostile input from targets
+
+Some tools parse documents a target serves, so their size is capped where a small input could
+expand without bound:
+
+- `api_import_openapi` reads YAML as a node graph only (no tags, no object construction). Anchors
+  and aliases are expanded under a budget of 10 million values, 256 levels and 64 MiB of expanded
+  text, where a long scalar or key counts at its full length every time an alias reuses it. An
+  example value over 1 MiB skips its operation with a warning, and the whole import (requests,
+  bodies, metadata) is capped at 64 MiB of text: going over fails the import with an error before
+  anything reaches Burp.
+- `probe(action=jwt, mode=decrypt)` refuses a password-based JWE whose `p2c` iteration count is
+  above 1,000,000, before deriving any key. Nimbus runs PBKDF2 over the count the token's header
+  names before checking anything else (CVE-2023-52428), so a hostile token could otherwise hold a
+  thread for hours.
 
 ## Files on disk
 
 | File | Content |
 |---|---|
-| `~/.raijin-audit.jsonl` | Audit trail of security-relevant calls: outbound requests, destructive and mutating tools (Turbo runs, `http_send_requests_parallel`, `config_*`, `websocket_*`, `persistence_*`, ...), errors, and `server.remote_bind`. Arguments are kept up to 8000 characters each. Rotated at 20,000 lines or 16 MiB. |
+| `~/.raijin-audit.jsonl` | Audit trail of security-relevant calls, under their member names (see `docs/dev/tool-consolidation.md`): outbound requests, destructive and state-changing tools (Turbo runs, `http_send_requests_parallel`, `http_send_pipeline`, `config_*`, `websocket_*`, `persistence_*`, rule and scope changes, ...; read-only members such as `turbo_run_status`, `websocket_list` or `websocket_wait_message` are left out), calls that failed or were cancelled, and `server.remote_bind`. Arguments are kept up to 8000 characters each. Rotated at 20,000 lines or 16 MiB. |
 | `~/.raijin-activity.jsonl` | The dashboard's MCP activity log, per Burp project (toggle: `mcp_persist_activity`). |
 | `~/.raijin-findings.jsonl` | The agent's findings, per Burp project. |
+| `~/.raijin-autorize.jsonl` | Autorize matches with the original exchange and every identity's replay (captured requests and responses, credentials included), per Burp project; trimmed past 64 MB. |
 
 Write failures go to Burp's error log. Raijin itself never writes the token to these files or to
 its logs, but tool arguments and result summaries are recorded: a call that passes or reads a

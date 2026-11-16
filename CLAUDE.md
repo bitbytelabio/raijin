@@ -6,8 +6,10 @@ Burp Suite extension: MCP server (`io.bitbytelab.raijin.{core,transport,bridge,t
 - **All source is Kotlin.** No `.java` files.
 - Namespace `io.bitbytelab.raijin`; Gradle group `io.bitbytelab`.
 - **Montoya API only** (compileOnly). No legacy Burp extender API (`IBurpExtender`, `callbacks`, `helpers`).
-- **No MCP auth token.** Protection is loopback bind + Host/Origin checks (`transport/SecurityConfig.kt`).
-- UI colours come from Burp (`ui/RaijinTheme.kt`); never hardcode backgrounds/foregrounds. Semantic colours (success/error/...) live in `RaijinTheme` with dark and light variants.
+- **No MCP auth token on loopback.** Protection is loopback bind + Host/Origin checks (`transport/SecurityConfig.kt`). Exception: a non-loopback bind (operator opt-in `mcp_allow_remote_bind`) or `mcp_require_auth` requires a bearer token, plus optional source-IP and Host allowlists (`transport/RemoteAccess.kt`), enforced by `installLocalhostSecurity` on all three listeners. Details: `docs/dev/ultra/SECURITY.md`.
+- **Pentest tool: never restrict what can be sent.** Malformed headers, CR/LF, raw bytes and odd Content-Length values must reach the wire as written. Use `safety/RequestHygiene.kt` for wire encoding and Content-Length, `safety/SafeRegex.kt` for every user-supplied regex.
+- Tool handlers return through `toolJsonResult` / `toolError` (`tools/ToolResultHelpers.kt`, sets `isError`) and read arguments with `core/JsonHelpers.kt`; closed parameters declare an `enum` (`EnumValidation`). Oversized limits are clamped and reported (`asClampedInt`, `<param>_clamped_to`), not rejected.
+- UI colours come from Burp (`ui/RaijinTheme.kt`); never hardcode backgrounds/foregrounds. Semantic colours (success/error/...) live in `RaijinTheme` with dark and light variants. Slow UI work runs on `ui/UiTasks.kt`, off the EDT, and whatever the tab starts is released on unload through `ui/Disposer.kt`.
 - Use neutral wording in user-facing text: "run", not "attack". Exceptions: "single-packet attack", security threat descriptions.
 
 ## Build
@@ -22,4 +24,4 @@ Burp Suite extension: MCP server (`io.bitbytelab.raijin.{core,transport,bridge,t
 - Skills (usage guides served over MCP): markdown in `src/main/resources/skills/`, listed in `skills/SkillCatalog.kt`, exposed as MCP prompts named `SkillCatalog.promptName(name)` (`http-testing` -> `http_testing_skill`; `transport/PromptRegistry.kt`). Claude Code and omp list prompts as slash commands, only ask when `McpServerManager.serverCapabilities()` declares `prompts`, and their pickers filter on the name, so keep the `_skill` suffix (users find skills by typing `skill`). Also served as `skill://<name>/SKILL.md` resources (`transport/ResourceRegistry.kt`; how a model reads one).
 - Turbo MCP tools: `tools/turbo/TurboTools.kt` over `bridge/TurboBridge.kt`; runs are shared with the GUI via `TurboModule.runManager`.
 - Jython scripts reach engine classes through the injected `turbo` object (`turbo/TurboPython.kt`); `import io...` does not work in Jython (it resolves `io` to Python's stdlib).
-- Turbo user docs ship as resources in `src/main/resources/turbo-docs/`; dev notes are in `docs/dev/`.
+- Turbo user docs ship as resources in `src/main/resources/turbo-docs/`; every file there is a `turbo_docs(action=get_docs)` topic (`McpResourceHandlers.docTopics`; a test fails if the two differ). Dev notes are in `docs/dev/`.

@@ -22,10 +22,10 @@ def handleResponse(req, interesting):
     table.add(req)
 ```
 
-Maybe we want to use regular expressions to help out with some cookie matching
+Maybe we want to use regular expressions to help out with some cookie matching. A regex decorator searches the whole response, headers included, so the pattern does not need a leading or trailing `.*`
 ```python
-@MatchRegex(r".*Set-Cookie.*")
-@MatchRegex(r".*SECRETCOOKIENAME.*")
+@MatchRegex(r"Set-Cookie")
+@MatchRegex(r"SECRETCOOKIENAME")
 def handleResponse(req, interesting):
     table.add(req)
 ```
@@ -33,7 +33,7 @@ def handleResponse(req, interesting):
 Or perhaps we want to filter out pesky 200 Not Founds
 ```python
 @MatchStatus(200)
-@FilterRegex(r".*Not Found.*")
+@FilterRegex(r"Not Found")
 def handleResponse(req, interesting):
     table.add(req)
 ```
@@ -55,11 +55,13 @@ def handleResponse(req, interesting):
 | @FilterLineCount(LineCount, ...) | Filters responses with 1 or more specified response line count(s) |
 | @MatchLineCountRange(min, max) | Matches responses whose line count fall between min and max (inclusive) |
 | @FilterLineCountRange(min, max) | Filters responses whose line count fall between min and max (inclusive) |
-| @MatchRegex(expression) | Matches responses which match the specified regex (case insensitive) |
-| @FilterRegex(expression) | Filters responses which match the specified regex (case insensitive) |
+| @MatchRegex(expression) | Matches responses that contain a match for the regex anywhere (case insensitive; `.` also matches newlines, `^`/`$` match at line breaks) |
+| @FilterRegex(expression) | Filters responses that contain a match for the regex anywhere (same flags as @MatchRegex) |
 | @UniqueSize(instances=1) | Only allows through N instances of responses with a given status/size |
 | @UniqueWordCount(instances=1) | Only allows through N instances of responses with a given status/word count |
 | @UniqueLineCount(instances=1) | Only allows through N instances of responses with a given status/line count |
 
 ### Unique Decorators
 Glancing at the table most of the decorators probably seem straight forward. The only decorators that may require a little more explanation are the ones that start with `Unique`. These decorators are useful for fuzzing campaigns against an API or HTTP headers in which the responses stay for the most part static. Unique decorators reduce the signal/noise ratio by keeping a history of keys and only allowing N instances (N=1 by default) of a key to be processed. A key is made up of a status/size, status/word count, and status/line count pair. So for example if we consider the `@UniqueSize(2)` decorator and 1000 responses were received, if 250 of those responses had a status 200 with a size of 270 bytes only the first 2 of the 250 responses would be processed into the `handleResponse` function. If one of the 1000 responses had a status of 200 with a size of 271 that would register into a separate unique key and be processed by `handleResponse`. If you perform fuzzing iterations on JSON structure to post to an endpoint you may use `@UniqueSize()` to catch all unique error messages produced by the endpoint and the decorator will throw away responses associated with duplicate keys.
+
+The counts are kept per engine and updated under a lock, so callbacks running on many threads at once never let more than N responses of one key through, and a new engine starts from zero.

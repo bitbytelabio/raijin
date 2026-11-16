@@ -118,11 +118,11 @@ def queueRequests(target, wordlists):
 
         # Alternate order to prevent false positives
         if i % 2 == 1:
-            engine.queue(request.replace('%s', 'payload1'), gate=gate_id, label='left')
-            engine.queue(request.replace('%s', 'payload2'), gate=gate_id, label='right')
+            engine.queue(target.req.replace('%s', 'payload1'), gate=gate_id, label='left')
+            engine.queue(target.req.replace('%s', 'payload2'), gate=gate_id, label='right')
         else:
-            engine.queue(request.replace('%s', 'payload2'), gate=gate_id, label='right')
-            engine.queue(request.replace('%s', 'payload1'), gate=gate_id, label='left')
+            engine.queue(target.req.replace('%s', 'payload2'), gate=gate_id, label='right')
+            engine.queue(target.req.replace('%s', 'payload1'), gate=gate_id, label='left')
 
         engine.openGate(gate_id)
         time.sleep(0.2)  # Avoid rate limiting
@@ -132,17 +132,21 @@ def queueRequests(target, wordlists):
 
 Use `req.order` to see which request in a gate got a response first (0 = first). A gate's callbacks
 fire together once the whole batch is back, because a rank cannot be given to one response until the
-others have arrived:
+others have arrived. On `Engine.BURP` and `Engine.BURP2` a request that got no response is not part of
+the ranking: its `req.order` is `-1` and it is called back after the ranked ones, so a dropped
+connection never shows up as the winner. `Engine.HTTP3` ranks only the requests that were answered.
 
 ```python
 def handleResponse(req, interesting):
     if req.order == 0:
         print("This request won the race")
+    elif req.order == -1:
+        print("No response: left out of the ranking")
     table.add(req)
 ```
 
 ## Example Scripts
 
-- [race-single-packet-attack.py](../resources/examples/race-single-packet-attack.py) - Basic race
-- [timing.py](../resources/examples/timing.py) - Statistical timing analysis
-- [race-multi-endpoint.py](../resources/examples/race-multi-endpoint.py) - Multi-endpoint races
+- [race-single-packet-attack.py](../examples/race-single-packet-attack.py) - Basic race
+- [timing.py](../examples/timing.py) - Statistical timing analysis
+- [race-multi-endpoint.py](../examples/race-multi-endpoint.py) - Multi-endpoint races

@@ -4,9 +4,11 @@
 # Transfer-Encoding header and represents request-line fields as pseudo-headers, so these
 # techniques only matter if something downstream turns this back into HTTP/1.1 text.
 #
-# Raijin's Engine.BURP2/HTTP2RequestEngine already rewrite the exact "^ -> \r, ~ -> \n, ` -> :"
-# marker convention DesyncTechniques.apply() produces for the h2* cases (see http2.py) into real
-# HTTP/2 pseudo-headers/frames — no extra translation needed here.
+# DesyncTechniques.apply() writes the h2* cases with kettle escapes: a CRLF inside a value as "^~"
+# and a colon inside a header name as a backtick. Queueing with kettled=True makes Engine.BURP2 turn
+# them into the real bytes of HTTP/2 header fields (see Kettled Requests in the engines doc);
+# without it they would be sent as literal text. The base request is written with explicit \r\n,
+# so the script behaves the same from the Turbo dialog and over MCP.
 #
 # Unlike desync-smuggler.py, this doesn't attempt automated canary-based confirmation: a
 # downgrading gateway's actual behavior on a mismatched/duplicated pseudo-header varies too much
@@ -43,7 +45,7 @@ def queueRequests(target, wordlists):
         mutated = turbo.DesyncTechniques.apply(base, 'Transfer-Encoding', technique)
         if mutated is None:
             continue
-        engine.queue(mutated, label=technique)
+        engine.queue(mutated, label=technique, kettled=True)
 
 
 def handleResponse(req, interesting):

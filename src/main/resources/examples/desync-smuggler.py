@@ -2,11 +2,15 @@
 # (turbo.DesyncTechniques, turbo.DesyncCanary — read turbo_docs(action=get_docs, topic=desync-techniques)
 # first). For each technique: builds an "attack" request whose Content-Length or Transfer-Encoding
 # header is obfuscated, with a body carrying a smuggled follow-up request tagged with a canary;
-# then a plain "victim" request on the SAME TCP connection (connectionId pins both to one socket,
-# so the attack's would-be-smuggled bytes land on the connection right before the victim's own
-# request). If a front-end/back-end disagree on where the attack request's body ends, the
-# smuggled bytes get treated as the start of the NEXT request (or get prefixed onto the victim's),
-# and the victim's response reflects it — which we detect by the canary leaking into that response.
+# then a plain "victim" request on the SAME connection, normally right after the attack's response.
+# If a front-end/back-end disagree on where the attack request's body ends, the smuggled bytes get
+# treated as the start of the NEXT request (or get prefixed onto the victim's), and the victim's
+# response reflects it — which we detect by the canary leaking into that response.
+#
+# Engine.BURP is what keeps each pair together: on Engine.BURP / Engine.BURP2 a connectionId names a
+# real connection that sends one request at a time, while Engine.THREADED only writes connectionId
+# on the result as a label (see 0cl-exploit). Every request is written with explicit \r\n, so the
+# bytes are the same whether the script runs from the Turbo dialog or over MCP.
 #
 # target.baseInput, if set, is a comma-separated technique list to run instead of the default set
 # (e.g. "spacejoin1,0dspam,CL-dualCL" — see turbo.DesyncTechniques.allTechniques() for every name).
@@ -58,11 +62,13 @@ def _desync_requests(host, technique, index):
 def queueRequests(target, wordlists):
     host = target.endpoint.replace('https://', '').replace('http://', '').split(':')[0].split('/')[0]
 
+    # Engine.BURP gives every request its own connection unless queue() pins it with connectionId,
+    # so requestsPerConnection is 1 and nothing is pipelined. maxRetriesPerRequest=0 keeps a failed
+    # attack from being resent after its victim.
     engine = RequestEngine(endpoint=target.endpoint,
                            concurrentConnections=10,
                            requestsPerConnection=1,
-                           engine=Engine.THREADED,
-                           pipeline=True,
+                           engine=Engine.BURP,
                            maxRetriesPerRequest=0,
                            )
 
@@ -76,9 +82,10 @@ def queueRequests(target, wordlists):
         if mutated is None:
             continue  # technique had no effect on Content-Length for this request shape
 
-        # Same connectionId on both queue() calls pins them to one TCP connection — without this
-        # the attack and victim are two unrelated requests on two unrelated connections and the
-        # desync this script exists to test never gets a chance to happen.
+        # The same connectionId on both queue() calls sends them one at a time on one connection (an
+        # attack the server never answers holds its victim until Burp's own response timeout).
+        # Without it the attack and victim would be two unrelated requests on two unrelated
+        # connections, racing each other.
         connectionId = 'desync-' + str(i)
         engine.queue(mutated, label=technique + '|attack|' + header, connectionId=connectionId, fixContentLength=False)
         engine.queue(victim, label=technique + '|victim', connectionId=connectionId)

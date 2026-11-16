@@ -11,7 +11,8 @@ The hard part of request smuggling — holding a connection open and sending onl
 request before pausing (`pauseBefore`/`pauseTime` in `engine.queue()`, see the `engines`/
 `settings` docs) — is something Raijin's Turbo engine already does. These three objects are
 *only* the pure byte/string mutation catalog; combine them with Turbo's existing engine/
-connection-pinning primitives rather than reaching for a new tool.
+connection-pinning primitives rather than reaching for a new tool. To send a few raw requests over
+one socket and read every response back without a script, use the `http_send_pipeline` MCP tool.
 
 ## `turbo.DesyncTechniques`
 
@@ -20,27 +21,30 @@ mutated = turbo.DesyncTechniques.apply(request, header, technique)
 ```
 
 - `request`: a request as text (or a `byte[]`) — mutation is byte-level (ISO-8859-1), so binary
-  bodies are safe.
+  bodies are safe. Write it with explicit `\r\n`: a triple-quoted request takes the script's own
+  line endings, which are LF when the script arrives over MCP.
 - `header`: `"Content-Length"` or `"Transfer-Encoding"` — which header's syntax to obfuscate.
 - `technique`: a name from `turbo.DesyncTechniques.allTechniques()`.
-- Returns the mutated request, or `None` if `header` is `"Content-Length"` and the technique had
-  no observable effect on this particular request (not worth sending) — for `"Transfer-Encoding"`
-  a no-effect technique is still returned.
+- Returns the mutated request, or `None` when `header` is `"Content-Length"` and the technique has
+  no effect on this request (a Transfer-Encoding-only technique, or a request it does not match:
+  not worth sending). For `"Transfer-Encoding"` a no-effect technique is still returned.
 
-Technique families (`turbo.DesyncTechniques.SHARED_TECHNIQUES` / `H1_TECHNIQUES` /
-`H2_TECHNIQUES` / `CL_TECHNIQUES`, plus `SPECIAL_CHARS`-parameterized `spacefix1:n` /
-`prefix1:n` / `suffix1:n` / `namesuffix1:n`):
+Technique families (`turbo.DesyncTechniques.SHARED_TECHNIQUES` / `TE_TECHNIQUES` /
+`H1_TECHNIQUES` / `H2_TECHNIQUES` / `CL_TECHNIQUES`, plus `SPECIAL_CHARS`-parameterized
+`spacefix1:n` / `prefix1:n` / `suffix1:n` / `namesuffix1:n`):
 
 | Family | Example names | Idea |
 |---|---|---|
-| Shared (either header) | `spacejoin1`, `nameprefix1`, `backslash`, `spjunk`, `0dsuffix`, `nested` | Obfuscate the header name/value so one parser recognizes it and another doesn't |
-| H1-specific | `badsetupCR`, `multiCase`, `0dspam`, `h1case`, `http1.0` | Header-line/version quirks specific to HTTP/1.1 parsers |
-| H2-specific | `h2colon`, `h2auth`, `h2path`, `h2method`, `http2case` | Pseudo-header confusion once an HTTP/2-downgrading gateway re-serializes to HTTP/1.1 — see `desync-h2-downgrade` |
+| Shared (either header) | `spacejoin1`, `nameprefix1`, `backslash`, `spjunk`, `0dsuffix`, `quoted` | Obfuscate the header name/value so one parser recognizes it and another doesn't |
+| Transfer-Encoding-specific | `commaCow`, `cowComma`, `contentEnc`, `dualchunk`, `lazygrep`, `revdualchunk`, `nested`, `accentCH` | Play on transfer codings themselves; `None` for Content-Length |
+| H1-specific (either header) | `badsetupCR`, `multiCase`, `0dspam`, `h1case`, `http1.0` | Header-line/version quirks specific to HTTP/1.1 parsers |
+| H2-specific (either header) | `h2colon`, `h2auth`, `h2path`, `h2method`, `http2case` | Pseudo-header confusion once an HTTP/2-downgrading gateway re-serializes to HTTP/1.1 — see `desync-h2-downgrade` |
 | Content-Length-specific | `CL-plus`, `CL-minus`, `CL-dualCL`, `CL-expect` | Malform/duplicate/pad the Content-Length value itself |
 
-H2-family techniques produce text using `^`/`~`/`` ` `` as `\r`/`\n`/`:` markers — exactly the
-convention Raijin's `Engine.BURP2`/HTTP2 engines already rewrite (see the `http2` example), so
-send the mutated text straight through, no extra translation needed.
+H2-family techniques write a CRLF inside a value as `^~` and a colon inside a header name as a
+backtick, the kettle escapes. `Engine.BURP2` and `Engine.HTTP3` decode them only for a request
+queued with `kettled=True` (without it they are sent as literal text); the deprecated
+`Engine.HTTP2` always decodes them. See Kettled Requests in the `engines` doc.
 
 ## `turbo.DesyncProbePayloads`
 

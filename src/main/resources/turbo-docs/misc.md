@@ -44,11 +44,12 @@ while True:
 
 ## Utility Functions
 
+`randstr`, `mean`, `stddev` and `queueForever` are defined before your script runs, like the
+decorators: call them directly. There is no `ScriptEnvironment` module to import from.
+
 ### Random Strings
 
 ```python
-from ScriptEnvironment import randstr
-
 randstr()           # 12 char alphanumeric
 randstr(8)          # 8 char alphanumeric
 randstr(8, False)   # 8 char letters only
@@ -67,11 +68,9 @@ Replaced with random 10-character alphanumeric string.
 ### Statistical Functions
 
 ```python
-from ScriptEnvironment import mean, stddev
-
-times = [req.time for req in results]
-avg = mean(times)
-std = stddev(times)
+def completed(reqsFromTable):
+    times = [req.time for req in reqsFromTable]   # microseconds
+    print(mean(times), stddev(times))
 ```
 
 ## Global Variables
@@ -80,17 +79,18 @@ std = stddev(times)
 |----------|------|-------------|
 | `target` | obj | `.endpoint`, `.req`, `.baseInput` |
 | `wordlists` | obj | `.clipboard`, `.observedWords`, `.bruteforce` |
-| `table` | OutputHandler | Results table |
+| `table` | ResultStore | Results table: `table.add(req)`, `table.setSortOrder(column, descending)` |
 | `handler` | RunHandler | Run control |
 | `api` | MontoyaApi | Montoya API |
 | `host` | str | Target hostname |
+| `turbo` | obj | Engine classes (`turbo.DesyncTechniques`, `turbo.Utils`, ...); `import io...` does not work in Jython |
 
 ## Target Object
 
 ```python
 target.endpoint  # "https://example.com:443"
 target.req       # Full HTTP request with %s markers
-target.baseInput # Original request before markers
+target.baseInput # The text the %s marker replaced in the Turbo dialog, or base_input over MCP
 ```
 
 ## Handler Object
@@ -137,6 +137,6 @@ def handleResponse(req, interesting):
 
 ## Example Scripts
 
-- [specialWordlists.py](../resources/examples/specialWordlists.py) - Wordlist sources
-- [multiHost.py](../resources/examples/multiHost.py) - Multi-host scanning
-- [outputToFile.py](../resources/examples/outputToFile.py) - File output
+- [specialWordlists.py](../examples/specialWordlists.py) - Wordlist sources
+- [multiHost.py](../examples/multiHost.py) - Multi-host scanning
+- [outputToFile.py](../examples/outputToFile.py) - File output

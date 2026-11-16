@@ -12,10 +12,10 @@ engine = RequestEngine(
     concurrentConnections=50,    # Parallel connections
     requestsPerConnection=100,   # Requests per TCP connection
     pipeline=False,              # Enable HTTP/1.1 pipelining
-    maxQueueSize=100,            # Max queued requests
+    maxQueueSize=100,            # Max queued requests (see Queue Limit)
     timeout=10,                  # Response timeout (seconds)
     maxRetriesPerRequest=3,      # Retry failed requests
-    idleTimeout=0,               # Total run timeout (ms, 0=none)
+    idleTimeout=0,               # Cancel after this many ms without activity (0 = never)
     readCallback=None,           # Partial response callback
     readSize=1024,               # Read buffer size
     resumeSSL=True,              # Resume SSL sessions
@@ -34,10 +34,10 @@ engine = RequestEngine(
 | `concurrentConnections` | int | AUTO-managed | Parallel connections (50 for explicit concrete engines, 10 for `Engine.HTTP3`) |
 | `requestsPerConnection` | int | AUTO-managed | Requests before reconnecting (100 for explicit concrete engines, 1000000 for `Engine.HTTP3`) |
 | `pipeline` | bool/int | AUTO-managed | Pipeline requests (defaults to False for explicit concrete engines; THREADED only) |
-| `maxQueueSize` | int | 100 | Queue limit (blocks when full) |
+| `maxQueueSize` | int | 100 | Requests waiting to be sent; see [Queue Limit](#queue-limit) |
 | `timeout` | int | 10 | Response timeout in seconds |
 | `maxRetriesPerRequest` | int | 3 | Retries for failed requests |
-| `idleTimeout` | int | 0 | Run timeout in ms (0=disabled) |
+| `idleTimeout` | int | 0 | Milliseconds with no request queued and no response handled before the run is cancelled (0 = never). Every engine honours it |
 | `autoStart` | bool | True | Start immediately vs manual `engine.start()` |
 | `verifyCertificates` | bool | False | Verify certificates for `Engine.HTTP3` and AUTO handshake probes |
 | `gateMode` | str | `'auto'` | Race gate: `'auto'`, `'sda'` or `'qpack'` (`Engine.HTTP3` only) |
@@ -80,7 +80,7 @@ engine.queue(
     pauseBefore=0,         # Pause N times during send
     pauseTime=1000,        # Pause duration (ms)
     pauseMarker=[],        # Pause after these strings
-    delay=0,               # Delay completion (ms)
+    delay=0,               # Accepted for compatibility; ignored
     endpoint=None,         # Override target endpoint
     fixContentLength=True, # Auto-fix Content-Length header
     connectionId=None,     # Connection identifier (user-specified or auto-assigned)
@@ -98,11 +98,20 @@ engine.queue(
 | `callback` | func | None | Override default callback |
 | `gate` | str | None | Gate name for race conditions |
 | `label` | str | "" | Custom label for grouping |
-| `delay` | int | 0 | Delay response processing (ms) |
+| `delay` | int | 0 | Accepted so older scripts keep running; it has no effect |
 | `endpoint` | str | None | Override target for this request. Rejected by `Engine.HTTP3` |
 | `fixContentLength` | bool | True | Update existing Content-Length header (does not add if missing) |
 | `connectionId` | str | None | Connection identifier. If set, pins request to named connection. If not set, auto-assigned after request (e.g., "1", "2"). Mutually exclusive with `gate`. Rejected by `Engine.HTTP3` |
 | `kettled` | bool | False | Decode kettle escapes and preserve deliberately malformed fields. Supported by `Engine.BURP2`, `Engine.HTTP3`, and AUTO when it selects HTTP/2 or HTTP/3 |
+
+### Queue Limit
+
+`maxQueueSize` bounds the requests waiting to be sent. Once the run is going, `queue()` waits while
+the queue is full. Before `start()` (with `autoStart=False`) nothing takes from the queue, so the
+requests beyond it wait in order in a backlog instead of blocking, and while that backlog holds
+requests every `queue()` call, including one from a callback, joins the end of it without blocking.
+`openGate()` and `complete()` move the backlog into the queue in order: `openGate()` until every
+request of its gate is staged, `complete()` all of it, within its own timeout.
 
 ### Special Payload Values
 
@@ -118,14 +127,8 @@ engine.queue(target.req, "$randomplz")  # Cache-busting
 table.add(req)  # Add request to results table
 ```
 
-The results table displays:
-- Status code
-- Response length
-- Word count
-- Response time
-- Payload
-- Label
-- Anomaly rank (Burp 2025.10+)
+The results table has these columns, numbered from 0: Row, Payload, Status, Anomaly rank (Burp 2025.10+),
+Words, Length, TTFB, TTLB, Arrival, Label, Queue ID, Connection ID.
 
 ### Custom Sort Order
 
@@ -135,14 +138,16 @@ table.setSortOrder(column, descending)
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `column` | int | Column index (0-based) |
+| `column` | int | Column number from the list above (0-11); any other value is an error |
 | `descending` | bool | `True` for descending, `False` for ascending |
 
-Setting a custom sort order also disables the automatic sort-by-anomaly-rank on run completion.
+The order applies to the results table and stops its automatic sort by anomaly rank on run
+completion. It is also the default order of `turbo_run(action=results)` over MCP when the call gives
+no `sort_by` (the result then says `sort_source: "script"`).
 
 ```python
-# Sort by first column (status) in ascending order
-table.setSortOrder(0, False)
+# Sort by status (column 2), highest first
+table.setSortOrder(2, True)
 ```
 
 ## Handler Methods

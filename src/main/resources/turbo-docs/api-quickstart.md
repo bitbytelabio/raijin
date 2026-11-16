@@ -52,6 +52,11 @@ engine.queue(target.req, kettled=True)           # Malformed fields; BURP2/HTTP3
 
 Use `%s` as injection point in request template. See [settings.md](settings.md) for all parameters.
 
+A request written in a triple-quoted string has the script's own line endings: CRLF in the Turbo
+dialog, which converts them, but LF when the script arrives over MCP and its lines all end in LF. When a
+request you build yourself must carry CRLF (desync, exact Content-Length), write `\r\n` explicitly, as
+the desync and 0.CL examples do. `target.req` uses CRLF (an LF-only `base_request` is converted).
+
 ## Request Object Properties
 
 In `handleResponse(req, interesting)`:
@@ -64,12 +69,13 @@ In `handleResponse(req, interesting)`:
 | `req.code` | int | HTTP status code (alias for `status`) |
 | `req.length` | int | Response body length |
 | `req.wordcount` | int | Word count in response |
-| `req.time` | long | Response time (μs) |
+| `req.time` | long | Response time in microseconds: to the first byte on THREADED, BURP and BURP2, to the last byte on HTTP2 and HTTP3 |
+| `req.ttfb`, `req.ttlb` | long | Time to first / last byte (μs), where the engine measures them |
 | `req.words` | list | Injected payloads |
 | `req.label` | str | Custom label (writable) |
 | `req.template` | str | Original request template |
 | `req.engine` | obj | Engine instance (for recursive queueing) |
-| `req.order` | int | Response order within gate, ranked by arrival (0 = the request the server answered first). Set by `Engine.BURP`, `Engine.BURP2` and `Engine.HTTP3` |
+| `req.order` | int | Response order within a gate, ranked by arrival (0 = the request the server answered first). Set by `Engine.BURP`, `Engine.BURP2` and `Engine.HTTP3`. On BURP and BURP2 a gated request that got no response has `-1` and is called back after the ranked ones; HTTP3 ranks only answered requests |
 | `req.id` | int | Unique request ID |
 | `req.connectionId` | str | Connection identifier (user-specified or auto-assigned) |
 | `req.gateMode` | str | For a gated `Engine.HTTP3` request, which gate released it: `'sda'` or `'qpack'`. None otherwise |
@@ -90,11 +96,15 @@ See [engines.md](engines.md) for details.
 
 | Variable | Description |
 |----------|-------------|
-| `target` | Target with `.endpoint`, `.req` |
-| `table` | Results table (`table.add(req)`) |
+| `target` | Target with `.endpoint`, `.req` (the request with `%s` markers) and `.baseInput` (the text the markers replaced in the Turbo dialog, or `base_input` over MCP) |
+| `table` | Results table (`table.add(req)`, `table.setSortOrder(column, descending)`) |
 | `wordlists` | Access `.clipboard`, `.observedWords`, `.bruteforce` |
 | `handler` | Run handler (`.setMessage()`, `.abort()`) |
 | `api` | Montoya API (Burp integration) |
+| `turbo` | Engine classes such as `turbo.DesyncTechniques` (`import io...` does not work in Jython) |
+
+The helpers `randstr`, `mean`, `stddev`, `queueForever` and the decorators are defined before your
+script runs; use them without importing anything.
 
 ## Quick Links
 

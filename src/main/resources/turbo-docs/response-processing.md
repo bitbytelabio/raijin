@@ -22,7 +22,7 @@ def handleResponse(req, interesting):
     req.code        # HTTP status code (alias for status)
     req.length      # Response body length (int)
     req.wordcount   # Word count in response (int)
-    req.time        # Response time in μs (long)
+    req.time        # Response time in microseconds (long); req.ttfb / req.ttlb where measured
 
     # Request data
     req.request     # Full HTTP request with payloads injected (str)
@@ -31,7 +31,7 @@ def handleResponse(req, interesting):
     req.label       # Custom label (writable)
 
     # Metadata
-    req.order       # Response order within gate (0 = first)
+    req.order       # Response order within gate (0 = first; -1 = no response, BURP/BURP2)
     req.id          # Unique request ID
     req.connectionId # Connection identifier (user-specified or auto-assigned)
     req.engine      # Engine instance
@@ -142,6 +142,6 @@ Available Burp objects:
 
 ## Example Scripts
 
-- [recursive.py](../resources/examples/recursive.py) - Recursive directory scanning
-- [burpIntegration.py](../resources/examples/burpIntegration.py) - Burp API integration
-- [timing.py](../resources/examples/timing.py) - Timing analysis with completed()
+- [recursive.py](../examples/recursive.py) - Recursive directory scanning
+- [burpIntegration.py](../examples/burpIntegration.py) - Burp API integration
+- [timing.py](../examples/timing.py) - Timing analysis with completed()
