@@ -135,7 +135,7 @@ class McpResourceHandlers(
         val request = run.store.getRequest(requestId)
             ?: return mapOf("error" to "request_not_found")
 
-        if (run.responsesStripped && request.response == null) {
+        if ((run.responsesStripped || run.store.droppedBodyCount() > 0) && request.response == null) {
             return mapOf(
                 "warning" to "Response body was stripped from this run to free memory. Metadata is still available.",
                 "request" to request.getRequest(),

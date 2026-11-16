@@ -203,8 +203,13 @@ class McpToolHandlers(
             "match_count" to matches.size
         )
 
-        if (run.responsesStripped && searchIn != "labels") {
-            result["warning"] = "Response bodies have been stripped from this run to free memory. Only label search is available."
+        if (searchIn != "labels") {
+            val dropped = run.store.droppedBodyCount()
+            if (run.responsesStripped) {
+                result["warning"] = "Response bodies have been stripped from this run to free memory. Only label search is available."
+            } else if (dropped > 0) {
+                result["warning"] = "$dropped older response bodies were dropped to stay within the run's memory budget and were not searched."
+            }
         }
 
         return result

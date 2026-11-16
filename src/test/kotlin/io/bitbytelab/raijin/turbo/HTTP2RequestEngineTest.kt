@@ -18,7 +18,6 @@ import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
-import kotlin.test.assertNotSame
 import kotlin.test.assertTrue
 
 class HTTP2RequestEngineTest {
@@ -140,14 +139,12 @@ class HTTP2RequestEngineTest {
     }
 
     @Test
-    fun `requests queued after queue() replaces a full queue are still sent`() {
+    fun `requests queued past a full queue before start are still sent`() {
         val answered = ConcurrentLinkedQueue<Request>()
         val engine = engine(server(), maxQueueSize = 100) { answered += it }
-        val original = engine.requestQueue
-        // Before start() nothing is sent, so the 101st request finds the queue full and queue()
-        // swaps in an unbounded copy; the 102nd goes into that copy.
+        // Before start() nothing is sent, so the 101st and 102nd requests overflow the queue
+        // and wait in the engine's pre-start backlog.
         repeat(102) { engine.queue(TEMPLATE, "$it") }
-        assertNotSame(original, engine.requestQueue)
 
         engine.start(5)
         engine.showStats(30)

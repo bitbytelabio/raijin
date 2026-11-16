@@ -149,7 +149,7 @@ object TurboTools {
         server.addTool(
             name = "turbo_run_results",
             description = "Paginated results of a Turbo run. Timing: ttfb = time to first byte, ttlb = time to last byte " +
-                "(microseconds). sort_by: id|status|length|ttfb|ttlb|wordcount|anomaly_rank.",
+                "(microseconds). sort_by: id|status|length|time|ttfb|ttlb|wordcount|anomaly_rank|arrival|payload|label|queue_id|connection_id.",
             inputSchema = ToolSchema(
                 properties = obj(
                     "run_id" to ("string" to "Run id"),
