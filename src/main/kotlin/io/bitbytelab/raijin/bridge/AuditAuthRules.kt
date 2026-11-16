@@ -338,7 +338,7 @@ internal class AuditAuthRules(
             if (current.size == 1 && merged.size == 1) return request.withUpdatedHeader(current[0].name(), merged[0])
             // None yet, or several: written back in order, under the name the first one was written with.
             val name = current.firstOrNull()?.name() ?: COOKIE
-            return merged.fold(ProxyRuleEdits.removeHeader(request, COOKIE)) { out, value -> out.withAddedHeader(name, value) }
+            return merged.fold(HeaderModifier.remove(request, COOKIE)) { out, value -> out.withAddedHeader(name, value) }
         }
 
         /**

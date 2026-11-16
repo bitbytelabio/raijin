@@ -20,7 +20,14 @@ import javax.net.ssl.X509TrustManager
  */
 internal object RawHttpConnector {
 
-    private val trustAll: SSLSocketFactory by lazy {
+    /**
+     * A fresh trust-all factory per connection, not a shared one: the JDK's client session cache is
+     * keyed by (host, port) without the SNI that was sent, so a shared `SSLContext` can silently
+     * resume an earlier connection's session — and its SNI — on a later `connect()` to the same
+     * host:port with a different `sni`. A dedicated `SSLContext` per connection has an empty session
+     * cache, so there is never a session to resume.
+     */
+    private fun trustAllSocketFactory(): SSLSocketFactory {
         val context = SSLContext.getInstance("TLS")
         context.init(
             null,
@@ -31,7 +38,7 @@ internal object RawHttpConnector {
             }),
             SecureRandom(),
         )
-        context.socketFactory
+        return context.socketFactory
     }
 
     /**
@@ -47,7 +54,7 @@ internal object RawHttpConnector {
             plain.tcpNoDelay = true
             plain.connect(InetSocketAddress(host, port), timeoutMs)
             if (!useTls) return plain
-            val ssl = trustAll.createSocket(plain, host, port, true) as SSLSocket
+            val ssl = trustAllSocketFactory().createSocket(plain, host, port, true) as SSLSocket
             // Bounds the handshake: a server that accepts TCP but never answers the ClientHello
             // would otherwise block forever.
             ssl.soTimeout = timeoutMs

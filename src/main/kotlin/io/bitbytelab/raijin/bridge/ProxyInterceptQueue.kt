@@ -1,6 +1,5 @@
 package io.bitbytelab.raijin.bridge
 
-import io.bitbytelab.raijin.safety.SafeRegex
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
@@ -268,7 +267,7 @@ internal class InterceptHoldQueue<T : Any>(private val unansweredLimit: Int = UN
 /**
  * Which proxied messages an armed [InterceptHoldQueue] holds. Every condition that is set must match.
  *
- * @property matchHost host glob or regex ([SafeRegex.matchesHostPattern]).
+ * @property matchHost host glob or regex ([RuleMatcher.host]).
  * @property matchUrl regex searched in the URL, case-insensitive.
  * @property matchMethod HTTP method, compared ignoring case.
  */
@@ -287,8 +286,8 @@ internal data class HoldPolicy(
      */
     fun matches(isRequest: Boolean, host: String?, url: String?, method: String?, inScope: () -> Boolean): Boolean {
         if (if (isRequest) !requests else !responses) return false
-        if (matchHost != null && (host == null || !SafeRegex.matchesHostPattern(matchHost, host))) return false
-        if (matchUrl != null && (url == null || !SafeRegex.containsMatchIn(matchUrl, url, ignoreCase = true))) return false
+        if (matchHost != null && !RuleMatcher.host(matchHost, host)) return false
+        if (matchUrl != null && !RuleMatcher.url(matchUrl, url)) return false
         if (matchMethod != null && (method == null || !method.equals(matchMethod, ignoreCase = true))) return false
         return !inScopeOnly || inScope()
     }

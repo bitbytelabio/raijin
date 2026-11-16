@@ -184,9 +184,11 @@ class AutorizeMatchLog(
      */
     fun restore(entries: List<AutorizeMatch>) {
         lock.withLock {
+            // A skipped entry does not stop the scan: one soft denial too big for the remaining
+            // character budget must not block every older (possibly confirmed) entry behind it.
             for (entry in entries) {
-                if (count >= maxMatches) break
-                if (count > 0 && chars + entry.storedChars > maxChars) break
+                if (count >= maxMatches) continue
+                if (count > 0 && chars + entry.storedChars > maxChars) continue
                 if (entry.softDenial && softDenials >= maxSoftDenials) continue
                 matches.addLast(entry)
                 track(entry, 1)
@@ -220,20 +222,25 @@ class AutorizeMatchLog(
     private fun evictLocked() {
         if (softDenials > maxSoftDenials) removeOldestSoftDenialLocked()
         while (count > maxMatches || (chars > maxChars && count > 1)) {
+            // A soft denial is never direct evidence of an access-control flaw; dropping one first
+            // keeps a confirmed match out of the way of the cap for as long as any remain.
+            if (softDenials > 0 && removeOldestSoftDenialLocked()) continue
             val oldest = matches.pollLast() ?: break
             track(oldest, -1)
         }
     }
 
-    private fun removeOldestSoftDenialLocked() {
+    /** @return true if a soft denial was removed. */
+    private fun removeOldestSoftDenialLocked(): Boolean {
         val oldestFirst = matches.descendingIterator()
         while (oldestFirst.hasNext()) {
             val match = oldestFirst.next()
             if (!match.softDenial) continue
             oldestFirst.remove()
             track(match, -1)
-            return
+            return true
         }
+        return false
     }
 
     private fun recountLocked() {
@@ -310,18 +317,23 @@ class AutorizeSeenGuard(
         /** Query-string variants of one endpoint replayed per rule. */
         const val MAX_QUERY_VARIANTS = 50
 
-        /** A value at least this long that contains a digit is a token (UUID, hash, signature), not a name. */
-        private const val TOKEN_MIN_CHARS = 16
+        /** Parameter names that only ever carry a cache-buster, nonce or signature, never an object id. */
+        private val VOLATILE_PARAM_NAMES = setOf(
+            "_", "ts", "t", "cb", "cachebuster", "cache_buster", "nonce", "sig", "signature", "timestamp",
+        )
 
-        /** A number, date or time at least this long is a moment or a cache buster, not an object id. */
-        private const val MOMENT_MIN_CHARS = 10
+        /** A 10-digit (seconds) or 13-digit (milliseconds) value that falls within a plausible current era. */
+        private val EPOCH_SECONDS_RANGE = 1_000_000_000L..2_500_000_000L
+        private val EPOCH_MILLIS_RANGE = EPOCH_SECONDS_RANGE.first * 1000..EPOCH_SECONDS_RANGE.last * 1000
+        private val ISO_DATE_TIME = Regex("""^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?""")
 
         /**
          * Dedup key for one Autorize replay: rule, method, URL path and query parameters. Parameter
          * order does not matter. Each value counts, so `?id=1` and `?id=2` are two keys (each object
-         * is its own authorization question) and so are `?action=export` and `?action=delete`; only
-         * a value that changes on every request is not told apart: a timestamp or cache buster
-         * (`?_=1731800000000`) and a long token with digits (UUID, hash, signature).
+         * is its own authorization question) and so are `?action=export` and `?action=delete` — a
+         * UUID, database ObjectId or snowflake object id stays distinct too. Only a value that is
+         * actually volatile is not told apart: a timestamp (`?_=1731800000000`) or a value under a
+         * name known to carry only a cache-buster, nonce or signature.
          */
         fun key(ruleId: String, method: String, url: String): String {
             val endpoint = endpointKey(ruleId, method, url)
@@ -339,18 +351,31 @@ class AutorizeSeenGuard(
             return query.split('&')
                 .filter { it.isNotEmpty() }
                 .map { parameter ->
+                    val name = parameter.substringBefore('=')
                     val value = parameter.substringAfter('=', "")
-                    if (isVolatile(value)) parameter.substringBefore('=') + "=#" else parameter
+                    if (isVolatile(name, value)) "$name=#" else parameter
                 }
                 .distinct()
                 .sorted()
                 .joinToString("&")
         }
 
-        private fun isVolatile(value: String): Boolean {
-            if (value.none { it.isDigit() }) return false
-            if (value.length >= TOKEN_MIN_CHARS) return true
-            return value.length >= MOMENT_MIN_CHARS && value.all { it.isDigit() || it == '.' || it == '-' || it == ':' }
+        private fun isVolatile(name: String, value: String): Boolean {
+            if (value.isEmpty()) return false
+            if (name.lowercase() in VOLATILE_PARAM_NAMES) return true
+            return looksLikeTimestamp(value)
+        }
+
+        private fun looksLikeTimestamp(value: String): Boolean {
+            if (value.all { it.isDigit() }) {
+                val epoch = value.toLongOrNull() ?: return false
+                return when (value.length) {
+                    10 -> epoch in EPOCH_SECONDS_RANGE
+                    13 -> epoch in EPOCH_MILLIS_RANGE
+                    else -> false
+                }
+            }
+            return ISO_DATE_TIME.containsMatchIn(value)
         }
     }
 }

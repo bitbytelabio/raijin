@@ -352,8 +352,8 @@ internal class ProxyInterceptHolds(private val eventBus: EventBus) {
         if (raw != null) request = HttpRequest.httpRequest(original.httpService(), BurpByteArray.byteArray(*raw.bytes))
         edit.method?.let { request = request.withMethod(it) }
         edit.path?.let { request = request.withPath(it) }
-        edit.removeHeaders.forEach { request = ProxyRuleEdits.removeHeader(request, ProxyRuleEdits.headerName(it)) }
-        edit.setHeaders.forEach { (name, value) -> request = ProxyRuleEdits.setHeader(request, ProxyRuleEdits.headerName(name), value) }
+        edit.removeHeaders.forEach { request = HeaderModifier.remove(request, ProxyRuleEdits.headerName(it)) }
+        edit.setHeaders.forEach { (name, value) -> request = HeaderModifier.set(request, ProxyRuleEdits.headerName(name), value) }
         edit.body?.let { request = request.withBody(it) }
         return HeldMessage(true, message.messageId, request, null, message.method, message.url, message.host, null)
     }
@@ -362,8 +362,8 @@ internal class ProxyInterceptHolds(private val eventBus: EventBus) {
         var response = original
         if (raw != null) response = HttpResponse.httpResponse(BurpByteArray.byteArray(*raw.bytes))
         edit.statusCode?.let { response = response.withStatusCode(it.toShort()) }
-        edit.removeHeaders.forEach { response = ProxyRuleEdits.removeHeader(response, ProxyRuleEdits.headerName(it)) }
-        edit.setHeaders.forEach { (name, value) -> response = ProxyRuleEdits.setHeader(response, ProxyRuleEdits.headerName(name), value) }
+        edit.removeHeaders.forEach { response = HeaderModifier.remove(response, ProxyRuleEdits.headerName(it)) }
+        edit.setHeaders.forEach { (name, value) -> response = HeaderModifier.set(response, ProxyRuleEdits.headerName(name), value) }
         edit.body?.let { response = response.withBody(it) }
         return HeldMessage(false, message.messageId, message.request, response, message.method, message.url, message.host, message.status)
     }

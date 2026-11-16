@@ -47,9 +47,11 @@ object WebProbeTools {
                 "Poisoning: sends headers and cookies a cache often leaves out of its key (X-Forwarded-Host, " +
                 "X-Forwarded-Scheme, X-Original-URL, method overrides, cookies the target sets, ...), each under a " +
                 "cache-buster query value used for nothing else, then asks for the same URL without the input and " +
-                "without a session: the changed response coming back is a confirmed poisoning, stored only under that " +
-                "throwaway key. Nothing is sent if the cache is seen to ignore the query string. Deception: requests " +
-                "path variants the origin may treat as the page and the cache as a static file (/page/x.css, " +
+                "without a session. Status/redirect/path probes wait until cache-buster isolation is demonstrated. " +
+                "Unproven isolation or a changed visitor baseline gives an inconclusive verdict, not confirmation. " +
+                "Stops can report rate_limited, baseline_changed or cache_buster_ignored. A unique query value " +
+                "cannot guarantee isolation when the cache key is unknown. Deception: requests path variants the " +
+                "origin may treat as the page and the cache as a static file (/page/x.css, " +
                 "/page;x.css, /page%23x.css, ...) as the user, then without a session. Pass the logged-in user's request " +
                 "headers as 'headers' to prove a private page gets stored. Respects the operator scope policy.",
             inputSchema = ToolSchema(

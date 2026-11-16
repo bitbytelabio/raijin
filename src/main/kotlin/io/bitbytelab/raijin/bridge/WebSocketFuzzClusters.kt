@@ -114,13 +114,13 @@ internal object WebSocketFuzzClusters {
     private fun digest(signature: String): String =
         HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(signature.toByteArray(Charsets.UTF_8)))
 
-    private fun frameSignature(frame: WebSocketMessage, reflections: List<String>, level: Level): String {
+    private fun frameSignature(frame: WebSocketMessage, reflections: List<Pair<String, String>>, level: Level): String {
         if (WebSocketFrames.isBinary(frame.type)) {
             return if (level == Level.SHAPE) "binary" else "binary:${frame.length}:${frame.payload.hashCode()}"
         }
         if (level == Level.SHAPE) return shape(frame.payload)
         var text = if (frame.payload.length > MAX_SIGNATURE_CHARS) frame.payload.substring(0, MAX_SIGNATURE_CHARS) else frame.payload
-        for (reflection in reflections) text = text.replace(reflection, "{PAYLOAD}")
+        for ((pattern, token) in reflections) text = text.replace(pattern, token)
         text = TIMESTAMP.replace(text, "{TIME}")
         text = UUID.replace(text, "{UUID}")
         text = LONG_TOKEN.replace(text, "{ID}")
@@ -130,18 +130,34 @@ internal object WebSocketFuzzClusters {
 
     /**
      * The forms in which a server is likely to echo what it was sent: the whole message and the
-     * payload, raw, JSON-escaped and HTML-escaped. Longest first, so a form is never masked in part
-     * by a shorter one it contains.
+     * payload. A payload with nothing to escape (plain text) is masked as `{PAYLOAD}` by its one raw
+     * form, same as always. A payload escaping WOULD change is masked as `{PAYLOAD}` only through
+     * its escaped form(s) — the raw, unescaped text then masks as `{PAYLOAD_RAW}` instead, a
+     * different signature, since an unescaped echo of something that needed escaping is the
+     * injection finding itself and must not cluster with the escaped, safe responses. Longest first,
+     * so a form is never masked in part by a shorter one it contains.
      */
-    private fun reflections(response: Response): List<String> {
-        val forms = LinkedHashSet<String>()
+    private fun reflections(response: Response): List<Pair<String, String>> {
+        val safe = LinkedHashSet<String>()
+        val dangerousRaw = LinkedHashSet<String>()
         for (sent in arrayOf(response.message, response.payload)) {
-            forms += sent
-            forms += WebSocketFuzzPlan.jsonEscape(sent)
-            forms += htmlEscape(sent, apostrophe = false)
-            forms += htmlEscape(sent, apostrophe = true)
+            val jsonEscaped = WebSocketFuzzPlan.jsonEscape(sent)
+            val htmlNoApos = htmlEscape(sent, apostrophe = false)
+            val htmlApos = htmlEscape(sent, apostrophe = true)
+            if (jsonEscaped == sent && htmlNoApos == sent && htmlApos == sent) {
+                safe += sent
+            } else {
+                if (jsonEscaped != sent) safe += jsonEscaped
+                if (htmlNoApos != sent) safe += htmlNoApos
+                if (htmlApos != sent) safe += htmlApos
+                dangerousRaw += sent
+            }
         }
-        return forms.filter { it.length >= MIN_REFLECTION_CHARS }.sortedByDescending { it.length }
+        val seen = HashSet<String>()
+        val out = ArrayList<Pair<String, String>>()
+        for (text in safe) if (text.length >= MIN_REFLECTION_CHARS && seen.add(text)) out += text to "{PAYLOAD}"
+        for (text in dangerousRaw) if (text.length >= MIN_REFLECTION_CHARS && seen.add(text)) out += text to "{PAYLOAD_RAW}"
+        return out.sortedByDescending { it.first.length }
     }
 
     private fun htmlEscape(text: String, apostrophe: Boolean): String {

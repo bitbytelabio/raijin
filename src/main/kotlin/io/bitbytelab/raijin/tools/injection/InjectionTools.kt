@@ -48,7 +48,8 @@ object InjectionTools {
                 "interaction that arrives after the call returned is reported by the next call. A finding needs a " +
                 "response that differs from the baseline (the same request with 'base_value' at FUZZ) in a way the " +
                 "payload explains: a timeout is never evidence, a delay must repeat while a zero-delay control stays " +
-                "fast, a TRUE/FALSE difference must hold over three rounds. Every finding carries its payload, a " +
+                "fast, a TRUE/FALSE difference must hold over three rounds. Boolean and operator checks only " +
+                "narrow the query: base_value must match a real row or document. Every finding carries its payload, a " +
                 "confidence (certain, firm, tentative) and the evidence (baseline next to probe) to re-check it. All " +
                 "classes together send about 130 requests when nothing is found; pass 'classes' to narrow. " +
                 "Scope-gated (mcp_scope_mode).",

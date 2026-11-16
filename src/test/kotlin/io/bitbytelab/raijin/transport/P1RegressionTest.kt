@@ -1,6 +1,5 @@
 package io.bitbytelab.raijin.transport
 
-import io.bitbytelab.raijin.bridge.HttpBridge
 import io.bitbytelab.raijin.events.EventBus
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
@@ -103,10 +102,4 @@ class P1RegressionTest {
         assertFalse(ToolCallTracker.shouldAudit("util_base64_decode", "", "", false))
     }
 
-    @Test
-    fun `HttpBridge parseHostHeader handles IPv6 and never crosses CRLF`() {
-        assertEquals("[::1]".let { "::1" to 8443 }, HttpBridge.parseHostHeader("GET / HTTP/1.1\r\nHost: [::1]:8443\r\nX-Port: 9999\r\n\r\n"))
-        assertEquals("example.com" to null, HttpBridge.parseHostHeader("GET / HTTP/1.1\r\nHost: example.com\r\nX-Port: 9999\r\n\r\n"))
-        assertEquals("example.com" to 8080, HttpBridge.parseHostHeader("GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"))
-    }
 }

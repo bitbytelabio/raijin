@@ -127,7 +127,7 @@ object ToolConsolidation {
             ),
         ),
         Group(
-            "http_rule", "Rules applied to outgoing HTTP traffic and session token handling.",
+            "http_rule", "Outgoing HTTP traffic rules, session tokens and bounded login macros.",
             mapOf(
                 "traffic_rule_set" to "http_set_traffic_rule",
                 "traffic_rule_list" to "http_list_traffic_rules",
@@ -135,14 +135,19 @@ object ToolConsolidation {
                 "token_rule_create" to "session_create_token_rule",
                 "token_rule_list" to "session_list_rules",
                 "token_rule_remove" to "session_remove_rule",
+                "macro_set" to "session_macro_set",
+                "macro_list" to "session_macro_list",
+                "macro_remove" to "session_macro_remove",
+                "macro_run" to "session_macro_run",
             ),
             renames = mapOf("traffic_rule_set" to RULE_ACTION),
         ),
         Group(
-            "http_state", "Burp cookie jar: read, set and delete cookies.",
+            "http_state", "Burp cookie jar (read, set, delete) and raw pipeline connections (list, close).",
             mapOf(
                 "cookie_jar_get" to "http_cookie_jar_get", "cookie_jar_set" to "http_cookie_jar_set",
                 "cookie_jar_delete" to "http_cookie_jar_delete",
+                "pipeline_connections" to "http_pipeline_connections",
             ),
         ),
         Group(

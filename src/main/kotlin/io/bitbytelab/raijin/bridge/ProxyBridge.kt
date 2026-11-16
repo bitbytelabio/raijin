@@ -689,12 +689,12 @@ class ProxyBridge(
 
     private fun matchesRequestConditions(rule: ProxyRule, request: InterceptedRequest): Boolean {
         if (rule.matchHost != null) {
-            if (!SafeRegex.matchesHostPattern(rule.matchHost, request.httpService().host())) {
+            if (!RuleMatcher.host(rule.matchHost, request.httpService().host())) {
                 return false
             }
         }
         if (rule.matchUrl != null) {
-            if (!SafeRegex.containsMatchIn(rule.matchUrl, request.url(), ignoreCase = true)) {
+            if (!RuleMatcher.url(rule.matchUrl, request.url())) {
                 return false
             }
         }
@@ -704,8 +704,7 @@ class ProxyBridge(
             }
         }
         if (rule.matchHeader != null) {
-            val headerStr = request.headers().joinToString("\r\n") { "${it.name()}: ${it.value()}" }
-            if (!SafeRegex.containsMatchIn(rule.matchHeader, headerStr, ignoreCase = true)) {
+            if (!RuleMatcher.headers(rule.matchHeader, request.headers())) {
                 return false
             }
         }
@@ -731,14 +730,14 @@ class ProxyBridge(
 
     private fun matchesResponseConditions(rule: ProxyRule, response: InterceptedResponse): Boolean {
         if (rule.matchHost != null) {
-            val host = safe { response.request()?.httpService()?.host() } ?: return false
-            if (!SafeRegex.matchesHostPattern(rule.matchHost, host)) {
+            val host = safe { response.request()?.httpService()?.host() }
+            if (!RuleMatcher.host(rule.matchHost, host)) {
                 return false
             }
         }
         if (rule.matchUrl != null) {
-            val url = safe { response.request()?.url() } ?: return false
-            if (!SafeRegex.containsMatchIn(rule.matchUrl, url, ignoreCase = true)) {
+            val url = safe { response.request()?.url() }
+            if (!RuleMatcher.url(rule.matchUrl, url)) {
                 return false
             }
         }
@@ -748,8 +747,7 @@ class ProxyBridge(
             }
         }
         if (rule.matchHeader != null) {
-            val headerStr = response.headers().joinToString("\r\n") { "${it.name()}: ${it.value()}" }
-            if (!SafeRegex.containsMatchIn(rule.matchHeader, headerStr, ignoreCase = true)) {
+            if (!RuleMatcher.headers(rule.matchHeader, response.headers())) {
                 return false
             }
         }

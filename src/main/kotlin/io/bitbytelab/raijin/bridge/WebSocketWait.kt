@@ -87,6 +87,11 @@ internal object WebSocketWait {
         awaitFirst: Boolean = true,
         maxFrames: Int = Int.MAX_VALUE,
         untilIndex: Long = Long.MAX_VALUE,
+        /** At most this many accepted frames are kept in [Collected.frames]; the rest still count
+         *  toward [maxFrames] and the idle-timer reset, so a caller that only needs to know whether
+         *  and how fast frames arrived (settling before a send, absorbing late frames) is not forced
+         *  to hold every one of them in memory. */
+        keepFrames: Int = maxFrames,
     ): Collected {
         val start = System.nanoTime()
         // Deadlines are offsets from `start`, so they compare correctly whatever nanoTime's origin is.
@@ -96,12 +101,13 @@ internal object WebSocketWait {
         var last = untilIndex - 1
         var windowOver = false
         var scanned = 0
+        var acceptedCount = 0
         var missed = 0L
         var firstFrame = -1L
         var closed = false
         val frames = ArrayList<WebSocketMessage>()
 
-        while (cursor < last && frames.size < maxFrames) {
+        while (cursor < last && acceptedCount < maxFrames) {
             val remaining = deadline - (System.nanoTime() - start)
             val page = connection.awaitPage(cursor, PAGE_SIZE, remaining)
             if (remaining <= 0 && !windowOver) {
@@ -124,9 +130,10 @@ internal object WebSocketWait {
                 scanned++
                 if (!filter.matches(message)) continue
                 if (firstFrame < 0) firstFrame = System.nanoTime() - start
-                frames += message
+                if (frames.size < keepFrames) frames += message
                 accepted = true
-                if (frames.size >= maxFrames) break
+                acceptedCount++
+                if (acceptedCount >= maxFrames) break
             }
             closed = page.closed && cursor >= page.nextIndex - 1
             if (reachedEnd || closed) break

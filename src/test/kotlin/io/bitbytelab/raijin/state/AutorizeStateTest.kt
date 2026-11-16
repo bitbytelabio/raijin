@@ -32,6 +32,16 @@ class AutorizeStateTest {
             "a long token with digits",
         )
         assertNotEquals(key("https://x/a?q=hello"), key("https://x/a?q=world"), "words stay apart")
+        assertNotEquals(
+            key("https://x/orders?id=7c9e6679-7425-40de-944b-e07cc4be7d0b"),
+            key("https://x/orders?id=16fd2706-8baf-433b-82eb-8c7fada847da"),
+            "a UUID object id is not a volatile value",
+        )
+        assertNotEquals(
+            key("https://x/accounts?id=9000000000001"),
+            key("https://x/accounts?id=9000000000002"),
+            "a 13-digit snowflake id outside the plausible epoch range stays an object id",
+        )
         assertEquals("a&b=", AutorizeSeenGuard.normalizedQuery("https://x/p?b=&a&b="))
     }
 
@@ -74,6 +84,30 @@ class AutorizeStateTest {
         log.add("https://x/confirmed")
         (1..3).forEach { log.add("https://x/soft$it", softDenial = true) }
         assertEquals(listOf("https://x/soft3", "https://x/soft2", "https://x/confirmed"), log.matches.map { it.url })
+    }
+
+    @Test
+    fun `a soft denial cannot evict a confirmed match even when the character budget is tight`() {
+        val log = AutorizeMatchLog(maxMatches = 10, maxSoftDenials = 5, maxChars = 100_000)
+        val big = "x".repeat(30_000)
+        log.add("https://x/confirmed", response = big)
+        repeat(3) { log.add("https://x/soft$it", softDenial = true, response = big) }
+        assertTrue(log.matches.any { it.url == "https://x/confirmed" }, "the confirmed match must survive")
+    }
+
+    @Test
+    fun `restoring skips an oversized soft denial instead of abandoning older confirmed matches behind it`() {
+        val log = AutorizeMatchLog(maxMatches = 10, maxChars = 50_000)
+        val big = "x".repeat(40_000)
+        // Newest first, as persisted: a soft denial too large for the budget, then a confirmed match
+        // that fits comfortably once the oversized one is skipped rather than aborting the scan.
+        val persisted = listOf(
+            log.add("https://x/soft", softDenial = true, response = big),
+            log.add("https://x/confirmed", response = "small"),
+        )
+        val fresh = AutorizeMatchLog(maxMatches = 10, maxChars = 50_000)
+        fresh.restore(persisted)
+        assertTrue(fresh.matches.any { it.url == "https://x/confirmed" }, "skipped past, not abandoned behind")
     }
 
     @Test

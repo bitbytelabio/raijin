@@ -348,7 +348,7 @@ internal object WebSocketFuzz {
         val error: String? = null,
         val openFailed: Boolean = false,
     ) {
-        /** The response frames kept, at most [MAX_KEPT_FRAMES]. */
+        /** The response frames kept, at most [MAX_REPORTED_FRAMES] (all that is ever read back). */
         val frames = ArrayList<WebSocketMessage>()
 
         /** Response frames that arrived, kept or not. */
@@ -366,7 +366,9 @@ internal object WebSocketFuzz {
         var cursor = sentIndex
 
         fun take(collected: WebSocketWait.Collected) {
-            val room = MAX_KEPT_FRAMES - frames.size
+            // Only MAX_REPORTED_FRAMES are ever read back (the result list and the cluster
+            // signature); MAX_KEPT_FRAMES only bounds how long collect() keeps accepting frames.
+            val room = MAX_REPORTED_FRAMES - frames.size
             if (room > 0) frames.addAll(collected.frames.take(room))
             frameCount += collected.frames.size
             missed += collected.missed
@@ -531,7 +533,7 @@ internal object WebSocketFuzz {
 
         /** Waits until no response frame has arrived for the idle time, at most one window. */
         private fun settle(connection: WebSocketConnection, since: Long) {
-            if (idleNanos > 0) WebSocketWait.collect(connection, since, filter, windowNanos, idleNanos, awaitFirst = false)
+            if (idleNanos > 0) WebSocketWait.collect(connection, since, filter, windowNanos, idleNanos, awaitFirst = false, keepFrames = 0)
         }
 
         private fun describe(e: Exception): String = e.message ?: e.javaClass.simpleName

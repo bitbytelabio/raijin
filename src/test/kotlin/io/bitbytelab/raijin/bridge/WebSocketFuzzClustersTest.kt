@@ -43,6 +43,19 @@ class WebSocketFuzzClustersTest {
     }
 
     @Test
+    fun `an unescaped reflection never clusters with an escaped one`() {
+        val responses = listOf(
+            response("<i>a</i>", """{"ok":true,"echo":"&lt;i&gt;a&lt;/i&gt;"}"""),
+            response("<u>c</u>", """{"ok":true,"echo":"&lt;u&gt;c&lt;/u&gt;"}"""),
+            response("<b>b</b>", """{"ok":true,"echo":"<b>b</b>"}"""),
+        )
+
+        val clustering = WebSocketFuzzClusters.cluster(responses)
+
+        assertEquals(listOf(listOf(0, 1), listOf(2)), clustering.clusters)
+    }
+
+    @Test
     fun `different outcomes never share a cluster`() {
         val responses = listOf(
             response("a", "same"),
