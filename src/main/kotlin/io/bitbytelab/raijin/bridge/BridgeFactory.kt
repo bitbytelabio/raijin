@@ -49,13 +49,15 @@ class BridgeFactory {
         val idorHunt: IdorHuntBridge,
         val autorize: AutorizeBridge
     ) {
-        /** Releases thread pools and extension registrations held by bridges on unload. */
+        /**
+         * Releases thread pools and extension registrations held by bridges on unload. One bridge
+         * failing to shut down does not stop the others.
+         */
         fun shutdown() {
-            proxy.shutdown()
-            http.shutdown()
-            websocket.shutdown()
-            scanCheck.shutdown()
-            bcheck.shutdown()
+            listOf<() -> Unit>(
+                proxy::shutdown, http::shutdown, websocket::shutdown,
+                scanner::shutdown, scanCheck::shutdown, bcheck::shutdown,
+            ).forEach { runCatching(it) }
         }
     }
 

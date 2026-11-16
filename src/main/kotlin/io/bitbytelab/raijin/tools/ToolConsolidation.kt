@@ -46,7 +46,7 @@ object ToolConsolidation {
         "http_send_request", "http_send_requests_parallel", "http_send_request_chain",
         "http_send_raw_bytes", "http_send_pipeline", "http_fuzz", "http_race",
         "proxy_history", "proxy_history_search", "proxy_annotate", "proxy_auto_auth",
-        "auth_diff", "api_import_openapi", "bambda_import",
+        "auth_diff", "api_import_openapi", "bambda_import", "bambda_templates",
         "jwt_keys",
         "search_skills", "load_skill", "read_skill_file",
     )
@@ -54,11 +54,12 @@ object ToolConsolidation {
     val GROUPS: List<Group> = listOf(
         Group(
             "custom_check",
-            "Custom Burp checks: BChecks and passive/active scan checks (create from a template, import, list, remove).",
+            "Custom Burp checks: BChecks and passive/active scan checks (create from a template, import, dry-run against proxy history, list, remove).",
             listOf(
                 "bcheck_create", "bcheck_import", "bcheck_list", "bcheck_remove", "bcheck_templates",
+                "bcheck_dry_run",
                 "scancheck_create_passive", "scancheck_create_active", "scancheck_list",
-                "scancheck_remove", "scancheck_templates",
+                "scancheck_remove", "scancheck_templates", "scancheck_dry_run",
             ).associateWith { it },
         ),
         Group(

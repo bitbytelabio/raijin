@@ -19,7 +19,9 @@ class HttpPipelineFramingTest {
     /** Starts a one-shot local server that writes [serverWrites] (in order, with the given
      * delays) to whatever connects, then returns the client-side [Socket]. */
     private fun connectedClient(serverWrites: List<Pair<ByteArray, Long>>, closeAfter: Boolean = false): Pair<Socket, ServerSocket> {
-        val server = ServerSocket(0)
+        // Bind and connect on the same loopback address: a wildcard bind plus "localhost" can
+        // reach another process listening on that port in the other address family.
+        val server = ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())
         val thread = Thread {
             val conn = server.accept()
             conn.getOutputStream().use { out ->
@@ -33,7 +35,7 @@ class HttpPipelineFramingTest {
         }
         thread.isDaemon = true
         thread.start()
-        val client = Socket("localhost", server.localPort)
+        val client = Socket(server.inetAddress, server.localPort)
         return client to server
     }
 
