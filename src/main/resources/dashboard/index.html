@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Raijin</title>
+<link rel="icon" href="logo.png">
+<link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+    <div class="header-left">
+        <h1><img src="logo.png" alt="" onerror="this.remove()">Raijin</h1>
+        <span class="version" id="versionText"></span>
+    </div>
+    <div class="header-right">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText">Connecting...</span>
+        <span id="uptimeText" style="font-family:var(--mono);font-size:11px;">00:00:00</span>
+        <div class="noise-toggle active" id="noiseToggle" onclick="toggleNoise()">
+            <span class="indicator"></span>
+            <span>Hide Noise</span>
+        </div>
+    </div>
+</div>
+
+<!-- Stats Bar -->
+<div class="stats-bar">
+    <div class="stat-pill events"><span class="stat-num" id="sEvents">0</span><span class="stat-label">Events</span></div>
+    <div class="stat-pill scope"><span class="stat-num" id="sScope">0</span><span class="stat-label">In-Scope</span></div>
+    <div class="stats-sep"></div>
+    <div class="stat-pill api"><span class="stat-num" id="sApi">0</span><span class="stat-label">API</span></div>
+    <div class="stat-pill auth"><span class="stat-num" id="sAuth">0</span><span class="stat-label">Auth</span></div>
+    <div class="stat-pill params"><span class="stat-num" id="sParams">0</span><span class="stat-label">Params</span></div>
+    <div class="stat-pill upload"><span class="stat-num" id="sUpload">0</span><span class="stat-label">Upload</span></div>
+    <div class="stat-pill admin"><span class="stat-num" id="sAdmin">0</span><span class="stat-label">Admin</span></div>
+    <div class="stat-pill data"><span class="stat-num" id="sData">0</span><span class="stat-label">Data</span></div>
+    <div class="stats-sep"></div>
+    <div class="stat-pill findings"><span class="stat-num" id="sFindings">0</span><span class="stat-label">Findings</span></div>
+    <div class="stats-sep"></div>
+    <div class="stat-pill scope" style="border-color:rgba(63,185,80,0.3);"><span class="stat-num" id="sToolCalls">0</span><span class="stat-label">MCP Calls</span></div>
+    <div class="stat-pill hidden"><span class="stat-num" id="sHidden">0</span><span class="stat-label">Noise</span></div>
+    <div class="stat-uptime" id="statUptime"></div>
+</div>
+
+<!-- Filter Bar -->
+<div class="filter-bar">
+    <div class="filter-group" id="typeFilter">
+        <button class="filter-btn active" data-filter="all">All</button>
+        <button class="filter-btn" data-filter="proxy">Proxy</button>
+        <button class="filter-btn" data-filter="scanner">Scanner</button>
+        <button class="filter-btn" data-filter="scope">Scope</button>
+        <button class="filter-btn" data-filter="tool">Tool</button>
+        <button class="filter-btn" data-filter="collab">Collab</button>
+        <button class="filter-btn" data-filter="websocket">WS</button>
+    </div>
+    <input type="text" class="search-box" id="searchBox" placeholder="Filter by URL, host, method...">
+    <div class="filter-group" id="tabNav">
+        <button class="filter-btn active" data-tab="stream">Activity Stream</button>
+        <button class="filter-btn" data-tab="rules">Rules</button>
+        <button class="filter-btn" data-tab="connections">Connections</button>
+    </div>
+    <button class="filter-clear" onclick="clearAll()">Clear All</button>
+</div>
+
+<!-- Activity Stream Tab -->
+<div class="tab-panel active" id="panel-stream">
+    <div class="activity-list" id="activityList">
+        <div class="empty-state">Waiting for events from Burp Suite proxy...</div>
+    </div>
+</div>
+
+<!-- Rules Tab -->
+<div class="tab-panel" id="panel-rules">
+    <div class="rules-grid" id="rulesGrid">
+        <div class="rule-section"><h3>Proxy Rules</h3><div id="proxyRulesList"><div class="empty-state">No proxy rules</div></div></div>
+        <div class="rule-section"><h3>Traffic Rules</h3><div id="trafficRulesList"><div class="empty-state">No traffic rules</div></div></div>
+        <div class="rule-section"><h3>Session Rules</h3><div id="sessionRulesList"><div class="empty-state">No session rules</div></div></div>
+    </div>
+</div>
+
+<!-- Connections Tab -->
+<div class="tab-panel" id="panel-connections">
+    <div class="conn-grid">
+        <div class="conn-card"><h4>Primary MCP (Streamable HTTP)</h4><div class="url" id="connPrimary"></div></div>
+        <div class="conn-card"><h4>Secondary MCP (Streamable HTTP)</h4><div class="url" id="connSecondary"></div></div>
+        <div class="conn-card"><h4>Dashboard</h4><div class="url" id="connDashboard"></div></div>
+        <div class="conn-card"><h4>Dashboard API - Proxy History</h4><div class="url" id="connProxyHistory"></div></div>
+        <div class="conn-card"><h4>MCP Client Config</h4><div class="url" style="font-size:11px;" id="connClientConfig"></div></div>
+        <div class="conn-card"><h4>Claude Code</h4><div class="url" style="font-size:11px;" id="connClaudeCode"></div></div>
+    </div>
+</div>
+
+<!-- Detail Panel (fixed bottom) -->
+<div class="detail-panel" id="detailPanel">
+    <div class="detail-wrapper">
+        <button class="detail-close" onclick="closeDetail()">&times;</button>
+        <div class="detail-inner" id="detailInner"></div>
+    </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script src="dashboard.js"></script>
+</body>
+</html>
