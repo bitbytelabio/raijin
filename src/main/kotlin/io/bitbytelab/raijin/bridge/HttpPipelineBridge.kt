@@ -2,6 +2,7 @@ package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
 import io.bitbytelab.raijin.core.BodyText
+import io.bitbytelab.raijin.safety.RequestHygiene
 import io.bitbytelab.raijin.safety.ScopeGate
 import kotlinx.serialization.json.*
 import java.net.InetSocketAddress
@@ -26,9 +27,9 @@ internal class PipelineRequestSpec(val bytes: ByteArray)
  * hand-write a Turbo Python script for this one primitive.
  *
  * Deliberately standalone: does not touch Turbo's RequestEngine/ThreadedRequestEngine/RunManager,
- * so a bug here cannot regress a running Turbo campaign, and it never calls [HttpBridge]'s
- * `fixContentLength` — a deliberately-wrong declared Content-Length is the entire point of this
- * tool. HTTP/2, HTTP/3 and kettled H2-smuggling escape fields remain Turbo-only; see
+ * so a bug here cannot regress a running Turbo campaign, and it never recomputes Content-Length
+ * ([RequestHygiene.fixContentLength]) — a deliberately-wrong declared Content-Length is the entire
+ * point of this tool. HTTP/2, HTTP/3 and kettled H2-smuggling escape fields remain Turbo-only; see
  * `tools/http/HttpTools.kt`'s `http_send_pipeline` description.
  */
 class HttpPipelineBridge(api: MontoyaApi) {
@@ -50,7 +51,7 @@ class HttpPipelineBridge(api: MontoyaApi) {
         connectionId: String?,
         maxResponseLength: Int?,
     ): JsonObject {
-        if (httpMode != null && httpMode != "HTTP_1") {
+        if (httpMode != null && !httpMode.equals("HTTP_1", ignoreCase = true)) {
             return buildJsonObject {
                 put("error", "http_send_pipeline only supports HTTP_1 in this version. HTTP/2, HTTP/3 and kettled H2 fields are Turbo-only (turbo_start_run with Engine.HTTP2 / Engine.HTTP3 / kettled=True).")
                 put("phase", "validate")
@@ -60,7 +61,7 @@ class HttpPipelineBridge(api: MontoyaApi) {
             return buildJsonObject { put("error", "'requests' must contain at least one item"); put("phase", "validate") }
         }
         val specs = try {
-            requests.map(::decodeRequestSpec)
+            requests.mapIndexed(::decodeRequestSpec)
         } catch (e: Exception) {
             return buildJsonObject { put("error", e.message ?: "invalid request spec"); put("phase", "validate") }
         }
@@ -68,35 +69,31 @@ class HttpPipelineBridge(api: MontoyaApi) {
         val scheme = if (useTls) "https" else "http"
         scopeGate.deny("$scheme://$host:$port/")?.let { return it }
 
+        // Registry entry whose socket this call uses; non-null exactly while this call holds its lock.
         var entry: HttpPipelineConnectionRegistry.Entry? = null
         var connectionReused = false
         var connectionMismatch = false
-        var lockedExistingEntry = false
 
         val socket: Socket = try {
-            if (connectionId != null) {
-                val existing = HttpPipelineConnectionRegistry.get(connectionId)
-                if (existing != null) {
-                    if (!existing.lock.tryLock(2, TimeUnit.SECONDS)) {
-                        return buildJsonObject { put("error", "connection_id '$connectionId' is in use by a concurrent call"); put("phase", "connect") }
-                    }
-                    lockedExistingEntry = true
-                    if (existing.host == host && existing.port == port && existing.useTls == useTls && !existing.socket.isClosed) {
-                        entry = existing
-                        connectionReused = true
-                        existing.socket
-                    } else {
-                        connectionMismatch = true
+            val existing = connectionId?.let { HttpPipelineConnectionRegistry.get(it) }
+            when {
+                existing == null -> connect(host, port, useTls, totalTimeoutMs)
+                !existing.lock.tryLock(2, TimeUnit.SECONDS) ->
+                    return buildJsonObject { put("error", "connection_id '$connectionId' is in use by a concurrent call"); put("phase", "connect") }
+                existing.host == host && existing.port == port && existing.useTls == useTls && !existing.socket.isClosed -> {
+                    entry = existing
+                    connectionReused = true
+                    existing.socket
+                }
+                else -> {
+                    connectionMismatch = true
+                    try {
+                        HttpPipelineConnectionRegistry.remove(connectionId, existing)
+                    } finally {
                         existing.lock.unlock()
-                        lockedExistingEntry = false
-                        HttpPipelineConnectionRegistry.remove(connectionId)
-                        connect(host, port, useTls, totalTimeoutMs)
                     }
-                } else {
                     connect(host, port, useTls, totalTimeoutMs)
                 }
-            } else {
-                connect(host, port, useTls, totalTimeoutMs)
             }
         } catch (e: Exception) {
             return buildJsonObject { put("error", "connect failed: ${e.message}"); put("phase", "connect") }
@@ -106,8 +103,7 @@ class HttpPipelineBridge(api: MontoyaApi) {
             val bytesSent = try {
                 writeRequests(socket, specs, writeMode, writePauseMs)
             } catch (e: Exception) {
-                runCatching { socket.close() }
-                connectionId?.let { HttpPipelineConnectionRegistry.remove(it) }
+                retire(socket, connectionId, entry)
                 return buildJsonObject {
                     put("error", "write failed: ${e.message}")
                     put("phase", "write")
@@ -123,7 +119,7 @@ class HttpPipelineBridge(api: MontoyaApi) {
             var bytesReceived = 0L
             var closeReason = "max_responses"
             var errorMessage: String? = null
-            var sawConnectionClose = false
+            var reusable = true
 
             for (i in 0 until wanted) {
                 val isHead = requestMethods.getOrNull(i)?.equals("HEAD", ignoreCase = true) == true
@@ -131,8 +127,10 @@ class HttpPipelineBridge(api: MontoyaApi) {
                 bytesReceived += outcome.bytesReadFromSocket
                 when (outcome) {
                     is HttpPipelineFraming.Outcome.Ok -> {
-                        if (outcome.response.connectionCloseHeader) sawConnectionClose = true
                         responses += serializeResponse(i, outcome.response, maxResponseLength)
+                        if (!outcome.response.persistent) reusable = false
+                        // After 101 the connection no longer speaks HTTP/1.1, so nothing more can be framed.
+                        if (outcome.response.statusCode == 101) { closeReason = "switching_protocols"; break }
                     }
                     is HttpPipelineFraming.Outcome.Eof -> { closeReason = "fin"; break }
                     is HttpPipelineFraming.Outcome.TimedOut -> { closeReason = if (outcome.kind == "total") "total_timeout" else "idle"; break }
@@ -141,17 +139,17 @@ class HttpPipelineBridge(api: MontoyaApi) {
                 }
             }
 
-            // Only offer connection reuse when every requested response framed cleanly AND the server did not send Connection: close.
-            val keepAlive = keepOpen && closeReason == "max_responses" && !sawConnectionClose
+            // Only offer the socket for reuse when every requested response framed cleanly and the
+            // server keeps the connection (no Connection: close, close-delimited body or HTTP/1.0 close).
+            val keepAlive = keepOpen && closeReason == "max_responses" && reusable
             val resultConnectionId = if (keepAlive) (connectionId ?: UUID.randomUUID().toString()) else null
 
             if (keepAlive) {
-                val newEntry = entry ?: HttpPipelineConnectionRegistry.Entry(socket, host, port, useTls)
-                newEntry.lastUsedAtMs = System.currentTimeMillis()
-                HttpPipelineConnectionRegistry.put(resultConnectionId!!, newEntry)
+                val kept = entry ?: HttpPipelineConnectionRegistry.Entry(socket, host, port, useTls)
+                kept.lastUsedAtMs = System.currentTimeMillis()
+                HttpPipelineConnectionRegistry.put(resultConnectionId!!, kept)
             } else {
-                runCatching { socket.close() }
-                connectionId?.let { HttpPipelineConnectionRegistry.remove(it) }
+                retire(socket, connectionId, entry)
             }
 
             return buildJsonObject {
@@ -167,20 +165,34 @@ class HttpPipelineBridge(api: MontoyaApi) {
                 errorMessage?.let { put("error", it) }
             }
         } catch (e: Exception) {
-            runCatching { socket.close() }
-            connectionId?.let { HttpPipelineConnectionRegistry.remove(it) }
+            retire(socket, connectionId, entry)
             return buildJsonObject { put("error", "pipeline failed: ${e.message}"); put("phase", "read") }
         } finally {
-            if (lockedExistingEntry) entry?.lock?.unlock()
+            entry?.lock?.unlock()
         }
     }
 
-    private fun decodeRequestSpec(obj: JsonObject): PipelineRequestSpec {
+    /** Closes [socket]; when it came from the registry under [connectionId], also drops that (locked) [entry]. */
+    private fun retire(socket: Socket, connectionId: String?, entry: HttpPipelineConnectionRegistry.Entry?) {
+        if (connectionId != null && entry != null) {
+            HttpPipelineConnectionRegistry.remove(connectionId, entry)
+        } else {
+            runCatching { socket.close() }
+        }
+    }
+
+    private fun decodeRequestSpec(index: Int, obj: JsonObject): PipelineRequestSpec {
         val hex = obj["raw_request_hex"]?.jsonPrimitive?.contentOrNull
         val str = obj["raw_request"]?.jsonPrimitive?.contentOrNull
-        val bytes = hex?.chunked(2)?.map { it.toInt(16).toByte() }?.toByteArray()
-            ?: str?.replace("\\r\\n", "\r\n")?.replace("\\n", "\n")?.toByteArray(Charsets.ISO_8859_1)
-            ?: throw IllegalArgumentException("each item in 'requests' must have 'raw_request' or 'raw_request_hex'")
+        val bytes = try {
+            when {
+                hex != null -> RequestHygiene.decodeHex(hex)
+                str != null -> RequestHygiene.unescapeLineEndings(str).let { it.toByteArray(RequestHygiene.wireCharset(it)) }
+                else -> throw IllegalArgumentException("must have 'raw_request' or 'raw_request_hex'")
+            }
+        } catch (e: IllegalArgumentException) {
+            throw IllegalArgumentException("requests[$index]: ${e.message}")
+        }
         return PipelineRequestSpec(bytes)
     }
 
@@ -212,15 +224,22 @@ class HttpPipelineBridge(api: MontoyaApi) {
     private fun connect(host: String, port: Int, useTls: Boolean, totalTimeoutMs: Long): Socket {
         val connectTimeoutMs = totalTimeoutMs.coerceIn(1, 10_000L).toInt()
         val plain = Socket()
-        plain.connect(InetSocketAddress(host, port), connectTimeoutMs)
-        if (!useTls) return plain
-        val ssl = trustAllSslSocketFactory().createSocket(plain, host, port, true) as SSLSocket
-        ssl.soTimeout = connectTimeoutMs
-        val params = ssl.sslParameters
-        params.applicationProtocols = arrayOf("http/1.1")
-        ssl.sslParameters = params
-        ssl.startHandshake()
-        return ssl
+        try {
+            plain.connect(InetSocketAddress(host, port), connectTimeoutMs)
+            if (!useTls) return plain
+            val ssl = trustAllSslSocketFactory().createSocket(plain, host, port, true) as SSLSocket
+            // Bounds the handshake: a server that accepts TCP but never answers the ClientHello
+            // would otherwise block this call forever.
+            ssl.soTimeout = connectTimeoutMs
+            val params = ssl.sslParameters
+            params.applicationProtocols = arrayOf("http/1.1")
+            ssl.sslParameters = params
+            ssl.startHandshake()
+            return ssl
+        } catch (e: Exception) {
+            runCatching { plain.close() }
+            throw e
+        }
     }
 
     private fun extractRequestMethod(bytes: ByteArray): String? {
@@ -249,13 +268,16 @@ class HttpPipelineBridge(api: MontoyaApi) {
         put("status_code", r.statusCode)
         put("framing", r.framing)
         put("connection_close_header", r.connectionCloseHeader)
-        put("headers", buildJsonArray {
-            r.headers.forEach { (name, value) -> add(buildJsonObject { put("name", name); put("value", value) }) }
-        })
+        put("headers", fieldsJson(r.headers))
         val renderedBody = BodyText.render(r.body, maxResponseLength)
         put("body", renderedBody.text)
         if (renderedBody.binary) put("body_binary", true)
         if (renderedBody.truncated) put("body_truncated", true)
+        if (r.trailers.isNotEmpty()) put("trailers", fieldsJson(r.trailers))
         if (r.warnings.isNotEmpty()) put("warnings", buildJsonArray { r.warnings.forEach { add(it) } })
+    }
+
+    private fun fieldsJson(fields: List<Pair<String, String>>): JsonArray = buildJsonArray {
+        fields.forEach { (name, value) -> add(buildJsonObject { put("name", name); put("value", value) }) }
     }
 }

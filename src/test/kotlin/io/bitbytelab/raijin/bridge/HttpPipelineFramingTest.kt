@@ -1,9 +1,11 @@
 package io.bitbytelab.raijin.bridge
 
+import io.bitbytelab.raijin.bridge.HttpPipelineFraming.Outcome
 import java.net.ServerSocket
 import java.net.Socket
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -196,6 +198,139 @@ class HttpPipelineFramingTest {
             assertEquals("", first.response.body)
             val second = HttpPipelineFraming.readOne(client, carry, 1000, System.currentTimeMillis() + 3000) as HttpPipelineFraming.Outcome.Ok
             assertEquals(204, second.response.statusCode)
+        } finally {
+            client.close(); server.close()
+        }
+    }
+
+    /** Serves [wire] in one write to a fresh connection and reads one response off it. */
+    private fun frame(
+        wire: String,
+        closeAfter: Boolean = false,
+        maxResponseBytes: Int = HttpPipelineFraming.DEFAULT_MAX_RESPONSE_BYTES,
+        carry: StringBuilder = StringBuilder(),
+    ): Outcome {
+        val (client, server) = connectedClient(listOf(bytes(wire) to 0), closeAfter)
+        try {
+            return HttpPipelineFraming.readOne(client, carry, 2000, System.currentTimeMillis() + 5000, maxResponseBytes)
+        } finally {
+            client.close(); server.close()
+        }
+    }
+
+    private fun describe(o: Outcome): String = when (o) {
+        is Outcome.Ok -> "Ok(${o.response})"
+        is Outcome.Malformed -> "Malformed(${o.reason})"
+        is Outcome.Eof -> "Eof(${o.partial})"
+        is Outcome.TimedOut -> "TimedOut(${o.kind})"
+        is Outcome.Reset -> "Reset(${o.message})"
+    }
+
+    @Test
+    fun `chunk size that overflows or exceeds the byte cap is Malformed`() {
+        val overflow = frame("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFFFFF\r\nx")
+        assertTrue(overflow is Outcome.Malformed && "overflows" in overflow.reason, describe(overflow))
+
+        val tooBig = frame("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFF\r\nx", maxResponseBytes = 1024)
+        assertTrue(tooBig is Outcome.Malformed && "out of bounds" in tooBig.reason, describe(tooBig))
+    }
+
+    @Test
+    fun `chunk data without its CRLF is Malformed`() {
+        val o = frame("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXY0\r\n\r\n")
+        assertTrue(o is Outcome.Malformed && "CRLF" in o.reason, describe(o))
+    }
+
+    @Test
+    fun `chunk trailers are returned with the response`() {
+        val ok = frame("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Checksum: abc\r\nX-Other: 1\r\n\r\n") as Outcome.Ok
+        assertEquals("hello", ok.response.body)
+        assertEquals(listOf("X-Checksum" to "abc", "X-Other" to "1"), ok.response.trailers)
+    }
+
+    @Test
+    fun `conflicting or non-numeric Content-Length is Malformed and a repeated equal one is a warning`() {
+        for (cl in listOf("Content-Length: 5\r\nContent-Length: 6", "Content-Length: 5, 6", "Content-Length: +5", "Content-Length: 0x5")) {
+            val o = frame("HTTP/1.1 200 OK\r\n$cl\r\n\r\nhello")
+            assertTrue(o is Outcome.Malformed, "$cl -> ${describe(o)}")
+        }
+        val ok = frame("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok") as Outcome.Ok
+        assertEquals("ok", ok.response.body)
+        assertTrue("repeated_content_length" in ok.response.warnings)
+    }
+
+    @Test
+    fun `transfer-encoding whose final coding is not chunked reads to close`() {
+        for (te in listOf("chunked, gzip", "xchunked")) {
+            val o = frame("HTTP/1.1 200 OK\r\nTransfer-Encoding: $te\r\n\r\n3\r\nabc\r\n0\r\n\r\n", closeAfter = true)
+            val ok = o as? Outcome.Ok ?: error("$te -> ${describe(o)}")
+            assertEquals("close-delimited", ok.response.framing, te)
+            assertEquals("3\r\nabc\r\n0\r\n\r\n", ok.response.body, te)
+            assertTrue("transfer_encoding_not_chunked" in ok.response.warnings, te)
+        }
+    }
+
+    @Test
+    fun `101 ends HTTP framing and leaves the upgraded bytes in carry`() {
+        val carry = StringBuilder()
+        val ok = frame("HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\r\nPRI-bytes", carry = carry) as Outcome.Ok
+        assertEquals(101, ok.response.statusCode)
+        assertEquals("switching-protocols", ok.response.framing)
+        assertFalse(ok.response.persistent)
+        assertEquals("PRI-bytes", carry.toString())
+    }
+
+    @Test
+    fun `persistence follows Connection and the HTTP version`() {
+        fun persistent(head: String) = (frame("$head\r\nContent-Length: 0\r\n\r\n") as Outcome.Ok).response.persistent
+        assertTrue(persistent("HTTP/1.1 200 OK"))
+        assertFalse(persistent("HTTP/1.1 200 OK\r\nConnection: close"))
+        assertFalse(persistent("HTTP/1.0 200 OK"))
+        assertTrue(persistent("HTTP/1.0 200 OK\r\nConnection: keep-alive"))
+        val closeDelimited = frame("HTTP/1.1 200 OK\r\n\r\nbody", closeAfter = true) as Outcome.Ok
+        assertFalse(closeDelimited.response.persistent)
+    }
+
+    @Test
+    fun `responses over the byte cap are Malformed`() {
+        val headers = frame("HTTP/1.1 200 OK\r\nX-Big: ${"a".repeat(500)}\r\n\r\n", maxResponseBytes = 100)
+        assertTrue(headers is Outcome.Malformed && "exceeded" in headers.reason, describe(headers))
+        val declared = frame("HTTP/1.1 200 OK\r\nContent-Length: 5000\r\n\r\nabc", maxResponseBytes = 1000)
+        assertTrue(declared is Outcome.Malformed && "exceeds" in declared.reason, describe(declared))
+    }
+
+    @Test
+    fun `a finely chunked large body and the response after it frame correctly`() {
+        val wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + "1\r\nx\r\n".repeat(30_000) +
+            "0\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n"
+        val (client, server) = connectedClient(listOf(bytes(wire) to 0))
+        try {
+            val carry = StringBuilder()
+            val first = HttpPipelineFraming.readOne(client, carry, 2000, System.currentTimeMillis() + 10_000) as Outcome.Ok
+            assertEquals("x".repeat(30_000), first.response.body)
+            val second = HttpPipelineFraming.readOne(client, carry, 2000, System.currentTimeMillis() + 10_000) as Outcome.Ok
+            assertEquals(204, second.response.statusCode)
+        } finally {
+            client.close(); server.close()
+        }
+    }
+
+    @Test
+    fun `framing boundaries split across reads are still found`() {
+        val (client, server) = connectedClient(
+            listOf(
+                bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r") to 0,
+                bytes("\n\r\n5") to 100,
+                bytes("\r\nhel") to 100,
+                bytes("lo\r\n0\r") to 100,
+                bytes("\nX-T: 1\r\n\r") to 100,
+                bytes("\n") to 100,
+            )
+        )
+        try {
+            val ok = HttpPipelineFraming.readOne(client, StringBuilder(), 2000, System.currentTimeMillis() + 5000) as Outcome.Ok
+            assertEquals("hello", ok.response.body)
+            assertEquals(listOf("X-T" to "1"), ok.response.trailers)
         } finally {
             client.close(); server.close()
         }

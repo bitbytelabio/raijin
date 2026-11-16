@@ -1,5 +1,7 @@
 package io.bitbytelab.raijin.bridge
 
+import io.bitbytelab.raijin.safety.RequestHygiene
+
 /**
  * Pure, Montoya-free planning logic for [HttpBridge.fuzz].
  *
@@ -16,6 +18,8 @@ package io.bitbytelab.raijin.bridge
  *  3. Astral / multi-byte payloads: planning stays at the String level and the caller
  *     (HttpBridge) encodes the final request with an explicit UTF-8 charset so surrogate
  *     pairs survive — the old path handed the String straight to Montoya's String overload.
+ *     [planRaw] / [raceRequests] recompute Content-Length for those UTF-8 bytes after
+ *     substitution, so a payload that changes the body length still gets a matching header.
  */
 internal object HttpFuzzPlan {
 
@@ -27,6 +31,56 @@ internal object HttpFuzzPlan {
         data class Ok(val mode: String, val requests: List<PlannedRequest>) : Result()
         data class Error(val message: String) : Result()
     }
+
+    /**
+     * [plan] for a request exactly as the caller typed it, producing ready-to-send text: the
+     * header block's line endings are canonicalized ([RequestHygiene.normalizeCrlf]), legacy
+     * offset [positions] (which index the text as typed) are moved onto the normalized request,
+     * and every substituted request gets an unambiguous Content-Length recomputed ([withContentLength]).
+     */
+    fun planRaw(
+        rawRequest: String,
+        positions: List<Pair<Int, Int>>?,
+        payloads: List<String>,
+        marker: String?
+    ): Result {
+        val normalized = RequestHygiene.normalizeCrlf(rawRequest)
+        var mapped = positions
+        if (!positions.isNullOrEmpty() && normalized != rawRequest) {
+            // Offset mode validates against the text as typed, so errors quote the caller's numbers.
+            val offsetMode = !normalized.contains("FUZZ") && countOccurrences(normalized, effectiveMarker(marker)) == 0
+            if (offsetMode) validatePositions(positions, rawRequest.length)?.let { return Result.Error(it) }
+            mapped = positions.map { (start, end) ->
+                RequestHygiene.adjustedOffset(rawRequest, start) to RequestHygiene.adjustedOffset(rawRequest, end)
+            }
+        }
+        return when (val planned = plan(normalized, mapped, payloads, marker)) {
+            is Result.Error -> planned
+            is Result.Ok -> Result.Ok(planned.mode, planned.requests.map { it.copy(request = withContentLength(it.request)) })
+        }
+    }
+
+    /**
+     * Request texts for one `http_race` batch: one per payload with every `FUZZ` replaced when
+     * [payloads] is non-empty (it wins over [count]), else [count] copies of the request. Line
+     * endings and Content-Length are handled as in [planRaw].
+     */
+    fun raceRequests(rawRequest: String, count: Int, payloads: List<String>?): List<String> {
+        val base = RequestHygiene.normalizeCrlf(rawRequest)
+        if (!payloads.isNullOrEmpty()) return payloads.map { withContentLength(base.replace("FUZZ", it)) }
+        val fixed = withContentLength(base)
+        return List(count) { fixed }
+    }
+
+    /**
+     * [request] with an unambiguous Content-Length set to its body's UTF-8 byte count (the charset
+     * fuzz and race send with). CL.TE / TE.CL / CL.CL shapes are left alone.
+     */
+    fun withContentLength(request: String): String =
+        RequestHygiene.fixContentLength(request, utf8Body = true).request
+
+    /** A blank marker would match everywhere; it means "use the default `§`". */
+    private fun effectiveMarker(marker: String?): String = marker?.takeIf { it.isNotEmpty() } ?: "§"
 
     /**
      * Builds the list of concrete requests to send for a fuzz run.
@@ -42,8 +96,7 @@ internal object HttpFuzzPlan {
         payloads: List<String>,
         marker: String?
     ): Result {
-        // A blank marker would match everywhere and count infinitely; treat it as "use default".
-        val effectiveMarker = marker?.takeIf { it.isNotEmpty() } ?: "§" // §
+        val effectiveMarker = effectiveMarker(marker)
         val hasFuzzKeyword = baseRequest.contains("FUZZ")
         val markerCount = countOccurrences(baseRequest, effectiveMarker)
         if (!hasFuzzKeyword && markerCount > 0 && markerCount % 2 != 0) {

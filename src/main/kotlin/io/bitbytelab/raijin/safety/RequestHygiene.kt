@@ -1,5 +1,7 @@
 package io.bitbytelab.raijin.safety
 
+import java.nio.charset.Charset
+
 /**
  * Input hygiene for `http_send_request`-style tools (GitHub issue #7).
  *
@@ -9,7 +11,8 @@ package io.bitbytelab.raijin.safety
  * control chars before the request is built (the actual fix), and [scan] reports what was cleaned so
  * the agent can self-correct.
  *
- * Only the STRUCTURED build path is sanitized; `raw_request` / `http_send_raw_bytes` stay verbatim so
+ * Only the STRUCTURED build path is sanitized. `raw_request` only gets its header block's line endings
+ * canonicalized ([normalizeCrlf]) and `http_send_raw_bytes` / `http_send_pipeline` stay byte-exact, so
  * intentional CRLF (request-smuggling / header-injection research) remains possible. Pure + tested.
  */
 object RequestHygiene {
@@ -24,29 +27,24 @@ object RequestHygiene {
         return buildString(s.length) { for (ch in s) if (ch == '\t' || ch.code >= 32) append(ch) }
     }
 
-    /**
-     * Canonicalizes a raw HTTP message's line endings to CRLF so Montoya's strict
-     * parser delimits the request line and headers correctly (issue #7, request-line
-     * variant seen in `repeater_send` / `intruder_send` / `organizer_send` /
-     * `sitemap_add_request` / `analyze_insertion_points`).
-     *
-     * Callers (and LLMs) frequently supply requests with bare-LF endings, or with the
-     * escaped "\r\n" / "\n" sequences that survive JSON transport.
-     * `HttpRequest.httpRequest(service, string)` is strict about CRLF: a bare-LF
-     * request never splits the request line from the headers, so the whole remainder
-     * folds into the HTTP/2 `:path` pseudo-header and Burp flags the request as
-     * **"kettled"** ("There is a newline in this header's value: :path"). Normalizing
-     * to CRLF up front is what makes such a request valid.
-     *
-     * Unlike [stripControl] this only fixes delimiters (it preserves content), so it is
-     * safe on the "send this request into Burp" paths and leaves an already-CRLF
-     * request byte-identical. Byte-exact tools (`http_send_raw_bytes` / `raw_request`)
-     * still bypass it so intentional smuggling bytes are untouched.
-     */
     private val REAL_HEADER_END = Regex("\\r?\\n\\r?\\n")
     private val ESCAPED_HEADER_END = Regex("""(?:\\r\\n|\\n)(?:\\r\\n|\\n)""")
     private val BARE_LF = Regex("(?<!\\r)\\n")
 
+    /**
+     * Canonicalizes the line endings of a raw HTTP message's request/status line and header
+     * block to CRLF so Montoya's strict parser delimits them (issue #7, request-line variant seen
+     * in `repeater_send` / `intruder_send` / `organizer_send` / `sitemap_add_request` /
+     * `analyze_insertion_points`). A bare-LF request never splits the request line from the
+     * headers, so the remainder folds into the HTTP/2 `:path` and Burp flags it **"kettled"**.
+     *
+     * Only the header block is touched: everything after the first blank line (`\r\n\r\n`,
+     * `\n\n`, ...) is kept byte for byte, so a JSON body's `\n` escapes, a body's own line
+     * endings and its Content-Length all survive. A message with no real line break at all
+     * (escaped "\r\n" / "\n" sequences that survived JSON transport) has its header block
+     * unescaped the same way, again leaving the body as typed. An already-CRLF message is
+     * returned unchanged.
+     */
     fun normalizeCrlf(raw: String): String {
         if (raw.contains('\n')) {
             val sep = REAL_HEADER_END.find(raw)
@@ -92,13 +90,14 @@ object RequestHygiene {
         val rewrittenTo: Int? = null
     )
 
-    private val CONTENT_LENGTH_REGEX = Regex("(?im)^Content-Length:\\s*(\\d+)\\s*$")
+    private val CONTENT_LENGTH_REGEX = Regex("(?im)^Content-Length:[ \\t]*(\\d+)[ \\t]*$")
     private val CONTENT_LENGTH_LINE_REGEX = Regex("(?im)^[^\\S\\r\\n]*Content-Length[^\\r\\n:]*:")
     private val TRANSFER_ENCODING_LINE_REGEX = Regex("(?im)^[^\\S\\r\\n]*Transfer-Encoding[^\\r\\n:]*:")
 
     /**
      * Recomputes the Content-Length header on a raw HTTP request to match the actual
-     * body size in bytes ([Charsets.UTF_8] when [utf8Body] is true, else [Charsets.ISO_8859_1]).
+     * body size in bytes ([Charsets.UTF_8] when [utf8Body] is true, else [Charsets.ISO_8859_1];
+     * pass the charset the request is sent with, see [wireCharset]). Only the digits change.
      * Returns the original request unchanged if there is no body section, no Content-Length
      * header, multiple Content-Length headers (CL.CL smuggling), or any Transfer-Encoding header
      * (CL.TE / TE.CL smuggling), so deliberate desync payloads are never silently altered.
@@ -115,13 +114,56 @@ object RequestHygiene {
         if (CONTENT_LENGTH_LINE_REGEX.findAll(headerSection).count() != 1) return ContentLengthFix(rawRequest)
 
         val clMatch = CONTENT_LENGTH_REGEX.find(headerSection) ?: return ContentLengthFix(rawRequest)
-        val declaredLength = clMatch.groupValues[1].toIntOrNull() ?: return ContentLengthFix(rawRequest)
+        val digits = clMatch.groups[1] ?: return ContentLengthFix(rawRequest)
+        val declaredLength = digits.value.toIntOrNull() ?: return ContentLengthFix(rawRequest)
         val charset = if (utf8Body) Charsets.UTF_8 else Charsets.ISO_8859_1
         val actualLength = bodySection.toByteArray(charset).size
         if (declaredLength == actualLength) return ContentLengthFix(rawRequest)
 
-        val fixedHeader = CONTENT_LENGTH_REGEX.replaceFirst(headerSection, "Content-Length: $actualLength")
+        val fixedHeader = headerSection.replaceRange(digits.range, actualLength.toString())
         return ContentLengthFix("$fixedHeader\r\n\r\n$bodySection", declaredLength, actualLength)
+    }
+
+    /**
+     * Charset request text goes on the wire with. ISO-8859-1 sends every char up to U+00FF as
+     * exactly that byte (how Burp holds raw bytes in a String); a char above U+00FF has no
+     * single-byte form, so the whole message is then sent as UTF-8. Content-Length must be
+     * counted in the same charset.
+     */
+    fun wireCharset(text: CharSequence): Charset =
+        if (text.any { it.code > 0xFF }) Charsets.UTF_8 else Charsets.ISO_8859_1
+
+    /**
+     * Decodes literal `\r\n` / `\n` escapes into real line breaks for the byte-level tools
+     * (`http_send_raw_bytes`, `http_send_pipeline`), throughout the message so a smuggled request
+     * in the body gets its CRLFs too. Only a message without any real CR or LF is decoded: once
+     * the text has real line breaks the caller writes real line endings, so every character stays
+     * as typed (a JSON body's `\n` escape stays two characters). Never turns LF into CRLF.
+     */
+    fun unescapeLineEndings(raw: String): String =
+        if (raw.indexOf('\n') >= 0 || raw.indexOf('\r') >= 0) raw
+        else raw.replace("\\r\\n", "\r\n").replace("\\n", "\n")
+
+    /**
+     * Decodes hex-encoded bytes (`474554 202f`; whitespace between digits is ignored).
+     * @throws IllegalArgumentException naming the problem for an odd digit count or a non-hex character.
+     */
+    fun decodeHex(hex: String): ByteArray {
+        val digits = hex.filterNot { it.isWhitespace() }
+        require(digits.length % 2 == 0) { "hex input has an odd number of digits (${digits.length}); every byte needs two" }
+        return ByteArray(digits.length / 2) { i ->
+            val hi = hexDigit(digits[2 * i])
+            val lo = hexDigit(digits[2 * i + 1])
+            require(hi >= 0 && lo >= 0) { "hex input has a non-hex character in byte $i ('${digits.substring(2 * i, 2 * i + 2)}')" }
+            ((hi shl 4) or lo).toByte()
+        }
+    }
+
+    private fun hexDigit(c: Char): Int = when (c) {
+        in '0'..'9' -> c - '0'
+        in 'a'..'f' -> c - 'a' + 10
+        in 'A'..'F' -> c - 'A' + 10
+        else -> -1
     }
 
     /** Advisory: reports raw CR/LF found (and removed by [stripControl]) so the agent notices. */

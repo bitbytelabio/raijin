@@ -67,6 +67,15 @@ object HttpPipelineConnectionRegistry {
         entries.remove(id)?.let { runCatching { it.socket.close() } }
     }
 
+    /**
+     * Removes [id] only while it still maps to [entry] and closes [entry]'s socket either way, so a
+     * caller retiring the connection it holds the lock of never evicts one registered since.
+     */
+    fun remove(id: String, entry: Entry) {
+        entries.remove(id, entry)
+        runCatching { entry.socket.close() }
+    }
+
     /** Called from the extension's unload handler so no socket or thread outlives the extension. */
     fun shutdownAll() {
         janitor.shutdownNow()

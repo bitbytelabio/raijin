@@ -163,4 +163,69 @@ class HttpFuzzPlanTest {
         assertTrue(overlap is HttpFuzzPlan.Result.Error)
         assertTrue(overlap.message.contains("overlaps"), overlap.message)
     }
+
+    @Test
+    fun `sniper mode with three marker pairs strips every inactive marker`() {
+        val base = "POST /a?x=§1§ HTTP/1.1\r\nX-T: §t§\r\n\r\nb=§2§"
+        val ok = HttpFuzzPlan.plan(base, null, listOf("P"), null) as HttpFuzzPlan.Result.Ok
+        assertEquals(
+            listOf(
+                "POST /a?x=P HTTP/1.1\r\nX-T: t\r\n\r\nb=2",
+                "POST /a?x=1 HTTP/1.1\r\nX-T: P\r\n\r\nb=2",
+                "POST /a?x=1 HTTP/1.1\r\nX-T: t\r\n\r\nb=P",
+            ),
+            ok.requests.map { it.request }
+        )
+        assertEquals(listOf(0, 1, 2), ok.requests.map { it.position })
+    }
+
+    // --- planRaw: ready-to-send requests ---
+
+    @Test
+    fun `planRaw recomputes Content-Length after a payload changes the body length`() {
+        val base = "POST /login HTTP/1.1\r\nHost: h\r\nContent-Length: 7\r\n\r\nq=§abc§"
+        val ok = HttpFuzzPlan.planRaw(base, null, listOf("much-longer", "é"), null) as HttpFuzzPlan.Result.Ok
+        assertEquals("POST /login HTTP/1.1\r\nHost: h\r\nContent-Length: 13\r\n\r\nq=much-longer", ok.requests[0].request)
+        // Counted as the UTF-8 bytes fuzz sends: "q=é" is 4 bytes.
+        assertTrue(ok.requests[1].request.contains("Content-Length: 4\r\n"), ok.requests[1].request)
+    }
+
+    @Test
+    fun `planRaw leaves the Content-Length of a CL-TE request alone`() {
+        val base = "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nFUZZ\r\n0\r\n\r\n"
+        val ok = HttpFuzzPlan.planRaw(base, null, listOf("Z"), null) as HttpFuzzPlan.Result.Ok
+        assertEquals(base.replace("FUZZ", "Z"), ok.requests[0].request)
+    }
+
+    @Test
+    fun `planRaw maps offsets typed against a bare-LF request onto the normalized request`() {
+        val raw = "GET /?id=000 HTTP/1.1\nHost: h\n\nbody=XYZ"
+        val start = raw.indexOf("XYZ")
+        val ok = HttpFuzzPlan.planRaw(raw, listOf(start to start + 3), listOf("P"), null) as HttpFuzzPlan.Result.Ok
+        assertEquals("offset", ok.mode)
+        assertEquals("GET /?id=000 HTTP/1.1\r\nHost: h\r\n\r\nbody=P", ok.requests[0].request)
+    }
+
+    @Test
+    fun `planRaw reports a bad offset in the caller's own numbers`() {
+        val raw = "GET / HTTP/1.1\nHost: h\n\n"
+        val err = HttpFuzzPlan.planRaw(raw, listOf(0 to raw.length + 5), listOf("P"), null) as HttpFuzzPlan.Result.Error
+        assertTrue(err.message.contains("end (${raw.length + 5})") && err.message.contains("length (${raw.length})"), err.message)
+    }
+
+    @Test
+    fun `raceRequests fixes Content-Length per payload or copies the request count times`() {
+        val base = "POST /redeem HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\ncode=FUZZ"
+        assertEquals(
+            listOf(
+                "POST /redeem HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n\r\ncode=A",
+                "POST /redeem HTTP/1.1\r\nHost: h\r\nContent-Length: 9\r\n\r\ncode=BBBB",
+            ),
+            HttpFuzzPlan.raceRequests(base, count = 10, payloads = listOf("A", "BBBB"))
+        )
+        assertEquals(
+            List(3) { "GET / HTTP/1.1\r\nHost: h\r\n\r\n" },
+            HttpFuzzPlan.raceRequests("GET / HTTP/1.1\nHost: h\n\n", count = 3, payloads = null)
+        )
+    }
 }

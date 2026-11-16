@@ -13,20 +13,38 @@ import java.net.SocketTimeoutException
  * Uses the same byte<->ISO-8859-1-String bijection Turbo's
  * [io.bitbytelab.raijin.turbo.ThreadedRequestEngine] uses for its own HTTP/1.1 parsing, so no byte
  * is ever lost or corrupted.
+ *
+ * Framing is strict, because a framing disagreement with the target is the finding this tool exists
+ * to surface: anything it cannot frame unambiguously (bad or conflicting Content-Length, bad chunk
+ * size, chunk data without its CRLF) ends in [Outcome.Malformed] instead of a guess or an exception.
  */
 internal object HttpPipelineFraming {
 
     const val DEFAULT_MAX_RESPONSE_BYTES = 10_000_000
+
+    /** Consumed bytes are dropped from the read buffer in bulk once there are at least this many. */
+    private const val COMPACT_AFTER = 65_536
 
     data class Response(
         val statusLine: String,
         val statusCode: Int,
         val headers: List<Pair<String, String>>,
         val body: String,
-        val framing: String, // "content-length" | "chunked" | "close-delimited" | "no-body"
+        val framing: String, // "content-length" | "chunked" | "close-delimited" | "no-body" | "switching-protocols"
         val connectionCloseHeader: Boolean,
         val warnings: List<String>,
-    )
+        val trailers: List<Pair<String, String>> = emptyList(),
+    ) {
+        /**
+         * Whether the connection can carry another request after this response: not after
+         * `Connection: close`, a close-delimited body, a protocol switch (101), or an HTTP/1.0
+         * response without `Connection: keep-alive` (RFC 9112 §9.3).
+         */
+        val persistent: Boolean
+            get() = !connectionCloseHeader && statusCode != 101 &&
+                (!statusLine.startsWith("HTTP/1.0") ||
+                    headers.any { it.first.equals("Connection", ignoreCase = true) && it.second.contains("keep-alive", ignoreCase = true) })
+    }
 
     sealed class Outcome(val bytesReadFromSocket: Int) {
         class Ok(val response: Response, bytesReadFromSocket: Int) : Outcome(bytesReadFromSocket)
@@ -41,6 +59,12 @@ internal object HttpPipelineFraming {
         object Eof : ReadResult()
         object TimedOut : ReadResult()
         class Errored(val message: String) : ReadResult()
+    }
+
+    /** A body read to its end, or the [Outcome] that ended the response before that. */
+    private sealed class Body {
+        class Read(val text: String, val trailers: List<Pair<String, String>> = emptyList()) : Body()
+        class Failed(val outcome: Outcome) : Body()
     }
 
     private class ChunkParseException(message: String) : Exception(message)
@@ -62,23 +86,60 @@ internal object HttpPipelineFraming {
         maxResponseBytes: Int = DEFAULT_MAX_RESPONSE_BYTES,
         expectNoBody: Boolean = false,
     ): Outcome {
-        val input = socket.getInputStream()
-        val readBuf = ByteArray(65536)
-        val buffer = StringBuilder(carry.toString())
+        val wire = Wire(socket, StringBuilder(carry), idleTimeoutMs, totalDeadlineAtMs, maxResponseBytes)
         carry.setLength(0)
-        var bytesRead = 0
+        val outcome = wire.readResponse(expectNoBody)
+        if (outcome is Outcome.Ok) carry.append(wire.buf, wire.pos, wire.buf.length)
+        return outcome
+    }
 
-        fun totalExceeded() = System.currentTimeMillis() >= totalDeadlineAtMs
-
-        fun remainingIdleMs(): Int {
-            val remainingTotal = totalDeadlineAtMs - System.currentTimeMillis()
-            return minOf(idleTimeoutMs, remainingTotal).coerceIn(1, Int.MAX_VALUE.toLong()).toInt()
+    /** `name: value` field lines from [lines] (from index [from] on); a line without a colon is skipped. */
+    private fun parseFields(lines: List<String>, from: Int): List<Pair<String, String>> =
+        lines.drop(from).mapNotNull { line ->
+            val idx = line.indexOf(':')
+            if (idx <= 0) null else line.substring(0, idx).trim() to line.substring(idx + 1).trim()
         }
 
-        fun readMore(): ReadResult {
+    /** Size announced by a `chunk-size [; ext]` line, bounded by [maxBytes]. */
+    private fun chunkSize(line: String, maxBytes: Int): Int {
+        val token = line.substringBefore(';').trim()
+        if (token.isEmpty() || !token.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+            throw ChunkParseException("invalid chunk size '$token'")
+        }
+        val size = token.toLongOrNull(16) ?: throw ChunkParseException("chunk size '$token' overflows")
+        if (size > maxBytes) throw ChunkParseException("chunk size $size out of bounds (max $maxBytes)")
+        return size.toInt()
+    }
+
+    /**
+     * One response's read off [socket]. [buf] holds the bytes read so far as ISO-8859-1 chars and
+     * [pos] is the first one not consumed yet. Consumed data is dropped in bulk ([compact]) instead
+     * of being shifted out after every chunk, and every search resumes where the previous one
+     * stopped, so a large or finely chunked response costs linear time.
+     */
+    private class Wire(
+        private val socket: Socket,
+        val buf: StringBuilder,
+        private val idleTimeoutMs: Long,
+        private val totalDeadlineAtMs: Long,
+        private val maxBytes: Int,
+    ) {
+        private val input = socket.getInputStream()
+        private val readBuf = ByteArray(65536)
+        var pos = 0
+        private var bytesRead = 0
+
+        private val available: Int get() = buf.length - pos
+
+        private fun rest(): String = buf.substring(pos)
+
+        private fun totalExceeded() = System.currentTimeMillis() >= totalDeadlineAtMs
+
+        private fun read(): ReadResult {
             if (totalExceeded()) return ReadResult.TimedOut
             return try {
-                socket.soTimeout = remainingIdleMs()
+                socket.soTimeout = minOf(idleTimeoutMs, totalDeadlineAtMs - System.currentTimeMillis())
+                    .coerceIn(1, Int.MAX_VALUE.toLong()).toInt()
                 val len = input.read(readBuf)
                 if (len == -1) {
                     ReadResult.Eof
@@ -86,7 +147,7 @@ internal object HttpPipelineFraming {
                     bytesRead += len
                     ReadResult.Data(len)
                 }
-            } catch (e: SocketTimeoutException) {
+            } catch (_: SocketTimeoutException) {
                 ReadResult.TimedOut
             } catch (e: SocketException) {
                 ReadResult.Errored(e.message ?: "connection reset")
@@ -95,214 +156,227 @@ internal object HttpPipelineFraming {
             }
         }
 
-        while (true) {
-            var headerEnd = buffer.indexOf("\r\n\r\n")
-            while (headerEnd == -1) {
-                when (val r = readMore()) {
-                    is ReadResult.Data -> {
-                        if (buffer.length + r.len > maxResponseBytes) {
-                            return Outcome.Malformed("response headers exceeded $maxResponseBytes byte cap", buffer.toString(), bytesRead)
+        private fun append(len: Int) {
+            buf.append(String(readBuf, 0, len, Charsets.ISO_8859_1))
+        }
+
+        /** The [Outcome] for a read that ended the response: timeout, reset, or (otherwise) EOF. */
+        private fun fail(r: ReadResult, partial: String): Outcome = when (r) {
+            ReadResult.TimedOut -> Outcome.TimedOut(partial, if (totalExceeded()) "total" else "idle", bytesRead)
+            is ReadResult.Errored -> Outcome.Reset(partial, r.message, bytesRead)
+            else -> Outcome.Eof(partial, bytesRead)
+        }
+
+        private fun malformed(reason: String, partial: String) = Outcome.Malformed(reason, partial, bytesRead)
+
+        private fun compact() {
+            if (pos >= COMPACT_AFTER && pos > buf.length / 2) {
+                buf.delete(0, pos)
+                pos = 0
+            }
+        }
+
+        fun readResponse(expectNoBody: Boolean): Outcome {
+            while (true) {
+                var scanFrom = pos
+                var headerEnd = buf.indexOf("\r\n\r\n", scanFrom)
+                while (headerEnd == -1) {
+                    scanFrom = maxOf(pos, buf.length - 3)
+                    when (val r = read()) {
+                        is ReadResult.Data -> {
+                            if (available.toLong() + r.len > maxBytes) {
+                                return malformed("response headers exceeded $maxBytes byte cap", rest())
+                            }
+                            append(r.len)
                         }
-                        buffer.append(String(readBuf, 0, r.len, Charsets.ISO_8859_1))
+                        ReadResult.Eof -> return if (available == 0) {
+                            Outcome.Eof("", bytesRead)
+                        } else {
+                            malformed("connection closed before headers completed", rest())
+                        }
+                        else -> return fail(r, rest())
                     }
-                    ReadResult.Eof -> return if (buffer.isEmpty()) {
-                        Outcome.Eof(buffer.toString(), bytesRead)
-                    } else {
-                        Outcome.Malformed("connection closed before headers completed", buffer.toString(), bytesRead)
-                    }
-                    ReadResult.TimedOut -> return Outcome.TimedOut(buffer.toString(), if (totalExceeded()) "total" else "idle", bytesRead)
-                    is ReadResult.Errored -> return Outcome.Reset(buffer.toString(), r.message, bytesRead)
+                    headerEnd = buf.indexOf("\r\n\r\n", scanFrom)
                 }
-                headerEnd = buffer.indexOf("\r\n\r\n")
-            }
 
-            val headerSection = buffer.substring(0, headerEnd)
-            if (!headerSection.startsWith("HTTP/")) {
-                return Outcome.Malformed("response did not start with HTTP/: '${headerSection.take(80)}'", buffer.toString(), bytesRead)
+                val headerSection = buf.substring(pos, headerEnd)
+                if (!headerSection.startsWith("HTTP/")) {
+                    return malformed("response did not start with HTTP/: '${headerSection.take(80)}'", rest())
+                }
+                val lines = headerSection.split("\r\n")
+                val statusCode = STATUS_LINE.find(lines[0])?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                pos = headerEnd + 4
+                // 1xx informational (e.g. 100-continue) is absorbed and does not count as the
+                // response; 101 is final, the connection stops speaking HTTP/1.1 after it.
+                if (statusCode in 100..199 && statusCode != 101) continue
+                return readBody(lines[0], statusCode, parseFields(lines, 1), expectNoBody)
             }
-            val lines = headerSection.split("\r\n")
-            val statusLine = lines[0]
-            val statusCode = STATUS_LINE.find(statusLine)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        }
 
-            if (statusCode in 100..199) {
-                // 1xx informational (e.g. 100-continue) is absorbed transparently and does not
-                // count as a response — keep reading for the real one.
-                buffer.delete(0, headerEnd + 4)
-                continue
-            }
-
-            val headers = lines.drop(1).mapNotNull { line ->
-                val idx = line.indexOf(':')
-                if (idx <= 0) null else line.substring(0, idx).trim() to line.substring(idx + 1).trim()
-            }
+        private fun readBody(
+            statusLine: String,
+            statusCode: Int,
+            headers: List<Pair<String, String>>,
+            expectNoBody: Boolean,
+        ): Outcome {
             val warnings = mutableListOf<String>()
-            val hasContentLength = headers.any { it.first.equals("Content-Length", ignoreCase = true) }
-            val hasChunked = headers.any {
-                it.first.equals("Transfer-Encoding", ignoreCase = true) && it.second.contains("chunked", ignoreCase = true)
-            }
-            if (hasContentLength && hasChunked) {
-                // RFC 7230 §3.3.3: ambiguous when both are present. We resolve it (Transfer-Encoding
-                // wins, below) but an ambiguous response from the target is itself a smuggling-research
-                // finding, not noise, so it's surfaced rather than silently resolved.
-                warnings += "both_content_length_and_transfer_encoding"
-            }
-            val connectionCloseHeader = headers.any {
+            val connectionClose = headers.any {
                 it.first.equals("Connection", ignoreCase = true) && it.second.contains("close", ignoreCase = true)
             }
+            fun ok(body: Body.Read, framing: String, closes: Boolean = connectionClose) = Outcome.Ok(
+                Response(statusLine, statusCode, headers, body.text, framing, closes, warnings, body.trailers),
+                bytesRead,
+            )
 
-            buffer.delete(0, headerEnd + 4)
+            if (statusCode == 101) return ok(Body.Read(""), "switching-protocols")
+            if (expectNoBody || statusCode == 204 || statusCode == 304) return ok(Body.Read(""), "no-body")
 
-            if (expectNoBody || statusCode == 204 || statusCode == 304) {
-                carry.append(buffer)
-                return Outcome.Ok(Response(statusLine, statusCode, headers, "", "no-body", connectionCloseHeader, warnings), bytesRead)
+            val codings = headers.filter { it.first.equals("Transfer-Encoding", ignoreCase = true) }
+                .flatMap { it.second.split(',') }.map { it.trim() }.filter { it.isNotEmpty() }
+            val lengths = headers.filter { it.first.equals("Content-Length", ignoreCase = true) }
+                .flatMap { it.second.split(',') }.map { it.trim() }
+            if (codings.isNotEmpty() && lengths.isNotEmpty()) {
+                // RFC 9112 §6.3: Transfer-Encoding wins, but an ambiguous response from the target is
+                // itself a smuggling-research finding, so it is surfaced rather than silently resolved.
+                warnings += "both_content_length_and_transfer_encoding"
             }
 
-            if (hasChunked) {
-                val body = StringBuilder()
-                try {
-                    while (true) {
-                        var chunk = nextChunk(buffer, maxResponseBytes)
-                        while (chunk == null) {
-                            when (val r = readMore()) {
-                                is ReadResult.Data -> {
-                                    if (body.length + buffer.length + r.len > maxResponseBytes) {
-                                        return Outcome.Malformed("response exceeded $maxResponseBytes byte cap", body.toString(), bytesRead)
-                                    }
-                                    buffer.append(String(readBuf, 0, r.len, Charsets.ISO_8859_1))
-                                }
-                                ReadResult.Eof -> return Outcome.Eof(body.toString(), bytesRead)
-                                ReadResult.TimedOut -> return Outcome.TimedOut(body.toString(), if (totalExceeded()) "total" else "idle", bytesRead)
-                                is ReadResult.Errored -> return Outcome.Reset(body.toString(), r.message, bytesRead)
-                            }
-                            chunk = nextChunk(buffer, maxResponseBytes)
-                        }
-                        val (skip, end) = chunk
-                        val chunkLen = end - skip
-                        if (chunkLen == 0) {
-                            // Zero-length terminal chunk: drop `0[;ext]\r\n` and consume trailers until `\r\n` or `...\r\n\r\n`
-                            buffer.delete(0, skip)
-                            while (true) {
-                                val bufStr = buffer.toString()
-                                if (bufStr.startsWith("\r\n")) {
-                                    buffer.delete(0, 2)
-                                    break
-                                }
-                                val trailerEnd = bufStr.indexOf("\r\n\r\n")
-                                if (trailerEnd >= 0) {
-                                    buffer.delete(0, trailerEnd + 4)
-                                    break
-                                }
-                                when (val r = readMore()) {
-                                    is ReadResult.Data -> {
-                                        if (body.length + buffer.length + r.len > maxResponseBytes) {
-                                            return Outcome.Malformed("chunk trailers exceeded $maxResponseBytes byte cap", body.toString(), bytesRead)
-                                        }
-                                        buffer.append(String(readBuf, 0, r.len, Charsets.ISO_8859_1))
-                                    }
-                                    ReadResult.Eof -> return Outcome.Eof(body.toString(), bytesRead)
-                                    ReadResult.TimedOut -> return Outcome.TimedOut(body.toString(), if (totalExceeded()) "total" else "idle", bytesRead)
-                                    is ReadResult.Errored -> return Outcome.Reset(body.toString(), r.message, bytesRead)
-                                }
-                            }
-                            break
-                        }
-                        while (buffer.length < end + 2) {
-                            when (val r = readMore()) {
-                                is ReadResult.Data -> {
-                                    if (body.length + buffer.length + r.len > maxResponseBytes) {
-                                        return Outcome.Malformed("response exceeded $maxResponseBytes byte cap", body.toString(), bytesRead)
-                                    }
-                                    buffer.append(String(readBuf, 0, r.len, Charsets.ISO_8859_1))
-                                }
-                                ReadResult.Eof -> return Outcome.Eof(body.toString(), bytesRead)
-                                ReadResult.TimedOut -> return Outcome.TimedOut(body.toString(), if (totalExceeded()) "total" else "idle", bytesRead)
-                                is ReadResult.Errored -> return Outcome.Reset(body.toString(), r.message, bytesRead)
-                            }
-                        }
-                        if (body.length + chunkLen > maxResponseBytes) {
-                            return Outcome.Malformed("response exceeded $maxResponseBytes byte cap", body.toString(), bytesRead)
-                        }
-                        body.append(buffer.substring(skip, end))
-                        buffer.delete(0, end + 2)
-                    }
-                } catch (e: ChunkParseException) {
-                    return Outcome.Malformed(e.message ?: "invalid chunked encoding", body.toString(), bytesRead)
-                }
-                carry.append(buffer)
-                return Outcome.Ok(Response(statusLine, statusCode, headers, body.toString(), "chunked", connectionCloseHeader, warnings), bytesRead)
-            }
-
-            val rawClHeader = headers.firstOrNull { it.first.equals("Content-Length", ignoreCase = true) }?.second?.trim()
-            if (rawClHeader != null) {
-                val parsedCl = rawClHeader.toLongOrNull()
-                if (parsedCl == null || parsedCl < 0L) {
-                    return Outcome.Malformed("invalid Content-Length '$rawClHeader'", "", bytesRead)
-                }
-                if (parsedCl > maxResponseBytes) {
-                    return Outcome.Malformed("declared Content-Length $parsedCl exceeds $maxResponseBytes byte cap", "", bytesRead)
-                }
-                val contentLength = parsedCl.toInt()
-                while (buffer.length < contentLength) {
-                    when (val r = readMore()) {
-                        is ReadResult.Data -> {
-                            if (buffer.length + r.len > maxResponseBytes) {
-                                return Outcome.Malformed("response exceeded $maxResponseBytes byte cap", buffer.toString(), bytesRead)
-                            }
-                            buffer.append(String(readBuf, 0, r.len, Charsets.ISO_8859_1))
-                        }
-                        ReadResult.Eof -> return Outcome.Eof(buffer.toString(), bytesRead)
-                        ReadResult.TimedOut -> return Outcome.TimedOut(buffer.toString(), if (totalExceeded()) "total" else "idle", bytesRead)
-                        is ReadResult.Errored -> return Outcome.Reset(buffer.toString(), r.message, bytesRead)
+            if (codings.isNotEmpty()) {
+                if (codings.last().equals("chunked", ignoreCase = true)) {
+                    return when (val body = readChunked()) {
+                        is Body.Failed -> body.outcome
+                        is Body.Read -> ok(body, "chunked")
                     }
                 }
-                val body = buffer.substring(0, contentLength)
-                carry.append(buffer.substring(contentLength))
-                return Outcome.Ok(Response(statusLine, statusCode, headers, body, "content-length", connectionCloseHeader, warnings), bytesRead)
+                // chunked is not the final coding, so the body runs until the server closes (RFC 9112 §6.3).
+                warnings += "transfer_encoding_not_chunked"
+            } else if (lengths.isNotEmpty()) {
+                val distinct = lengths.distinct()
+                if (distinct.size > 1) {
+                    return malformed("conflicting Content-Length values: ${lengths.joinToString(", ")}", "")
+                }
+                val declared = distinct.single()
+                val length = declared.takeIf { v -> v.isNotEmpty() && v.all { it in '0'..'9' } }?.toLongOrNull()
+                    ?: return malformed("invalid Content-Length '$declared'", "")
+                if (length > maxBytes) {
+                    return malformed("declared Content-Length $length exceeds $maxBytes byte cap", "")
+                }
+                if (lengths.size > 1) warnings += "repeated_content_length"
+                return when (val body = readFixed(length.toInt())) {
+                    is Body.Failed -> body.outcome
+                    is Body.Read -> ok(body, "content-length")
+                }
             }
 
-            // Close-delimited: no Content-Length, no Transfer-Encoding. This is exactly the "no
-            // response came back the normal way" signal a 0.CL-style probe cares about — EOF here
-            // is the expected terminator, not an error.
-            val body = StringBuilder(buffer)
-            if (body.length > maxResponseBytes) {
-                return Outcome.Malformed("response exceeded $maxResponseBytes byte cap", body.toString(), bytesRead)
+            // Close-delimited: this is exactly the "no response came back the normal way" signal a
+            // 0.CL-style probe cares about, so EOF here is the expected terminator, not an error.
+            return when (val body = readToClose()) {
+                is Body.Failed -> body.outcome
+                is Body.Read -> ok(body, "close-delimited", closes = true)
             }
+        }
+
+        private fun readFixed(length: Int): Body {
+            while (available < length) {
+                when (val r = read()) {
+                    is ReadResult.Data -> append(r.len)
+                    else -> return Body.Failed(fail(r, rest()))
+                }
+            }
+            val text = buf.substring(pos, pos + length)
+            pos += length
+            return Body.Read(text)
+        }
+
+        private fun readToClose(): Body {
             while (true) {
-                when (val r = readMore()) {
+                when (val r = read()) {
                     is ReadResult.Data -> {
-                        if (body.length + r.len > maxResponseBytes) {
-                            return Outcome.Malformed("response exceeded $maxResponseBytes byte cap", body.toString(), bytesRead)
+                        if (available.toLong() + r.len > maxBytes) {
+                            return Body.Failed(malformed("response exceeded $maxBytes byte cap", rest()))
                         }
-                        body.append(String(readBuf, 0, r.len, Charsets.ISO_8859_1))
+                        append(r.len)
                     }
-                    ReadResult.Eof -> return Outcome.Ok(
-                        Response(statusLine, statusCode, headers, body.toString(), "close-delimited", true, warnings),
-                        bytesRead,
-                    )
-                    ReadResult.TimedOut -> return Outcome.TimedOut(body.toString(), if (totalExceeded()) "total" else "idle", bytesRead)
-                    is ReadResult.Errored -> return Outcome.Reset(body.toString(), r.message, bytesRead)
+                    ReadResult.Eof -> {
+                        val text = rest()
+                        pos = buf.length
+                        return Body.Read(text)
+                    }
+                    else -> return Body.Failed(fail(r, rest()))
                 }
             }
         }
-    }
 
-    /** (skipBytes, endOfChunkDataOffset) for the next chunk in [buf], or null if not enough data buffered yet. */
-    private fun nextChunk(buf: StringBuilder, maxResponseBytes: Int): Pair<Int, Int>? {
-        val sizeLineEnd = buf.indexOf("\r\n")
-        if (sizeLineEnd == -1) return null
-        val sizeToken = buf.substring(0, sizeLineEnd).split(";").first().trim()
-        if (sizeToken.isEmpty() || !sizeToken.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
-            throw ChunkParseException("invalid chunk size '$sizeToken'")
+        private fun readChunked(): Body {
+            val body = StringBuilder()
+            while (true) {
+                var scanFrom = pos
+                var lineEnd = buf.indexOf("\r\n", scanFrom)
+                while (lineEnd == -1) {
+                    scanFrom = maxOf(pos, buf.length - 1)
+                    when (val r = read()) {
+                        is ReadResult.Data -> {
+                            if (body.length.toLong() + available + r.len > maxBytes) {
+                                return Body.Failed(malformed("response exceeded $maxBytes byte cap", body.toString()))
+                            }
+                            append(r.len)
+                        }
+                        else -> return Body.Failed(fail(r, body.toString()))
+                    }
+                    lineEnd = buf.indexOf("\r\n", scanFrom)
+                }
+                val size = try {
+                    chunkSize(buf.substring(pos, lineEnd), maxBytes)
+                } catch (e: ChunkParseException) {
+                    return Body.Failed(malformed(e.message ?: "invalid chunked encoding", body.toString()))
+                }
+                pos = lineEnd + 2
+                if (size == 0) return readTrailers(body)
+                if (body.length.toLong() + size > maxBytes) {
+                    return Body.Failed(malformed("response exceeded $maxBytes byte cap", body.toString()))
+                }
+                while (available.toLong() < size.toLong() + 2) {
+                    when (val r = read()) {
+                        is ReadResult.Data -> append(r.len)
+                        else -> return Body.Failed(fail(r, body.toString()))
+                    }
+                }
+                body.append(buf, pos, pos + size)
+                if (buf[pos + size] != '\r' || buf[pos + size + 1] != '\n') {
+                    return Body.Failed(malformed("chunk data not followed by CRLF", body.toString()))
+                }
+                pos += size + 2
+                compact()
+            }
         }
-        val sizeLong = sizeToken.toLongOrNull(16) ?: throw ChunkParseException("invalid chunk size '$sizeToken'")
-        if (sizeLong < 0L || sizeLong > maxResponseBytes) {
-            throw ChunkParseException("chunk size $sizeLong out of bounds (max $maxResponseBytes)")
+
+        /** Consumes the trailer section after the last chunk: field lines up to an empty line (RFC 9112 §7.1.2). */
+        private fun readTrailers(body: StringBuilder): Body {
+            var scanFrom = pos
+            while (true) {
+                if (available >= 2) {
+                    if (buf[pos] == '\r' && buf[pos + 1] == '\n') {
+                        pos += 2
+                        return Body.Read(body.toString())
+                    }
+                    val end = buf.indexOf("\r\n\r\n", scanFrom)
+                    if (end != -1) {
+                        val trailers = parseFields(buf.substring(pos, end).split("\r\n"), 0)
+                        pos = end + 4
+                        return Body.Read(body.toString(), trailers)
+                    }
+                    scanFrom = maxOf(pos, buf.length - 3)
+                }
+                when (val r = read()) {
+                    is ReadResult.Data -> {
+                        if (body.length.toLong() + available + r.len > maxBytes) {
+                            return Body.Failed(malformed("chunk trailers exceeded $maxBytes byte cap", body.toString()))
+                        }
+                        append(r.len)
+                    }
+                    else -> return Body.Failed(fail(r, body.toString()))
+                }
+            }
         }
-        val size = sizeLong.toInt()
-        val skip = sizeLineEnd + 2
-        if (skip.toLong() + size.toLong() + 2L > Int.MAX_VALUE.toLong()) {
-            throw ChunkParseException("chunk frame offset overflow")
-        }
-        return skip to (skip + size)
     }
 }

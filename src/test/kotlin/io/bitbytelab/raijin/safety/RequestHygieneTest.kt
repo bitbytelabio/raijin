@@ -1,8 +1,11 @@
 package io.bitbytelab.raijin.safety
 
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -95,6 +98,78 @@ class RequestHygieneTest {
 
     @Test fun `normalizeCrlf canonicalizes escaped JSON-transport line endings`() {
         assertEquals("A\r\nB\r\nC", RequestHygiene.normalizeCrlf("A\\r\\nB\\nC"))
+    }
+
+    @Test fun `normalizeCrlf rewrites only the header block and keeps body bytes and Content-Length`() {
+        val body = "line1\nline2 {\"msg\":\"a\\nb\"}"
+        val raw = "POST /api HTTP/1.1\nHost: x.com\nContent-Length: ${body.length}\n\n$body"
+        val normalized = RequestHygiene.normalizeCrlf(raw)
+        assertEquals("POST /api HTTP/1.1\r\nHost: x.com\r\nContent-Length: ${body.length}\r\n\r\n$body", normalized)
+        assertNull(RequestHygiene.fixContentLength(normalized).rewrittenFrom, "the declared length still matches the untouched body")
+    }
+
+    @Test fun `normalizeCrlf keeps a smuggled request in the body exactly as typed`() {
+        val smuggled = "0\r\n\r\nGET /admin HTTP/1.1\nX: y"
+        val raw = "POST / HTTP/1.1\nHost: x.com\nTransfer-Encoding: chunked\n\n$smuggled"
+        assertTrue(RequestHygiene.normalizeCrlf(raw).endsWith("\r\n\r\n$smuggled"))
+    }
+
+    @Test fun `normalizeCrlf unescapes a fully escaped single-line request but not its body`() {
+        val raw = "POST /api HTTP/1.1\\r\\nHost: x.com\\r\\n\\r\\n{\"msg\":\"a\\nb\"}"
+        assertEquals("POST /api HTTP/1.1\r\nHost: x.com\r\n\r\n{\"msg\":\"a\\nb\"}", RequestHygiene.normalizeCrlf(raw))
+    }
+
+    // --- fixContentLength() ---
+
+    @Test fun `fixContentLength rewrites only the digits of a wrong Content-Length`() {
+        val fix = RequestHygiene.fixContentLength("POST / HTTP/1.1\r\ncontent-length:  1\r\n\r\nabc")
+        assertEquals("POST / HTTP/1.1\r\ncontent-length:  3\r\n\r\nabc", fix.request)
+        assertEquals(1, fix.rewrittenFrom)
+        assertEquals(3, fix.rewrittenTo)
+    }
+
+    @Test fun `fixContentLength never reads a value from the next header line`() {
+        // An empty Content-Length followed by a digits-only line: the value must not be taken from it.
+        val raw = "POST / HTTP/1.1\r\nContent-Length:\r\n12\r\n\r\nabc"
+        assertEquals(raw, RequestHygiene.fixContentLength(raw).request)
+    }
+
+    @Test fun `fixContentLength counts bytes in the requested charset`() {
+        val raw = "POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\né"
+        assertEquals(1, RequestHygiene.fixContentLength(raw).rewrittenTo)
+        assertEquals(2, RequestHygiene.fixContentLength(raw, utf8Body = true).rewrittenTo)
+    }
+
+    // --- wire encoding helpers ---
+
+    @Test fun `wireCharset keeps Latin-1 text single-byte and switches to UTF-8 for wider chars`() {
+        assertEquals(Charsets.ISO_8859_1, RequestHygiene.wireCharset("GET /café HTTP/1.1"))
+        assertEquals(Charsets.UTF_8, RequestHygiene.wireCharset("GET /日本 HTTP/1.1"))
+        assertEquals(Charsets.UTF_8, RequestHygiene.wireCharset("q=\uD83D\uDCA5"))
+    }
+
+    @Test fun `unescapeLineEndings decodes a single-line message throughout`() {
+        assertEquals(
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /admin HTTP/1.1\n",
+            RequestHygiene.unescapeLineEndings("POST / HTTP/1.1\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n0\\r\\n\\r\\nGET /admin HTTP/1.1\\n")
+        )
+    }
+
+    @Test fun `unescapeLineEndings leaves text with real line breaks untouched`() {
+        val raw = "POST / HTTP/1.1\r\nHost: x\r\n\r\n{\"a\":\"b\\nc\"}"
+        assertEquals(raw, RequestHygiene.unescapeLineEndings(raw))
+    }
+
+    @Test fun `decodeHex decodes pairs and ignores whitespace`() {
+        assertContentEquals("GET /".toByteArray(), RequestHygiene.decodeHex("47 45 54\n20 2F"))
+        assertContentEquals(byteArrayOf(0x00, 0xFF.toByte(), 0x0d, 0x0a), RequestHygiene.decodeHex("00ff0D0A"))
+    }
+
+    @Test fun `decodeHex rejects an odd digit count and non-hex characters`() {
+        assertTrue(assertFailsWith<IllegalArgumentException> { RequestHygiene.decodeHex("474") }.message!!.contains("odd"))
+        assertTrue(assertFailsWith<IllegalArgumentException> { RequestHygiene.decodeHex("47zz") }.message!!.contains("byte 1"))
+        // Unicode digits are not hex digits.
+        assertFailsWith<IllegalArgumentException> { RequestHygiene.decodeHex("4\u0663") }
     }
 
     // --- adjustedOffset(): keeps Intruder positions aligned after LF→CRLF expansion ---
