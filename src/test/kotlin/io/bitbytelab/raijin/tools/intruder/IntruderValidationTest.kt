@@ -1,14 +1,18 @@
 package io.bitbytelab.raijin.tools.intruder
 
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * Unit tests for [IntruderValidation], the pure position-pair and regex validators used by
@@ -117,5 +121,69 @@ class IntruderValidationTest {
             "regex_replace requires a non-empty regex_pattern",
             err["error"]?.jsonPrimitive?.content
         )
+    }
+
+    @Test
+    fun `a replacement that names a group the pattern lacks is rejected at registration time`() {
+        // Java only reads the replacement once a payload matches, so these used to surface mid-run.
+        fun error(pattern: String, replacement: String) =
+            IntruderValidation.regexError(mapOf("regex_pattern" to pattern, "regex_replacement" to replacement))
+                ?.get("error")?.jsonPrimitive?.content
+
+        assertNull(error("(a)(b)", "$2$1"))
+        assertNull(error("(?<user>\\w+)@", "\${user} at "))
+        assertNull(error("a", "costs \\$5"))
+        assertTrue(error("a", "$1")!!.startsWith("Invalid regex_replacement:"))
+        assertTrue(error("(a)", "\${user}")!!.contains("user"))
+        assertTrue(error("a", "trailing \\")!!.startsWith("Invalid regex_replacement:"))
+        assertTrue(error("a", "100$")!!.startsWith("Invalid regex_replacement:"))
+    }
+
+    // ---- numeric bounds ----
+
+    @Test
+    fun `a position cannot start before the request does`() {
+        val e = assertFailsWith<IllegalArgumentException> { IntruderValidation.parsePositionArray(arr(-1, 4)) }
+        assertEquals("position start (-1) must be >= 0", e.message)
+    }
+
+    @Test
+    fun `the object form of a position follows the same rules as the array form`() {
+        assertEquals(3 to 7, IntruderValidation.parsePositionObject(buildJsonObject { put("start", 3); put("end", 7) }))
+        assertEquals(3 to 7, IntruderValidation.parsePositionObject(buildJsonObject { put("0", 3); put("1", 7) }))
+        assertEquals(
+            "position end (2) must be >= start (9)",
+            assertFailsWith<IllegalArgumentException> {
+                IntruderValidation.parsePositionObject(buildJsonObject { put("start", 9); put("end", 2) })
+            }.message
+        )
+        assertEquals(
+            "Position missing 'end' field",
+            assertFailsWith<IllegalArgumentException> {
+                IntruderValidation.parsePositionObject(buildJsonObject { put("start", 9) })
+            }.message
+        )
+    }
+
+    @Test
+    fun `port must be a TCP port`() {
+        assertEquals(8443, IntruderValidation.port(JsonPrimitive(8443)))
+        assertEquals(443, IntruderValidation.port(JsonPrimitive("443")), "a numeric string is accepted")
+        for (bad in listOf(JsonPrimitive(0), JsonPrimitive(65536), JsonPrimitive(-1))) {
+            assertEquals(
+                "Parameter 'port' must be between 1 and 65535",
+                assertFailsWith<IllegalArgumentException> { IntruderValidation.port(bad) }.message
+            )
+        }
+        assertEquals(
+            "Parameter 'port' must be an integer",
+            assertFailsWith<IllegalArgumentException> { IntruderValidation.port(JsonPrimitive("https")) }.message
+        )
+        for (missing in listOf(null, JsonNull)) {
+            assertEquals(
+                "Missing required parameter: port",
+                assertFailsWith<IllegalArgumentException> { IntruderValidation.port(missing) }.message
+            )
+        }
     }
 }

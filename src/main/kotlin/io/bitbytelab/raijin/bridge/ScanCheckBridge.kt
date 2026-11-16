@@ -1,76 +1,38 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
-import io.bitbytelab.raijin.safety.BoundedHttp
-import burp.api.montoya.scanner.AuditResult
-import burp.api.montoya.scanner.ConsolidationAction
-import burp.api.montoya.scanner.ScanCheck
-import burp.api.montoya.scanner.audit.insertionpoint.AuditInsertionPoint
-import burp.api.montoya.scanner.audit.issues.AuditIssue
-import burp.api.montoya.scanner.audit.issues.AuditIssueConfidence
-import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity
-import burp.api.montoya.http.message.HttpRequestResponse
-import burp.api.montoya.core.ByteArray as BurpByteArray
-import io.bitbytelab.raijin.core.EnumValidation
-import burp.api.montoya.core.Registration
-import io.bitbytelab.raijin.safety.SafeRegex
 import io.bitbytelab.raijin.state.StateManager
 import kotlinx.serialization.json.*
-import java.time.Instant
-import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * Tracks a live Script-mode scan check deployed via the Montoya API.
+ * The `scancheck_*` tools: custom scan checks described as JSON (conditions for a passive check,
+ * payload steps for an active one) that Burp's scanner then runs.
  *
- * @property id Unique identifier (e.g. "scheck-001").
- * @property name Human-readable check name.
- * @property mode "passive" or "active".
- * @property config The full configuration used to create this check.
- * @property deployedAt ISO-8601 timestamp of deployment.
- * @property registration The Montoya [Registration] handle for deregistration.
- */
-data class DeployedScanCheck(
-    val id: String,
-    val name: String,
-    val mode: String,
-    val config: JsonObject,
-    val deployedAt: String,
-    var registration: Registration? = null
-)
-
-/**
- * Bridge that creates and manages custom scan checks at runtime via the
- * Montoya API's [ScanCheck] interface.
- *
- * Script mode is the programmatic complement to BCheck (DSL-based). It
- * supports multi-step payload chains, conditional branching, response
- * analysis with capture groups, and complex consolidation logic.
- *
- * The agent describes the check as structured JSON parameters. This bridge
- * compiles the description into a live [ScanCheck] implementation and
- * registers it with Burp's scanner.
+ * Script mode is the programmatic complement to BCheck (DSL-based): multi-step payload chains,
+ * condition lists joined by AND or OR, negation, and comparison with the baseline response.
+ * Parsing and evaluation live in [ScanCheckLogic], registration in [CustomScanCheckManager],
+ * which `scanner_register_check` shares.
  */
 class ScanCheckBridge(
     private val api: MontoyaApi,
-    private val stateManager: StateManager
+    stateManager: StateManager
 ) {
-    private val deployedChecks = CopyOnWriteArrayList<DeployedScanCheck>()
+    private val checks = CustomScanCheckManager(api, stateManager)
 
     /**
      * Create a PASSIVE scan check (Script mode).
      *
-     * Runs on every response during scanning. Can match response body,
-     * headers, status codes, request fields, and more. Supports multiple
-     * conditions with AND logic and negation.
+     * Runs on every message Burp audits passively. Conditions can look at the response body,
+     * headers, status code and length and at the request, each optionally negated.
      *
-     * @param name Unique name for the check / issue.
+     * @param name Name of the check and of the issue it reports. An existing check of that name is replaced.
      * @param description What this check detects.
-     * @param conditions List of condition objects, all must match (AND logic).
-     *   Each condition: {location, pattern, condition_type, negate}.
+     * @param conditions Condition objects: {location, pattern, condition_type, negate}.
      * @param severity Issue severity: high, medium, low, information.
      * @param confidence Issue confidence: certain, firm, tentative.
      * @param issueDetail Detailed description included in reported issues.
      * @param issueRemediation Remediation guidance (optional).
+     * @param matchMode "all" (default): every condition must hold. "any": one is enough.
      * @return JSON object with deployment status or error.
      */
     fun createPassive(
@@ -80,118 +42,27 @@ class ScanCheckBridge(
         severity: String,
         confidence: String,
         issueDetail: String,
-        issueRemediation: String?
-    ): JsonObject {
-        return try {
-            EnumValidation.error(severity, VALID_SEVERITIES, "severity", required = true)?.let { return it }
-            EnumValidation.error(confidence, VALID_CONFIDENCES, "confidence", required = true)?.let { return it }
-            ScanCheckValidation.nonEmptyError(conditions, "conditions", "condition")?.let { return it }
-            validateConditions(conditions, "conditions")?.let { return it }
-            val auditSeverity = parseSeverity(severity)
-            val auditConfidence = parseConfidence(confidence)
-
-            val scanCheck = object : ScanCheck {
-                override fun passiveAudit(baseRequestResponse: HttpRequestResponse): AuditResult {
-                    val issues = mutableListOf<AuditIssue>()
-
-                    // Evaluate all conditions -- all must match (AND)
-                    val allMatch = conditions.isNotEmpty() && conditions.all { cond ->
-                        evaluateCondition(cond, baseRequestResponse)
-                    }
-
-                    if (allMatch) {
-                        val url = baseRequestResponse.request()?.url() ?: ""
-                        val issue = AuditIssue.auditIssue(
-                            name,
-                            issueDetail,
-                            issueRemediation ?: "Review and address the identified issue.",
-                            url,
-                            auditSeverity,
-                            auditConfidence,
-                            null,
-                            null,
-                            auditSeverity,
-                            baseRequestResponse
-                        )
-                        issues.add(issue)
-                    }
-
-                    return AuditResult.auditResult(issues)
-                }
-
-                override fun activeAudit(
-                    baseRequestResponse: HttpRequestResponse,
-                    insertionPoint: AuditInsertionPoint
-                ): AuditResult {
-                    // Passive-only check -- no active audit behavior
-                    return AuditResult.auditResult(emptyList())
-                }
-
-                override fun consolidateIssues(
-                    existingIssue: AuditIssue,
-                    newIssue: AuditIssue
-                ): ConsolidationAction {
-                    return if (existingIssue.name() == newIssue.name() &&
-                        existingIssue.baseUrl() == newIssue.baseUrl()
-                    ) {
-                        ConsolidationAction.KEEP_EXISTING
-                    } else {
-                        ConsolidationAction.KEEP_BOTH
-                    }
-                }
-            }
-
-            val registration = api.scanner().registerScanCheck(scanCheck)
-
-            val id = stateManager.generateId("scheck")
-            val config = buildJsonObject {
-                put("name", name)
-                put("description", description)
-                put("mode", "passive")
-                put("conditions", buildJsonArray { conditions.forEach { add(it) } })
-                put("severity", severity)
-                put("confidence", confidence)
-            }
-
-            deployedChecks.add(DeployedScanCheck(id, name, "passive", config, Instant.now().toString(), registration))
-            stateManager.registeredScanChecks.add(name)
-            stateManager.scanCheckRegistrations[id] = registration
-
-            buildJsonObject {
-                put("id", id)
-                put("name", name)
-                put("mode", "passive")
-                put("status", "deployed")
-                put("description", description)
-                put("conditions_count", conditions.size)
-                put("note", "Passive scan check active. It will analyze all responses during scanning and in proxy history.")
-            }
-        } catch (e: UnsupportedOperationException) {
-            buildJsonObject {
-                put("error", "Scanner API is not available in Burp Suite Community Edition")
-            }
-        } catch (e: Exception) {
-            buildJsonObject {
-                put("error", "Failed to create passive scan check: ${e.message}")
-            }
-        }
+        issueRemediation: String?,
+        matchMode: String? = null
+    ): JsonObject = deploy("passive") {
+        passiveDefinition(name, description, conditions, severity, confidence, issueDetail, issueRemediation, matchMode)
     }
 
     /**
      * Create an ACTIVE scan check (Script mode).
      *
-     * Injects payloads at insertion points and analyzes responses. Supports
-     * multi-step checks: inject payload A, check response, inject payload B,
-     * confirm. Steps are executed sequentially at each insertion point.
+     * Sends each step's payload at the insertion point, in order, and judges the response. The
+     * check reports only when a step matches and the response to the unmodified request would not
+     * have: see [ScanCheckLogic.runActive].
      *
-     * @param name Unique name for the check / issue.
+     * @param name Name of the check and of the issue it reports. An existing check of that name is replaced.
      * @param description What this check detects.
-     * @param steps List of step objects executed in order. Each step:
-     *   {payload, response_conditions[], stop_if_no_match}.
+     * @param steps Step objects: {payload, response_conditions[], match_mode, stop_if_no_match}.
      * @param severity Issue severity: high, medium, low, information.
      * @param confidence Issue confidence: certain, firm, tentative.
      * @param issueDetail Detailed description included in reported issues.
      * @param issueRemediation Remediation guidance (optional).
+     * @param matchMode How a step's conditions combine unless the step says otherwise: "all" (default) or "any".
      * @return JSON object with deployment status or error.
      */
     fun createActive(
@@ -201,188 +72,124 @@ class ScanCheckBridge(
         severity: String,
         confidence: String,
         issueDetail: String,
-        issueRemediation: String?
-    ): JsonObject {
-        return try {
-            EnumValidation.error(severity, VALID_SEVERITIES, "severity", required = true)?.let { return it }
-            EnumValidation.error(confidence, VALID_CONFIDENCES, "confidence", required = true)?.let { return it }
-            ScanCheckValidation.nonEmptyError(steps, "steps", "step")?.let { return it }
-            steps.forEachIndexed { i, step ->
-                val payload = step["payload"]?.jsonPrimitive?.contentOrNull
-                if (payload == null) {
-                    return buildJsonObject {
-                        put("error", "steps[$i].payload is required and must be a string")
-                    }
+        issueRemediation: String?,
+        matchMode: String? = null
+    ): JsonObject = deploy("active") {
+        activeDefinition(name, description, steps, severity, confidence, issueDetail, issueRemediation, matchMode)
+    }
+
+    private fun deploy(kind: String, define: () -> CheckDefinition): JsonObject = try {
+        val definition = define()
+        val (check, replaced) = checks.register(definition)
+        buildJsonObject {
+            put("id", check.id)
+            put("name", definition.name)
+            put("mode", definition.mode)
+            put("status", "deployed")
+            put("description", definition.description)
+            definition.passive?.let {
+                put("conditions_count", it.conditions.size)
+                put("match_mode", it.mode.name.lowercase())
+            }
+            definition.active?.let { put("steps_count", it.size) }
+            if (replaced != null) put("replaced", replaced.id)
+            put(
+                "note",
+                if (definition.active != null) {
+                    "Active scan check deployed. During active audits it sends its payloads at each insertion " +
+                        "point and reports only what a payload changes compared with the unmodified response."
+                } else {
+                    "Passive scan check deployed. It runs on every message Burp audits passively from now on. " +
+                        "scancheck_dry_run shows what it matches in the proxy history already recorded."
                 }
-                val rc = step["response_conditions"]?.jsonArray?.filterIsInstance<JsonObject>() ?: emptyList()
-                validateConditions(rc, "steps[$i].response_conditions")?.let { return it }
-            }
-            val auditSeverity = parseSeverity(severity)
-            val auditConfidence = parseConfidence(confidence)
-
-            val scanCheck = object : ScanCheck {
-                override fun passiveAudit(baseRequestResponse: HttpRequestResponse): AuditResult {
-                    // Active-only check -- no passive audit behavior
-                    return AuditResult.auditResult(emptyList())
-                }
-
-                override fun activeAudit(
-                    baseRequestResponse: HttpRequestResponse,
-                    insertionPoint: AuditInsertionPoint
-                ): AuditResult {
-                    val httpService = baseRequestResponse.httpService()
-                        ?: return AuditResult.auditResult(emptyList())
-                    val issues = mutableListOf<AuditIssue>()
-                    var executedSteps = 0
-                    var requiredFailed = false
-                    var anyMatched = false
-                    var anyStepHasConditions = false
-                    var hasNovelMatch = false
-                    val evidenceResponses = mutableListOf<HttpRequestResponse>()
-
-                    for (step in steps) {
-                        val payload = step["payload"]?.jsonPrimitive?.contentOrNull ?: continue
-                        val stopIfNoMatch = step["stop_if_no_match"]?.jsonPrimitive?.booleanOrNull ?: true
-                        val responseConditions = step["response_conditions"]?.jsonArray
-                            ?.mapNotNull { elem ->
-                                when (elem) {
-                                    is JsonObject -> elem
-                                    else -> null
-                                }
-                            } ?: emptyList()
-
-                        // Build the modified request with payload at the insertion point
-                        val modifiedRequest = insertionPoint.buildHttpRequestWithPayload(
-                            BurpByteArray.byteArray(payload)
-                        )
-
-                        // Send the request
-                        val checkResponse = BoundedHttp.send(api, modifiedRequest.withService(httpService))
-                        if (checkResponse == null) {
-                            if (stopIfNoMatch) {
-                                requiredFailed = true
-                                break
-                            }
-                            continue
-                        }
-                        executedSteps++
-                        evidenceResponses.add(checkResponse)
-
-                        // Check response conditions for this step against both response and baseline
-                        val stepMatched = if (responseConditions.isNotEmpty()) {
-                            anyStepHasConditions = true
-                            val matched = responseConditions.all { cond ->
-                                evaluateCondition(cond, checkResponse)
-                            }
-                            if (matched) {
-                                val baselineAlsoMatched = responseConditions.all { cond ->
-                                    evaluateCondition(cond, baseRequestResponse)
-                                }
-                                if (!baselineAlsoMatched) hasNovelMatch = true
-                            }
-                            matched
-                        } else {
-                            true
-                        }
-
-                        if (!stepMatched) {
-                            if (stopIfNoMatch) {
-                                requiredFailed = true
-                                break
-                            }
-                        } else {
-                            anyMatched = true
-                        }
-                    }
-
-                    if (executedSteps > 0 && !requiredFailed && anyMatched && (!anyStepHasConditions || hasNovelMatch)) {
-                        val url = baseRequestResponse.request()?.url() ?: ""
-                        // Include base and all evidence responses in the issue
-                        val allEvidence = mutableListOf(baseRequestResponse)
-                        allEvidence.addAll(evidenceResponses)
-                        val issue = AuditIssue.auditIssue(
-                            name,
-                            issueDetail,
-                            issueRemediation ?: "Review and address the identified issue.",
-                            url,
-                            auditSeverity,
-                            auditConfidence,
-                            null,
-                            null,
-                            auditSeverity,
-                            *allEvidence.toTypedArray()
-                        )
-                        issues.add(issue)
-                    }
-
-                    return AuditResult.auditResult(issues)
-                }
-
-                override fun consolidateIssues(
-                    existingIssue: AuditIssue,
-                    newIssue: AuditIssue
-                ): ConsolidationAction {
-                    return if (existingIssue.name() == newIssue.name() &&
-                        existingIssue.baseUrl() == newIssue.baseUrl()
-                    ) {
-                        ConsolidationAction.KEEP_EXISTING
-                    } else {
-                        ConsolidationAction.KEEP_BOTH
-                    }
-                }
-            }
-
-            val registration = api.scanner().registerScanCheck(scanCheck)
-
-            val id = stateManager.generateId("scheck")
-            val config = buildJsonObject {
-                put("name", name)
-                put("description", description)
-                put("mode", "active")
-                put("steps", buildJsonArray { steps.forEach { add(it) } })
-                put("severity", severity)
-                put("confidence", confidence)
-            }
-
-            deployedChecks.add(DeployedScanCheck(id, name, "active", config, Instant.now().toString(), registration))
-            stateManager.registeredScanChecks.add(name)
-            stateManager.scanCheckRegistrations[id] = registration
-
-            buildJsonObject {
-                put("id", id)
-                put("name", name)
-                put("mode", "active")
-                put("status", "deployed")
-                put("description", description)
-                put("steps_count", steps.size)
-                put("note", "Active scan check deployed. It will inject payloads at insertion points during active scanning.")
-            }
-        } catch (e: UnsupportedOperationException) {
-            buildJsonObject {
-                put("error", "Scanner API is not available in Burp Suite Community Edition")
-            }
-        } catch (e: Exception) {
-            buildJsonObject {
-                put("error", "Failed to create active scan check: ${e.message}")
-            }
+            )
         }
+    } catch (e: InvalidCheckException) {
+        errorJson(e.message ?: "Invalid scan check")
+    } catch (e: UnsupportedOperationException) {
+        errorJson("Scanner API is not available in Burp Suite Community Edition")
+    } catch (e: Exception) {
+        errorJson("Failed to create $kind scan check: ${e.message}")
     }
 
     /**
-     * Lists all Script-mode scan checks deployed via this bridge.
+     * Evaluates a check definition against the proxy history Burp has already recorded, without
+     * registering it and without sending anything.
+     *
+     * With [conditions], it reports which recorded messages the passive check would flag. With
+     * [steps], it reports how many recorded responses already satisfy each step with no payload
+     * sent: there the step cannot count as evidence, and a step that matches much of the baseline
+     * is too broad to be useful.
+     *
+     * @param conditions Passive check conditions; exclusive with [steps].
+     * @param steps Active check steps; exclusive with [conditions].
+     * @param matchMode "all" (default) or "any".
+     * @param urlPattern Regex a history item's URL must match to be read (optional).
+     * @param inScopeOnly Read only in-scope items.
+     * @param maxItems How many of the newest matching items to read (default 200).
+     * @param maxMatches How many matches to list in full (default 20).
+     */
+    fun dryRun(
+        conditions: List<JsonObject>?,
+        steps: List<JsonObject>?,
+        matchMode: String?,
+        urlPattern: String?,
+        inScopeOnly: Boolean,
+        maxItems: Int?,
+        maxMatches: Int?
+    ): JsonObject = try {
+        if ((conditions == null) == (steps == null)) {
+            throw InvalidCheckException("Give either 'conditions' (a passive check) or 'steps' (an active check)")
+        }
+        val mode = ScanCheckLogic.matchMode(matchMode)
+        val filter = HistoryFilter.of(urlPattern, inScopeOnly, maxItems)
+        val listed = HistoryFilter.matchLimit(maxMatches)
+        val sampler = HistorySampler(api)
+        if (conditions != null) {
+            requireNonEmpty(conditions, "conditions", "condition")
+            val run = PassiveDryRun(ScanCheckLogic.conditions(conditions, "conditions"), mode, listed)
+            val historySize = sampler.forEach(filter, run.parts, run::visit)
+            dryRunReport(
+                "passive", historySize, filter, run.toJson(),
+                "would_report counts the recorded messages the check flags; Burp consolidates them to one issue per path."
+            )
+        } else {
+            requireNonEmpty(steps.orEmpty(), "steps", "step")
+            val run = BaselineDryRun(ScanCheckLogic.steps(steps.orEmpty(), mode), listed)
+            val historySize = sampler.forEach(filter, run.parts, run::visit)
+            dryRunReport(
+                "active", historySize, filter, run.toJson(),
+                "No payload was sent. baseline_matches counts recorded responses that satisfy a step's response " +
+                    "conditions as they are: on those requests the step is not evidence, and cannot_report_on counts " +
+                    "the requests where no step can be. A high baseline_matches means the conditions are too broad."
+            )
+        }
+    } catch (e: InvalidCheckException) {
+        errorJson(e.message ?: "Invalid scan check")
+    } catch (e: Exception) {
+        errorJson("Dry run failed: ${e.message}")
+    }
+
+    /**
+     * Lists every custom scan check Burp is running for this extension, including the ones
+     * registered with `scanner_register_check`.
      *
      * @return JSON object with count and array of deployed checks.
      */
     fun list(): JsonObject {
+        val deployed = checks.list()
         return buildJsonObject {
-            put("count", deployedChecks.size)
+            put("count", deployed.size)
             put("checks", buildJsonArray {
-                deployedChecks.forEach { check ->
+                deployed.forEach { check ->
                     add(buildJsonObject {
                         put("id", check.id)
-                        put("name", check.name)
-                        put("mode", check.mode)
-                        put("deployed_at", check.deployedAt)
+                        put("name", check.definition.name)
+                        put("mode", check.definition.mode)
+                        put("issue_name", check.definition.issueName)
+                        put("severity", check.definition.severity)
+                        put("confidence", check.definition.confidence)
+                        put("deployed_at", check.deployedAt.toString())
                     })
                 }
             })
@@ -390,42 +197,29 @@ class ScanCheckBridge(
     }
 
     /**
-     * Removes a deployed Script-mode scan check by ID.
+     * Deregisters a custom scan check from Burp's scanner.
      *
-     * Deregisters the check from Burp's scanner via the [Registration]
-     * handle, then removes it from internal tracking.
-     *
-     * @param id The scan check ID (e.g. "scheck-001").
+     * @param id The scan check ID (e.g. "scheck-001") or the name it was created under.
      * @return JSON object confirming removal or reporting an error.
      */
     fun remove(id: String): JsonObject {
-        val check = deployedChecks.find { it.id == id }
-            ?: return buildJsonObject { put("error", "Scan check not found: $id") }
-
-        // Deregister via the Montoya Registration handle
-        try {
-            check.registration?.deregister()
-        } catch (_: Exception) { }
-
-        deployedChecks.removeIf { it.id == id }
-        stateManager.registeredScanChecks.remove(check.name)
-        stateManager.scanCheckRegistrations.remove(id)
-
-        return buildJsonObject {
-            put("id", id)
-            put("name", check.name)
-            put("mode", check.mode)
-            put("removed", true)
+        val check = checks.find(id) ?: return errorJson("Scan check not found: $id")
+        return try {
+            checks.remove(check)
+            buildJsonObject {
+                put("id", check.id)
+                put("name", check.definition.name)
+                put("mode", check.definition.mode)
+                put("removed", true)
+            }
+        } catch (e: Exception) {
+            errorJson("Failed to remove scan check ${check.id}: ${e.message}")
         }
     }
 
     /** Deregisters all live MCP scan checks on extension unload. */
     fun shutdown() {
-        deployedChecks.forEach { check ->
-            runCatching { check.registration?.deregister() }
-            stateManager.scanCheckRegistrations.remove(check.id)
-        }
-        deployedChecks.clear()
+        checks.shutdown()
     }
 
     /**
@@ -441,11 +235,11 @@ class ScanCheckBridge(
         return buildJsonObject {
             put("mode", "script")
             put("description", "Script mode creates scan checks via the Montoya Java API at runtime. " +
-                "More powerful than BCheck -- supports multi-step active checks, conditional payload " +
-                "chains, programmatic response analysis, and custom consolidation logic.")
+                "More powerful than BCheck -- supports multi-step active checks, condition lists joined " +
+                "by AND or OR with negation, and comparison with the baseline response.")
             put("when_to_use", "Use Script mode when you need: multi-step verification (inject A, " +
-                "check, inject B, confirm), complex conditional logic, response comparison between " +
-                "payloads, or custom consolidation rules. Use BCheck mode for simpler pattern matching.")
+                "check, inject B, confirm), conditions on several parts of a message, or evidence that " +
+                "must differ from the unmodified response. Use BCheck mode for simpler pattern matching.")
 
             put("passive_check_templates", buildJsonArray {
                 add(buildJsonObject {
@@ -596,108 +390,100 @@ class ScanCheckBridge(
                     add("request_url - Full request URL")
                 })
                 put("condition_types", buildJsonArray {
-                    add("matches - Regex pattern match")
-                    add("contains - Substring containment check")
-                    add("equals - Exact string equality")
+                    add("matches - Regex found anywhere in the text (case-insensitive)")
+                    add("contains - Substring containment check (case-insensitive)")
+                    add("equals - The whole text equals the pattern (case-insensitive)")
                 })
-                put("negate", "Set to true to invert the condition (NOT matches)")
+                put("negate", "Set to true to invert the condition (NOT matches). A condition on the response " +
+                    "never holds for a message without a response, negated or not.")
+                put("match_mode", "all (default): every condition in the list must hold. any: one is enough. " +
+                    "Given on the tool call, or per step for an active check.")
                 put("active_step_fields", buildJsonArray {
                     add("payload - String to inject at the insertion point")
-                    add("response_conditions - Array of conditions to check on the response")
-                    add("stop_if_no_match - If true, stop the chain if conditions don't match (default: true)")
+                    add("response_conditions - Array of conditions to check on the response to that payload")
+                    add("match_mode - all | any for this step's conditions (default: the tool call's match_mode)")
+                    add("stop_if_no_match - true (default): a required step; the check ends without reporting when " +
+                        "it does not match or gets no response. false: an optional step; the chain goes on")
                 })
+                put("baseline_comparison", "An active check reports only when some step matches and the response " +
+                    "to the unmodified request would not have matched the same conditions. A pattern the page " +
+                    "shows anyway, or a failed request, never raises an issue. At least one step needs a " +
+                    "condition on the response.")
+                put("consolidation", "One issue per name and URL path for a passive check; for an active check " +
+                    "one per name, URL path and insertion point, so two vulnerable parameters stay two issues.")
+                put("dry_run", "scancheck_dry_run evaluates conditions or steps against the recorded proxy history " +
+                    "before you deploy: what a passive check would flag, how much of the baseline an active step matches.")
             })
         }
     }
 
-    // ---------------------------------------------------------------
-    // Helper methods
-    // ---------------------------------------------------------------
+    private fun errorJson(message: String): JsonObject = buildJsonObject { put("error", message) }
 
-    /**
-     * Evaluates a single condition against an [HttpRequestResponse].
-     *
-     * @param condition JSON object with keys: location, pattern,
-     *   condition_type (matches/contains/equals), negate (boolean).
-     * @param requestResponse The request/response pair to evaluate against.
-     * @return true if the condition matches (after applying negation).
-     */
-    private fun evaluateCondition(condition: JsonObject, requestResponse: HttpRequestResponse): Boolean {
-        val location = condition["location"]?.jsonPrimitive?.contentOrNull ?: return false
-        val pattern = condition["pattern"]?.jsonPrimitive?.contentOrNull ?: return false
-        val conditionType = condition["condition_type"]?.jsonPrimitive?.contentOrNull ?: "matches"
-        val negate = condition["negate"]?.jsonPrimitive?.booleanOrNull ?: false
+    internal companion object {
+        private const val DEFAULT_REMEDIATION = "Review and address the identified issue."
 
-        val text = when (location.lowercase()) {
-            "response_body" -> requestResponse.response()?.bodyToString() ?: ""
-            "response_headers" -> requestResponse.response()?.headers()
-                ?.joinToString("\r\n") { "${it.name()}: ${it.value()}" } ?: ""
-            "status_code" -> requestResponse.response()?.statusCode()?.toString() ?: ""
-            "response_length" -> (requestResponse.response()?.body()?.length() ?: 0).toString()
-            "request_body" -> requestResponse.request()?.bodyToString() ?: ""
-            "request_headers" -> requestResponse.request()?.headers()
-                ?.joinToString("\r\n") { "${it.name()}: ${it.value()}" } ?: ""
-            "request_url" -> requestResponse.request()?.url() ?: ""
-            else -> ""
+        /** The `scancheck_create_passive` parameters as a [CheckDefinition]. @throws InvalidCheckException */
+        fun passiveDefinition(
+            name: String,
+            description: String,
+            conditions: List<JsonObject>,
+            severity: String,
+            confidence: String,
+            issueDetail: String,
+            issueRemediation: String?,
+            matchMode: String?,
+        ): CheckDefinition {
+            if (name.isBlank()) throw InvalidCheckException("name must not be blank")
+            val issueSeverity = ScanCheckLogic.severity(severity)
+            val issueConfidence = ScanCheckLogic.confidence(confidence)
+            requireNonEmpty(conditions, "conditions", "condition")
+            return CheckDefinition(
+                name = name,
+                issueName = name,
+                description = description,
+                detail = issueDetail,
+                remediation = issueRemediation ?: DEFAULT_REMEDIATION,
+                severity = issueSeverity,
+                confidence = issueConfidence,
+                passive = PassiveRule(
+                    ScanCheckLogic.conditions(conditions, "conditions"),
+                    ScanCheckLogic.matchMode(matchMode),
+                ),
+            )
         }
 
-        val result = when (conditionType.lowercase()) {
-            "contains" -> text.contains(pattern, ignoreCase = true)
-            "equals" -> text.equals(pattern, ignoreCase = true)
-            "matches" -> SafeRegex.containsMatchIn(pattern, text, ignoreCase = true)
-            else -> false
+        /** The `scancheck_create_active` parameters as a [CheckDefinition]. @throws InvalidCheckException */
+        fun activeDefinition(
+            name: String,
+            description: String,
+            steps: List<JsonObject>,
+            severity: String,
+            confidence: String,
+            issueDetail: String,
+            issueRemediation: String?,
+            matchMode: String?,
+        ): CheckDefinition {
+            if (name.isBlank()) throw InvalidCheckException("name must not be blank")
+            val issueSeverity = ScanCheckLogic.severity(severity)
+            val issueConfidence = ScanCheckLogic.confidence(confidence)
+            requireNonEmpty(steps, "steps", "step")
+            return CheckDefinition(
+                name = name,
+                issueName = name,
+                description = description,
+                detail = issueDetail,
+                remediation = issueRemediation ?: DEFAULT_REMEDIATION,
+                severity = issueSeverity,
+                confidence = issueConfidence,
+                active = ScanCheckLogic.steps(steps, ScanCheckLogic.matchMode(matchMode)),
+            )
         }
 
-        return if (negate) !result else result
-    }
-
-    private fun parseSeverity(s: String): AuditIssueSeverity {
-        return when (s.lowercase()) {
-            "high" -> AuditIssueSeverity.HIGH
-            "medium" -> AuditIssueSeverity.MEDIUM
-            "low" -> AuditIssueSeverity.LOW
-            "information", "info" -> AuditIssueSeverity.INFORMATION
-            else -> AuditIssueSeverity.MEDIUM
-        }
-    }
-
-    private fun parseConfidence(c: String): AuditIssueConfidence {
-        return when (c.lowercase()) {
-            "certain" -> AuditIssueConfidence.CERTAIN
-            "firm" -> AuditIssueConfidence.FIRM
-            "tentative" -> AuditIssueConfidence.TENTATIVE
-            else -> AuditIssueConfidence.TENTATIVE
-        }
-    }
-
-    private val VALID_LOCATIONS = setOf(
-        "response_body", "response_headers", "status_code", "response_length",
-        "request_body", "request_headers", "request_url"
-    )
-    private val VALID_CONDITION_TYPES = setOf("contains", "equals", "matches")
-    private val VALID_SEVERITIES = setOf("high", "medium", "low", "information", "info")
-    private val VALID_CONFIDENCES = setOf("certain", "firm", "tentative")
-
-    /**
-     * Rejects scan-check conditions whose location/condition_type are not recognised, so a
-     * mistyped rule fails at registration instead of silently never firing (or, with negate,
-     * firing on every request). condition_type is optional (defaults to "matches").
-     */
-    private fun validateConditions(conditions: List<JsonObject>, prefix: String): JsonObject? {
-        conditions.forEachIndexed { i, c ->
-            val loc = c["location"]?.jsonPrimitive?.contentOrNull
-            EnumValidation.error(loc, VALID_LOCATIONS, "$prefix[$i].location", required = true)?.let { return it }
-            val ct = c["condition_type"]?.jsonPrimitive?.contentOrNull
-            EnumValidation.error(ct, VALID_CONDITION_TYPES, "$prefix[$i].condition_type")?.let { return it }
-            val pattern = c["pattern"]?.jsonPrimitive?.contentOrNull
-                ?: return buildJsonObject { put("error", "$prefix[$i].pattern is required") }
-            if ((ct ?: "matches").equals("matches", ignoreCase = true)) {
-                SafeRegex.validate(pattern, ignoreCase = true)?.let { err ->
-                    return buildJsonObject { put("error", "Invalid regex in $prefix[$i].pattern: $err") }
-                }
+        private fun requireNonEmpty(items: List<JsonObject>, paramName: String, elementNoun: String) {
+            ScanCheckValidation.nonEmptyError(items, paramName, elementNoun)?.let {
+                throw InvalidCheckException(it.getValue("error").jsonPrimitive.content)
             }
         }
-        return null
     }
 }
 

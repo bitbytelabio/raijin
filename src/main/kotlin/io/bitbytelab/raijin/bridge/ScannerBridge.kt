@@ -1,18 +1,14 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
+import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.core.ServiceParts
-import io.bitbytelab.raijin.safety.BoundedHttp
 import burp.api.montoya.scanner.AuditConfiguration
-import burp.api.montoya.scanner.AuditResult
 import burp.api.montoya.scanner.BuiltInAuditConfiguration
-import burp.api.montoya.scanner.ConsolidationAction
 import burp.api.montoya.scanner.Crawl
 import burp.api.montoya.scanner.CrawlConfiguration
-import burp.api.montoya.scanner.ScanCheck
 import burp.api.montoya.scanner.audit.Audit
 import burp.api.montoya.scanner.audit.AuditIssueHandler
-import burp.api.montoya.scanner.audit.insertionpoint.AuditInsertionPoint
 import burp.api.montoya.scanner.audit.issues.AuditIssue
 import burp.api.montoya.scanner.audit.issues.AuditIssueConfidence
 import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity
@@ -23,16 +19,15 @@ import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.sitemap.SiteMapFilter
 import burp.api.montoya.core.ByteArray as BurpByteArray
-import burp.api.montoya.core.Registration
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.safety.RequestHygiene
 import io.bitbytelab.raijin.safety.SafeRegex
 import io.bitbytelab.raijin.state.ScanTask
 import io.bitbytelab.raijin.state.StateManager
 import kotlinx.serialization.json.*
-import java.net.URI
 import java.time.Instant
 import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Bridge wrapping the Montoya Scanner API (Pro only).
@@ -46,6 +41,18 @@ class ScannerBridge(
     private val eventBus: EventBus,
     private val stateManager: StateManager
 ) {
+    private val checks = CustomScanCheckManager(api, stateManager)
+
+    private val authRules = AuditAuthRules(stateManager, observe = { task ->
+        val audit = task.taskObject as? Audit
+        AuditAuthRules.Observation(
+            status = try { audit?.statusMessage() } catch (_: Throwable) { null },
+            requestCount = try { audit?.requestCount() } catch (_: Throwable) { null },
+        )
+    })
+
+    /** Audit task id -> site map URL prefixes of its targets, for [getTaskIssues] when Burp cannot list a task's issues. */
+    private val auditTargets = ConcurrentHashMap<String, Set<String>>()
 
     /**
      * Starts a crawl task against the given URLs.
@@ -139,11 +146,17 @@ class ScannerBridge(
      * now actually starts a real crawl when [urls] are given — Montoya has no crawl-then-audit
      * pipe, so the crawl's discoveries are not auto-added to this audit; the response says so.
      *
+     * [authHeaderName] / [authHeaderValue] put one header on the audit's requests through traffic
+     * rules that only apply to Scanner traffic to the audited hosts ([AuditAuthRules]). The rules
+     * are removed when the audit ends or is deleted, and a start that fails leaves none behind.
+     *
      * @param urls Target URLs to audit directly.
      * @param requests Optional base64-encoded HTTP requests to audit directly.
      * @param auditMode Audit mode: "light" (passive), "normal" or "thorough" (both active). Defaults to "normal".
      * @param crawlFirst When true and [urls] is non-empty, starts a real crawl on those URLs alongside the audit.
      * @param insertionPointTypes Accepted but not enforced — see above.
+     * @param authHeaderName Name of a header to set on the audit's requests; needs [authHeaderValue].
+     * @param authHeaderValue Value of that header.
      * @return JSON object with task ID, status, and which parameters were actually applied.
      */
     fun startAudit(
@@ -155,58 +168,48 @@ class ScannerBridge(
         authHeaderName: String? = null,
         authHeaderValue: String? = null
     ): JsonObject {
-        var authRuleId: String? = null
-        try {
-            val builtInConfig = when (auditMode?.lowercase()) {
-                "light" -> BuiltInAuditConfiguration.LEGACY_PASSIVE_AUDIT_CHECKS
-                null, "normal", "thorough" -> BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS
-                else -> throw IllegalArgumentException("Invalid audit_mode '$auditMode'. Allowed: light, normal, thorough")
+        EnumValidation.error(auditMode, AUDIT_MODES, "audit_mode")?.let { return it }
+        val mode = auditMode?.trim()?.lowercase().takeUnless { it.isNullOrEmpty() } ?: "normal"
+        // Decoded once: the auth scope, the site map prefixes and the audit itself all read them.
+        val rawRequests = requests.orEmpty().map { runCatching { Base64.getDecoder().decode(it) }.getOrNull() }
+        val requestTexts = rawRequests.filterNotNull().map { String(it, Charsets.ISO_8859_1) }
+
+        // Clients often send "" for a parameter they mean to leave out: a blank name with a blank
+        // value is no auth header. An empty value under a real name is a header with an empty value.
+        val headerName = authHeaderName?.takeIf { it.isNotBlank() }
+        val headerValue = authHeaderValue.takeIf { headerName != null || !it.isNullOrBlank() }
+        val auth = when {
+            headerName == null && headerValue == null -> null
+            headerName == null || headerValue == null ->
+                return errorJson("auth_header_name and auth_header_value must be given together")
+            else -> try {
+                AuditAuthRules.plan(headerName, headerValue, urls.orEmpty(), requestTexts)
+            } catch (e: IllegalArgumentException) {
+                return errorJson(e.message ?: "Invalid auth header")
             }
+        }
+
+        var authRuleId: String? = null
+        var started: Audit? = null
+        var registered = false
+        try {
+            val builtInConfig =
+                if (mode == "light") BuiltInAuditConfiguration.LEGACY_PASSIVE_AUDIT_CHECKS
+                else BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS
             val auditConfig = AuditConfiguration.auditConfiguration(builtInConfig)
 
-            // If auth header provided, create a scanner-only, host-scoped traffic rule to inject it.
-            if (authHeaderName != null && authHeaderValue != null) {
-                val targetHosts = linkedSetOf<String>()
-                urls?.forEach { u ->
-                    runCatching { URI(u).host }.getOrNull()?.takeIf { it.isNotBlank() }?.let { targetHosts.add(it) }
-                }
-                requests?.forEach { reqB64 ->
-                    runCatching {
-                        val decoded = Base64.getDecoder().decode(reqB64)
-                        val parsed = HttpRequest.httpRequest(BurpByteArray.byteArray(*decoded))
-                        parsed.headerValue("Host")?.substringBefore(':')?.trim()?.takeIf { it.isNotBlank() }
-                    }.getOrNull()?.let { targetHosts.add(it) }
-                }
-                val matchHostPattern = when (targetHosts.size) {
-                    0 -> null
-                    1 -> targetHosts.first()
-                    else -> targetHosts.joinToString("|") { Regex.escape(it) }
-                }
-                authRuleId = stateManager.generateId("auth-rule")
-                stateManager.trafficRules.add(io.bitbytelab.raijin.state.TrafficRule(
-                    ruleId = authRuleId,
-                    direction = "request",
-                    matchUrl = null,
-                    matchHost = matchHostPattern,
-                    matchHeader = null,
-                    modifyAddHeader = "$authHeaderName: $authHeaderValue",
-                    modifyRemoveHeader = null,
-                    modifyReplaceHeader = null,
-                    enabled = true,
-                    toolFilter = setOf("SCANNER")
-                ))
-            }
-
+            // The rules have to be in place before the audit sends its first request.
+            if (auth != null) authRuleId = authRules.install(auth)
             val auditTask: Audit = api.scanner().startAudit(auditConfig)
+            started = auditTask
 
             // Raw requests are added directly.
             var requestsAdded = 0
             var requestsFailed = 0
-            requests?.forEach { reqBase64 ->
+            rawRequests.forEach { decoded ->
                 try {
-                    val decoded = Base64.getDecoder().decode(reqBase64)
-                    val httpRequest = HttpRequest.httpRequest(BurpByteArray.byteArray(*decoded))
-                    auditTask.addRequest(httpRequest)
+                    if (decoded == null) throw IllegalArgumentException("not base64")
+                    auditTask.addRequest(HttpRequest.httpRequest(BurpByteArray.byteArray(*decoded)))
                     requestsAdded++
                 } catch (_: Exception) {
                     requestsFailed++
@@ -252,14 +255,17 @@ class ScannerBridge(
                 authRuleId = authRuleId
             )
             stateManager.scanTasks[taskId] = scanTask
+            auditTargets[taskId] = targetPrefixes(urls.orEmpty(), requestTexts)
+            authRuleId?.let { authRules.track(taskId, it) }
+            registered = true
 
-            val statusMsg = try { auditTask.statusMessage() } catch (_: Exception) { "started" }
+            val statusMsg = try { auditTask.statusMessage() } catch (_: Throwable) { "started" }
 
             return buildJsonObject {
                 put("task_id", taskId)
                 put("type", "audit")
                 put("status", statusMsg)
-                put("audit_mode", auditMode ?: "normal")
+                put("audit_mode", mode)
                 put(
                     "audit_mode_effective",
                     if (builtInConfig == BuiltInAuditConfiguration.LEGACY_PASSIVE_AUDIT_CHECKS) "passive" else "active"
@@ -281,7 +287,7 @@ class ScannerBridge(
                 if (crawlSkipped != null) put("crawl_skipped", crawlSkipped)
                 val ignored = buildList {
                     if (!insertionPointTypes.isNullOrEmpty()) add("insertion_point_types")
-                    if (auditMode?.lowercase() == "thorough") add("thorough (runs identically to normal)")
+                    if (mode == "thorough") add("thorough (runs identically to normal)")
                 }
                 if (ignored.isNotEmpty()) {
                     put("ignored", buildJsonArray { ignored.forEach { add(it) } })
@@ -293,20 +299,26 @@ class ScannerBridge(
                     )
                 }
                 put("created_at", scanTask.createdAt)
-                if (authRuleId != null) {
+                if (auth != null) {
                     put("auth_rule_id", authRuleId)
-                    put("auth_note", "Traffic rule '$authRuleId' injects auth header. Use http_remove_traffic_rule to remove it when done.")
+                    put("auth_hosts", buildJsonArray { auth.hosts.forEach { add(it) } })
+                    put(
+                        "auth_note",
+                        "'${auth.headerName}' is set on Scanner requests to auth_hosts only, replacing any " +
+                            "value the request already has. The rule is removed when the audit ends or is deleted."
+                    )
                 }
             }
         } catch (e: UnsupportedOperationException) {
-            if (authRuleId != null) stateManager.trafficRules.removeIf { it.ruleId == authRuleId }
-            return buildJsonObject {
-                put("error", "Scanner API is not available in Burp Suite Community Edition")
-            }
+            return errorJson("Scanner API is not available in Burp Suite Community Edition")
         } catch (e: Exception) {
-            if (authRuleId != null) stateManager.trafficRules.removeIf { it.ruleId == authRuleId }
-            return buildJsonObject {
-                put("error", "Failed to start audit: ${e.message}")
+            return errorJson("Failed to start audit: ${e.message}")
+        } finally {
+            // However the start failed, an Error from an older Burp included: no rule and no
+            // untracked audit is left behind.
+            if (!registered) {
+                authRuleId?.let { authRules.remove(it) }
+                started?.let { audit -> runCatching { audit.delete() } }
             }
         }
     }
@@ -322,16 +334,8 @@ class ScannerBridge(
             ?: return buildJsonObject { put("error", "Task not found: $taskId") }
 
         val task = scanTask.taskObject
+        if (scanTask.authRuleId != null) authRules.sweep()
         val statusMsg = safeStatusMessage(task)
-        if (scanTask.authRuleId != null && (
-                statusMsg.contains("finished", true) ||
-                statusMsg.contains("complete", true) ||
-                statusMsg.contains("cancelled", true) ||
-                statusMsg.contains("aborted", true)
-            )
-        ) {
-            stateManager.trafficRules.removeIf { it.ruleId == scanTask.authRuleId }
-        }
         val reqCount = safeRequestCount(task)
         val errCount = try { when (task) { is Crawl -> task.errorCount(); is Audit -> task.errorCount(); else -> -1 } } catch (_: Throwable) { -1 }
         val issueCount = try { if (task is Audit) task.issues().size else 0 } catch (_: Throwable) { -1 }
@@ -353,6 +357,11 @@ class ScannerBridge(
                         "unreliable (e.g. stuck at 0) on some Burp versions — poll this twice and " +
                         "watch for it to stop growing instead."
                 )
+            }
+            scanTask.authRuleId?.let { ruleId ->
+                put("auth_rule_id", ruleId)
+                put("auth_rule_active", authRules.isActive(taskId))
+                authRules.releasedReason(taskId)?.let { put("auth_rule_released", it) }
             }
             put("created_at", scanTask.createdAt)
         }
@@ -382,6 +391,7 @@ class ScannerBridge(
         // exceptions from unimplemented Montoya methods are caught cleanly.
         data class TaskEntry(val id: String, val type: String, val statusMsg: String, val reqCount: Int, val createdAt: String)
 
+        authRules.sweep()
         val entries = stateManager.scanTasks.values.map { scanTask ->
             val msg = safeStatusMessage(scanTask.taskObject)
             val cnt = safeRequestCount(scanTask.taskObject)
@@ -440,9 +450,9 @@ class ScannerBridge(
                 is Audit -> task.delete()
             }
             stateManager.scanTasks.remove(taskId)
-            scanTask.authRuleId?.let { ruleId ->
-                stateManager.trafficRules.removeIf { it.ruleId == ruleId }
-            }
+            authRules.forget(taskId)
+            scanTask.authRuleId?.let { authRules.remove(it) }
+            auditTargets.remove(taskId)
             buildJsonObject {
                 put("task_id", taskId)
                 put("deleted", true)
@@ -483,21 +493,25 @@ class ScannerBridge(
         return try {
             val decoded = Base64.getDecoder().decode(request)
             var httpRequest = HttpRequest.httpRequest(BurpByteArray.byteArray(*decoded))
+            val requestText = String(decoded, Charsets.ISO_8859_1)
 
-            if (host != null) {
-                val service = HttpService.httpService(
-                    host,
-                    port ?: if (useTls == true) 443 else 80,
-                    useTls ?: false
-                )
-                httpRequest = httpRequest.withService(service)
+            val prefixes = if (host != null) {
+                val tls = useTls ?: false
+                val servicePort = port ?: if (tls) 443 else 80
+                httpRequest = httpRequest.withService(HttpService.httpService(host, servicePort, tls))
+                setOf(origin(if (tls) "https" else "http", "$host:$servicePort"))
+            } else {
+                targetPrefixes(emptyList(), listOf(requestText))
             }
 
             task.addRequest(httpRequest)
+            auditTargets.merge(taskId, prefixes) { known, added -> known + added }
 
+            val targetHost = host ?: AuditAuthRules.authorityOfRawRequest(requestText)?.let { AuditAuthRules.hostOf(it) }
             buildJsonObject {
                 put("task_id", taskId)
                 put("request_added", true)
+                authScopeNote(scanTask, targetHost)?.let { put("auth_note", it) }
             }
         } catch (e: Exception) {
             buildJsonObject {
@@ -509,8 +523,12 @@ class ScannerBridge(
     /**
      * Returns issues found by a specific audit task.
      *
+     * Some Burp versions cannot list a task's issues. The response then carries the site map's
+     * issues under the task's targets, marked `"source": "site_map"`: scans other than this task
+     * may have reported some of them.
+     *
      * @param taskId The audit task identifier.
-     * @return JSON array of issue objects.
+     * @return JSON object with the issues.
      */
     fun getTaskIssues(taskId: String): JsonObject {
         val scanTask = stateManager.scanTasks[taskId]
@@ -521,28 +539,39 @@ class ScannerBridge(
             return buildJsonObject { put("error", "Task $taskId is not an audit task") }
         }
 
-        // task.issues() may throw "Currently unsupported" on some Burp versions.
-        // Fall back to fetching issues from the sitemap for the task's target URLs.
-        val issues = try {
-            task.issues()
-        } catch (_: Exception) {
-            // Fallback: get all issues from sitemap instead
-            try {
-                api.siteMap().issues()
-            } catch (_: Exception) {
-                return buildJsonObject {
-                    put("task_id", taskId)
-                    put("issue_count", 0)
-                    put("issues", buildJsonArray {})
-                    put("note", "task.issues() not supported in this Burp version; use scanner_get_all_issues for sitemap issues")
-                }
+        val own = try { task.issues() } catch (_: Throwable) { null }
+        if (own != null) {
+            return buildJsonObject {
+                put("task_id", taskId)
+                put("issue_count", own.size)
+                put("issues", serializeIssues(own))
             }
         }
 
+        // The site map can only be asked by URL, so the fallback is limited to the task's targets
+        // and labelled; the whole site map must never be passed off as this task's issues.
+        val prefixes = auditTargets[taskId].orEmpty()
+        val underTargets = try {
+            prefixes.flatMap { api.siteMap().issues(SiteMapFilter.prefixFilter(it)) }
+        } catch (_: Throwable) {
+            emptyList<AuditIssue>()
+        }
         return buildJsonObject {
             put("task_id", taskId)
-            put("issue_count", issues.size)
-            put("issues", serializeIssues(issues))
+            put("issue_count", underTargets.size)
+            put("issues", serializeIssues(underTargets))
+            put("source", "site_map")
+            putJsonArray("url_prefixes") { prefixes.forEach { add(it) } }
+            put(
+                "note",
+                if (prefixes.isEmpty()) {
+                    "This Burp version cannot list a task's issues and the task's targets are unknown, " +
+                        "so nothing could be looked up. Use scanner_get_all_issues with a url_prefix."
+                } else {
+                    "This Burp version cannot list a task's issues. These are the site map's issues under " +
+                        "the task's targets (url_prefixes); other scans of them may have reported some."
+                }
+            )
         }
     }
 
@@ -550,8 +579,8 @@ class ScannerBridge(
      * Returns all issues from the site map, with optional filtering.
      *
      * @param urlPrefix Optional URL prefix filter.
-     * @param severity Optional severity filter (HIGH, MEDIUM, LOW, INFORMATION).
-     * @param confidence Optional confidence filter (CERTAIN, FIRM, TENTATIVE).
+     * @param severity Optional severity filter: high, medium, low, information, false_positive.
+     * @param confidence Optional confidence filter: certain, firm, tentative.
      * @param maxResults Maximum number of results to return.
      * @return JSON object with issues array.
      */
@@ -561,6 +590,11 @@ class ScannerBridge(
         confidence: String?,
         maxResults: Int?
     ): JsonObject {
+        // An unknown filter value used to match nothing and return an empty list as if there were no issues.
+        EnumValidation.error(severity, FILTER_SEVERITIES, "severity")?.let { return it }
+        EnumValidation.error(confidence, ScanCheckLogic.CONFIDENCES, "confidence")?.let { return it }
+        val wantedSeverity = severity?.takeIf { it.isNotBlank() }?.let { severityName(it) }
+        val wantedConfidence = confidence?.takeIf { it.isNotBlank() }?.trim()?.uppercase()
         return try {
             val allIssues = if (urlPrefix != null) {
                 api.siteMap().issues(SiteMapFilter.prefixFilter(urlPrefix))
@@ -569,11 +603,8 @@ class ScannerBridge(
             }
 
             val filteredIssues = allIssues.filter { issue ->
-                val severityMatch = severity == null ||
-                    issue.severity().name.equals(severity, ignoreCase = true)
-                val confidenceMatch = confidence == null ||
-                    issue.confidence().name.equals(confidence, ignoreCase = true)
-                severityMatch && confidenceMatch
+                (wantedSeverity == null || issue.severity().name == wantedSeverity) &&
+                    (wantedConfidence == null || issue.confidence().name == wantedConfidence)
             }
 
             val limited = if (maxResults != null && maxResults > 0) {
@@ -614,6 +645,12 @@ class ScannerBridge(
         severityFilter: List<String>?,
         outputPath: String
     ): JsonObject {
+        EnumValidation.error(format, REPORT_FORMATS, "format", required = true)?.let { return it }
+        severityFilter?.forEachIndexed { i, value ->
+            EnumValidation.error(value, FILTER_SEVERITIES, "severity_filter[$i]", required = true)?.let { return it }
+        }
+        val xml = format.trim().equals("xml", ignoreCase = true)
+        val wantedSeverities = severityFilter.orEmpty().map { severityName(it) }.toSet()
         return try {
             val allIssues = if (urlPrefix != null) {
                 api.siteMap().issues(SiteMapFilter.prefixFilter(urlPrefix))
@@ -621,25 +658,18 @@ class ScannerBridge(
                 api.siteMap().issues()
             }
 
-            val filteredIssues = if (!severityFilter.isNullOrEmpty()) {
-                allIssues.filter { issue ->
-                    severityFilter.any { it.equals(issue.severity().name, ignoreCase = true) }
-                }
-            } else {
-                allIssues
-            }
+            val filteredIssues =
+                if (wantedSeverities.isEmpty()) allIssues else allIssues.filter { it.severity().name in wantedSeverities }
 
-            val reportFormat = when (format.uppercase()) {
-                "XML" -> burp.api.montoya.scanner.ReportFormat.XML
-                else -> burp.api.montoya.scanner.ReportFormat.HTML
-            }
+            val reportFormat =
+                if (xml) burp.api.montoya.scanner.ReportFormat.XML else burp.api.montoya.scanner.ReportFormat.HTML
 
             // Confine writes to a reports directory. Without this, an attacker-
             // controlled (or prompt-injected) outputPath is an arbitrary file-write
             // primitive (e.g. ~/.bashrc, autostart entries). Absolute paths outside
             // the base and ".." traversal are rejected; everything else resolves
             // under <user.home>/.raijin/reports/.
-            val ext = if (format.equals("XML", ignoreCase = true)) "xml" else "html"
+            val ext = if (xml) "xml" else "html"
             val baseDir = java.io.File(System.getProperty("user.home"), ".raijin/reports").canonicalFile
             baseDir.mkdirs()
             // Issue #20: a blank output_path (or one that resolves to the reports directory itself)
@@ -665,7 +695,7 @@ class ScannerBridge(
 
             buildJsonObject {
                 put("report_generated", true)
-                put("format", format.uppercase())
+                put("format", if (xml) "XML" else "HTML")
                 put("output_path", target.path)
                 put("issue_count", filteredIssues.size)
             }
@@ -695,22 +725,11 @@ class ScannerBridge(
         request: String?,
         response: String?
     ): JsonObject {
+        EnumValidation.error(severity, CREATE_SEVERITIES, "severity", required = true)?.let { return it }
+        EnumValidation.error(confidence, ScanCheckLogic.CONFIDENCES, "confidence", required = true)?.let { return it }
+        val issueSeverity = AuditIssueSeverity.valueOf(severityName(severity))
+        val issueConfidence = AuditIssueConfidence.valueOf(confidence.trim().uppercase())
         return try {
-            val issueSeverity = when (severity.uppercase()) {
-                "HIGH" -> AuditIssueSeverity.HIGH
-                "MEDIUM" -> AuditIssueSeverity.MEDIUM
-                "LOW" -> AuditIssueSeverity.LOW
-                "INFORMATION", "INFO" -> AuditIssueSeverity.INFORMATION
-                else -> throw IllegalArgumentException("Invalid severity '$severity'. Allowed: high, medium, low, information")
-            }
-
-            val issueConfidence = when (confidence.uppercase()) {
-                "CERTAIN" -> AuditIssueConfidence.CERTAIN
-                "FIRM" -> AuditIssueConfidence.FIRM
-                "TENTATIVE" -> AuditIssueConfidence.TENTATIVE
-                else -> throw IllegalArgumentException("Invalid confidence '$confidence'. Allowed: certain, firm, tentative")
-            }
-
             // The schema documents 'request'/'response' as plain HTTP messages,
             // so accept plain HTTP text directly. Base64 is still accepted for
             // backward compatibility (see decodeMessagePayload). Evidence is
@@ -752,8 +771,8 @@ class ScannerBridge(
                 put("created", true)
                 put("name", name)
                 put("url", url)
-                put("severity", severity.uppercase())
-                put("confidence", confidence.uppercase())
+                put("severity", issueSeverity.name)
+                put("confidence", issueConfidence.name)
             }
         } catch (e: UnsupportedOperationException) {
             buildJsonObject {
@@ -803,14 +822,17 @@ class ScannerBridge(
     }
 
     /**
-     * Registers a dynamic scan check (passive or active) that pattern-matches
-     * responses and optionally sends active probes.
+     * Registers a scan check that pattern-matches responses and, when active, the responses to
+     * its payloads. It runs on the same engine as the `scancheck_*` checks
+     * ([CustomScanCheckManager]): a passive check reports when the body regex or the header regex
+     * matches; an active check reports when a payload makes the body regex match and the response
+     * to the unmodified request does not.
      *
-     * @param checkName Unique name for the scan check registration.
-     * @param checkType "passive" or "active".
+     * @param checkName Name of the registration; registering it again replaces the check.
+     * @param checkType "passive", "active" or "both".
      * @param issueName Name of the issue to report when a match is found.
-     * @param severity Issue severity: HIGH, MEDIUM, LOW, INFORMATION.
-     * @param confidence Issue confidence: CERTAIN, FIRM, TENTATIVE.
+     * @param severity Issue severity: high, medium, low, information.
+     * @param confidence Issue confidence: certain, firm, tentative.
      * @param detail Issue detail text.
      * @param remediation Issue remediation text.
      * @param passiveResponseMatch Regex to match against response body (passive checks).
@@ -833,190 +855,44 @@ class ScannerBridge(
         activeResponseMatch: String?
     ): JsonObject {
         return try {
-            val issueSeverity = when (severity.uppercase()) {
-                "HIGH" -> AuditIssueSeverity.HIGH
-                "MEDIUM" -> AuditIssueSeverity.MEDIUM
-                "LOW" -> AuditIssueSeverity.LOW
-                "INFORMATION", "INFO" -> AuditIssueSeverity.INFORMATION
-                else -> throw IllegalArgumentException("Invalid severity '$severity'. Allowed: high, medium, low, information")
-            }
-
-            val issueConfidence = when (confidence.uppercase()) {
-                "CERTAIN" -> AuditIssueConfidence.CERTAIN
-                "FIRM" -> AuditIssueConfidence.FIRM
-                "TENTATIVE" -> AuditIssueConfidence.TENTATIVE
-                else -> throw IllegalArgumentException("Invalid confidence '$confidence'. Allowed: certain, firm, tentative")
-            }
-
-            if (passiveResponseMatch != null) {
-                SafeRegex.validate(passiveResponseMatch, ignoreCase = true)?.let { err ->
-                    return buildJsonObject { put("error", "Invalid passive_response_match regex: $err") }
-                }
-            }
-            if (passiveHeaderMatch != null) {
-                SafeRegex.validate(passiveHeaderMatch, ignoreCase = true)?.let { err ->
-                    return buildJsonObject { put("error", "Invalid passive_header_match regex: $err") }
-                }
-            }
-            if (activeResponseMatch != null) {
-                SafeRegex.validate(activeResponseMatch, ignoreCase = true)?.let { err ->
-                    return buildJsonObject { put("error", "Invalid active_response_match regex: $err") }
-                }
-            }
-
-            val scanCheck = object : ScanCheck {
-                override fun passiveAudit(baseRequestResponse: HttpRequestResponse): AuditResult {
-                    if (checkType.equals("active", ignoreCase = true)) {
-                        return AuditResult.auditResult(emptyList())
-                    }
-
-                    val issues = mutableListOf<AuditIssue>()
-                    val responseBody = baseRequestResponse.response()?.bodyToString() ?: ""
-                    val responseHeaders = baseRequestResponse.response()?.headers()
-                        ?.joinToString("\r\n") { "${it.name()}: ${it.value()}" } ?: ""
-
-                    var matched = false
-
-                    if (passiveResponseMatch != null &&
-                        SafeRegex.containsMatchIn(passiveResponseMatch, responseBody, ignoreCase = true)
-                    ) {
-                        matched = true
-                    }
-
-                    if (!matched && passiveHeaderMatch != null &&
-                        SafeRegex.containsMatchIn(passiveHeaderMatch, responseHeaders, ignoreCase = true)
-                    ) {
-                        matched = true
-                    }
-
-                    if (matched) {
-                        val url = baseRequestResponse.request()?.url() ?: ""
-                        val issue = AuditIssue.auditIssue(
-                            issueName,
-                            detail,
-                            remediation,
-                            url,
-                            issueSeverity,
-                            issueConfidence,
-                            null,
-                            null,
-                            issueSeverity,
-                            baseRequestResponse
-                        )
-                        issues.add(issue)
-                    }
-
-                    return AuditResult.auditResult(issues)
-                }
-
-                override fun activeAudit(
-                    baseRequestResponse: HttpRequestResponse,
-                    insertionPoint: AuditInsertionPoint
-                ): AuditResult {
-                    if (checkType.equals("passive", ignoreCase = true)) {
-                        return AuditResult.auditResult(emptyList())
-                    }
-
-                    val issues = mutableListOf<AuditIssue>()
-                    val payloads = activePayloads ?: return AuditResult.auditResult(emptyList())
-                    val matchPattern = activeResponseMatch ?: return AuditResult.auditResult(emptyList())
-                    val baseBody = baseRequestResponse.response()?.bodyToString() ?: ""
-
-                    for (payload in payloads) {
-                        try {
-                            val modifiedRequest = insertionPoint.buildHttpRequestWithPayload(
-                                BurpByteArray.byteArray(payload)
-                            )
-
-                            val httpService = baseRequestResponse.httpService()
-                                ?: continue
-
-                            val checkRequestResponse = BoundedHttp.send(api, modifiedRequest.withService(httpService))
-                                ?: continue   // timeout/error -> skip this payload
-
-                            val respBody = checkRequestResponse.response()?.bodyToString() ?: ""
-
-                            if (SafeRegex.containsMatchIn(matchPattern, respBody, ignoreCase = true) &&
-                                !SafeRegex.containsMatchIn(matchPattern, baseBody, ignoreCase = true)
-                            ) {
-                                val url = baseRequestResponse.request()?.url() ?: ""
-                                val matchDetail = "$detail\n\nPayload: $payload\nMatch found in response body."
-                                val issue = AuditIssue.auditIssue(
-                                    issueName,
-                                    matchDetail,
-                                    remediation,
-                                    url,
-                                    issueSeverity,
-                                    issueConfidence,
-                                    null,
-                                    null,
-                                    issueSeverity,
-                                    baseRequestResponse, checkRequestResponse
-                                )
-                                issues.add(issue)
-                            }
-                        } catch (_: Exception) {
-                            // Skip payloads that fail to send
-                        }
-                    }
-
-                    return AuditResult.auditResult(issues)
-                }
-
-                override fun consolidateIssues(existingIssue: AuditIssue, newIssue: AuditIssue): ConsolidationAction {
-                    return if (existingIssue.name() == newIssue.name() &&
-                        existingIssue.baseUrl() == newIssue.baseUrl()) {
-                        ConsolidationAction.KEEP_EXISTING
-                    } else {
-                        ConsolidationAction.KEEP_BOTH
-                    }
-                }
-            }
-
-            val registration: Registration = api.scanner().registerScanCheck(scanCheck)
-            stateManager.registeredScanChecks.add(checkName)
-            // Retain the Registration so the check can be deregistered later
-            // (via unregisterScanCheck or on extension unload). Previously this
-            // handle was discarded, leaking the check with no way to remove it.
-            stateManager.scanCheckRegistrations.put(checkName, registration)
-                ?.let { previous -> try { previous.deregister() } catch (_: Exception) {} }
-
+            val definition = legacyCheckDefinition(
+                checkName, checkType, issueName, severity, confidence, detail, remediation,
+                passiveResponseMatch, passiveHeaderMatch, activePayloads, activeResponseMatch
+            )
+            val (check, replaced) = checks.register(definition)
             buildJsonObject {
                 put("registered", true)
-                put("check_name", checkName)
-                put("check_type", checkType)
-                put("issue_name", issueName)
+                put("id", check.id)
+                put("check_name", definition.name)
+                put("check_type", definition.mode)
+                put("issue_name", definition.issueName)
+                if (replaced != null) put("replaced", replaced.id)
             }
+        } catch (e: InvalidCheckException) {
+            errorJson(e.message ?: "Invalid scan check")
         } catch (e: UnsupportedOperationException) {
-            buildJsonObject {
-                put("error", "Scanner API is not available in Burp Suite Community Edition")
-            }
+            errorJson("Scanner API is not available in Burp Suite Community Edition")
         } catch (e: Exception) {
-            buildJsonObject {
-                put("error", "Failed to register scan check: ${e.message}")
-            }
+            errorJson("Failed to register scan check: ${e.message}")
         }
     }
 
     /**
-     * Deregisters a scan check previously registered via [registerScanCheck].
-     *
-     * Uses the retained Montoya [Registration] handle to remove the check
-     * from Burp's scanner, then drops it from internal tracking.
+     * Deregisters a custom scan check by the name it was registered under, or by its id. Checks
+     * created with the `scancheck_*` tools can be removed here too.
      *
      * @param checkName The name used when the check was registered.
      * @return JSON object confirming removal or reporting an error.
      */
     fun unregisterScanCheck(checkName: String): JsonObject {
-        val registration = stateManager.scanCheckRegistrations[checkName]
-            ?: return buildJsonObject { put("error", "Scan check not found: $checkName") }
+        val check = checks.find(checkName)
+            ?: return errorJson("Scan check not found: $checkName")
 
         return try {
-            registration.deregister()
-            stateManager.scanCheckRegistrations.remove(checkName)
-            stateManager.registeredScanChecks.remove(checkName)
+            checks.remove(check)
             buildJsonObject {
-                put("check_name", checkName)
+                put("check_name", check.definition.name)
+                put("id", check.id)
                 put("unregistered", true)
             }
         } catch (e: Exception) {
@@ -1025,6 +901,11 @@ class ScannerBridge(
                 put("error", "Failed to unregister scan check: ${e.message}")
             }
         }
+    }
+
+    /** Removes every audit auth rule and stops watching audits. Called on extension unload. */
+    fun shutdown() {
+        authRules.shutdown()
     }
 
     /**
@@ -1100,7 +981,127 @@ class ScannerBridge(
         }
     }
 
+    private fun errorJson(message: String): JsonObject = buildJsonObject { put("error", message) }
+
+    /** Says so when [host] lies outside the hosts the audit's auth header is limited to. */
+    private fun authScopeNote(scanTask: ScanTask, host: String?): String? {
+        val rule = stateManager.trafficRules.firstOrNull { it.ruleId == scanTask.authRuleId } ?: return null
+        val scope = rule.matchHost ?: return null
+        if (host == null || SafeRegex.matchesHostPattern(scope, host)) return null
+        return "The audit's auth header is limited to the hosts the audit was started with and is not sent to '$host'."
+    }
+
     companion object {
+        internal val AUDIT_MODES = setOf("light", "normal", "thorough")
+        internal val CHECK_TYPES = setOf("passive", "active", "both")
+        internal val REPORT_FORMATS = setOf("html", "xml")
+
+        /** Severities an issue can be created with; `info` is accepted for `information`. */
+        private val CREATE_SEVERITIES = ScanCheckLogic.SEVERITIES + "info"
+
+        /** Severities an issue can be filtered by. */
+        private val FILTER_SEVERITIES = CREATE_SEVERITIES + "false_positive"
+
+        /** The [AuditIssueSeverity] constant name for a validated severity value. */
+        private fun severityName(value: String): String =
+            value.trim().uppercase().let { if (it == "INFO") "INFORMATION" else it }
+
+        /**
+         * Site map URL prefixes (`scheme://host[:port]/`) covering what an audit of [urls] and
+         * [rawRequests] targets. A raw request does not say which scheme it is for, so it yields both.
+         */
+        internal fun targetPrefixes(urls: List<String>, rawRequests: List<String>): Set<String> {
+            val prefixes = LinkedHashSet<String>()
+            urls.forEach { url ->
+                val authority = AuditAuthRules.authorityOfUrl(url) ?: return@forEach
+                prefixes += origin(url.substringBefore("://").lowercase(), authority)
+            }
+            rawRequests.forEach { raw ->
+                val authority = AuditAuthRules.authorityOfRawRequest(raw) ?: return@forEach
+                prefixes += origin("https", authority)
+                prefixes += origin("http", authority)
+            }
+            return prefixes
+        }
+
+        /** `scheme://host[:port]/` the way Burp writes site map URLs: lower case, default port left out. */
+        internal fun origin(scheme: String, authority: String): String {
+            val defaultPort = if (scheme == "https") ":443" else ":80"
+            return "$scheme://${authority.lowercase().removeSuffix(defaultPort)}/"
+        }
+
+        /**
+         * The `scanner_register_check` parameters as a [CheckDefinition]: the passive regexes become
+         * conditions joined by OR, and each payload an optional step whose response body must match.
+         *
+         * @throws InvalidCheckException when a value is invalid or the chosen type lacks its parameters.
+         */
+        internal fun legacyCheckDefinition(
+            checkName: String,
+            checkType: String,
+            issueName: String,
+            severity: String,
+            confidence: String,
+            detail: String,
+            remediation: String,
+            passiveResponseMatch: String?,
+            passiveHeaderMatch: String?,
+            activePayloads: List<String>?,
+            activeResponseMatch: String?,
+        ): CheckDefinition {
+            if (checkName.isBlank()) throw InvalidCheckException("check_name must not be blank")
+            if (issueName.isBlank()) throw InvalidCheckException("issue_name must not be blank")
+            EnumValidation.error(checkType, CHECK_TYPES, "check_type", required = true)?.let {
+                throw InvalidCheckException(it.getValue("error").jsonPrimitive.content)
+            }
+            val type = checkType.trim().lowercase()
+
+            fun regexOn(location: String, param: String, pattern: String?): CheckCondition? {
+                if (pattern == null) return null
+                if (pattern.isEmpty()) throw InvalidCheckException("$param is empty; an empty regex matches every response")
+                SafeRegex.validate(pattern, ignoreCase = true)?.let {
+                    throw InvalidCheckException("Invalid $param regex: $it")
+                }
+                return CheckCondition(location, pattern, "matches")
+            }
+
+            val passiveConditions = if (type == "active") emptyList<CheckCondition>() else listOfNotNull(
+                regexOn("response_body", "passive_response_match", passiveResponseMatch),
+                regexOn("response_headers", "passive_header_match", passiveHeaderMatch),
+            )
+            val activeMatch =
+                if (type == "passive") null else regexOn("response_body", "active_response_match", activeResponseMatch)
+            val payloads = if (type == "passive") emptyList<String>() else activePayloads.orEmpty()
+            val activeSteps = if (activeMatch == null || payloads.isEmpty()) null else payloads.map {
+                ActiveStep(it, listOf(activeMatch), stopIfNoMatch = false)
+            }
+
+            if (type == "passive" && passiveConditions.isEmpty()) {
+                throw InvalidCheckException("A passive check needs passive_response_match and/or passive_header_match")
+            }
+            if (type == "active" && activeSteps == null) {
+                throw InvalidCheckException("An active check needs active_payloads and active_response_match")
+            }
+            if (passiveConditions.isEmpty() && activeSteps == null) {
+                throw InvalidCheckException(
+                    "check_type 'both' needs passive_response_match / passive_header_match, " +
+                        "or active_payloads with active_response_match"
+                )
+            }
+
+            return CheckDefinition(
+                name = checkName,
+                issueName = issueName,
+                description = "",
+                detail = detail,
+                remediation = remediation,
+                severity = ScanCheckLogic.severity(severity, "issue_severity"),
+                confidence = ScanCheckLogic.confidence(confidence, "issue_confidence"),
+                passive = passiveConditions.takeIf { it.isNotEmpty() }?.let { PassiveRule(it, MatchMode.ANY) },
+                active = activeSteps,
+            )
+        }
+
         /**
          * Decodes an HTTP message payload supplied to [createCustomIssue].
          *

@@ -2,6 +2,7 @@ package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
 import io.bitbytelab.raijin.core.EnumValidation
+import io.bitbytelab.raijin.safety.SafeRegex
 import io.bitbytelab.raijin.state.StateManager
 import kotlinx.serialization.json.*
 import java.time.Instant
@@ -13,6 +14,44 @@ data class DeployedBCheck(
     val type: String,
     val script: String,
     val deployedAt: String
+)
+
+/**
+ * A `bcheck_create` definition with every default and fallback resolved, so the script emitter
+ * and the dry run act on the same decisions.
+ */
+internal sealed interface BCheckSpec {
+
+    /**
+     * One comparison in the generated script.
+     *
+     * @property location which part of a message, named as [CheckCondition.location] names it.
+     * @property regex true for `matches`, false for `is`.
+     * @property value the regex or the exact text.
+     */
+    class Match(val location: String, val regex: Boolean, val value: String) {
+        /** The same comparison for the dry run. BCheck comparisons are case-sensitive. */
+        fun condition(): CheckCondition =
+            CheckCondition(location, value, if (regex) "matches" else "equals", ignoreCase = false)
+    }
+
+    class Passive(val onRequest: Boolean, val match: Match) : BCheckSpec
+    class InsertionPoint(val payloads: List<String>, val match: Match) : BCheckSpec
+    class Host(val path: String, val match: Match) : BCheckSpec
+    class Path(val suffixes: List<String>, val match: Match?) : BCheckSpec
+    class Collaborator(val header: String, val valueTemplate: String, val interaction: String) : BCheckSpec
+}
+
+/**
+ * A BCheck dry run: it is shown history items, then says what the check would have done with them.
+ *
+ * @property parts the message parts it looks at; nothing else has to be read from the history.
+ */
+internal class BCheckDryRun(
+    val parts: Set<String>,
+    val visit: (HistoryItem) -> Unit,
+    val result: () -> JsonObject,
+    val note: String,
 )
 
 class BCheckBridge(
@@ -44,36 +83,82 @@ class BCheckBridge(
         severity: String,           // high, medium, low, information
         confidence: String,         // certain, firm, tentative
         issueDetail: String?,
-        issueRemediation: String?
+        issueRemediation: String?,
+        path: String? = null        // Path a host_level check requests (default "/")
     ): JsonObject {
         // Validate all closed-set parameters BEFORE emitting or importing any DSL.
         // A bad enum here must return a clean structured error, never a deployed check.
         validateInputs(type, severity, confidence, matchCondition)?.let { return it }
+        if (name.isBlank()) return errorJson("name must not be blank")
+        // What the type needs: a non-empty pattern (an empty one matches every message), a valid
+        // regex, payloads to send. Rejected here rather than by Burp's importer, or not at all.
+        definitionError(
+            type, matchPattern, matchLocation, matchCondition, payloads, responseMatchPattern,
+            collaboratorPayloadType, path
+        )?.let { return errorJson(it) }
 
-        // Active checks need something to look for in the response; a `matches ""`
-        // condition would fire on every response, so require a non-empty match here.
-        if (type.trim().lowercase() == "insertion_point") {
-            val respMatch = (responseMatchPattern ?: matchPattern)?.trim()
-            if (respMatch.isNullOrEmpty()) {
-                return buildJsonObject {
-                    put("error", "insertion_point checks require a non-empty response_match_pattern " +
-                        "(or match_pattern) so the check has something to detect in the response. " +
-                        "Emitting an empty match would fire on every response.")
-                }
-            }
-        }
-
-        // Generate the BCheck script
-        val script = generateScript(
+        val script = emitScript(
             name, description, author ?: "Raijin AI Agent", tags ?: "ai-generated",
             type, matchPattern, matchLocation, matchCondition,
             payloads, responseMatchPattern,
             collaboratorPayloadType,
-            severity, confidence, issueDetail, issueRemediation
+            severity, confidence, issueDetail, issueRemediation, path
         )
 
         // Import into Burp
-        return importScript(script, name, type)
+        return importScript(script, name, type.trim().lowercase())
+    }
+
+    /**
+     * Shows what a `bcheck_create` definition would do with the proxy history Burp has already
+     * recorded. Nothing is imported and nothing is sent.
+     *
+     * A passive check is evaluated in full: which recorded messages it would report. A check that
+     * sends requests cannot be, so the result says how much it would send and what the history
+     * already shows: responses that carry the pattern before any payload (insertion_point), or
+     * recorded responses for the very paths the check would request (host_level, path_level).
+     *
+     * The parameters up to [path] are those of [create]. [urlPattern], [inScopeOnly] and
+     * [maxItems] choose the history items read (the newest [maxItems] that match); [maxMatches]
+     * is how many matches are listed in full.
+     */
+    fun dryRun(
+        type: String,
+        matchPattern: String?,
+        matchLocation: String?,
+        matchCondition: String?,
+        payloads: List<String>?,
+        responseMatchPattern: String?,
+        collaboratorPayloadType: String?,
+        path: String?,
+        urlPattern: String?,
+        inScopeOnly: Boolean,
+        maxItems: Int?,
+        maxMatches: Int?
+    ): JsonObject {
+        validateInputs(type, DRY_RUN_SEVERITY, DRY_RUN_CONFIDENCE, matchCondition)?.let { return it }
+        return try {
+            val spec = resolve(
+                type, matchPattern, matchLocation, matchCondition, payloads, responseMatchPattern,
+                collaboratorPayloadType, path
+            )
+            val filter = HistoryFilter.of(urlPattern, inScopeOnly, maxItems)
+            val run = dryRunOf(spec, HistoryFilter.matchLimit(maxMatches))
+            val script = emitScript(
+                "Dry run", "Dry run of a bcheck_create definition", "Raijin", "dry-run",
+                type, matchPattern, matchLocation, matchCondition, payloads, responseMatchPattern,
+                collaboratorPayloadType, DRY_RUN_SEVERITY, DRY_RUN_CONFIDENCE, null, null, path
+            )
+            val historySize = HistorySampler(api).forEach(filter, run.parts, run.visit)
+            val report = dryRunReport(type.trim().lowercase(), historySize, filter, run.result(), run.note)
+            JsonObject(report + ("script" to JsonPrimitive(script)))
+        } catch (e: IllegalArgumentException) {
+            errorJson(e.message ?: "Invalid BCheck definition")
+        } catch (e: InvalidCheckException) {
+            errorJson(e.message ?: "Invalid dry run parameters")
+        } catch (e: Exception) {
+            errorJson("Dry run failed: ${e.message}")
+        }
     }
 
     /**
@@ -269,23 +354,25 @@ given request then
 metadata:
     language: v2-beta
     name: "Server-side template injection (basic)"
-    description: "Detects basic SSTI by injecting math expressions"
+    description: "Detects basic SSTI by injecting a math expression"
     author: "Raijin"
     tags: "ssti", "injection", "active"
 
+define:
+    probe = "${'$'}{1337*1337}"
+    answer = "1787569"
+
 given insertion point then
-    send payload called check_ssti:
-        replacing: `${'$'}{7*7}`
+    # the answer must not already be in the response to the unmodified request
+    if not({answer} in {base.response.body}) then
+        send payload called check_ssti:
+            replacing: {probe}
 
-    if {check_ssti.response.body} matches "49" then
-        send payload called confirm_ssti:
-            replacing: `${'$'}{7*6}`
-
-        if {confirm_ssti.response.body} matches "42" then
+        if {answer} in {check_ssti.response.body} then
             report issue:
                 severity: high
                 confidence: firm
-                detail: `Server-side template injection detected. The expression ${'$'}{7*7} evaluated to 49 and ${'$'}{7*6} evaluated to 42, confirming server-side expression evaluation.`
+                detail: `Server-side template injection detected. The expression {probe} was evaluated: the response contains {answer}, which the unmodified response does not.`
                 remediation: `Never pass user input directly into template engines. Use template engines in sandboxed mode. Validate and sanitize all user input before template processing.`
         end if
     end if""".trimIndent())
@@ -316,7 +403,7 @@ given host then
             severity: high
             confidence: certain
             detail: `The .git directory is publicly accessible. An attacker can download the entire source code repository, including commit history, branches, and potentially sensitive configuration files.`
-            remediation: `Block access to .git directories in your web server configuration. For nginx: location ~ /\.git { deny all; }. For Apache: RedirectMatch 404 /\.git`
+            remediation: "Block access to .git directories in your web server configuration."
     end if""".trimIndent())
                 })
 
@@ -334,23 +421,27 @@ metadata:
     author: "Raijin"
     tags: "backup", "exposure", "path"
 
-define:
-    extensions = ".bak", ".old", ".orig", ".save", ".swp", "~", ".tmp"
+run for each:
+    extension = ".bak", ".old", ".orig", ".save", ".swp", "~", ".tmp"
 
 given path then
-    run for each:
-        extensions as ext
-
     send request called backup_check:
         method: "GET"
-        path: `{base.request.url.path}{ext}`
+        replacing path: `{base.request.url.path}{extension}`
 
     if {backup_check.response.status_code} is "200" then
-        report issue:
-            severity: medium
-            confidence: tentative
-            detail: `A backup file was found at {backup_check.request.url}. Backup files may contain source code, configuration details, or other sensitive information.`
-            remediation: `Remove all backup files from production servers. Configure your deployment process to exclude backup files.`
+        # a site that answers 200 to anything is not serving a backup file
+        send request called garbage_check:
+            method: "GET"
+            replacing path: `{base.request.url.path}.{random_str(10)}`
+
+        if {garbage_check} differs from {backup_check} then
+            report issue and continue:
+                severity: medium
+                confidence: tentative
+                detail: `A backup file was found at {backup_check.request.url}. Backup files may contain source code, configuration details, or other sensitive information.`
+                remediation: `Remove all backup files from production servers. Configure your deployment process to exclude backup files.`
+        end if
     end if""".trimIndent())
                 })
 
@@ -370,8 +461,8 @@ metadata:
 
 given request then
     send request called ssrf_test:
-        method: `{base.request.method}`
-        replacing header "Referer": `https://{generate_collaborator_address()}/ssrf-test`
+        replacing headers:
+            "Referer": `https://{generate_collaborator_address()}/ssrf-test`
 
     if dns interactions then
         report issue:
@@ -386,7 +477,7 @@ given request then
                 add(buildJsonObject {
                     put("type", "multi_step")
                     put("name", "Multi-step with variables")
-                    put("description", "Complex check with multiple requests, variables, and conditional logic. Uses define blocks for reusable values and run-for-each for iteration.")
+                    put("description", "A check with a variable, a modified request and two conditions that must both hold. Use define for a single value and run for each (before given) to repeat the check per value.")
                     put("use_cases", "Complex vulnerability detection requiring multiple requests, IDOR verification, authentication bypass chains")
                     put("example", """
 metadata:
@@ -397,23 +488,20 @@ metadata:
     tags: "cors", "misconfiguration"
 
 define:
-    evil_origins = "https://evil.com", "null", "https://attacker.example.com"
+    evil_origin = "https://evil.example"
 
-given host then
-    run for each:
-        evil_origins as origin
-
+given request then
     send request called cors_test:
-        method: "GET"
-        replacing header "Origin": `{origin}`
+        replacing headers:
+            "Origin": {evil_origin}
 
-    if {cors_test.response.headers} matches "(?i)access-control-allow-origin:\s*((\*)|({origin}))" and
+    if {cors_test.response.headers} matches "(?i)access-control-allow-origin:\s*https://evil\.example" and
         {cors_test.response.headers} matches "(?i)access-control-allow-credentials:\s*true" then
         report issue:
             severity: high
             confidence: firm
-            detail: `CORS misconfiguration detected. The server reflects the Origin header '{origin}' in Access-Control-Allow-Origin while also setting Access-Control-Allow-Credentials: true. This allows an attacker-controlled domain to read authenticated responses cross-origin.`
-            remediation: `Implement a strict allowlist of permitted origins. Never reflect arbitrary Origin values when Access-Control-Allow-Credentials is true. Never use Access-Control-Allow-Origin: * with credentials.`
+            detail: `CORS misconfiguration detected. The server reflects the Origin header {evil_origin} in Access-Control-Allow-Origin while also setting Access-Control-Allow-Credentials: true. This allows an attacker-controlled domain to read authenticated responses cross-origin.`
+            remediation: `Implement a strict allowlist of permitted origins. Never reflect arbitrary Origin values when Access-Control-Allow-Credentials is true.`
     end if""".trimIndent())
                 })
             })
@@ -428,38 +516,50 @@ given host then
                 })
                 put("scope_keywords", buildJsonArray {
                     add("given response then - passive, runs on every response")
-                    add("given request then - passive, runs on every request")
-                    add("given insertion point then - active, runs at each insertion point")
+                    add("given request then - runs once per request; may send requests")
+                    add("given insertion point then - active, runs at each insertion point (any | query | header | body | cookie insertion point)")
                     add("given host then - once per unique host")
                     add("given path then - once per unique path")
                 })
+                put("variables_and_loops", buildJsonArray {
+                    add("define: name = \"value\" - a variable; placed after metadata, before given")
+                    add("run for each: name = \"a\", \"b\" - placed before given; the check runs once per value")
+                })
                 put("request_operations", buildJsonArray {
                     add("send request called <name>: method: \"GET\" path: \"/test\"")
-                    add("send payload called <name>: replacing: `payload_value`")
-                    add("replacing header \"Name\": `value` - modify a header")
+                    add("send payload called <name>: replacing: \"payload\" (or appending:) - insertion point checks only")
+                    add("replacing headers: \"Name\": \"value\", \"Other\": {variable} - under send request; also appending headers, removing headers")
+                    add("replacing path / appending path / replacing queries / replacing body - under send request")
                 })
                 put("conditions", buildJsonArray {
-                    add("{var.response.body} matches \"regex\"")
+                    add("{var.response.body} matches \"regex\" - Java regex found in the text")
                     add("{var.response.status_code} is \"200\"")
-                    add("{var.response.headers} matches \"regex\"")
-                    add("dns interactions - collaborator DNS callback detected")
-                    add("http interactions - collaborator HTTP callback detected")
+                    add("\"text\" in {var.response.body} - substring test")
+                    add("{a} differs from {b} - two responses differ")
+                    add("dns interactions | http interactions | smtp interactions | any interactions - Collaborator callbacks")
                     add("not(...) - negate a condition")
                     add("... and ... - combine conditions")
-                    add("... or ... - alternative conditions")
+                    add("... or ... - alternative conditions; use brackets to group")
+                })
+                put("strings", buildJsonArray {
+                    add("\"literal\" - taken as written: { and \\ are plain characters, \\\" is a quote. A regex after matches must be a literal")
+                    add("`interpolated` - {variable} is replaced. Write \\{ for a brace, \\\\ for a backslash, \\` for a backtick; \\n \\r \\t \\s are line feed, carriage return, tab, space")
                 })
                 put("variables", buildJsonArray {
                     add("{base.request.url} - original request URL")
                     add("{base.request.url.path} - original request path")
                     add("{base.request.method} - original request method")
                     add("{base.request.body} - original request body")
+                    add("{base.response.body} - response to the original request (the baseline)")
                     add("{latest.response.body} - most recent response body")
                     add("{latest.response.status_code} - most recent status code")
                     add("{latest.response.headers} - most recent response headers")
                     add("{generate_collaborator_address()} - generate OOB payload")
+                    add("{random_str(10)} - random string of that length")
                 })
                 put("reporting", buildJsonArray {
-                    add("severity: high | medium | low | information")
+                    add("report issue: - reports and ends the check; report issue and continue: - reports and goes on")
+                    add("severity: info | low | medium | high")
                     add("confidence: certain | firm | tentative")
                     add("detail: `Issue description with {variables}`")
                     add("remediation: `How to fix`")
@@ -468,35 +568,9 @@ given host then
         }
     }
 
-    /**
-     * Generate a BCheck script from structured parameters.
-     * Delegates to the pure static [emitScript] so the DSL output can be
-     * unit-tested without a live Burp/Montoya instance.
-     */
-    private fun generateScript(
-        name: String,
-        description: String,
-        author: String,
-        tags: String,
-        type: String,
-        matchPattern: String?,
-        matchLocation: String?,
-        matchCondition: String?,
-        payloads: List<String>?,
-        responseMatchPattern: String?,
-        collaboratorPayloadType: String?,
-        severity: String,
-        confidence: String,
-        issueDetail: String?,
-        issueRemediation: String?
-    ): String = emitScript(
-        name, description, author, tags, type,
-        matchPattern, matchLocation, matchCondition,
-        payloads, responseMatchPattern, collaboratorPayloadType,
-        severity, confidence, issueDetail, issueRemediation
-    )
-
     fun getDeployedChecks(): List<DeployedBCheck> = deployedChecks.toList()
+
+    private fun errorJson(message: String): JsonObject = buildJsonObject { put("error", message) }
 
     companion object {
         // Closed sets accepted by the v2-beta BCheck DSL. Anything outside these
@@ -513,6 +587,26 @@ given host then
         // the tool schema as a convenience and is translated to an escaped-substring
         // `matches` regex — see [normalizeCondition].
         internal val ALLOWED_CONDITIONS = setOf("matches", "is", "contains")
+        internal val ALLOWED_INTERACTIONS = setOf("dns", "http")
+
+        /** `match_location` values of a passive_response check, as [CheckCondition.location] names. */
+        private val RESPONSE_LOCATIONS = mapOf(
+            "response_body" to "response_body", "body" to "response_body",
+            "response_headers" to "response_headers", "headers" to "response_headers",
+            "status_code" to "status_code",
+        )
+
+        /** `match_location` values of a passive_request check. */
+        private val REQUEST_LOCATIONS = mapOf(
+            "request_url" to "request_url", "url" to "request_url",
+            "request_headers" to "request_headers", "headers" to "request_headers",
+            "request_body" to "request_body", "body" to "request_body",
+        )
+
+        private val DEFAULT_SUFFIXES = listOf(".bak", ".old", ".orig", ".swp", "~")
+        private const val COLLABORATOR_ADDRESS = "{generate_collaborator_address()}"
+        private const val DRY_RUN_SEVERITY = "information"
+        private const val DRY_RUN_CONFIDENCE = "tentative"
 
         /**
          * Validate every closed-set parameter that feeds the DSL emitter. Returns a
@@ -534,9 +628,135 @@ given host then
         }
 
         /**
+         * What is wrong with a definition beyond its enums, or null when a script can be emitted
+         * for it: a missing or empty pattern, an invalid regex, a location the type does not have,
+         * no payload to send.
+         */
+        internal fun definitionError(
+            type: String,
+            matchPattern: String?,
+            matchLocation: String?,
+            matchCondition: String?,
+            payloads: List<String>?,
+            responseMatchPattern: String?,
+            collaboratorPayloadType: String?,
+            path: String?,
+        ): String? = try {
+            resolve(
+                type, matchPattern, matchLocation, matchCondition, payloads, responseMatchPattern,
+                collaboratorPayloadType, path
+            )
+            null
+        } catch (e: IllegalArgumentException) {
+            e.message ?: "Invalid BCheck definition"
+        }
+
+        /**
+         * Resolves a definition's defaults and fallbacks into a [BCheckSpec].
+         *
+         * @throws IllegalArgumentException naming what is missing or invalid. An unsupported [type]
+         *   is rejected here, never turned into a check that matches everything.
+         */
+        internal fun resolve(
+            type: String,
+            matchPattern: String?,
+            matchLocation: String?,
+            matchCondition: String?,
+            payloads: List<String>?,
+            responseMatchPattern: String?,
+            collaboratorPayloadType: String?,
+            path: String?,
+        ): BCheckSpec {
+            val kind = type.trim().lowercase()
+
+            fun match(location: String, param: String, pattern: String?): BCheckSpec.Match {
+                require(!pattern.isNullOrEmpty()) {
+                    "$kind checks need a non-empty $param: an empty pattern matches every message"
+                }
+                val (operator, operand) = normalizeCondition(matchCondition, pattern)
+                if (operator == "matches") {
+                    regexError(operand)?.let { throw IllegalArgumentException("Invalid $param regex: $it") }
+                }
+                return BCheckSpec.Match(location, regex = operator == "matches", value = operand)
+            }
+
+            fun location(known: Map<String, String>, default: String): String {
+                val given = matchLocation?.trim()?.lowercase().takeUnless { it.isNullOrEmpty() } ?: return default
+                return known[given] ?: throw IllegalArgumentException(
+                    "match_location '$matchLocation' is not available for $kind checks. " +
+                        "Allowed: ${known.keys.joinToString(", ")}"
+                )
+            }
+
+            return when (kind) {
+                "passive_response" -> BCheckSpec.Passive(
+                    onRequest = false,
+                    match = match(location(RESPONSE_LOCATIONS, "response_body"), "match_pattern", matchPattern),
+                )
+
+                "passive_request" -> BCheckSpec.Passive(
+                    onRequest = true,
+                    match = match(location(REQUEST_LOCATIONS, "request_url"), "match_pattern", matchPattern),
+                )
+
+                "insertion_point" -> {
+                    val response = match("response_body", "response_match_pattern", responseMatchPattern ?: matchPattern)
+                    // Without 'payloads', match_pattern is the payload when response_match_pattern
+                    // says what to look for: the shape this tool had before it took a payload list.
+                    val sent = payloads.orEmpty().filter { it.isNotEmpty() }.ifEmpty {
+                        listOfNotNull(matchPattern?.takeIf { it.isNotEmpty() && responseMatchPattern != null })
+                    }
+                    require(sent.isNotEmpty()) { "insertion_point checks need 'payloads' to inject" }
+                    BCheckSpec.InsertionPoint(sent, response)
+                }
+
+                "host_level" -> {
+                    // Before 'path' existed, match_pattern was the path whenever it looked like one.
+                    val pathFromPattern = matchPattern?.takeIf { path == null && it.startsWith("/") }
+                    val probe = path ?: pathFromPattern ?: "/"
+                    require(probe.isNotBlank()) { "host_level checks need a non-blank path" }
+                    val body = responseMatchPattern ?: matchPattern.takeIf { pathFromPattern == null }
+                    BCheckSpec.Host(probe, match("response_body", "response_match_pattern", body))
+                }
+
+                "path_level" -> BCheckSpec.Path(
+                    suffixes = payloads.orEmpty().filter { it.isNotEmpty() }.ifEmpty { DEFAULT_SUFFIXES },
+                    match = responseMatchPattern?.takeIf { it.isNotEmpty() }
+                        ?.let { match("response_body", "response_match_pattern", it) },
+                )
+
+                "collaborator" -> {
+                    val header = matchLocation ?: "Referer"
+                    require(header.isNotBlank()) { "collaborator checks need a header name in match_location" }
+                    val template = matchPattern ?: "https://$COLLABORATOR_ADDRESS"
+                    require(COLLABORATOR_ADDRESS in template) {
+                        "For a collaborator check, match_pattern is the header value to inject and must contain " +
+                            "$COLLABORATOR_ADDRESS; without it nothing can call back"
+                    }
+                    val interaction = collaboratorPayloadType?.trim()?.lowercase().takeUnless { it.isNullOrEmpty() } ?: "dns"
+                    require(interaction in ALLOWED_INTERACTIONS) {
+                        "Parameter 'collaborator_payload_type' has invalid value '$collaboratorPayloadType'. " +
+                            "Allowed: ${ALLOWED_INTERACTIONS.joinToString(", ")}"
+                    }
+                    BCheckSpec.Collaborator(header, template, interaction)
+                }
+
+                else -> throw IllegalArgumentException(
+                    "Unsupported BCheck type '$type'. Allowed: ${ALLOWED_TYPES.sorted().joinToString(", ")}"
+                )
+            }
+        }
+
+        /**
          * Pure BCheck v2-beta DSL emitter. No Burp/Montoya dependency, so it can be
-         * unit-tested directly. Throws [IllegalArgumentException] on an unsupported
-         * [type] rather than emitting a degenerate always-firing check.
+         * unit-tested directly.
+         *
+         * Every caller-supplied string is written through [stringToken], [regexToken],
+         * [metadataToken] or [interpolatedBody], so whatever it contains (quotes, backslashes,
+         * backticks, braces, line breaks) it stays inside its string and is taken as text.
+         *
+         * @throws IllegalArgumentException for a definition [resolve] rejects, or a severity or
+         *   confidence outside the grammar.
          */
         internal fun emitScript(
             name: String,
@@ -553,174 +773,218 @@ given host then
             severity: String,
             confidence: String,
             issueDetail: String?,
-            issueRemediation: String?
+            issueRemediation: String?,
+            path: String? = null,
         ): String {
-            val sb = StringBuilder()
+            val spec = resolve(
+                type, matchPattern, matchLocation, matchCondition, payloads, responseMatchPattern,
+                collaboratorPayloadType, path
+            )
 
             // QA #32 (live-verified): Burp's BCheck v2-beta parser rejects `severity: information`
             // ("Unexpected token information") — it expects `info`. Callers still pass "information"
             // (matching AuditIssueSeverity + the tool schema); we emit the token Burp accepts.
-            val emitSeverity = if (severity.equals("information", ignoreCase = true)) "info" else severity.lowercase()
+            val emitSeverity = when (val given = severity.trim().lowercase()) {
+                "information", "info" -> "info"
+                "high", "medium", "low" -> given
+                else -> throw IllegalArgumentException("Unsupported severity '$severity'")
+            }
+            val emitConfidence = confidence.trim().lowercase()
+            require(emitConfidence in ALLOWED_CONFIDENCES) { "Unsupported confidence '$confidence'" }
+
+            val detail = issueDetail ?: "$name was detected."
+            val remediation = issueRemediation ?: "Review and fix the identified issue."
+            val sb = StringBuilder()
+
+            fun report(indent: String, detailToken: String, action: String = "report issue") {
+                sb.appendLine("$indent$action:")
+                sb.appendLine("$indent    severity: $emitSeverity")
+                sb.appendLine("$indent    confidence: $emitConfidence")
+                sb.appendLine("$indent    detail: $detailToken")
+                sb.appendLine("$indent    remediation: `${interpolatedBody(remediation)}`")
+            }
 
             // Metadata
             sb.appendLine("metadata:")
             sb.appendLine("    language: v2-beta")
-            sb.appendLine("    name: \"$name\"")
-            sb.appendLine("    description: \"$description\"")
-            sb.appendLine("    author: \"$author\"")
-            sb.appendLine("    tags: ${tags.split(",").joinToString(", ") { "\"${it.trim()}\"" }}")
+            sb.appendLine("    name: ${metadataToken(name)}")
+            sb.appendLine("    description: ${metadataToken(description)}")
+            sb.appendLine("    author: ${metadataToken(author)}")
+            val tagList = tags.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+            if (tagList.isNotEmpty()) sb.appendLine("    tags: ${tagList.joinToString(", ") { metadataToken(it) }}")
             sb.appendLine()
 
-            val detail = issueDetail ?: "$name was detected."
-            val remediation = issueRemediation ?: "Review and fix the identified issue."
-
-            when (type.trim().lowercase()) {
-                "passive_response" -> {
-                    sb.appendLine("given response then")
-                    val location = when (matchLocation?.lowercase()) {
-                        "response_headers", "headers" -> "{latest.response.headers}"
-                        "status_code" -> "{latest.response.status_code}"
-                        else -> "{latest.response.body}"
-                    }
-                    val (op, cond) = normalizeCondition(matchCondition, matchPattern ?: "")
-                    sb.appendLine("    if $location $op \"${escapeRegex(cond)}\" then")
-                    sb.appendLine("        report issue:")
-                    sb.appendLine("            severity: $emitSeverity")
-                    sb.appendLine("            confidence: $confidence")
-                    sb.appendLine("            detail: `$detail`")
-                    sb.appendLine("            remediation: `$remediation`")
+            when (spec) {
+                is BCheckSpec.Passive -> {
+                    sb.appendLine(if (spec.onRequest) "given request then" else "given response then")
+                    sb.appendLine("    if ${comparison(if (spec.onRequest) "base" else "latest", spec.match)} then")
+                    report("        ", "`${interpolatedBody(detail)}`")
                     sb.appendLine("    end if")
                 }
 
-                "passive_request" -> {
-                    sb.appendLine("given request then")
-                    val location = when (matchLocation?.lowercase()) {
-                        "request_headers", "headers" -> "{base.request.headers}"
-                        "request_body", "body" -> "{base.request.body}"
-                        else -> "{base.request.url}"
-                    }
-                    val (op, cond) = normalizeCondition(matchCondition, matchPattern ?: "")
-                    sb.appendLine("    if $location $op \"${escapeRegex(cond)}\" then")
-                    sb.appendLine("        report issue:")
-                    sb.appendLine("            severity: $emitSeverity")
-                    sb.appendLine("            confidence: $confidence")
-                    sb.appendLine("            detail: `$detail`")
-                    sb.appendLine("            remediation: `$remediation`")
-                    sb.appendLine("    end if")
-                }
-
-                "insertion_point" -> {
+                is BCheckSpec.InsertionPoint -> {
                     // v2-beta does NOT support `run for each` over a define list under
                     // `given insertion point then` with `send payload`. Emit one distinct
-                    // `send payload called p{n}` per payload, each with its own detection
-                    // block, which is the documented insertion-point pattern.
+                    // `send payload called p{n}` per payload, each with its own detection block.
                     //
-                    // create() guarantees a non-empty response_match_pattern/match_pattern
-                    // for this type, so `matches ""` can never be emitted; we still fall
-                    // back defensively here in case emitScript is reached another way.
-                    val respMatch = (responseMatchPattern ?: matchPattern)
-                        ?.takeIf { it.isNotBlank() }
-                        ?: "error|exception|stack.trace"
-                    val payloadList = payloads?.filter { it.isNotEmpty() }
-                        ?.takeIf { it.isNotEmpty() }
-                        ?: listOf(matchPattern?.takeIf { it.isNotBlank() } ?: "FUZZ")
-
+                    // The outer `if` is the baseline guard: what the payloads are meant to provoke
+                    // must not already be in the response to the unmodified request, or every
+                    // insertion point of such a page would be reported.
                     sb.appendLine("given insertion point then")
-                    payloadList.forEachIndexed { index, payload ->
-                        val varName = "p${index + 1}"
-                        sb.appendLine("    send payload called $varName:")
-                        sb.appendLine("        replacing: `$payload`")
+                    sb.appendLine("    if not(${comparison("base", spec.match)}) then")
+                    spec.payloads.forEachIndexed { index, payload ->
+                        val pair = "p${index + 1}"
+                        sb.appendLine("        send payload called $pair:")
+                        sb.appendLine("            replacing: ${stringToken(payload)}")
                         sb.appendLine()
-                        sb.appendLine("    if {$varName.response.body} matches \"${escapeRegex(respMatch)}\" then")
-                        sb.appendLine("        report issue:")
-                        sb.appendLine("            severity: $emitSeverity")
-                        sb.appendLine("            confidence: $confidence")
-                        sb.appendLine("            detail: `$detail Payload: $payload`")
-                        sb.appendLine("            remediation: `$remediation`")
-                        sb.appendLine("    end if")
-                        if (index < payloadList.lastIndex) sb.appendLine()
+                        sb.appendLine("        if ${comparison(pair, spec.match)} then")
+                        report("            ", "`${interpolatedBody(detail)} Payload: ${interpolatedBody(payload)}`")
+                        sb.appendLine("        end if")
+                        if (index < spec.payloads.lastIndex) sb.appendLine()
                     }
+                    sb.appendLine("    end if")
                 }
 
-                "host_level" -> {
+                is BCheckSpec.Host -> {
                     sb.appendLine("given host then")
                     sb.appendLine("    send request called host_check:")
                     sb.appendLine("        method: \"GET\"")
-                    sb.appendLine("        path: \"${matchPattern ?: "/"}\"")
+                    sb.appendLine("        path: ${stringToken(spec.path)}")
                     sb.appendLine()
-                    val respMatch = responseMatchPattern ?: matchPattern ?: ""
-                    val (op, cond) = normalizeCondition(matchCondition, respMatch)
                     sb.appendLine("    if {host_check.response.status_code} is \"200\" and")
-                    sb.appendLine("        {host_check.response.body} $op \"${escapeRegex(cond)}\" then")
-                    sb.appendLine("        report issue:")
-                    sb.appendLine("            severity: $emitSeverity")
-                    sb.appendLine("            confidence: $confidence")
-                    sb.appendLine("            detail: `$detail`")
-                    sb.appendLine("            remediation: `$remediation`")
+                    sb.appendLine("        ${comparison("host_check", spec.match)} then")
+                    report("        ", "`${interpolatedBody(detail)}`")
                     sb.appendLine("    end if")
                 }
 
-                "path_level" -> {
-                    val extensions = (payloads?.filter { it.isNotEmpty() }?.takeIf { it.isNotEmpty() })
-                        ?: listOf(".bak", ".old", ".orig", ".swp", "~")
-                    sb.appendLine("define:")
-                    // Each list value must be a valid quoted string; escape embedded quotes
-                    // so one stray `"` can't terminate the list and corrupt the grammar.
-                    sb.appendLine("    test_extensions = ${extensions.joinToString(", ") { "\"${escapeRegex(it)}\"" }}")
+                is BCheckSpec.Path -> {
+                    // `run for each` declares the list and goes before `given`; the check then runs
+                    // once per suffix. The second request asks for a path that cannot exist: a site
+                    // that answers it the same way answers 200 to anything and has no backup file.
+                    sb.appendLine("run for each:")
+                    sb.appendLine("    extension = ${spec.suffixes.joinToString(", ") { stringToken(it) }}")
                     sb.appendLine()
                     sb.appendLine("given path then")
-                    sb.appendLine("    run for each:")
-                    sb.appendLine("        test_extensions as ext")
-                    sb.appendLine()
                     sb.appendLine("    send request called path_check:")
                     sb.appendLine("        method: \"GET\"")
-                    sb.appendLine("        path: `{base.request.url.path}{ext}`")
+                    sb.appendLine("        replacing path: `{base.request.url.path}{extension}`")
                     sb.appendLine()
-                    sb.appendLine("    if {path_check.response.status_code} is \"200\" then")
-                    sb.appendLine("        report issue:")
-                    sb.appendLine("            severity: $emitSeverity")
-                    sb.appendLine("            confidence: $confidence")
-                    sb.appendLine("            detail: `$detail Found at: {path_check.request.url}`")
-                    sb.appendLine("            remediation: `$remediation`")
-                    sb.appendLine("    end if")
-                }
-
-                "collaborator" -> {
-                    sb.appendLine("given request then")
-                    val headerName = matchLocation ?: "Referer"
-                    sb.appendLine("    send request called collab_test:")
-                    sb.appendLine("        method: `{base.request.method}`")
-                    sb.appendLine("        replacing header \"$headerName\": `${matchPattern ?: "https://{generate_collaborator_address()}"}`")
+                    if (spec.match == null) {
+                        sb.appendLine("    if {path_check.response.status_code} is \"200\" then")
+                    } else {
+                        sb.appendLine("    if {path_check.response.status_code} is \"200\" and")
+                        sb.appendLine("        ${comparison("path_check", spec.match)} then")
+                    }
+                    sb.appendLine("        send request called garbage_check:")
+                    sb.appendLine("            method: \"GET\"")
+                    sb.appendLine("            replacing path: `{base.request.url.path}.{random_str(10)}`")
                     sb.appendLine()
-                    val interactionType = if (collaboratorPayloadType?.trim()?.lowercase() == "http") "http" else "dns"
-                    sb.appendLine("    if $interactionType interactions then")
-                    sb.appendLine("        report issue:")
-                    sb.appendLine("            severity: $emitSeverity")
-                    sb.appendLine("            confidence: $confidence")
-                    sb.appendLine("            detail: `$detail`")
-                    sb.appendLine("            remediation: `$remediation`")
-                    sb.appendLine("    end if")
-                }
-
-                else -> {
-                    // An unknown type must be rejected, never silently turned into a
-                    // `matches ""` passive check that fires on every response. create()
-                    // validates the type up front via validateInputs(); this guard makes
-                    // emitScript() safe even if reached by another path.
-                    throw IllegalArgumentException(
-                        "Unsupported BCheck type '$type'. Allowed: ${ALLOWED_TYPES.sorted().joinToString(", ")}"
+                    sb.appendLine("        if {garbage_check} differs from {path_check} then")
+                    report(
+                        "            ",
+                        "`${interpolatedBody(detail)} Found at: {path_check.request.url}`",
+                        action = "report issue and continue",
                     )
+                    sb.appendLine("        end if")
+                    sb.appendLine("    end if")
+                }
+
+                is BCheckSpec.Collaborator -> {
+                    val value = spec.valueTemplate.split(COLLABORATOR_ADDRESS)
+                        .joinToString(COLLABORATOR_ADDRESS) { interpolatedBody(it) }
+                    sb.appendLine("given request then")
+                    sb.appendLine("    send request called collab_test:")
+                    sb.appendLine("        replacing headers:")
+                    sb.appendLine("            ${stringToken(spec.header)}: `$value`")
+                    sb.appendLine()
+                    sb.appendLine("    if ${spec.interaction} interactions then")
+                    report("        ", "`${interpolatedBody(detail)}`")
+                    sb.appendLine("    end if")
                 }
             }
 
             return sb.toString()
         }
 
-        private fun escapeRegex(pattern: String): String {
-            // BCheck uses its own regex dialect - don't double-escape.
-            // We only neutralise the double-quote so it can't terminate the
-            // enclosing "..." string literal in the emitted DSL.
-            return pattern.replace("\"", "\\\"")
+        /** `{pair...} matches "regex"` or `{pair...} is "text"` for [match] on the request/response pair [pair]. */
+        private fun comparison(pair: String, match: BCheckSpec.Match): String {
+            val variable = when (match.location) {
+                "response_headers" -> "{$pair.response.headers}"
+                "status_code" -> "{$pair.response.status_code}"
+                "request_url" -> "{$pair.request.url}"
+                "request_headers" -> "{$pair.request.headers}"
+                "request_body" -> "{$pair.request.body}"
+                else -> "{$pair.response.body}"
+            }
+            return if (match.regex) "$variable matches ${regexToken(match.value)}" else "$variable is ${stringToken(match.value)}"
+        }
+
+        // BCheck has two kinds of string. A "literal" is taken as written: the only escape is \"
+        // and a backslash is an ordinary character, so a literal cannot end in one (the backslash
+        // would pair with the closing quote). An `interpolated` string substitutes {variables}
+        // and reads \ as an escape character. A line break inside either is re-wrapped by Burp
+        // (line endings replaced, each line trimmed), so none is ever emitted raw.
+
+        /** [text] for inside a `"literal"`. */
+        internal fun literalBody(text: String): String = text.replace("\"", "\\\"")
+
+        /** [text] for inside an `` `interpolated` `` string, so that it comes out as exactly [text]. */
+        internal fun interpolatedBody(text: String): String = buildString(text.length + 8) {
+            for (c in text) {
+                when (c) {
+                    '\\' -> append("\\\\")
+                    '`' -> append("\\`")
+                    '{' -> append("\\{")
+                    '\r' -> append("\\r")
+                    '\n' -> append("\\n")
+                    else -> append(c)
+                }
+            }
+        }
+
+        /**
+         * One string token whose value is exactly [text]: a literal where a literal can hold it,
+         * an escaped interpolated string for a trailing backslash or a line break.
+         */
+        internal fun stringToken(text: String): String =
+            if (text.endsWith('\\') || text.any { it == '\r' || it == '\n' }) "`${interpolatedBody(text)}`"
+            else "\"${literalBody(text)}\""
+
+        /**
+         * [pattern] as the operand of `matches`, which has to be a literal. A line break becomes
+         * its regex escape. A pattern ending in an escaped backslash gets an empty group appended,
+         * which matches nothing extra and keeps the backslash off the closing quote.
+         */
+        internal fun regexToken(pattern: String): String {
+            val oneLine = buildString(pattern.length + 8) {
+                var escaped = false
+                for (c in pattern) {
+                    when (c) {
+                        // After an escaping backslash the pair already means "this character".
+                        '\n' -> append(if (escaped) "n" else "\\n")
+                        '\r' -> append(if (escaped) "r" else "\\r")
+                        else -> append(c)
+                    }
+                    escaped = !escaped && c == '\\'
+                }
+            }
+            return "\"" + literalBody(if (oneLine.endsWith('\\')) "$oneLine(?:)" else oneLine) + "\""
+        }
+
+        /** [text] as a metadata literal: one line, as Burp's UI shows it, and never ending in a backslash. */
+        internal fun metadataToken(text: String): String {
+            val oneLine = text.replace(LINE_BREAKS, " ").trim()
+            return "\"" + literalBody(if (oneLine.endsWith('\\')) "$oneLine " else oneLine) + "\""
+        }
+
+        private val LINE_BREAKS = Regex("[\\r\\n]+")
+
+        /** Why [pattern] cannot be the regex of a `matches`, or null. */
+        private fun regexError(pattern: String): String? {
+            SafeRegex.validate(pattern)?.let { return it }
+            // Java accepts a lone trailing backslash inside an unterminated \Q quote; a literal cannot end in one.
+            val trailing = pattern.length - pattern.trimEnd('\\').length
+            return if (trailing % 2 == 1) "the pattern ends in a backslash that escapes nothing" else null
         }
 
         /**
@@ -753,5 +1017,71 @@ given host then
             }
             return sb.toString()
         }
+
+        /**
+         * The dry run of [spec]: what to count over the history, and how to read the counts.
+         *
+         * @param maxMatches how many matches to list in full.
+         */
+        internal fun dryRunOf(spec: BCheckSpec, maxMatches: Int): BCheckDryRun = when (spec) {
+            is BCheckSpec.Passive -> {
+                val run = PassiveDryRun(listOf(spec.match.condition()), MatchMode.ALL, maxMatches)
+                BCheckDryRun(
+                    run.parts, run::visit, run::toJson,
+                    "would_report counts the recorded messages the BCheck flags; Burp consolidates them per path."
+                )
+            }
+
+            is BCheckSpec.InsertionPoint -> {
+                val guard = ActiveStep(spec.payloads.joinToString(", "), listOf(spec.match.condition()))
+                val run = BaselineDryRun(listOf(guard), maxMatches)
+                BCheckDryRun(
+                    run.parts, run::visit, run::toJson,
+                    "No payload was sent. baseline_matches counts recorded responses that already show the response " +
+                        "pattern: the generated BCheck skips those requests, and a high count means the pattern is too broad."
+                )
+            }
+
+            is BCheckSpec.Host -> {
+                val conditions = listOf(STATUS_200, spec.match.condition())
+                val run = ProbeDryRun({ it == spec.path }, conditions, maxMatches)
+                BCheckDryRun(
+                    run.parts, run::visit,
+                    { JsonObject(run.toJson() + mapOf("hosts" to JsonPrimitive(run.hostCount), "probe_requests" to JsonPrimitive(run.hostCount))) },
+                    "A scan would send one GET ${spec.path} to each of the hosts. recorded_hits are recorded responses " +
+                        "for that path that already meet the check's conditions; none recorded does not mean none exists."
+                )
+            }
+
+            is BCheckSpec.Path -> {
+                val conditions = listOfNotNull(STATUS_200, spec.match?.condition())
+                val run = ProbeDryRun({ path -> spec.suffixes.any { path.endsWith(it) } }, conditions, maxMatches)
+                BCheckDryRun(
+                    run.parts, run::visit,
+                    {
+                        JsonObject(
+                            run.toJson() + mapOf(
+                                "distinct_paths" to JsonPrimitive(run.pathCount),
+                                "probe_requests" to JsonPrimitive(run.pathCount * spec.suffixes.size),
+                            )
+                        )
+                    },
+                    "A scan would request every recorded path with each suffix (probe_requests, plus one comparison " +
+                        "request per 200 answer). recorded_hits are recorded 200 responses whose path already ends in a suffix."
+                )
+            }
+
+            is BCheckSpec.Collaborator -> {
+                val run = ProbeDryRun({ false }, emptyList(), maxMatches)
+                BCheckDryRun(
+                    run.parts, run::visit,
+                    { JsonObject(mapOf("items_evaluated" to JsonPrimitive(run.itemCount), "probe_requests" to JsonPrimitive(run.itemCount))) },
+                    "A scan would resend each audited request once with the ${spec.header} header replaced. Whether a " +
+                        "${spec.interaction} interaction follows can only be seen by running it."
+                )
+            }
+        }
+
+        private val STATUS_200 = CheckCondition("status_code", "200", "equals", ignoreCase = false)
     }
 }
