@@ -2,9 +2,9 @@ package io.bitbytelab.raijin.tools.comparer
 
 import io.bitbytelab.raijin.bridge.ComparerBridge
 import io.bitbytelab.raijin.core.asStringList
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -30,25 +30,15 @@ object ComparerTools {
                 val args = request.params.arguments ?: emptyMap()
 
                 val dataItems = args["data"].asStringList()
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: data (array of strings)"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: data (array of strings)")
 
                 if (dataItems.isEmpty()) {
-                    return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"data array must contain at least one item"}""")),
-                        isError = true
-                    )
+                    return@addTool toolError("data array must contain at least one item")
                 }
 
-                val result = bridge.send(dataItems)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.send(dataItems))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

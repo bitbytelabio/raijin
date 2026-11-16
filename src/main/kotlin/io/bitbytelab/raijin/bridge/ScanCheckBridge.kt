@@ -13,11 +13,11 @@ import burp.api.montoya.http.message.HttpRequestResponse
 import burp.api.montoya.core.ByteArray as BurpByteArray
 import io.bitbytelab.raijin.core.EnumValidation
 import burp.api.montoya.core.Registration
+import io.bitbytelab.raijin.safety.SafeRegex
 import io.bitbytelab.raijin.state.StateManager
 import kotlinx.serialization.json.*
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.regex.Pattern
 
 /**
  * Tracks a live Script-mode scan check deployed via the Montoya API.
@@ -155,6 +155,7 @@ class ScanCheckBridge(
 
             deployedChecks.add(DeployedScanCheck(id, name, "passive", config, Instant.now().toString(), registration))
             stateManager.registeredScanChecks.add(name)
+            stateManager.scanCheckRegistrations[id] = registration
 
             buildJsonObject {
                 put("id", id)
@@ -207,6 +208,12 @@ class ScanCheckBridge(
             EnumValidation.error(confidence, VALID_CONFIDENCES, "confidence", required = true)?.let { return it }
             ScanCheckValidation.nonEmptyError(steps, "steps", "step")?.let { return it }
             steps.forEachIndexed { i, step ->
+                val payload = step["payload"]?.jsonPrimitive?.contentOrNull
+                if (payload == null) {
+                    return buildJsonObject {
+                        put("error", "steps[$i].payload is required and must be a string")
+                    }
+                }
                 val rc = step["response_conditions"]?.jsonArray?.filterIsInstance<JsonObject>() ?: emptyList()
                 validateConditions(rc, "steps[$i].response_conditions")?.let { return it }
             }
@@ -223,8 +230,14 @@ class ScanCheckBridge(
                     baseRequestResponse: HttpRequestResponse,
                     insertionPoint: AuditInsertionPoint
                 ): AuditResult {
+                    val httpService = baseRequestResponse.httpService()
+                        ?: return AuditResult.auditResult(emptyList())
                     val issues = mutableListOf<AuditIssue>()
-                    var allStepsPassed = true
+                    var executedSteps = 0
+                    var requiredFailed = false
+                    var anyMatched = false
+                    var anyStepHasConditions = false
+                    var hasNovelMatch = false
                     val evidenceResponses = mutableListOf<HttpRequestResponse>()
 
                     for (step in steps) {
@@ -243,31 +256,46 @@ class ScanCheckBridge(
                             BurpByteArray.byteArray(payload)
                         )
 
-                        // Resolve the HTTP service from the base request
-                        val httpService = baseRequestResponse.httpService() ?: continue
-
                         // Send the request
                         val checkResponse = BoundedHttp.send(api, modifiedRequest.withService(httpService))
                         if (checkResponse == null) {
-                            allStepsPassed = false
-                            if (stopIfNoMatch) break else continue
+                            if (stopIfNoMatch) {
+                                requiredFailed = true
+                                break
+                            }
+                            continue
                         }
+                        executedSteps++
                         evidenceResponses.add(checkResponse)
 
-                        // Check response conditions for this step
-                        if (responseConditions.isNotEmpty()) {
-                            val stepMatched = responseConditions.all { cond ->
+                        // Check response conditions for this step against both response and baseline
+                        val stepMatched = if (responseConditions.isNotEmpty()) {
+                            anyStepHasConditions = true
+                            val matched = responseConditions.all { cond ->
                                 evaluateCondition(cond, checkResponse)
                             }
-
-                            if (!stepMatched) {
-                                allStepsPassed = false
-                                if (stopIfNoMatch) break
+                            if (matched) {
+                                val baselineAlsoMatched = responseConditions.all { cond ->
+                                    evaluateCondition(cond, baseRequestResponse)
+                                }
+                                if (!baselineAlsoMatched) hasNovelMatch = true
                             }
+                            matched
+                        } else {
+                            true
+                        }
+
+                        if (!stepMatched) {
+                            if (stopIfNoMatch) {
+                                requiredFailed = true
+                                break
+                            }
+                        } else {
+                            anyMatched = true
                         }
                     }
 
-                    if (allStepsPassed && steps.isNotEmpty()) {
+                    if (executedSteps > 0 && !requiredFailed && anyMatched && (!anyStepHasConditions || hasNovelMatch)) {
                         val url = baseRequestResponse.request()?.url() ?: ""
                         // Include base and all evidence responses in the issue
                         val allEvidence = mutableListOf(baseRequestResponse)
@@ -318,6 +346,7 @@ class ScanCheckBridge(
 
             deployedChecks.add(DeployedScanCheck(id, name, "active", config, Instant.now().toString(), registration))
             stateManager.registeredScanChecks.add(name)
+            stateManager.scanCheckRegistrations[id] = registration
 
             buildJsonObject {
                 put("id", id)
@@ -380,6 +409,7 @@ class ScanCheckBridge(
 
         deployedChecks.removeIf { it.id == id }
         stateManager.registeredScanChecks.remove(check.name)
+        stateManager.scanCheckRegistrations.remove(id)
 
         return buildJsonObject {
             put("id", id)
@@ -387,6 +417,15 @@ class ScanCheckBridge(
             put("mode", check.mode)
             put("removed", true)
         }
+    }
+
+    /** Deregisters all live MCP scan checks on extension unload. */
+    fun shutdown() {
+        deployedChecks.forEach { check ->
+            runCatching { check.registration?.deregister() }
+            stateManager.scanCheckRegistrations.remove(check.id)
+        }
+        deployedChecks.clear()
     }
 
     /**
@@ -605,14 +644,7 @@ class ScanCheckBridge(
         val result = when (conditionType.lowercase()) {
             "contains" -> text.contains(pattern, ignoreCase = true)
             "equals" -> text.equals(pattern, ignoreCase = true)
-            "matches" -> {
-                try {
-                    Pattern.compile(pattern, Pattern.CASE_INSENSITIVE).matcher(text).find()
-                } catch (_: Exception) {
-                    // Fallback: treat as substring match if regex is invalid
-                    text.contains(pattern, ignoreCase = true)
-                }
-            }
+            "matches" -> SafeRegex.containsMatchIn(pattern, text, ignoreCase = true)
             else -> false
         }
 
@@ -657,6 +689,13 @@ class ScanCheckBridge(
             EnumValidation.error(loc, VALID_LOCATIONS, "$prefix[$i].location", required = true)?.let { return it }
             val ct = c["condition_type"]?.jsonPrimitive?.contentOrNull
             EnumValidation.error(ct, VALID_CONDITION_TYPES, "$prefix[$i].condition_type")?.let { return it }
+            val pattern = c["pattern"]?.jsonPrimitive?.contentOrNull
+                ?: return buildJsonObject { put("error", "$prefix[$i].pattern is required") }
+            if ((ct ?: "matches").equals("matches", ignoreCase = true)) {
+                SafeRegex.validate(pattern, ignoreCase = true)?.let { err ->
+                    return buildJsonObject { put("error", "Invalid regex in $prefix[$i].pattern: $err") }
+                }
+            }
         }
         return null
     }

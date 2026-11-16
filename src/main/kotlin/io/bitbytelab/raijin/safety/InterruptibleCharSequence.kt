@@ -14,15 +14,23 @@ class InterruptibleCharSequence(
     private val base: CharSequence,
     private val abort: () -> Boolean
 ) : CharSequence {
+    @Volatile
+    private var armed: Boolean = true
+
+    /** Disables further deadline checks once matching has completed within budget. */
+    internal fun disarm() {
+        armed = false
+    }
+
     override val length: Int get() = base.length
 
     override fun get(index: Int): Char {
-        if (abort()) throw RegexTimeoutException()
+        if (armed && abort()) throw RegexTimeoutException()
         return base[index]
     }
 
     override fun subSequence(startIndex: Int, endIndex: Int): CharSequence =
-        InterruptibleCharSequence(base.subSequence(startIndex, endIndex), abort)
+        InterruptibleCharSequence(base.subSequence(startIndex, endIndex)) { armed && abort() }
 
     override fun toString(): String = base.toString()
 }

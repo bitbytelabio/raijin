@@ -1,6 +1,8 @@
 package io.bitbytelab.raijin.tools.burpsuite
 
 import io.bitbytelab.raijin.bridge.BurpSuiteBridge
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
@@ -20,15 +22,11 @@ object BurpSuiteTools {
                 properties = buildJsonObject {},
                 required = emptyList()
             )
-        ) { request ->
+        ) { _ ->
             try {
-                val result = bridge.getVersion()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.getVersion())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -59,10 +57,7 @@ object BurpSuiteTools {
                 val configJson = bridge.exportProjectConfig(paths)
                 CallToolResult(content = listOf(TextContent(configJson)))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -92,10 +87,7 @@ object BurpSuiteTools {
                 val configJson = bridge.exportUserConfig(paths)
                 CallToolResult(content = listOf(TextContent(configJson)))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -115,19 +107,12 @@ object BurpSuiteTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val configJson = args["config_json"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: config_json"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: config_json")
 
                 destructiveBlocked("burp_import_project_config", bridge.destructiveAllowed())?.let { return@addTool it }
-                val result = bridge.importProjectConfig(configJson)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.importProjectConfig(configJson))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -147,19 +132,12 @@ object BurpSuiteTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val configJson = args["config_json"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: config_json"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: config_json")
 
                 destructiveBlocked("burp_import_user_config", bridge.destructiveAllowed())?.let { return@addTool it }
-                val result = bridge.importUserConfig(configJson)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.importUserConfig(configJson))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -173,15 +151,11 @@ object BurpSuiteTools {
                 properties = buildJsonObject {},
                 required = emptyList()
             )
-        ) { request ->
+        ) { _ ->
             try {
-                val result = bridge.getTaskEngineState()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.getTaskEngineState())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -201,18 +175,11 @@ object BurpSuiteTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val state = args["state"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: state"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: state")
 
-                val result = bridge.setTaskEngineState(state)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.setTaskEngineState(state))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -225,15 +192,11 @@ object BurpSuiteTools {
                 properties = buildJsonObject {},
                 required = emptyList()
             )
-        ) { request ->
+        ) { _ ->
             try {
-                val result = bridge.getCommandLineArgs()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.getCommandLineArgs())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -255,13 +218,9 @@ object BurpSuiteTools {
                 val promptUser = args["prompt_user"]?.jsonPrimitive?.booleanOrNull ?: false
 
                 destructiveBlocked("burp_shutdown", bridge.destructiveAllowed())?.let { return@addTool it }
-                val result = bridge.shutdown(promptUser)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.shutdown(promptUser))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

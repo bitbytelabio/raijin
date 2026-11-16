@@ -2,9 +2,9 @@ package io.bitbytelab.raijin.tools.analysis
 
 import io.bitbytelab.raijin.bridge.BridgeFactory
 import io.bitbytelab.raijin.core.asStringList
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -52,18 +52,11 @@ object AnalysisTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: request"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: request")
                 val bridge = bridges.analysis
-                val result = bridge.analyzeRequest(rawRequest)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.analyzeRequest(rawRequest))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -83,18 +76,11 @@ object AnalysisTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val rawResponse = args["response"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: response"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: response")
                 val bridge = bridges.analysis
-                val result = bridge.analyzeResponse(rawResponse)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.analyzeResponse(rawResponse))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -123,26 +109,16 @@ object AnalysisTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: request"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: request")
                 val rawResponse = args["response"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: response"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: response")
 
                 val additionalValues = args["additional_values"].asStringList() ?: emptyList()
 
                 val bridge = bridges.analysis
-                val result = bridge.findReflected(rawRequest, rawResponse, additionalValues)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.findReflected(rawRequest, rawResponse, additionalValues))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -162,18 +138,11 @@ object AnalysisTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: request"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: request")
                 val bridge = bridges.analysis
-                val result = bridge.extractParams(rawRequest)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.extractParams(rawRequest))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -198,30 +167,17 @@ object AnalysisTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: request"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: request")
                 val host = args["host"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: host"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: host")
                 val port = args["port"]?.jsonPrimitive?.intOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: port"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: port")
                 val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull ?: false
 
                 val bridge = bridges.analysis
-                val result = bridge.getInsertionPoints(rawRequest, host, port, useTls)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.getInsertionPoints(rawRequest, host, port, useTls))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -246,29 +202,16 @@ object AnalysisTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val item1 = args["item1"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: item1"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: item1")
                 val item2 = args["item2"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: item2"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: item2")
                 val type = args["type"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: type ('request' or 'response')"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: type ('request' or 'response')")
 
                 val bridge = bridges.analysis
-                val result = bridge.diff(item1, item2, type)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.diff(item1, item2, type))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -293,21 +236,14 @@ object AnalysisTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val pattern = args["pattern"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: pattern"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: pattern")
                 val maxResults = args["max_results"]?.jsonPrimitive?.intOrNull ?: 50
                 val inScopeOnly = args["in_scope_only"]?.jsonPrimitive?.booleanOrNull ?: false
 
                 val bridge = bridges.analysis
-                val result = bridge.searchResponseBodies(pattern, maxResults, inScopeOnly)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.searchResponseBodies(pattern, maxResults, inScopeOnly))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

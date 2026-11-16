@@ -1,9 +1,9 @@
 package io.bitbytelab.raijin.tools.apiimport
 
 import io.bitbytelab.raijin.bridge.ApiImportBridge
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -32,10 +32,7 @@ object ApiImportTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val specJson = args["spec_json"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Parameter 'spec_json' is required"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Parameter 'spec_json' is required")
                 val baseUrl = args["base_url"]?.jsonPrimitive?.contentOrNull
                 val authHeader = args["auth_header"]?.jsonPrimitive?.contentOrNull
                 val authValue = args["auth_value"]?.jsonPrimitive?.contentOrNull
@@ -43,13 +40,9 @@ object ApiImportTools {
                 val addToSitemap = args["add_to_sitemap"]?.jsonPrimitive?.booleanOrNull ?: true
                 val sendRequests = args["send_requests"]?.jsonPrimitive?.booleanOrNull ?: false
 
-                val result = bridge.importOpenApi(specJson, baseUrl, authHeader, authValue, addToScope, addToSitemap, sendRequests)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.importOpenApi(specJson, baseUrl, authHeader, authValue, addToScope, addToSitemap, sendRequests))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

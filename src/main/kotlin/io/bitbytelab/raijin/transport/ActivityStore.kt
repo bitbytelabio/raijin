@@ -3,6 +3,80 @@ package io.bitbytelab.raijin.transport
 import io.bitbytelab.raijin.state.McpActivityEntry
 import kotlinx.serialization.json.*
 import java.io.File
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
+
+class ActivityFileStore(private val file: File) {
+    private val lock = ReentrantLock()
+
+    @Volatile
+    var lastError: String? = null
+        private set
+
+    fun path(): String = file.absolutePath
+
+    fun append(e: McpActivityEntry, project: String, enabled: Boolean) {
+        if (!enabled) return
+        lock.withLock {
+            try {
+                JsonlStoreSupport.appendLine(file, ActivityStore.buildEntry(e, project))
+                lastError = null
+            } catch (ex: Exception) {
+                recordError("append", ex)
+            }
+        }
+    }
+
+    fun rewriteProject(project: String, replacement: List<McpActivityEntry>) {
+        lock.withLock {
+            try {
+                val existing = if (file.exists()) file.readLines().mapNotNull { ActivityStore.parseEntry(it) } else emptyList()
+                val lines = ActivityStore.rebuildLines(existing, project, replacement)
+                if (lines.isEmpty()) {
+                    if (file.exists()) file.delete()
+                } else {
+                    JsonlStoreSupport.atomicWriteLines(file, lines)
+                }
+                lastError = null
+            } catch (ex: Exception) {
+                recordError("rewriteProject", ex)
+            }
+        }
+    }
+
+    fun load(project: String, max: Int): List<McpActivityEntry> = lock.withLock {
+        try {
+            if (!file.exists()) emptyList()
+            else {
+                val res = ActivityStore.selectForProject(file.readLines().mapNotNull { ActivityStore.parseEntry(it) }, project, max)
+                lastError = null
+                res
+            }
+        } catch (ex: Exception) {
+            recordError("load", ex)
+            emptyList()
+        }
+    }
+
+    fun compact(maxLines: Int) {
+        lock.withLock {
+            try {
+                if (!file.exists()) return
+                val lines = file.readLines()
+                if (lines.size <= maxLines) return
+                JsonlStoreSupport.atomicWriteLines(file, lines.takeLast(maxLines))
+                lastError = null
+            } catch (ex: Exception) {
+                recordError("compact", ex)
+            }
+        }
+    }
+
+    private fun recordError(op: String, ex: Exception) {
+        lastError = ex.message ?: ex::class.simpleName
+        System.err.println("Raijin: ActivityStore.$op failed (${file.absolutePath}): $lastError")
+    }
+}
 
 /**
  * Durable, append-only persistence for the dashboard's MCP activity log so it survives
@@ -25,12 +99,12 @@ object ActivityStore {
     /** Upper bound on retained file lines; older lines are dropped on startup [compact]. */
     const val MAX_LINES = 20000
 
-    private val file: File = File(System.getProperty("user.home") ?: ".", ".raijin-activity.jsonl")
+    private val defaultStore = ActivityFileStore(File(System.getProperty("user.home") ?: ".", ".raijin-activity.jsonl"))
     private val json = Json { ignoreUnknownKeys = true }
 
-    @Volatile
-    var lastError: String? = null
-        private set
+    val lastError: String? get() = defaultStore.lastError
+
+    fun path(): String = defaultStore.path()
 
     /**
      * Whether new entries are written to disk. Operator-controlled (Burp pref
@@ -39,8 +113,6 @@ object ActivityStore {
      */
     @Volatile
     var enabled: Boolean = true
-
-    fun path(): String = file.absolutePath
 
     /** Serializes one activity entry to a JSONL record (pure; no I/O). */
     fun buildEntry(e: McpActivityEntry, project: String): String = buildJsonObject {
@@ -101,14 +173,7 @@ object ActivityStore {
     }
 
     /** Appends one entry to the durable store. No-ops when [enabled] is false (session-only mode). */
-    fun append(e: McpActivityEntry, project: String) {
-        if (!enabled) return
-        try {
-            file.appendText(buildEntry(e, project) + "\n")
-        } catch (ex: Exception) {
-            lastError = ex.message
-        }
-    }
+    fun append(e: McpActivityEntry, project: String) = defaultStore.append(e, project, enabled)
 
     /**
      * Pure: rebuild the file's lines, dropping every entry tagged [project] and re-adding
@@ -126,20 +191,8 @@ object ActivityStore {
         return others + mine
     }
 
-    /** Reads the store, drops+replaces the [project]'s entries, and rewrites (deletes file if empty). */
-    private fun rewriteProject(project: String, replacement: List<McpActivityEntry>) {
-        try {
-            val existing = if (file.exists()) file.readLines().mapNotNull { parseEntry(it) } else emptyList()
-            val lines = rebuildLines(existing, project, replacement)
-            if (lines.isEmpty()) { if (file.exists()) file.delete() }
-            else file.writeText(lines.joinToString("\n") + "\n")
-        } catch (ex: Exception) {
-            lastError = ex.message
-        }
-    }
-
     /** Permanently deletes [project]'s saved history from disk (keeps other projects). Issue #8. */
-    fun deleteForProject(project: String) = rewriteProject(project, emptyList())
+    fun deleteForProject(project: String) = defaultStore.rewriteProject(project, emptyList())
 
     /**
      * Snapshots the current in-memory [entries] (newest-first, as the live deque) to disk for
@@ -147,26 +200,11 @@ object ActivityStore {
      * persistence on saves what you already have — not just future calls.
      */
     fun flushProject(entries: List<McpActivityEntry>, project: String) =
-        rewriteProject(project, entries.asReversed())
+        defaultStore.rewriteProject(project, entries.asReversed())
 
     /** Loads up to [max] most-recent entries for [project], newest-first. Empty on any error. */
-    fun load(project: String, max: Int): List<McpActivityEntry> = try {
-        if (!file.exists()) emptyList()
-        else selectForProject(file.readLines().mapNotNull { parseEntry(it) }, project, max)
-    } catch (ex: Exception) {
-        lastError = ex.message
-        emptyList()
-    }
+    fun load(project: String, max: Int): List<McpActivityEntry> = defaultStore.load(project, max)
 
     /** Bounds file growth by rewriting only the last [maxLines] lines. Called on startup. */
-    fun compact(maxLines: Int) {
-        try {
-            if (!file.exists()) return
-            val lines = file.readLines()
-            if (lines.size <= maxLines) return
-            file.writeText(lines.takeLast(maxLines).joinToString("\n") + "\n")
-        } catch (ex: Exception) {
-            lastError = ex.message
-        }
-    }
+    fun compact(maxLines: Int) = defaultStore.compact(maxLines)
 }

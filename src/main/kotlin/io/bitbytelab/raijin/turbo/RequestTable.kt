@@ -69,9 +69,17 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
     private var descending = true
     private var initialized = false
     private var sortModifiedAfterInit = false
+    private val panelUpdater: Timer
+    private val storePoller: Timer
 
     fun clear() {
         model.clear()
+    }
+
+    /** Stops UI polling timers when the Turbo dialog closes or extension unloads. */
+    fun dispose() {
+        storePoller.stop()
+        panelUpdater.stop()
     }
 
     fun hasSortBeenModified(): Boolean = sortModifiedAfterInit
@@ -156,8 +164,10 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
         //issueTable.getColumnModel().getColumn(0).setPreferredWidth(500)
 
         issueTable.selectionModel.addListSelectionListener {
-            val req = model.getRequest(issueTable.convertRowIndexToModel(issueTable.selectedRow))
-            setCurrentRequest(req!!)
+            val viewRow = issueTable.selectedRow
+            if (viewRow < 0) return@addListSelectionListener
+            val req = model.getRequest(issueTable.convertRowIndexToModel(viewRow)) ?: return@addListSelectionListener
+            setCurrentRequest(req)
         }
 
         requestListView = JScrollPane(issueTable)
@@ -194,14 +204,14 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
         statusPanel.add(statusLabel)
 
         val updateStatusbar = UpdateStatusbar(statusLabel, handler)
-        val panelUpdater = Timer(1000, updateStatusbar)
+        panelUpdater = Timer(1000, updateStatusbar)
         updateStatusbar.timer = panelUpdater
         panelUpdater.start()
 
         // Poll ResultStore for new results
         var lastKnownSize = 0
         var finishedAt: Long? = null
-        val storePoller = javax.swing.Timer(100) {
+        storePoller = javax.swing.Timer(100) {
             // Stop polling 10 seconds after run completes
             if (handler.status() != "running") {
                 if (finishedAt == null) {
@@ -231,11 +241,12 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
 
         val reportToOrganizerButton = JMenuItem("Save to Organizer")
         reportToOrganizerButton.addActionListener {
-            val comment = JOptionPane.showInputDialog(menu, "Comment", "",  JOptionPane.PLAIN_MESSAGE) as String
-            val reqs = getSelectedRequests().map(Request::getMontoyaRequest)
+            val comment = JOptionPane.showInputDialog(menu, "Comment", "", JOptionPane.PLAIN_MESSAGE) as? String
+                ?: return@addActionListener
+            val reqs = getSelectedRequests().mapNotNull(Request::getMontoyaRequest)
             val notes = comment + "\n" + handler.statusString() + "\n\n" + SCRIPT_MARKER + "\n" + handler.code
             for (req in reqs) {
-                req!!.annotations().setNotes(notes)
+                req.annotations().setNotes(notes)
                 Utils.montoyaApi!!.organizer().sendToOrganizer(req)
             }
         }
@@ -255,7 +266,8 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
             val reqs = getSelectedRequests().mapNotNull(Request::getMontoyaRequest)
             if (reqs.isEmpty()) return@addActionListener
 
-            val comment = JOptionPane.showInputDialog(menu, "Comment", "", JOptionPane.PLAIN_MESSAGE) as String
+            val comment = JOptionPane.showInputDialog(menu, "Comment", "", JOptionPane.PLAIN_MESSAGE) as? String
+                ?: return@addActionListener
 
             val htmlTable = StringBuilder()
             htmlTable.append("<table>")
@@ -319,6 +331,7 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
             val requests = ArrayList<Request>()
             val table = issueTable.model as RequestTableModel
             for (index in issueTable.selectedRows) {
+                if (index < 0) continue
                 val req = table.getRequest(issueTable.convertRowIndexToModel(index))
                 if (req != null) {
                     requests.add(req)

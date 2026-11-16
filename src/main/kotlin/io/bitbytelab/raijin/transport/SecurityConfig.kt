@@ -23,12 +23,21 @@ import io.ktor.server.response.*
  */
 object SecurityConfig {
     /**
+     * Normalizes a hostname / literal IP so IPv6 addresses are bracketed as `[addr]`
+     * and hostnames are lowercased per RFC 3986.
+     */
+    internal fun formatHostForAuthority(host: String): String {
+        val clean = host.trim().removePrefix("[").removeSuffix("]").lowercase()
+        return if (':' in clean) "[$clean]" else clean
+    }
+
+    /**
      * Builds the (Host-header allowlist, CORS-origin allowlist) for every ([hosts] x [ports])
      * pair. Pure — the anti-DNS-rebinding invariant is that only these explicit hosts are ever
      * permitted, never `anyHost()`.
      */
     fun buildAllowlists(hosts: List<String>, ports: List<Int>): Pair<Set<String>, Set<String>> {
-        val h = hosts.distinct()
+        val h = hosts.map(::formatHostForAuthority).filter { it.isNotEmpty() }.distinct()
         val allowedHosts = ports.flatMap { port -> h.map { host -> "$host:$port" } }.toSet()
         val allowedOrigins = ports.flatMap { port -> h.map { host -> "http://$host:$port" } }.toSet()
         return allowedHosts to allowedOrigins
@@ -65,8 +74,8 @@ fun Application.installLocalhostSecurity(
     }
 
     intercept(ApplicationCallPipeline.ApplicationPhase.Plugins) {
-        // 1. Host-header allowlist — primary anti-DNS-rebinding control.
-        val host = call.request.headers[HttpHeaders.Host]
+        // 1. Host-header allowlist — primary anti-DNS-rebinding control (case-insensitive per RFC 3986).
+        val host = call.request.headers[HttpHeaders.Host]?.trim()?.lowercase()
         if (host == null || host !in allowedHosts) {
             call.respondText(
                 """{"error":"forbidden: invalid Host header"}""",
@@ -76,8 +85,8 @@ fun Application.installLocalhostSecurity(
             return@intercept finish()
         }
 
-        // 2. Origin lockdown — reject cross-origin browser requests outright.
-        val origin = call.request.headers[HttpHeaders.Origin]
+        // 2. Origin lockdown — reject cross-origin browser requests outright (case-insensitive scheme/host).
+        val origin = call.request.headers[HttpHeaders.Origin]?.trim()?.lowercase()
         if (origin != null && origin !in allowedOrigins) {
             call.respondText(
                 """{"error":"forbidden: cross-origin request rejected"}""",

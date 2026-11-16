@@ -2,9 +2,9 @@ package io.bitbytelab.raijin.tools.intruder
 
 import io.bitbytelab.raijin.bridge.IntruderBridge
 import io.bitbytelab.raijin.state.StateManager
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -32,30 +32,17 @@ object IntruderTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: request"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: request")
                 val host = args["host"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: host"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: host")
                 val port = args["port"]?.jsonPrimitive?.intOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: port"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: port")
                 val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull ?: false
                 val tabName = args["tab_name"]?.jsonPrimitive?.contentOrNull
 
-                val result = bridge.sendToIntruder(rawRequest, host, port, useTls, tabName)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.sendToIntruder(rawRequest, host, port, useTls, tabName))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -85,28 +72,16 @@ object IntruderTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: request"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: request")
                 val host = args["host"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: host"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: host")
                 val port = args["port"]?.jsonPrimitive?.intOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: port"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: port")
                 val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull ?: false
                 val tabName = args["tab_name"]?.jsonPrimitive?.contentOrNull
 
                 val rawPositions = args["positions"]?.jsonArray
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: positions"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: positions")
 
                 val positions = rawPositions.map { pos ->
                     when {
@@ -126,24 +101,13 @@ object IntruderTools {
                     }
                 }
 
-                val result = bridge.sendWithPositions(rawRequest, host, port, useTls, positions, tabName)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.sendWithPositions(rawRequest, host, port, useTls, positions, tabName))
             } catch (e: IllegalArgumentException) {
                 // Validation failures carry a clean, descriptive message safe to surface.
-                CallToolResult(
-                    content = listOf(TextContent(
-                        buildJsonObject { put("error", e.message ?: "invalid positions") }.toString()
-                    )),
-                    isError = true
-                )
+                toolError(e.message ?: "invalid positions")
             } catch (e: Exception) {
                 // Never leak raw JDK internals (e.g. IndexOutOfBoundsException bounds text).
-                CallToolResult(
-                    content = listOf(TextContent(
-                        buildJsonObject { put("error", "internal error processing positions") }.toString()
-                    )),
-                    isError = true
-                )
+                toolError("internal error processing positions")
             }
         }
 
@@ -172,15 +136,9 @@ object IntruderTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val name = args["name"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: name"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: name")
                 val transformType = args["transform_type"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: transform_type"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: transform_type")
 
                 val validTypes = listOf(
                     "encode_base64", "encode_url",
@@ -188,12 +146,7 @@ object IntruderTools {
                     "prefix", "suffix", "regex_replace"
                 )
                 if (transformType !in validTypes) {
-                    return@addTool CallToolResult(
-                        content = listOf(TextContent(
-                            """{"error":"Invalid transform_type: $transformType. Valid types: ${validTypes.joinToString(", ")}"}"""
-                        )),
-                        isError = true
-                    )
+                    return@addTool toolError("Invalid transform_type: $transformType. Valid types: ${validTypes.joinToString(", ")}")
                 }
 
                 val params = mutableMapOf<String, String>()
@@ -207,20 +160,13 @@ object IntruderTools {
                 // when each payload is processed.
                 if (transformType == "regex_replace") {
                     IntruderValidation.regexError(params)?.let { errObj ->
-                        return@addTool CallToolResult(
-                            content = listOf(TextContent(errObj.toString())),
-                            isError = true
-                        )
+                        return@addTool toolJsonResult(errObj)
                     }
                 }
 
-                val result = bridge.registerPayloadProcessor(name, transformType, params)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.registerPayloadProcessor(name, transformType, params))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

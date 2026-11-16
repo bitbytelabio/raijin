@@ -2,9 +2,9 @@ package io.bitbytelab.raijin.tools.websocket
 
 import io.bitbytelab.raijin.bridge.WebSocketBridge
 import io.bitbytelab.raijin.state.StateManager
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -32,23 +32,16 @@ object WebSocketTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val url = args["url"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: url"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: url")
 
                 val headers = args["headers"]?.jsonObject?.let { obj ->
                     obj.entries.associate { (k, v) -> k to v.jsonPrimitive.content }
                 }
                 val subprotocol = args["subprotocol"]?.jsonPrimitive?.contentOrNull
 
-                val result = bridge.createConnection(url, headers, subprotocol)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.createConnection(url, headers, subprotocol))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -69,23 +62,13 @@ object WebSocketTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val connectionId = args["connection_id"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: connection_id"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: connection_id")
                 val message = args["message"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: message"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: message")
 
-                val result = bridge.sendText(connectionId, message)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.sendText(connectionId, message))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -106,23 +89,13 @@ object WebSocketTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val connectionId = args["connection_id"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: connection_id"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: connection_id")
                 val data = args["data"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: data"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: data")
 
-                val result = bridge.sendBinary(connectionId, data)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.sendBinary(connectionId, data))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -141,18 +114,11 @@ object WebSocketTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val connectionId = args["connection_id"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: connection_id"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: connection_id")
 
-                val result = bridge.close(connectionId)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.close(connectionId))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -164,13 +130,9 @@ object WebSocketTools {
             inputSchema = ToolSchema(properties = buildJsonObject {}, required = emptyList())
         ) { _ ->
             try {
-                val result = bridge.listConnections()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.listConnections())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -195,21 +157,14 @@ object WebSocketTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val connectionId = args["connection_id"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: connection_id"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: connection_id")
                 val direction = args["direction"]?.jsonPrimitive?.contentOrNull
                 val sinceIndex = args["since_index"]?.jsonPrimitive?.longOrNull ?: -1L
                 val maxResults = args["max_results"]?.jsonPrimitive?.intOrNull ?: 100
 
-                val result = bridge.getMessages(connectionId, direction, sinceIndex, maxResults)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.getMessages(connectionId, direction, sinceIndex, maxResults))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -249,16 +204,10 @@ object WebSocketTools {
                 val matchMessage = args["match_message"]?.jsonPrimitive?.contentOrNull
                 val direction = args["direction"]?.jsonPrimitive?.contentOrNull ?: "both"
                 val action = args["action"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: action"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: action")
 
                 if (action !in listOf("modify", "drop", "tag")) {
-                    return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Invalid action: $action. Must be 'modify', 'drop', or 'tag'"}""")),
-                        isError = true
-                    )
+                    return@addTool toolError("Invalid action: $action. Must be 'modify', 'drop', or 'tag'")
                 }
 
                 val modifyRegex = args["modify_regex"]?.jsonPrimitive?.contentOrNull
@@ -266,16 +215,12 @@ object WebSocketTools {
                 val tagComment = args["tag_comment"]?.jsonPrimitive?.contentOrNull
                 val enabled = args["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
 
-                val result = bridge.setInterceptRule(
+                toolJsonResult(bridge.setInterceptRule(
                     ruleId, matchUrl, matchMessage, direction, action,
                     modifyRegex, modifyReplacement, tagComment, enabled
-                )
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                ))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

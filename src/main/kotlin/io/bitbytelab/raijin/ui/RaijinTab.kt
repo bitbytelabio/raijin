@@ -9,6 +9,7 @@ import burp.api.montoya.ui.editor.HttpResponseEditor
 import io.bitbytelab.raijin.bridge.BridgeFactory
 import io.bitbytelab.raijin.core.BuildInfo
 import io.bitbytelab.raijin.core.ConnectionInfo
+import io.bitbytelab.raijin.core.RaijinExtension
 import io.bitbytelab.raijin.core.RebindOutcome
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.state.McpActivityEntry
@@ -29,8 +30,10 @@ import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import javax.swing.*
 import javax.swing.border.EmptyBorder
 import javax.swing.table.DefaultTableCellRenderer
@@ -75,6 +78,9 @@ class RaijinTab(
     // Fetch buttons captured so tabs can lazily auto-load on first view.
     private var proxyFetchButton: JButton? = null
     private var scannerFetchButton: JButton? = null
+    private var turboRunsPanel: TurboRunsPanel? = null
+    private var collaboratorSubId: String? = null
+    private var activityListener: ((McpActivityEntry) -> Unit)? = null
 
     // Activity tab state
     private val activityById = ConcurrentHashMap<Long, McpActivityEntry>()
@@ -91,7 +97,8 @@ class RaijinTab(
         tabbedPane.addTab("Collaborator", buildCollaboratorTab())
         tabbedPane.addTab("Rules", buildRulesTab())
         tabbedPane.addTab("JWT", JwtPanel(bridges.jwt))
-        tabbedPane.addTab("Turbo", TurboRunsPanel())
+        val runsPanel = TurboRunsPanel().also { turboRunsPanel = it }
+        tabbedPane.addTab("Turbo", runsPanel)
         tabbedPane.addTab("Server", buildServerTab())
         mainPanel.add(RaijinTheme.brandHeader(BuildInfo.VERSION), BorderLayout.NORTH)
         mainPanel.add(tabbedPane, BorderLayout.CENTER)
@@ -135,10 +142,16 @@ class RaijinTab(
     fun getComponent(): Component = mainPanel
     fun dispose() {
         refreshTimer.stop()
-        stateManager.mcpActivityListeners.clear()
+        turboRunsPanel?.dispose()
+        collaboratorSubId?.let { eventBus.unsubscribe(it) }
+        activityListener?.let { stateManager.mcpActivityListeners.remove(it) }
     }
     fun log(level: String, category: String, message: String) {
-        if (level == "INFO") api.logging().logToOutput("Raijin: $message")
+        when (level.uppercase()) {
+            "ERROR", "FATAL" -> api.logging().logToError("Raijin [$category]: $message")
+            "WARN", "WARNING" -> api.logging().logToOutput("Raijin [WARN/$category]: $message")
+            "INFO" -> api.logging().logToOutput("Raijin: $message")
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -226,10 +239,11 @@ class RaijinTab(
                 "Delete Saved History", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE
             )
             if (ok != JOptionPane.YES_OPTION) return@addActionListener
+            val project = currentProject()
             stateManager.clearMcpActivity()
-            ActivityStore.deleteForProject(currentProject())
             eventBus.clear()
             clearViewOnly()
+            CompletableFuture.runAsync { ActivityStore.deleteForProject(project) }
         }
         filterBar.add(deleteSavedBtn)
 
@@ -243,10 +257,15 @@ class RaijinTab(
         val persistCheck = JCheckBox("Persist", ActivityStore.enabled); persistCheck.font = persistCheck.font.deriveFont(11f)
         persistCheck.toolTipText = "Save MCP activity to disk so it survives Burp restarts. Off = this session only."
         persistCheck.addActionListener {
-            ActivityStore.enabled = persistCheck.isSelected
-            api.persistence().preferences().setBoolean("mcp_persist_activity", persistCheck.isSelected)
-            // Flush on enable: save what's already in memory, not just future calls.
-            if (persistCheck.isSelected) ActivityStore.flushProject(stateManager.mcpActivity.toList(), currentProject())
+            val enabled = persistCheck.isSelected
+            ActivityStore.enabled = enabled
+            api.persistence().preferences().setBoolean("mcp_persist_activity", enabled)
+            // Flush on enable: save what's already in memory, off the Swing EDT.
+            if (enabled) {
+                val snapshot = stateManager.mcpActivity.toList()
+                val project = currentProject()
+                CompletableFuture.runAsync { ActivityStore.flushProject(snapshot, project) }
+            }
             refreshPersistStatus()
         }
         filterBar.add(Box.createHorizontalStrut(10))
@@ -304,7 +323,7 @@ class RaijinTab(
     }
 
     private fun wireActivityListener() {
-        stateManager.mcpActivityListeners.add { entry ->
+        val listener: (McpActivityEntry) -> Unit = { entry ->
             totalToolCalls.incrementAndGet()
             if (entry.isError) totalErrors.incrementAndGet()
             perToolCounts.computeIfAbsent(entry.toolName) { AtomicLong(0) }.incrementAndGet()
@@ -319,6 +338,8 @@ class RaijinTab(
                 updateActivityStats()
             }
         }
+        activityListener = listener
+        stateManager.mcpActivityListeners.add(listener)
     }
 
     /**
@@ -363,8 +384,8 @@ class RaijinTab(
         }
     }
 
-    /** Current Burp project name — the key ActivityStore tags/persists entries under. */
-    private fun currentProject(): String = try { api.project().name() } catch (_: Exception) { "" }
+    /** Current Burp project key — matching [RaijinExtension.projectKey] across stores. */
+    private fun currentProject(): String = RaijinExtension.projectKey(api)
 
     private fun updateActivityStats() {
         val top = perToolCounts.entries.sortedByDescending { it.value.get() }.take(3).joinToString("  ") { "${it.key}(${it.value.get()})" }
@@ -380,10 +401,11 @@ class RaijinTab(
             "Arguments:\n${prettyActivityJson(entry.argsSummary)}\n\n" +
             "Result:\n${prettyActivityJson(entry.resultSummary)}"
         activityDetailInfo.caretPosition = 0
-        entry.requestResponse?.let { rr ->
-            try { rr.request()?.let { activityRequestEditor.setRequest(it) } } catch (_: Exception) {}
-            try { rr.response()?.let { activityResponseEditor.setResponse(it) } } catch (_: Exception) {}
-        }
+        val rr = entry.requestResponse
+        val req = try { rr?.request() } catch (_: Exception) { null }
+        val resp = try { rr?.response() } catch (_: Exception) { null }
+        try { activityRequestEditor.setRequest(req ?: HttpRequest.httpRequest()) } catch (_: Exception) {}
+        try { activityResponseEditor.setResponse(resp ?: HttpResponse.httpResponse()) } catch (_: Exception) {}
     }
 
     /**
@@ -567,17 +589,17 @@ class RaijinTab(
             if (reqStr != null) {
                 val host = item["host"]?.jsonPrimitive?.contentOrNull ?: ""
                 val port = item["port"]?.jsonPrimitive?.intOrNull ?: 443
-                // The serializer emits "secure" — reading the old "is_tls" key made every
-                // miss default to TLS, so plain-HTTP items rendered (and were sent to
-                // Repeater/Intruder) as https.
                 val tls = item["secure"]?.jsonPrimitive?.booleanOrNull ?: (port == 443)
                 val service = burp.api.montoya.http.HttpService.httpService(host, port, tls)
                 proxyRequestEditor.setRequest(HttpRequest.httpRequest(service, reqStr))
+            } else {
+                proxyRequestEditor.setRequest(HttpRequest.httpRequest())
             }
         } catch (_: Exception) {}
         try {
             val respStr = item["response"]?.jsonPrimitive?.contentOrNull
             if (respStr != null) proxyResponseEditor.setResponse(HttpResponse.httpResponse(respStr))
+            else proxyResponseEditor.setResponse(HttpResponse.httpResponse())
         } catch (_: Exception) {}
     }
 
@@ -695,6 +717,8 @@ class RaijinTab(
                     scannerRequestEditor.setRequest(
                         HttpRequest.httpRequest(burp.api.montoya.http.HttpService.httpService(reqUrl), reqText)
                     )
+                } else {
+                    scannerRequestEditor.setRequest(HttpRequest.httpRequest())
                 }
             } catch (_: Exception) {}
         }
@@ -924,10 +948,13 @@ class RaijinTab(
                     HttpRequest.httpRequest(f.request)
                 }
                 findingsRequestEditor.setRequest(req)
+            } else {
+                findingsRequestEditor.setRequest(HttpRequest.httpRequest())
             }
         } catch (_: Exception) {}
         try {
             if (f.response.isNotEmpty()) findingsResponseEditor.setResponse(HttpResponse.httpResponse(f.response))
+            else findingsResponseEditor.setResponse(HttpResponse.httpResponse())
         } catch (_: Exception) {}
     }
 
@@ -1059,11 +1086,11 @@ class RaijinTab(
         // emits one collaborator.interaction event per hit on every poll — from
         // an MCP tool call OR this panel's Poll button — so the table now fills
         // even when the operator never touched these controls.
-        eventBus.subscribe(listOf("collaborator.interaction")) { event ->
+        collaboratorSubId = eventBus.subscribeInternal(listOf("collaborator.interaction")) { event ->
             addInteraction(event.data)
         }
 
-        var currentClientId = ""
+        val currentClientId = AtomicReference("")
 
         createBtn.addActionListener {
             SwingWorker(api, "Creating collaborator client...") {
@@ -1071,7 +1098,7 @@ class RaijinTab(
                 if (showBridgeError(result, "Create collaborator client")) return@SwingWorker
                 val cid = result["client_id"]?.jsonPrimitive?.contentOrNull ?: ""
                 val server = result["server"]?.jsonPrimitive?.contentOrNull ?: ""
-                currentClientId = cid
+                currentClientId.set(cid)
                 SwingUtilities.invokeLater {
                     clientIdField.text = cid; serverField.text = server
                     generateBtn.isEnabled = cid.isNotEmpty(); pollBtn.isEnabled = cid.isNotEmpty()
@@ -1080,9 +1107,10 @@ class RaijinTab(
         }
 
         generateBtn.addActionListener {
-            if (currentClientId.isEmpty()) return@addActionListener
+            val cid = currentClientId.get()
+            if (cid.isEmpty()) return@addActionListener
             SwingWorker(api, "Generating payload...") {
-                val result = bridges.collaborator.generatePayload(currentClientId, null)
+                val result = bridges.collaborator.generatePayload(cid, null)
                 val payload = result["payload"]?.jsonPrimitive?.contentOrNull ?: ""
                 SwingUtilities.invokeLater {
                     payloadField.text = payload; copyPayloadBtn.isEnabled = payload.isNotEmpty()
@@ -1093,9 +1121,10 @@ class RaijinTab(
         copyPayloadBtn.addActionListener { copyToClipboard(payloadField.text) }
 
         pollBtn.addActionListener {
-            if (currentClientId.isEmpty()) return@addActionListener
+            val cid = currentClientId.get()
+            if (cid.isEmpty()) return@addActionListener
             SwingWorker(api, "Polling interactions...") {
-                val result = bridges.collaborator.pollInteractions(currentClientId, null, null)
+                val result = bridges.collaborator.pollInteractions(cid, null, null)
                 if (showBridgeError(result, "Poll interactions")) return@SwingWorker
                 // pollInteractions already emits collaborator.interaction events
                 // that the subscription above renders (deduped). Route the direct

@@ -4,6 +4,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.time.Instant
 
@@ -39,6 +40,7 @@ data class BurpEvent(
  */
 class EventBus(private val maxBufferSize: Int = 10000) {
     private val buffer = ConcurrentLinkedDeque<BurpEvent>()
+    private val bufferSize = AtomicInteger(0)
     private val idCounter = AtomicLong(0)
     private val subscribers = CopyOnWriteArrayList<EventSubscriber>()
 
@@ -58,10 +60,11 @@ class EventBus(private val maxBufferSize: Int = 10000) {
         )
 
         buffer.addLast(event)
+        bufferSize.incrementAndGet()
 
-        // Evict oldest events when the buffer exceeds capacity
-        while (buffer.size > maxBufferSize) {
-            buffer.pollFirst()
+        // Evict oldest events when the buffer exceeds capacity (O(1) size check)
+        while (bufferSize.get() > maxBufferSize) {
+            if (buffer.pollFirst() != null) bufferSize.decrementAndGet() else break
         }
 
         // Notify matching subscribers (type filter is empty == wildcard)
@@ -87,6 +90,22 @@ class EventBus(private val maxBufferSize: Int = 10000) {
     }
 
     /**
+     * Returns up to [maxEvents] most-recent events in chronological (oldest-to-newest) order
+     * by iterating from the tail in O(maxEvents).
+     */
+    fun getRecentEvents(maxEvents: Int = 50): List<BurpEvent> {
+        val cap = maxEvents.coerceIn(0, maxBufferSize)
+        if (cap == 0) return emptyList()
+        val recent = ArrayList<BurpEvent>(cap)
+        val it = buffer.descendingIterator()
+        while (it.hasNext() && recent.size < cap) {
+            recent.add(it.next())
+        }
+        recent.reverse()
+        return recent
+    }
+
+    /**
      * Returns events matching any of the given [types] whose id is strictly
      * greater than [sinceId], up to [maxEvents] results.
      */
@@ -108,7 +127,17 @@ class EventBus(private val maxBufferSize: Int = 10000) {
      */
     fun subscribe(types: List<String>, callback: (BurpEvent) -> Unit): String {
         val id = "sub-${idCounter.incrementAndGet()}"
-        subscribers.add(EventSubscriber(id, types, callback))
+        subscribers.add(EventSubscriber(id, types, callback, internal = false))
+        return id
+    }
+
+    /**
+     * Registers an internal infrastructure subscriber (e.g. Dashboard SSE stream, UI panels)
+     * that is preserved across [clear] calls and only removed on [unsubscribe] or [clearAll].
+     */
+    fun subscribeInternal(types: List<String>, callback: (BurpEvent) -> Unit): String {
+        val id = "sub-int-${idCounter.incrementAndGet()}"
+        subscribers.add(EventSubscriber(id, types, callback, internal = true))
         return id
     }
 
@@ -120,16 +149,29 @@ class EventBus(private val maxBufferSize: Int = 10000) {
     }
 
     /**
-     * Clears the entire buffer and removes all subscribers. Called during
-     * extension unload.
+     * Clears the buffered events and removes non-internal (client-created) subscribers.
+     * Internal Dashboard SSE and Burp UI subscribers are preserved.
      */
     fun clear() {
+        while (buffer.pollFirst() != null) {
+            bufferSize.decrementAndGet()
+        }
+        if (bufferSize.get() != 0) bufferSize.set(buffer.size)
+        subscribers.removeIf { !it.internal }
+    }
+
+    /**
+     * Clears the entire buffer and removes ALL subscribers including internal ones.
+     * Called only during extension unload.
+     */
+    fun clearAll() {
         buffer.clear()
+        bufferSize.set(0)
         subscribers.clear()
     }
 
     /** Number of events currently in the buffer. */
-    fun size(): Int = buffer.size
+    fun size(): Int = bufferSize.get().coerceAtLeast(0)
 
     /** The id of the most recently emitted event (0 if none). */
     fun lastId(): Long = idCounter.get()
@@ -141,9 +183,11 @@ class EventBus(private val maxBufferSize: Int = 10000) {
  * @property id Unique subscription identifier.
  * @property types Event types this subscriber is interested in (empty = all).
  * @property callback Invoked on the emitter's thread for each matching event.
+ * @property internal True for infrastructure subscribers (Dashboard SSE, UI) preserved across [EventBus.clear].
  */
 data class EventSubscriber(
     val id: String,
     val types: List<String>,
-    val callback: (BurpEvent) -> Unit
+    val callback: (BurpEvent) -> Unit,
+    val internal: Boolean = false
 )

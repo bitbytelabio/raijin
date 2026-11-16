@@ -18,7 +18,7 @@ object TextSimilarity {
         val intersection = bigrams1.intersect(bigrams2).size
         val total = bigrams1.size + bigrams2.size
 
-        if (total == 0) return 100.0
+        if (total == 0) return 0.0
         return Math.round((2.0 * intersection / total) * 10000.0) / 100.0
     }
 }

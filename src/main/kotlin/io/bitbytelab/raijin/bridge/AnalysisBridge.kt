@@ -7,6 +7,7 @@ import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.sitemap.SiteMapFilter
 import io.bitbytelab.raijin.core.TextSimilarity
+import io.bitbytelab.raijin.safety.SafeRegex
 import io.bitbytelab.raijin.safety.ScopeGate
 import kotlinx.serialization.json.*
 
@@ -451,10 +452,8 @@ class AnalysisBridge(private val api: MontoyaApi) {
      * @param inScopeOnly Whether to limit search to in-scope items.
      */
     fun searchResponseBodies(pattern: String, maxResults: Int, inScopeOnly: Boolean): JsonObject {
-        val regex = try {
-            Regex(pattern, RegexOption.IGNORE_CASE)
-        } catch (e: Exception) {
-            return buildJsonObject { put("error", "Invalid regex: ${e.message}") }
+        SafeRegex.validate(pattern, ignoreCase = true)?.let { err ->
+            return buildJsonObject { put("error", "Invalid regex: $err") }
         }
 
         val proxyHistory = api.proxy().history()
@@ -471,7 +470,7 @@ class AnalysisBridge(private val api: MontoyaApi) {
                     if (inScopeOnly && !api.scope().isInScope(url)) continue
 
                     val responseBody = resp.bodyToString()
-                    val matchResult = regex.find(responseBody)
+                    val matchResult = SafeRegex.find(pattern, responseBody, ignoreCase = true)
                     if (matchResult != null) {
                         addJsonObject {
                             put("url", url)
@@ -538,7 +537,8 @@ class AnalysisBridge(private val api: MontoyaApi) {
                 val body: String,
                 val headers: Map<String, String>,
                 val responseTime: Long,
-                val contentType: String? = null
+                val contentType: String? = null,
+                val location: String? = null
             )
 
             val results = mutableListOf<AuthResult>()
@@ -561,7 +561,11 @@ class AnalysisBridge(private val api: MontoyaApi) {
                     if (headerName != null && headerValue != null) {
                         // Remove existing auth header and add new one
                         httpRequest = httpRequest.withRemovedHeader(headerName).withHeader(headerName, headerValue)
-                    } else if (levelName.equals("none", ignoreCase = true) || levelName.equals("unauth", ignoreCase = true)) {
+                    } else if (
+                        levelName.equals("none", ignoreCase = true) ||
+                        levelName.equals("unauth", ignoreCase = true) ||
+                        levelName.equals("anonymous", ignoreCase = true)
+                    ) {
                         // Remove common auth headers for unauthenticated test
                         httpRequest = httpRequest
                             .withRemovedHeader("Authorization")
@@ -571,18 +575,23 @@ class AnalysisBridge(private val api: MontoyaApi) {
                     }
 
                     val startTime = System.nanoTime()
-                    val result = BoundedHttp.send(api, httpRequest)
+                    val result = BoundedHttp.sendInternal(api, httpRequest)
                     val elapsed = (System.nanoTime() - startTime) / 1_000_000
 
                     val resp = result?.response()
+                    if (resp == null) {
+                        errors.add("Level '$levelName' failed: no response received (timeout or connection error)")
+                        continue
+                    }
                     results.add(AuthResult(
                         levelName = levelName,
-                        statusCode = resp?.statusCode()?.toInt() ?: 0,
-                        bodyLength = resp?.body()?.length() ?: 0,
-                        body = resp?.bodyToString() ?: "",
-                        headers = resp?.headers()?.associate { it.name() to it.value() } ?: emptyMap(),
+                        statusCode = resp.statusCode().toInt(),
+                        bodyLength = resp.body()?.length() ?: 0,
+                        body = resp.bodyToString() ?: "",
+                        headers = resp.headers()?.associate { it.name() to it.value() } ?: emptyMap(),
                         responseTime = elapsed,
-                        contentType = try { resp?.headerValue("Content-Type") } catch (_: Exception) { null }
+                        contentType = try { resp.headerValue("Content-Type") } catch (_: Exception) { null },
+                        location = try { resp.headerValue("Location") } catch (_: Exception) { null }
                     ))
                 } catch (e: Exception) {
                     errors.add("Level '$levelName' failed: ${describe(e)}")
@@ -654,7 +663,7 @@ class AnalysisBridge(private val api: MontoyaApi) {
             val allSameBody = results.map { it.body }.distinct().size == 1
 
             val verdict = AuthDiffVerdict.assess(
-                results.map { AuthDiffVerdict.LevelResult(it.levelName, it.statusCode, it.body, it.contentType) },
+                results.map { AuthDiffVerdict.LevelResult(it.levelName, it.statusCode, it.body, it.contentType, it.location) },
                 similarity = { x, y -> calculateSimilarity(x, y) },
                 url = sharedUrl
             )

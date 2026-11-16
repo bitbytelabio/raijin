@@ -40,6 +40,25 @@ object PortPolicy {
     }
 
     /**
+     * Detects duplicate listening port assignments across Primary SSE, Secondary SSE, and
+     * Dashboard listeners so configuration clashes are surfaced explicitly rather than failing
+     * silently on bind.
+     */
+    fun duplicatePortMessages(ssePort: Int, httpPort: Int, dashboardPort: Int): List<String> {
+        val assignments = listOf(
+            PREF_SSE_PORT to ssePort,
+            PREF_HTTP_PORT to httpPort,
+            PREF_DASHBOARD_PORT to dashboardPort
+        )
+        return assignments.groupBy { it.second }
+            .filterValues { it.size > 1 }
+            .map { (port, owners) ->
+                "Raijin: conflicting port configuration — port $port is assigned to multiple listeners " +
+                    "(${owners.joinToString(", ") { it.first }}). Assign distinct ports to each preference."
+            }
+    }
+
+    /**
      * The message logged when [port] is already taken, naming the causes an operator can actually
      * act on. [prefKey] is the preference that changes this particular port.
      */

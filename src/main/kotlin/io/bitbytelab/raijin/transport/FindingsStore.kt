@@ -3,26 +3,28 @@ package io.bitbytelab.raijin.transport
 import io.bitbytelab.raijin.state.StoredFinding
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
 import java.io.File
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * Durable, per-project persistence for the agent's findings working memory
- * ([StateManager.findings]) so it survives extension reloads, Burp restarts, and
- * crashes — the in-memory list is otherwise wiped by [StateManager.cleanup] on
- * every unload, while the (persisted) MCP activity log still *shows* the historical
+ * ([io.bitbytelab.raijin.state.StateManager.findings]) so it survives extension reloads, Burp restarts,
+ * and crashes — the in-memory list is otherwise wiped by [io.bitbytelab.raijin.state.StateManager.cleanup]
+ * on every unload, while the (persisted) MCP activity log still *shows* the historical
  * `findings_add` calls, making it look like the findings were lost for no reason.
  *
  * Mirrors [ActivityStore]: JSON Lines under the user home, appended per entry
  * (crash-safe), project-tagged so each engagement restores its own findings.
- * Deletes and clears rewrite the file with the project's section replaced,
+ * Deletes and clears rewrite the file atomically with the project's section replaced,
  * preserving other projects' lines.
  */
-object FindingsStore {
-    private val file: File = File(System.getProperty("user.home") ?: ".", ".raijin-findings.jsonl")
+class FindingsFileStore(private val file: File) {
+    private val lock = ReentrantLock()
     private val json = Json { ignoreUnknownKeys = true }
 
     @Volatile
@@ -30,6 +32,64 @@ object FindingsStore {
         private set
 
     fun path(): String = file.absolutePath
+
+    fun append(f: StoredFinding, project: String) {
+        lock.withLock {
+            try {
+                JsonlStoreSupport.appendLine(file, FindingsStore.buildEntry(f, project))
+                lastError = null
+            } catch (ex: Exception) {
+                recordError("append", ex)
+            }
+        }
+    }
+
+    fun load(project: String): List<StoredFinding> = lock.withLock {
+        try {
+            if (!file.exists()) emptyList()
+            else file.readLines().mapNotNull { FindingsStore.parseEntry(it) }
+                .filter { it.second == project }
+                .map { it.first }
+        } catch (ex: Exception) {
+            recordError("load", ex)
+            emptyList()
+        }
+    }
+
+    fun replaceProject(project: String, findings: List<StoredFinding>) {
+        lock.withLock {
+            try {
+                val existing = if (file.exists()) {
+                    file.readLines().mapNotNull { FindingsStore.parseEntry(it) }
+                } else {
+                    emptyList()
+                }
+                val lines = FindingsStore.rebuildLines(existing, project, findings)
+                if (lines.isEmpty()) {
+                    if (file.exists()) file.delete()
+                } else {
+                    JsonlStoreSupport.atomicWriteLines(file, lines)
+                }
+                lastError = null
+            } catch (ex: Exception) {
+                recordError("replaceProject", ex)
+            }
+        }
+    }
+
+    private fun recordError(op: String, ex: Exception) {
+        lastError = ex.message ?: ex::class.simpleName
+        System.err.println("Raijin: FindingsStore.$op failed (${file.absolutePath}): $lastError")
+    }
+}
+
+object FindingsStore {
+    private val defaultStore = FindingsFileStore(File(System.getProperty("user.home") ?: ".", ".raijin-findings.jsonl"))
+    private val json = Json { ignoreUnknownKeys = true }
+
+    val lastError: String? get() = defaultStore.lastError
+
+    fun path(): String = defaultStore.path()
 
     /** Serializes one finding to a JSONL record (pure; no I/O). */
     fun buildEntry(f: StoredFinding, project: String): String = buildJsonObject {
@@ -74,22 +134,10 @@ object FindingsStore {
     }
 
     /** Appends one finding to the durable store (oldest-first file order). */
-    fun append(f: StoredFinding, project: String) {
-        try {
-            file.appendText(buildEntry(f, project) + "\n")
-        } catch (ex: Exception) {
-            lastError = ex.message
-        }
-    }
+    fun append(f: StoredFinding, project: String) = defaultStore.append(f, project)
 
     /** Loads all findings for [project] in file order (oldest-first). Empty on any error. */
-    fun load(project: String): List<StoredFinding> = try {
-        if (!file.exists()) emptyList()
-        else file.readLines().mapNotNull { parseEntry(it) }.filter { it.second == project }.map { it.first }
-    } catch (ex: Exception) {
-        lastError = ex.message
-        emptyList()
-    }
+    fun load(project: String): List<StoredFinding> = defaultStore.load(project)
 
     /**
      * Pure: rebuild the file's lines, dropping every finding tagged [project] and
@@ -108,14 +156,5 @@ object FindingsStore {
     }
 
     /** Reads the store, replaces [project]'s findings with [findings], and rewrites (deletes file if empty). */
-    fun replaceProject(project: String, findings: List<StoredFinding>) {
-        try {
-            val existing = if (file.exists()) file.readLines().mapNotNull { parseEntry(it) } else emptyList()
-            val lines = rebuildLines(existing, project, findings)
-            if (lines.isEmpty()) { if (file.exists()) file.delete() }
-            else file.writeText(lines.joinToString("\n") + "\n")
-        } catch (ex: Exception) {
-            lastError = ex.message
-        }
-    }
+    fun replaceProject(project: String, findings: List<StoredFinding>) = defaultStore.replaceProject(project, findings)
 }

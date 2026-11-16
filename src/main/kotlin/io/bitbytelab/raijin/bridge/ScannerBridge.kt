@@ -25,9 +25,12 @@ import burp.api.montoya.sitemap.SiteMapFilter
 import burp.api.montoya.core.ByteArray as BurpByteArray
 import burp.api.montoya.core.Registration
 import io.bitbytelab.raijin.events.EventBus
+import io.bitbytelab.raijin.safety.RequestHygiene
+import io.bitbytelab.raijin.safety.SafeRegex
 import io.bitbytelab.raijin.state.ScanTask
 import io.bitbytelab.raijin.state.StateManager
 import kotlinx.serialization.json.*
+import java.net.URI
 import java.time.Instant
 import java.util.Base64
 
@@ -152,30 +155,47 @@ class ScannerBridge(
         authHeaderName: String? = null,
         authHeaderValue: String? = null
     ): JsonObject {
+        var authRuleId: String? = null
         try {
-            // If auth header provided, create a traffic rule to inject it
-            var authRuleId: String? = null
-            if (authHeaderName != null && authHeaderValue != null) {
-                authRuleId = stateManager.generateId("auth-rule")
-                stateManager.trafficRules.add(io.bitbytelab.raijin.state.TrafficRule(
-                    ruleId = authRuleId,
-                    direction = "request",
-                    matchUrl = null,
-                    matchHost = null,
-                    matchHeader = null,
-                    modifyAddHeader = "$authHeaderName: $authHeaderValue",
-                    modifyRemoveHeader = null,
-                    modifyReplaceHeader = null,
-                    enabled = true
-                ))
-            }
-
             val builtInConfig = when (auditMode?.lowercase()) {
                 "light" -> BuiltInAuditConfiguration.LEGACY_PASSIVE_AUDIT_CHECKS
                 null, "normal", "thorough" -> BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS
                 else -> throw IllegalArgumentException("Invalid audit_mode '$auditMode'. Allowed: light, normal, thorough")
             }
             val auditConfig = AuditConfiguration.auditConfiguration(builtInConfig)
+
+            // If auth header provided, create a scanner-only, host-scoped traffic rule to inject it.
+            if (authHeaderName != null && authHeaderValue != null) {
+                val targetHosts = linkedSetOf<String>()
+                urls?.forEach { u ->
+                    runCatching { URI(u).host }.getOrNull()?.takeIf { it.isNotBlank() }?.let { targetHosts.add(it) }
+                }
+                requests?.forEach { reqB64 ->
+                    runCatching {
+                        val decoded = Base64.getDecoder().decode(reqB64)
+                        val parsed = HttpRequest.httpRequest(BurpByteArray.byteArray(*decoded))
+                        parsed.headerValue("Host")?.substringBefore(':')?.trim()?.takeIf { it.isNotBlank() }
+                    }.getOrNull()?.let { targetHosts.add(it) }
+                }
+                val matchHostPattern = when (targetHosts.size) {
+                    0 -> null
+                    1 -> targetHosts.first()
+                    else -> targetHosts.joinToString("|") { Regex.escape(it) }
+                }
+                authRuleId = stateManager.generateId("auth-rule")
+                stateManager.trafficRules.add(io.bitbytelab.raijin.state.TrafficRule(
+                    ruleId = authRuleId,
+                    direction = "request",
+                    matchUrl = null,
+                    matchHost = matchHostPattern,
+                    matchHeader = null,
+                    modifyAddHeader = "$authHeaderName: $authHeaderValue",
+                    modifyRemoveHeader = null,
+                    modifyReplaceHeader = null,
+                    enabled = true,
+                    toolFilter = setOf("SCANNER")
+                ))
+            }
 
             val auditTask: Audit = api.scanner().startAudit(auditConfig)
 
@@ -228,7 +248,8 @@ class ScannerBridge(
                 taskId = taskId,
                 type = "audit",
                 taskObject = auditTask,
-                createdAt = Instant.now().toString()
+                createdAt = Instant.now().toString(),
+                authRuleId = authRuleId
             )
             stateManager.scanTasks[taskId] = scanTask
 
@@ -278,10 +299,12 @@ class ScannerBridge(
                 }
             }
         } catch (e: UnsupportedOperationException) {
+            if (authRuleId != null) stateManager.trafficRules.removeIf { it.ruleId == authRuleId }
             return buildJsonObject {
                 put("error", "Scanner API is not available in Burp Suite Community Edition")
             }
         } catch (e: Exception) {
+            if (authRuleId != null) stateManager.trafficRules.removeIf { it.ruleId == authRuleId }
             return buildJsonObject {
                 put("error", "Failed to start audit: ${e.message}")
             }
@@ -300,6 +323,15 @@ class ScannerBridge(
 
         val task = scanTask.taskObject
         val statusMsg = safeStatusMessage(task)
+        if (scanTask.authRuleId != null && (
+                statusMsg.contains("finished", true) ||
+                statusMsg.contains("complete", true) ||
+                statusMsg.contains("cancelled", true) ||
+                statusMsg.contains("aborted", true)
+            )
+        ) {
+            stateManager.trafficRules.removeIf { it.ruleId == scanTask.authRuleId }
+        }
         val reqCount = safeRequestCount(task)
         val errCount = try { when (task) { is Crawl -> task.errorCount(); is Audit -> task.errorCount(); else -> -1 } } catch (_: Throwable) { -1 }
         val issueCount = try { if (task is Audit) task.issues().size else 0 } catch (_: Throwable) { -1 }
@@ -408,6 +440,9 @@ class ScannerBridge(
                 is Audit -> task.delete()
             }
             stateManager.scanTasks.remove(taskId)
+            scanTask.authRuleId?.let { ruleId ->
+                stateManager.trafficRules.removeIf { it.ruleId == ruleId }
+            }
             buildJsonObject {
                 put("task_id", taskId)
                 put("deleted", true)
@@ -813,6 +848,22 @@ class ScannerBridge(
                 else -> throw IllegalArgumentException("Invalid confidence '$confidence'. Allowed: certain, firm, tentative")
             }
 
+            if (passiveResponseMatch != null) {
+                SafeRegex.validate(passiveResponseMatch, ignoreCase = true)?.let { err ->
+                    return buildJsonObject { put("error", "Invalid passive_response_match regex: $err") }
+                }
+            }
+            if (passiveHeaderMatch != null) {
+                SafeRegex.validate(passiveHeaderMatch, ignoreCase = true)?.let { err ->
+                    return buildJsonObject { put("error", "Invalid passive_header_match regex: $err") }
+                }
+            }
+            if (activeResponseMatch != null) {
+                SafeRegex.validate(activeResponseMatch, ignoreCase = true)?.let { err ->
+                    return buildJsonObject { put("error", "Invalid active_response_match regex: $err") }
+                }
+            }
+
             val scanCheck = object : ScanCheck {
                 override fun passiveAudit(baseRequestResponse: HttpRequestResponse): AuditResult {
                     if (checkType.equals("active", ignoreCase = true)) {
@@ -826,18 +877,16 @@ class ScannerBridge(
 
                     var matched = false
 
-                    if (passiveResponseMatch != null) {
-                        val regex = Regex(passiveResponseMatch, RegexOption.IGNORE_CASE)
-                        if (regex.containsMatchIn(responseBody)) {
-                            matched = true
-                        }
+                    if (passiveResponseMatch != null &&
+                        SafeRegex.containsMatchIn(passiveResponseMatch, responseBody, ignoreCase = true)
+                    ) {
+                        matched = true
                     }
 
-                    if (!matched && passiveHeaderMatch != null) {
-                        val regex = Regex(passiveHeaderMatch, RegexOption.IGNORE_CASE)
-                        if (regex.containsMatchIn(responseHeaders)) {
-                            matched = true
-                        }
+                    if (!matched && passiveHeaderMatch != null &&
+                        SafeRegex.containsMatchIn(passiveHeaderMatch, responseHeaders, ignoreCase = true)
+                    ) {
+                        matched = true
                     }
 
                     if (matched) {
@@ -870,9 +919,8 @@ class ScannerBridge(
 
                     val issues = mutableListOf<AuditIssue>()
                     val payloads = activePayloads ?: return AuditResult.auditResult(emptyList())
-                    val matchRegex = activeResponseMatch?.let {
-                        Regex(it, RegexOption.IGNORE_CASE)
-                    } ?: return AuditResult.auditResult(emptyList())
+                    val matchPattern = activeResponseMatch ?: return AuditResult.auditResult(emptyList())
+                    val baseBody = baseRequestResponse.response()?.bodyToString() ?: ""
 
                     for (payload in payloads) {
                         try {
@@ -888,7 +936,9 @@ class ScannerBridge(
 
                             val respBody = checkRequestResponse.response()?.bodyToString() ?: ""
 
-                            if (matchRegex.containsMatchIn(respBody)) {
+                            if (SafeRegex.containsMatchIn(matchPattern, respBody, ignoreCase = true) &&
+                                !SafeRegex.containsMatchIn(matchPattern, baseBody, ignoreCase = true)
+                            ) {
                                 val url = baseRequestResponse.request()?.url() ?: ""
                                 val matchDetail = "$detail\n\nPayload: $payload\nMatch found in response body."
                                 val issue = AuditIssue.auditIssue(
@@ -1074,9 +1124,7 @@ class ScannerBridge(
             // Treat as plain HTTP text. Normalize line endings to CRLF (Burp
             // parses on \r\n) using the repo's 3-step normalization, then encode
             // byte-accurately with an explicit charset.
-            val normalized = payload
-                .replace("\r\n", "\n")
-                .replace(Regex("(?<!\\r)\\n"), "\r\n")
+            val normalized = RequestHygiene.normalizeCrlf(payload)
             return normalized.toByteArray(Charsets.ISO_8859_1)
         }
 

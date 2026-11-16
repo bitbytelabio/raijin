@@ -41,13 +41,15 @@ object HttpPipelineConnectionRegistry {
 
     private fun sweep() {
         val now = System.currentTimeMillis()
-        entries.entries.removeAll { (_, entry) ->
-            val idle = now - entry.lastUsedAtMs
-            if (idle > IDLE_EVICTION_MS) {
-                runCatching { entry.socket.close() }
-                true
-            } else {
-                false
+        entries.entries.forEach { (id, entry) ->
+            if (now - entry.lastUsedAtMs <= IDLE_EVICTION_MS) return@forEach
+            if (!entry.lock.tryLock()) return@forEach
+            try {
+                if (now - entry.lastUsedAtMs > IDLE_EVICTION_MS && entries.remove(id, entry)) {
+                    runCatching { entry.socket.close() }
+                }
+            } finally {
+                entry.lock.unlock()
             }
         }
     }

@@ -2,6 +2,7 @@ package io.bitbytelab.raijin.tools.events
 
 import io.bitbytelab.raijin.events.BurpEvent
 import io.bitbytelab.raijin.events.EventBus
+import io.bitbytelab.raijin.tools.toolError
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
@@ -44,10 +45,7 @@ object EventsTools {
                 }
                 CallToolResult(content = listOf(TextContent(result.toString())))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -75,10 +73,7 @@ object EventsTools {
                 val args = request.params.arguments ?: emptyMap()
 
                 val types = args["types"]?.jsonArray?.map { it.jsonPrimitive.content }
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: types (array of strings)"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: types (array of strings)")
 
                 val sinceId = args["since_id"]?.jsonPrimitive?.longOrNull ?: 0L
                 val maxEvents = args["max_events"]?.jsonPrimitive?.intOrNull ?: 200
@@ -94,10 +89,7 @@ object EventsTools {
                 }
                 CallToolResult(content = listOf(TextContent(result.toString())))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -122,36 +114,25 @@ object EventsTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
 
-                val types = args["types"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
+                val types = (args["types"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull } ?: emptyList()
 
-                // Create a buffer for the subscription
-                val subscriptionBuffer = java.util.concurrent.ConcurrentLinkedDeque<BurpEvent>()
-                val subscriptionId = eventBus.subscribe(types) { event ->
-                    subscriptionBuffer.addLast(event)
-                    // Cap the subscription buffer at 1000 events
-                    while (subscriptionBuffer.size > 1000) {
-                        subscriptionBuffer.pollFirst()
-                    }
-                }
+                val sinceId = eventBus.lastId()
+                val subscriptionId = eventBus.subscribe(types) { _ -> }
 
                 val result = buildJsonObject {
                     put("subscription_id", subscriptionId)
                     put("status", "subscribed")
+                    put("cursor_since_id", sinceId)
                     putJsonArray("types") { types.forEach { add(it) } }
-                    put("note", if (types.isEmpty()) "Subscribed to all event types" else "Subscribed to ${types.size} event type(s)")
-                    putJsonArray("resource_uris") {
-                        add("burp://events")
-                        types.forEach { type ->
-                            add("burp://events/$type")
-                        }
-                    }
+                    put(
+                        "note",
+                        "Recorded cursor since_id=$sinceId. Poll events using events(action='get', since_id=$sinceId) " +
+                            "or events(action='get_by_type', types=..., since_id=$sinceId)."
+                    )
                 }
                 CallToolResult(content = listOf(TextContent(result.toString())))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -171,10 +152,7 @@ object EventsTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val subscriptionId = args["subscription_id"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: subscription_id"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: subscription_id")
 
                 eventBus.unsubscribe(subscriptionId)
 
@@ -184,10 +162,7 @@ object EventsTools {
                 }
                 CallToolResult(content = listOf(TextContent(result.toString())))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -208,10 +183,7 @@ object EventsTools {
                 }
                 CallToolResult(content = listOf(TextContent(result.toString())))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

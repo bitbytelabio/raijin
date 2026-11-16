@@ -45,9 +45,13 @@ internal object HttpFuzzPlan {
         // A blank marker would match everywhere and count infinitely; treat it as "use default".
         val effectiveMarker = marker?.takeIf { it.isNotEmpty() } ?: "§" // §
         val hasFuzzKeyword = baseRequest.contains("FUZZ")
-        // Count occurrences of the WHOLE marker string, not just its first char, so multi-char
-        // custom markers (e.g. "MARK", "[[") are detected correctly. Need >= 2 to form a pair.
         val markerCount = countOccurrences(baseRequest, effectiveMarker)
+        if (!hasFuzzKeyword && markerCount > 0 && markerCount % 2 != 0) {
+            return Result.Error(
+                "Odd number ($markerCount) of '$effectiveMarker' markers; every injection point needs a closing marker " +
+                    "(e.g. ${effectiveMarker}value${effectiveMarker})."
+            )
+        }
         val hasMarkerPairs = markerCount >= 2
 
         return when {
@@ -61,8 +65,14 @@ internal object HttpFuzzPlan {
                 )
             }
 
-            // Mode 2: Marker pairs — find marker…marker pairs, replace each with payloads (sniper).
+            // Mode 2: Marker pairs — find marker…marker pairs, replace active pair with payload and
+            // strip markers from inactive positions (True Sniper mode).
             hasMarkerPairs -> {
+                if (markerCount % 2 != 0) {
+                    return Result.Error(
+                        "Odd number ($markerCount) of '$effectiveMarker' markers; every injection point needs a closing marker."
+                    )
+                }
                 val markerPositions = findMarkerPairs(baseRequest, effectiveMarker)
                 if (markerPositions.isEmpty()) {
                     return Result.Error(
@@ -72,11 +82,10 @@ internal object HttpFuzzPlan {
                 }
                 val out = ArrayList<PlannedRequest>(payloads.size * markerPositions.size)
                 for (payload in payloads) {
-                    for ((posIdx, pos) in markerPositions.withIndex()) {
-                        val (start, end) = pos
+                    for (posIdx in markerPositions.indices) {
                         out.add(
                             PlannedRequest(
-                                baseRequest.substring(0, start) + payload + baseRequest.substring(end),
+                                substituteSniperMarker(baseRequest, markerPositions, effectiveMarker.length, posIdx, payload),
                                 payload,
                                 posIdx
                             )
@@ -141,9 +150,29 @@ internal object HttpFuzzPlan {
         return positions
     }
 
+    private fun substituteSniperMarker(
+        baseRequest: String,
+        positions: List<Pair<Int, Int>>,
+        markerLen: Int,
+        activeIdx: Int,
+        payload: String
+    ): String = buildString(baseRequest.length + payload.length) {
+        var cursor = 0
+        positions.forEachIndexed { idx, (start, end) ->
+            append(baseRequest, cursor, start)
+            if (idx == activeIdx) {
+                append(payload)
+            } else {
+                append(baseRequest, start + markerLen, end - markerLen)
+            }
+            cursor = end
+        }
+        append(baseRequest, cursor, baseRequest.length)
+    }
+
     /**
      * Validates legacy offset pairs against [length]. Returns an error message describing the
-     * first bad pair, or null when every pair is in-bounds and non-reversed.
+     * first bad or overlapping pair, or null when every pair is valid.
      */
     fun validatePositions(positions: List<Pair<Int, Int>>, length: Int): String? {
         positions.forEachIndexed { i, (start, end) ->
@@ -156,6 +185,15 @@ internal object HttpFuzzPlan {
             }
             if (end > length) {
                 return "positions[$i] = [$start, $end] is out of bounds: end ($end) exceeds request length ($length)."
+            }
+        }
+        val indexed = positions.withIndex().sortedWith(compareBy({ it.value.first }, { it.value.second }))
+        for (i in 1 until indexed.size) {
+            val prev = indexed[i - 1]
+            val curr = indexed[i]
+            if (curr.value.first < prev.value.second) {
+                return "positions[${prev.index}] = [${prev.value.first}, ${prev.value.second}] overlaps with " +
+                    "positions[${curr.index}] = [${curr.value.first}, ${curr.value.second}]."
             }
         }
         return null

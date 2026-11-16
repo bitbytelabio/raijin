@@ -61,16 +61,17 @@ class AiBridge(private val api: MontoyaApi) {
 
             val promptBuilder = aiApi.prompt()
 
-            // Build the prompt message by joining all messages
-            val fullPrompt = if (context != null) {
-                "Context: $context\n\n${messages.joinToString("\n")}"
+            // Build the prompt messages including context so both primary and fallback paths receive it.
+            val promptMessages = if (context != null) {
+                listOf("Context: $context") + messages
             } else {
-                messages.joinToString("\n")
+                messages
             }
+            val fullPrompt = promptMessages.joinToString("\n\n")
 
             // Try varargs signature first (execute(String...)), fall back to single string
             val response = try {
-                promptBuilder.execute(*messages.toTypedArray())
+                promptBuilder.execute(*promptMessages.toTypedArray())
             } catch (_: Exception) {
                 promptBuilder.execute(fullPrompt)
             }

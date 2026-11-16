@@ -2,9 +2,9 @@ package io.bitbytelab.raijin.tools.ai
 
 import io.bitbytelab.raijin.bridge.AiBridge
 import io.bitbytelab.raijin.core.asStringList
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -19,15 +19,11 @@ object AiTools {
                 "available. Returns the current AI status. This feature is only " +
                 "available in Burp Suite Professional 2025+ editions.",
             inputSchema = ToolSchema(properties = buildJsonObject {}, required = emptyList())
-        ) { request ->
+        ) { _ ->
             try {
-                val result = bridge.isEnabled()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.isEnabled())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -55,27 +51,17 @@ object AiTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val messages = args["messages"].asStringList()
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: messages (array of strings)"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: messages (array of strings)")
 
                 if (messages.isEmpty()) {
-                    return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Messages array cannot be empty"}""")),
-                        isError = true
-                    )
+                    return@addTool toolError("Messages array cannot be empty")
                 }
 
                 val context = args["context"]?.jsonPrimitive?.contentOrNull
 
-                val result = bridge.prompt(messages, context)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.prompt(messages, context))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

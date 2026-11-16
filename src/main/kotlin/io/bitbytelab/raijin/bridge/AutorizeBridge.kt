@@ -70,6 +70,7 @@ class AutorizeBridge(private val stateManager: StateManager) {
         )
         stateManager.autorizeRules.removeIf { it.ruleId == id }
         stateManager.autorizeRules.add(rule)
+        if (existing != null) stateManager.clearAutorizeSeen(id)
         return buildJsonObject {
             put("rule_id", id)
             put("status", if (resolvedEnabled) "active" else "disabled")

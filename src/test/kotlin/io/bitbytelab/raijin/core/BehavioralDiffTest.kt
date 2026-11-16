@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.core
 
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -39,5 +40,12 @@ class BehavioralDiffTest {
         val baseline = ProbeResult(200, "x".repeat(1000))
         val candidate = ProbeResult(200, "x".repeat(1000) + "y".repeat(50))
         assertTrue(BehavioralDiff.changed(baseline, candidate, noiseThresholdBytes = 10))
+    }
+
+    @Test
+    fun `TextSimilarity dice returns 0 for single-char non-equal strings and 100 for identical`() {
+        assertEquals(0.0, TextSimilarity.dice("a", "b"))
+        assertEquals(0.0, TextSimilarity.dice("a", ""))
+        assertEquals(100.0, TextSimilarity.dice("a", "a"))
     }
 }

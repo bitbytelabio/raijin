@@ -41,6 +41,7 @@ class TurboRunsPanel : JPanel(BorderLayout()) {
 
     private val table = JTable(model)
     private val status = JLabel(" ")
+    private val refreshTimer = Timer(1000) { refresh() }.apply { isRepeats = true }
 
     init {
         table.autoCreateRowSorter = false
@@ -81,8 +82,13 @@ class TurboRunsPanel : JPanel(BorderLayout()) {
             font = RaijinTheme.displayFont(11f); foreground = RaijinTheme.muted()
         }, BorderLayout.SOUTH)
 
-        Timer(1000) { refresh() }.apply { isRepeats = true; start() }
+        refreshTimer.start()
         refresh()
+    }
+
+    /** Stops the periodic UI refresh timer on extension unload. */
+    fun dispose() {
+        refreshTimer.stop()
     }
 
     private fun selected(): ActiveRun? = table.selectedRow.takeIf { it >= 0 }?.let { rows.getOrNull(table.convertRowIndexToModel(it)) }

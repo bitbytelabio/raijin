@@ -1,9 +1,9 @@
 package io.bitbytelab.raijin.tools.logging
 
 import io.bitbytelab.raijin.bridge.LoggingBridge
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -29,19 +29,12 @@ object LoggingTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val message = args["message"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: message"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: message")
                 val level = args["level"]?.jsonPrimitive?.contentOrNull ?: "output"
 
-                val result = bridge.logMessage(message, level)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.logMessage(message, level))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -63,29 +56,17 @@ object LoggingTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val message = args["message"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: message"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: message")
                 val level = args["level"]?.jsonPrimitive?.contentOrNull ?: "info"
 
                 val validLevels = listOf("debug", "info", "error", "critical")
                 if (level.lowercase() !in validLevels) {
-                    return@addTool CallToolResult(
-                        content = listOf(TextContent(
-                            """{"error":"Invalid level: $level. Valid levels: ${validLevels.joinToString(", ")}"}"""
-                        )),
-                        isError = true
-                    )
+                    return@addTool toolError("Invalid level: $level. Valid levels: ${validLevels.joinToString(", ")}")
                 }
 
-                val result = bridge.logEvent(message, level)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.logEvent(message, level))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

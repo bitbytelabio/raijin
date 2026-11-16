@@ -9,6 +9,7 @@ import burp.api.montoya.intruder.PayloadProcessor
 import burp.api.montoya.intruder.PayloadProcessingResult
 import burp.api.montoya.intruder.PayloadData
 import io.bitbytelab.raijin.safety.RequestHygiene
+import io.bitbytelab.raijin.safety.SafeRegex
 import io.bitbytelab.raijin.state.StateManager
 import kotlinx.serialization.json.*
 import java.security.MessageDigest
@@ -88,6 +89,12 @@ class IntruderBridge(private val api: MontoyaApi, private val stateManager: Stat
         transformType: String,
         params: Map<String, String>
     ): JsonObject {
+        if (transformType == "regex_replace") {
+            val pattern = params["regex_pattern"] ?: ""
+            SafeRegex.validate(pattern)?.let { err ->
+                return buildJsonObject { put("error", "Invalid regex_pattern: $err") }
+            }
+        }
         val processor = object : PayloadProcessor {
             override fun displayName(): String = name
 
@@ -121,7 +128,7 @@ class IntruderBridge(private val api: MontoyaApi, private val stateManager: Stat
                     "regex_replace" -> {
                         val pattern = params["regex_pattern"] ?: ""
                         val replacement = params["regex_replacement"] ?: ""
-                        currentPayload.replace(Regex(pattern), replacement)
+                        SafeRegex.replace(pattern, currentPayload, replacement)
                     }
                     else -> currentPayload
                 }
@@ -132,7 +139,8 @@ class IntruderBridge(private val api: MontoyaApi, private val stateManager: Stat
             }
         }
 
-        api.intruder().registerPayloadProcessor(processor)
+        val registration = api.intruder().registerPayloadProcessor(processor)
+        stateManager.intruderRegistrations[name] = registration
         stateManager.registeredPayloadProcessors.add(name)
 
         return buildJsonObject {

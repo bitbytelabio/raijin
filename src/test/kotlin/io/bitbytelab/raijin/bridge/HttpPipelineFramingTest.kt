@@ -150,4 +150,54 @@ class HttpPipelineFramingTest {
             client.close(); server.close()
         }
     }
+
+    @Test
+    fun `chunked trailers are consumed cleanly before next pipelined response`() {
+        val combined = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+        val (client, server) = connectedClient(listOf(bytes(combined) to 0))
+        try {
+            val carry = StringBuilder()
+            val first = HttpPipelineFraming.readOne(client, carry, idleTimeoutMs = 2000, totalDeadlineAtMs = System.currentTimeMillis() + 5000) as HttpPipelineFraming.Outcome.Ok
+            assertEquals("hello", first.response.body)
+            val second = HttpPipelineFraming.readOne(client, carry, idleTimeoutMs = 2000, totalDeadlineAtMs = System.currentTimeMillis() + 5000) as HttpPipelineFraming.Outcome.Ok
+            assertEquals("ok", second.response.body)
+        } finally {
+            client.close(); server.close()
+        }
+    }
+
+    @Test
+    fun `negative Content-Length and negative hex chunk size fail cleanly as Malformed`() {
+        val (c1, s1) = connectedClient(listOf(bytes("HTTP/1.1 200 OK\r\nContent-Length: -5\r\n\r\nhello") to 0))
+        try {
+            val o1 = HttpPipelineFraming.readOne(c1, StringBuilder(), 1000, System.currentTimeMillis() + 3000)
+            assertTrue(o1 is HttpPipelineFraming.Outcome.Malformed, o1.toString())
+        } finally {
+            c1.close(); s1.close()
+        }
+
+        val (c2, s2) = connectedClient(listOf(bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n-1\r\nhello") to 0))
+        try {
+            val o2 = HttpPipelineFraming.readOne(c2, StringBuilder(), 1000, System.currentTimeMillis() + 3000)
+            assertTrue(o2 is HttpPipelineFraming.Outcome.Malformed, o2.toString())
+        } finally {
+            c2.close(); s2.close()
+        }
+    }
+
+    @Test
+    fun `HEAD response with declared Content-Length treats body as empty and preserves carry`() {
+        val combined = "HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n"
+        val (client, server) = connectedClient(listOf(bytes(combined) to 0))
+        try {
+            val carry = StringBuilder()
+            val first = HttpPipelineFraming.readOne(client, carry, 1000, System.currentTimeMillis() + 3000, expectNoBody = true) as HttpPipelineFraming.Outcome.Ok
+            assertEquals("no-body", first.response.framing)
+            assertEquals("", first.response.body)
+            val second = HttpPipelineFraming.readOne(client, carry, 1000, System.currentTimeMillis() + 3000) as HttpPipelineFraming.Outcome.Ok
+            assertEquals(204, second.response.statusCode)
+        } finally {
+            client.close(); server.close()
+        }
+    }
 }

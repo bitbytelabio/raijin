@@ -181,6 +181,11 @@ class BCheckBridge(
         }
     }
 
+    /** Clears MCP tracking list on extension unload. */
+    fun shutdown() {
+        deployedChecks.clear()
+    }
+
     /**
      * Get BCheck script by ID (full script content).
      */

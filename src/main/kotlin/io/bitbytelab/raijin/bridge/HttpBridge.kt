@@ -1,9 +1,11 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
+import burp.api.montoya.core.ToolType
 import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.params.HttpParameter
+import io.bitbytelab.raijin.safety.BoundedHttp
 import io.bitbytelab.raijin.safety.HeaderSafety
 import io.bitbytelab.raijin.safety.RequestHygiene
 import io.bitbytelab.raijin.safety.SafeRegex
@@ -124,7 +126,7 @@ class HttpBridge(
             val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
 
             addToSitemap(result, "[MCP] http_send_request via Raijin")
-            ToolCallTracker.lastSentResult.set(result)
+            ToolCallTracker.recordSentResult(result)
 
             val hygiene = RequestHygiene.scan(method, url, headers)
             withFixReport(withScopeWarning(withRequestWarnings(serializeRequestResponse(result, elapsedMs, maxBodyLength), hygiene), scope.warning), fixReport)
@@ -282,7 +284,8 @@ class HttpBridge(
         steps: List<JsonObject>,
         httpMode: String?,
         stopOnError: Boolean,
-        connectionId: String? = null
+        connectionId: String? = null,
+        timeoutMs: Long? = null
     ): JsonObject {
         val mode = resolveHttpMode(httpMode)
         val variables = mutableMapOf<String, String>()
@@ -317,10 +320,12 @@ class HttpBridge(
                 }
 
                 val startTime = System.nanoTime()
-                val result = if (connectionId != null) {
-                    api.http().sendRequest(httpRequest, mode, connectionId)
-                } else {
-                    api.http().sendRequest(httpRequest, mode)
+                val result = executeWithTimeout(timeoutMs) {
+                    if (connectionId != null) {
+                        api.http().sendRequest(httpRequest, mode, connectionId)
+                    } else {
+                        api.http().sendRequest(httpRequest, mode)
+                    }
                 }
                 val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
 
@@ -557,12 +562,7 @@ class HttpBridge(
         caseSensitive: Boolean
     ): JsonObject {
         return try {
-            // Normalize line endings: convert literal \r\n to CRLF, literal \n to LF,
-            // then any bare LF to CRLF, so Montoya parses pasted responses correctly.
-            val normalizedResponse = response
-                .replace("\\r\\n", "\r\n")
-                .replace("\\n", "\n")
-                .replace(Regex("(?<!\r)\n"), "\r\n")
+            val normalizedResponse = RequestHygiene.normalizeCrlf(response)
             if (caseSensitive) {
                 // Montoya's analyzer is case-INSENSITIVE only. Honour case_sensitive=true by
                 // counting exact substring occurrences ourselves over the normalized response,
@@ -628,11 +628,7 @@ class HttpBridge(
             val analyzer: ResponseVariationsAnalyzer = api.http().createResponseVariationsAnalyzer()
 
             responses.forEach { rawResp ->
-                // Normalize line endings so Montoya parses pasted responses correctly.
-                val normalizedResp = rawResp
-                    .replace("\\r\\n", "\r\n")
-                    .replace("\\n", "\n")
-                    .replace(Regex("(?<!\r)\n"), "\r\n")
+                val normalizedResp = RequestHygiene.normalizeCrlf(rawResp)
                 val httpResponse = HttpResponse.httpResponse(normalizedResp)
                 analyzer.updateWith(httpResponse)
             }
@@ -669,8 +665,22 @@ class HttpBridge(
      * [RaijinExtension.registerBurpHandlers].
      */
     fun createGlobalHttpHandler(): HttpHandler {
+        val internalBypassMessageIds = java.util.Collections.synchronizedMap(
+            object : java.util.LinkedHashMap<Int, Boolean>(256, 0.75f, false) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, Boolean>): Boolean = size > 4096
+            }
+        )
         return object : HttpHandler {
             override fun handleHttpRequestToBeSent(requestToBeSent: HttpRequestToBeSent): RequestToBeSentAction {
+                // Exclude internal replays (auth_diff, autorize, idor_hunt, etc.) from TrafficRule and
+                // SessionRule injection so an unauth/none probe never silently receives global auth headers.
+                val fromExtension = try { requestToBeSent.toolSource().isFromTool(ToolType.EXTENSIONS) } catch (_: Exception) { false }
+                if (fromExtension && requestToBeSent.hasHeader(BoundedHttp.INTERNAL_BYPASS_HEADER)) {
+                    try { internalBypassMessageIds[requestToBeSent.messageId()] = true } catch (_: Exception) {}
+                    val clean = requestToBeSent.withRemovedHeader(BoundedHttp.INTERNAL_BYPASS_HEADER)
+                    return RequestToBeSentAction.continueWith(clean, requestToBeSent.annotations())
+                }
+
                 var currentRequest: HttpRequest = requestToBeSent
                 var currentAnnotations = requestToBeSent.annotations()
 
@@ -736,6 +746,11 @@ class HttpBridge(
             }
 
             override fun handleHttpResponseReceived(responseReceived: HttpResponseReceived): ResponseReceivedAction {
+                val bypassed = try { internalBypassMessageIds.remove(responseReceived.messageId()) != null } catch (_: Exception) { false }
+                if (bypassed) {
+                    return ResponseReceivedAction.continueWith(responseReceived)
+                }
+
                 var currentResponse: HttpResponse = responseReceived
                 var currentAnnotations = responseReceived.annotations()
 
@@ -826,14 +841,19 @@ class HttpBridge(
     // ---------------------------------------------------------------
 
     private fun matchesTrafficRuleRequest(rule: TrafficRule, request: HttpRequestToBeSent): Boolean {
+        if (rule.toolFilter != null) {
+            val toolName = try { request.toolSource().toolType().name } catch (_: Exception) { null }
+            if (toolName == null || rule.toolFilter.none { it.equals(toolName, ignoreCase = true) }) {
+                return false
+            }
+        }
         if (rule.matchUrl != null) {
             if (!SafeRegex.containsMatchIn(rule.matchUrl, request.url(), ignoreCase = true)) {
                 return false
             }
         }
         if (rule.matchHost != null) {
-            val hostPattern = rule.matchHost.replace("*", ".*")
-            if (!SafeRegex.matches(hostPattern, request.httpService().host(), ignoreCase = true)) {
+            if (!SafeRegex.matchesHostPattern(rule.matchHost, request.httpService().host())) {
                 return false
             }
         }
@@ -847,19 +867,22 @@ class HttpBridge(
     }
 
     private fun matchesTrafficRuleResponse(rule: TrafficRule, response: HttpResponseReceived): Boolean {
+        if (rule.toolFilter != null) {
+            val toolName = try { response.toolSource().toolType().name } catch (_: Exception) { null }
+            if (toolName == null || rule.toolFilter.none { it.equals(toolName, ignoreCase = true) }) {
+                return false
+            }
+        }
         if (rule.matchUrl != null) {
-            val url = try { response.initiatingRequest()?.url() } catch (_: Exception) { null }
-            if (url != null && !SafeRegex.containsMatchIn(rule.matchUrl, url, ignoreCase = true)) {
+            val url = try { response.initiatingRequest()?.url() } catch (_: Exception) { null } ?: return false
+            if (!SafeRegex.containsMatchIn(rule.matchUrl, url, ignoreCase = true)) {
                 return false
             }
         }
         if (rule.matchHost != null) {
-            val host = try { response.initiatingRequest()?.httpService()?.host() } catch (_: Exception) { null }
-            if (host != null) {
-                val hostPattern = rule.matchHost.replace("*", ".*")
-                if (!SafeRegex.matches(hostPattern, host, ignoreCase = true)) {
-                    return false
-                }
+            val host = try { response.initiatingRequest()?.httpService()?.host() } catch (_: Exception) { null } ?: return false
+            if (!SafeRegex.matchesHostPattern(rule.matchHost, host)) {
+                return false
             }
         }
         if (rule.matchHeader != null) {
@@ -1019,8 +1042,8 @@ class HttpBridge(
         var request: HttpRequest = if (rawRequest != null) {
             buildFromRawRequest(rawRequest, host, port, useTls, autoFixContentLength, fixReport)
         } else if (cUrl != null) {
-            if (preserveHeaders && !cHeaders.isNullOrEmpty()) {
-                buildFromUrlPreservingHeaders(cUrl, cMethod, cHeaders, body, host, port, useTls)
+            if (preserveHeaders) {
+                buildFromUrlPreservingHeaders(cUrl, cMethod, cHeaders.orEmpty(), body, host, port, useTls)
             } else {
                 buildFromUrlMontoya(cUrl, cMethod, cHeaders, body, host, port, useTls)
             }
@@ -1059,7 +1082,7 @@ class HttpBridge(
         // bare-LF input.
         val normalized = RequestHygiene.normalizeCrlf(rawRequest)
         val cleaned = if (autoFixContentLength) {
-            val fix = fixContentLength(normalized)
+            val fix = RequestHygiene.fixContentLength(normalized, utf8Body = normalized.any { it.code > 0xFF })
             if (fix.rewrittenFrom != null && fixReport != null) {
                 fixReport["content_length_rewritten"] = buildJsonObject {
                     put("from", fix.rewrittenFrom)
@@ -1071,24 +1094,25 @@ class HttpBridge(
             normalized
         }
 
-        val resolvedHost = host ?: Regex("(?i)^Host:\\s*([^:\\r\\n]+)", RegexOption.MULTILINE)
-            .find(cleaned)?.groupValues?.get(1)?.trim()
+        val hostMatch = parseHostHeader(cleaned)
+        val resolvedHost = host ?: hostMatch?.first
 
         if (resolvedHost == null) {
             return HttpRequest.httpRequest(cleaned)
         }
 
-        val hostHeaderPort = if (host == null) {
-            Regex("(?i)^Host:\\s*[^:]+:(\\d+)", RegexOption.MULTILINE)
-                .find(cleaned)?.groupValues?.get(1)?.toIntOrNull()
-        } else null
+        val hostHeaderPort = if (host == null) hostMatch?.second else null
 
         // Modern web default: TLS:443 unless caller explicitly says otherwise
         val effectivePort = port ?: hostHeaderPort ?: 443
         val effectiveTls = useTls ?: (effectivePort != 80)
 
         val service = HttpService.httpService(resolvedHost, effectivePort, effectiveTls)
-        return HttpRequest.httpRequest(service, cleaned)
+        return if (cleaned.any { it.code > 0xFF }) {
+            HttpRequest.httpRequest(service, BurpByteArray.byteArray(*cleaned.toByteArray(Charsets.UTF_8)))
+        } else {
+            HttpRequest.httpRequest(service, cleaned)
+        }
     }
 
     /**
@@ -1108,7 +1132,11 @@ class HttpBridge(
         val (svcHost, svcPort, svcTls) = resolveService(url, hostOverride, portOverride, tlsOverride)
         val rawHttp = constructRawHttpRequest(url, method ?: "GET", headers, body, svcHost, svcPort, svcTls)
         val service = HttpService.httpService(svcHost, svcPort, svcTls)
-        return HttpRequest.httpRequest(service, rawHttp)
+        return if (rawHttp.any { it.code > 0xFF }) {
+            HttpRequest.httpRequest(service, BurpByteArray.byteArray(*rawHttp.toByteArray(Charsets.UTF_8)))
+        } else {
+            HttpRequest.httpRequest(service, rawHttp)
+        }
     }
 
     /**
@@ -1129,10 +1157,12 @@ class HttpBridge(
         if (method != null) req = req.withMethod(method)
         if (body != null) req = req.withBody(body)
         headers?.forEach { (n, v) -> req = req.withHeader(n, v) }
-        if (hostOverride != null) {
-            val tls = tlsOverride ?: url.startsWith("https", ignoreCase = true)
-            val effectivePort = portOverride ?: if (tls) 443 else 80
-            req = req.withService(HttpService.httpService(hostOverride, effectivePort, tls))
+        if (hostOverride != null || portOverride != null || tlsOverride != null) {
+            val baseSvc = try { req.httpService() } catch (_: Exception) { null }
+            val tls = tlsOverride ?: baseSvc?.secure() ?: url.startsWith("https", ignoreCase = true)
+            val effectivePort = portOverride ?: baseSvc?.port() ?: if (tls) 443 else 80
+            val effectiveHost = hostOverride ?: baseSvc?.host() ?: URI(url).host
+            req = req.withService(HttpService.httpService(effectiveHost, effectivePort, tls))
         }
         return req
     }
@@ -1189,7 +1219,8 @@ class HttpBridge(
         val hasContentLength = headers.keys.any { it.equals("Content-Length", ignoreCase = true) }
         val hasTransferEncoding = headers.keys.any { it.equals("Transfer-Encoding", ignoreCase = true) }
         if (body != null && !hasContentLength && !hasTransferEncoding) {
-            val bodyBytes = body.toByteArray(Charsets.ISO_8859_1)
+            val charset = if (body.any { it.code > 0xFF }) Charsets.UTF_8 else Charsets.ISO_8859_1
+            val bodyBytes = body.toByteArray(charset)
             sb.append("Content-Length: ${bodyBytes.size}\r\n")
         }
 
@@ -1199,39 +1230,17 @@ class HttpBridge(
         return sb.toString()
     }
 
-    /**
-     * Recomputes the Content-Length header on a raw HTTP request to match the actual
-     * body size in bytes (ISO-8859-1). Returns the original request unchanged if there
-     * is no body section or no Content-Length header.
-     *
-     * Fixes the silent status_code:0 ghost response when caller-computed CL is wrong.
-     */
-    private data class ContentLengthFix(val request: String, val rewrittenFrom: Int? = null, val rewrittenTo: Int? = null)
-
-    private fun fixContentLength(rawRequest: String): ContentLengthFix {
-        val boundary = rawRequest.indexOf("\r\n\r\n")
-        if (boundary < 0) return ContentLengthFix(rawRequest)
-
-        val headerSection = rawRequest.substring(0, boundary)
-        val bodySection = rawRequest.substring(boundary + 4)
-
-        val clRegex = Regex("(?im)^Content-Length:\\s*(\\d+)\\s*$")
-        val clMatch = clRegex.find(headerSection) ?: return ContentLengthFix(rawRequest)
-
-        val declaredLength = clMatch.groupValues[1].toIntOrNull() ?: return ContentLengthFix(rawRequest)
-        val actualLength = bodySection.toByteArray(Charsets.ISO_8859_1).size
-        if (declaredLength == actualLength) return ContentLengthFix(rawRequest)
-
-        val fixedHeader = clRegex.replaceFirst(headerSection, "Content-Length: $actualLength")
-        return ContentLengthFix("$fixedHeader\r\n\r\n$bodySection", declaredLength, actualLength)
-    }
-
     // ---------------------------------------------------------------
     // Timeout-bounded execution
     // ---------------------------------------------------------------
 
     private val httpExecutor = Executors.newCachedThreadPool { r ->
         Thread(r, "raijin-http-${System.nanoTime()}").apply { isDaemon = true }
+    }
+
+    /** Shuts down internal HTTP timeout pool on extension unload. */
+    fun shutdown() {
+        httpExecutor.shutdownNow()
     }
 
     /** Thrown by [executeWithTimeout] on expiry, so callers can detect a timeout structurally
@@ -1328,7 +1337,7 @@ class HttpBridge(
             val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
 
             addToSitemap(result, "[MCP] Raw bytes request via Raijin")
-            ToolCallTracker.lastSentResult.set(result)
+            ToolCallTracker.recordSentResult(result)
 
             withScopeWarning(serializeRequestResponse(result, elapsedMs, maxBodyLength), scope.warning)
         } catch (e: Exception) {
@@ -1404,7 +1413,8 @@ class HttpBridge(
         maxBodyLength: Int?,
         marker: String?,
         stopOnStatusCodes: List<Int>? = null,
-        stopOnBodyRegex: String? = null
+        stopOnBodyRegex: String? = null,
+        timeoutMs: Long? = null
     ): JsonObject {
         return try {
             val service = HttpService.httpService(host, port, useTls)
@@ -1412,11 +1422,7 @@ class HttpBridge(
             scopeGate.deny((if (useTls) "https" else "http") + "://$host:$port/")?.let { return it }
             val results = mutableListOf<JsonObject>()
 
-            // Normalize the request string: convert literal \r\n to CRLF, bare \n to CRLF
-            val baseRequest = request
-                .replace("\\r\\n", "\r\n")
-                .replace("\\n", "\n")
-                .replace(Regex("(?<!\r)\n"), "\r\n")
+            val baseRequest = RequestHygiene.normalizeCrlf(request)
 
             // Resolve injection points via the pure planner (FUZZ keyword / custom-marker pairs /
             // legacy offsets). This fixes the custom multi-char marker no-op and rejects reversed
@@ -1428,13 +1434,12 @@ class HttpBridge(
 
             var stoppedEarly = false
             for (planned in plan.requests) {
-                // Encode the substituted request with an EXPLICIT UTF-8 charset so astral /
-                // multi-byte payloads (emoji, non-Latin scripts) survive intact. Handing the
-                // String straight to Montoya's String overload previously corrupted them.
-                val reqBytes = planned.request.toByteArray(Charsets.UTF_8)
+                // Recompute Content-Length if present & unambiguous (skips Transfer-Encoding/multi-CL smuggling).
+                val fixed = RequestHygiene.fixContentLength(planned.request, utf8Body = true).request
+                val reqBytes = fixed.toByteArray(Charsets.UTF_8)
                 val httpRequest = HttpRequest.httpRequest(service, BurpByteArray.byteArray(*reqBytes))
                 val startTime = System.nanoTime()
-                val result = api.http().sendRequest(httpRequest, mode)
+                val result = executeWithTimeout(timeoutMs) { api.http().sendRequest(httpRequest, mode) }
                 val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
                 addToSitemap(result, "[MCP] Fuzz ${plan.mode} pos=${planned.position} payload=${planned.payload}")
 
@@ -1509,7 +1514,8 @@ class HttpBridge(
         payloads: List<String>?,
         httpMode: String?,
         maxBodyLength: Int?,
-        gateDelay: Long
+        gateDelay: Long,
+        timeoutMs: Long? = null
     ): JsonObject {
         return try {
             val service = HttpService.httpService(host, port, useTls)
@@ -1517,18 +1523,18 @@ class HttpBridge(
             scopeGate.deny((if (useTls) "https" else "http") + "://$host:$port/")?.let { return it }
 
             // Normalize request
-            val baseRequest = request
-                .replace("\\r\\n", "\r\n")
-                .replace("\\n", "\n")
-                .replace(Regex("(?<!\r)\n"), "\r\n")
+            val baseRequest = RequestHygiene.normalizeCrlf(request)
 
-            // Build all requests
+            // Build all requests (updating unambiguous Content-Length after payload substitution)
+            val baseFixed = RequestHygiene.fixContentLength(baseRequest, utf8Body = true).request
             val requests = if (payloads != null && payloads.isNotEmpty()) {
                 payloads.map { payload ->
-                    HttpRequest.httpRequest(service, baseRequest.replace("FUZZ", payload))
+                    val substituted = RequestHygiene.fixContentLength(baseRequest.replace("FUZZ", payload), utf8Body = true).request
+                    HttpRequest.httpRequest(service, BurpByteArray.byteArray(*substituted.toByteArray(Charsets.UTF_8)))
                 }
             } else {
-                (1..count).map { HttpRequest.httpRequest(service, baseRequest) }
+                val baseBytes = baseFixed.toByteArray(Charsets.UTF_8)
+                (1..count).map { HttpRequest.httpRequest(service, BurpByteArray.byteArray(*baseBytes)) }
             }
 
             // Optional pre-dispatch gate: sleep gateDelay ms before releasing the batch.
@@ -1539,7 +1545,7 @@ class HttpBridge(
             // Send all requests in parallel using Burp's parallel sender (best-effort
             // concurrency — see kdoc; this is NOT guaranteed single-packet sync).
             val startTime = System.nanoTime()
-            val responses = api.http().sendRequests(requests, mode)
+            val responses = executeWithTimeout(timeoutMs) { api.http().sendRequests(requests, mode) }
             val totalElapsedMs = (System.nanoTime() - startTime) / 1_000_000
 
             // Analyze results for race condition indicators
@@ -1707,12 +1713,10 @@ class HttpBridge(
                         }
                     })
                     val bodyStr = resp.bodyToString()
-                    val responseBody = if (maxBodyLength != null && maxBodyLength > 0 && bodyStr.length > maxBodyLength) {
-                        bodyStr.take(maxBodyLength) + "... [truncated, full length: ${bodyStr.length}]"
-                    } else {
-                        bodyStr
-                    }
-                    put("response_body", responseBody)
+                    val rendered = io.bitbytelab.raijin.core.BodyText.render(bodyStr, maxBodyLength, resp.mimeType().name)
+                    put("response_body", rendered.text)
+                    if (rendered.isBinary) put("response_body_encoding", "base64")
+                    if (rendered.truncated) put("response_body_truncated", true)
 
                     // Cookies
                     val cookies = resp.cookies()
@@ -1749,6 +1753,24 @@ class HttpBridge(
                     })
                 }
             } catch (_: Exception) { }
+        }
+    }
+
+    companion object {
+        private val HOST_HEADER_PATTERN = Regex(
+            "(?im)^Host:\\s*(?:\\[([^\\]\\r\\n]+)\\]|([^:\\r\\n\\s]+))(?::(\\d+))?\\s*$"
+        )
+
+        /**
+         * Parses `Host: example.com:8080` or `Host: [::1]:8443` without crossing CRLF boundaries
+         * onto subsequent headers.
+         */
+        internal fun parseHostHeader(raw: String): Pair<String, Int?>? {
+            val m = HOST_HEADER_PATTERN.find(raw) ?: return null
+            val host = (m.groupValues[1].ifEmpty { m.groupValues[2] }).trim()
+            if (host.isEmpty()) return null
+            val port = m.groupValues[3].toIntOrNull()
+            return host to port
         }
     }
 }

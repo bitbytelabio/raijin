@@ -10,6 +10,7 @@ import io.bitbytelab.raijin.core.ParamMinerWordlists
 import io.bitbytelab.raijin.core.ProbeResult
 import io.bitbytelab.raijin.recon.JsEndpoints
 import io.bitbytelab.raijin.recon.ReconHeuristics
+import io.bitbytelab.raijin.safety.SafeRegex
 import io.bitbytelab.raijin.safety.ScopeGate
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
@@ -45,8 +46,13 @@ class ReconBridge(private val api: MontoyaApi) {
         return try {
             var items = api.proxy().history().toList()
             if (hostFilter != null) {
-                val rx = Regex(hostFilter, RegexOption.IGNORE_CASE)
-                items = items.filter { try { rx.containsMatchIn(it.finalRequest().httpService().host()) } catch (_: Exception) { false } }
+                SafeRegex.validate(hostFilter, ignoreCase = true)?.let { err ->
+                    return buildJsonObject { put("error", "Invalid host_filter regex: $err") }
+                }
+                items = items.filter {
+                    val h = try { it.finalRequest().httpService().host() } catch (_: Exception) { "" }
+                    SafeRegex.containsMatchIn(hostFilter, h, ignoreCase = true)
+                }
             }
             items = items.takeLast(maxItems.coerceIn(1, 2000))
             val endpoints = linkedSetOf<String>()

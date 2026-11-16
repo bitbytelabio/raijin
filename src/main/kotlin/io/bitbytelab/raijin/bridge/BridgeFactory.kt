@@ -48,7 +48,16 @@ class BridgeFactory {
         val injection: InjectionBridge,
         val idorHunt: IdorHuntBridge,
         val autorize: AutorizeBridge
-    )
+    ) {
+        /** Releases thread pools and extension registrations held by bridges on unload. */
+        fun shutdown() {
+            proxy.shutdown()
+            http.shutdown()
+            websocket.shutdown()
+            scanCheck.shutdown()
+            bcheck.shutdown()
+        }
+    }
 
     companion object {
         /**

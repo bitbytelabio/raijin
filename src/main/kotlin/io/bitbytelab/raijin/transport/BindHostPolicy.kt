@@ -47,7 +47,7 @@ object BindHostPolicy {
 
     /** Classifies a requested bind host without ever binding. Whitespace/empty ⇒ [Kind.INVALID]. */
     fun classify(host: String): Kind {
-        val h = host.trim()
+        val h = host.trim().removePrefix("[").removeSuffix("]")
         if (h.isEmpty() || h.any { it.isWhitespace() }) return Kind.INVALID
         return try {
             val addr = InetAddress.getByName(h)
@@ -62,33 +62,37 @@ object BindHostPolicy {
     }
 
     /** Applies the operator gate to a requested host, returning the host to actually bind to. */
-    fun resolve(requested: String, allowRemoteBind: Boolean): Decision = when (classify(requested)) {
-        Kind.LOOPBACK -> Decision(requested.trim(), exposed = false, downgraded = false, message = null)
+    fun resolve(requested: String, allowRemoteBind: Boolean): Decision {
+        val clean = requested.trim().removePrefix("[").removeSuffix("]")
+        return when (classify(clean)) {
+            Kind.LOOPBACK -> Decision(clean, exposed = false, downgraded = false, message = null)
 
-        Kind.INVALID -> Decision(
-            LOOPBACK, exposed = false, downgraded = true,
-            message = "invalid bind host '$requested' — falling back to $LOOPBACK"
-        )
-
-        Kind.WILDCARD, Kind.OTHER ->
-            if (allowRemoteBind) Decision(
-                requested.trim(), exposed = true, downgraded = false,
-                message = "binding to non-loopback interface '${requested.trim()}' — the MCP servers and " +
-                    "dashboard are reachable from the network and Raijin has no authentication"
-            ) else Decision(
+            Kind.INVALID -> Decision(
                 LOOPBACK, exposed = false, downgraded = true,
-                message = "non-loopback bind '${requested.trim()}' requires an operator opt-in " +
-                    "(set Burp pref mcp_allow_remote_bind=true or -Draijin.allowRemoteBind=true) — " +
-                    "falling back to $LOOPBACK"
+                message = "invalid bind host '$requested' — falling back to $LOOPBACK"
             )
+
+            Kind.WILDCARD, Kind.OTHER ->
+                if (allowRemoteBind) Decision(
+                    clean, exposed = true, downgraded = false,
+                    message = "binding to non-loopback interface '$clean' — remote security controls apply"
+                ) else Decision(
+                    LOOPBACK, exposed = false, downgraded = true,
+                    message = "non-loopback bind '$clean' requires an operator opt-in " +
+                        "(set Burp pref mcp_allow_remote_bind=true or -Draijin.allowRemoteBind=true) — " +
+                        "falling back to $LOOPBACK"
+                )
+        }
     }
 
     /**
      * The address to PROBE for liveness. A server bound to a wildcard (`0.0.0.0`/`::`) is not
      * directly connectable at that address, so probe loopback instead — otherwise the bind
      * verification false-negatives and logs the misleading "Java 22+" error. Concrete addresses
-     * are probed as-is.
+     * are probed as-is (unbracketed for [java.net.InetSocketAddress]).
      */
-    fun probeHost(bindHost: String): String =
-        if (classify(bindHost) == Kind.WILDCARD) LOOPBACK else bindHost
+    fun probeHost(bindHost: String): String {
+        val clean = bindHost.trim().removePrefix("[").removeSuffix("]")
+        return if (classify(clean) == Kind.WILDCARD) LOOPBACK else clean
+    }
 }

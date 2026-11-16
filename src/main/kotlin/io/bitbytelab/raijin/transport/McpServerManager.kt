@@ -14,11 +14,13 @@ import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.cio.*
 import io.ktor.server.engine.*
+import io.ktor.server.http.*
 import io.ktor.server.plugins.cors.routing.*
 import io.ktor.server.sse.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import io.ktor.sse.ServerSentEvent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.server.SseServerTransport
@@ -75,9 +77,16 @@ class McpServerManager(
      */
     private val sendTimeoutMs: Long = 45_000L
 
+    @Volatile
+    private var lastRegisteredCounts: Triple<Int, Int, Int>? = null
+
     companion object {
         /** Path of the Streamable HTTP endpoint on both listeners. */
         const val STREAMABLE_HTTP_PATH = ConnectionInfo.MCP_PATH
+
+        /** Cap on concurrent legacy SSE connections per listener to bound memory/file descriptors. */
+        private const val MAX_SSE_SESSIONS = 64
+        private const val SSE_HEARTBEAT_INTERVAL_MS = 15_000L
 
         /**
          * Sent to every client on initialize. Keep it short (omp keeps only the first 4000
@@ -102,8 +111,8 @@ class McpServerManager(
         internal fun serverCapabilities() = ServerCapabilities(
             tools = ServerCapabilities.Tools(listChanged = true),
             resources = ServerCapabilities.Resources(
-                subscribe = true,
-                listChanged = true
+                subscribe = false,
+                listChanged = false
             ),
             // Skills are static, so the list never changes while a session is open.
             prompts = ServerCapabilities.Prompts(listChanged = false)
@@ -116,12 +125,15 @@ class McpServerManager(
      * keeps per-client state).
      */
     fun createMcpServer(): Server {
+        val options = ServerOptions(capabilities = serverCapabilities()).apply {
+            handlerCoroutineContext = Dispatchers.IO
+        }
         val server = Server(
             serverInfo = Implementation(
                 name = "burpsuite",
                 version = BuildInfo.VERSION
             ),
-            options = ServerOptions(capabilities = serverCapabilities()),
+            options = options,
             instructions = SERVER_INSTRUCTIONS
         )
 
@@ -133,17 +145,19 @@ class McpServerManager(
         // Wrap all tools to emit tool.called events for dashboard + native UI visibility
         ToolCallTracker.wrapAll(server, eventBus, stateManager)
 
+        lastRegisteredCounts = Triple(server.tools.size, server.resources.size, server.prompts.size)
         return server
     }
 
     /**
-     * Returns the REAL number of (tools, resources, prompts) actually registered, by
-     * building a throwaway server and counting. Used for honest startup
-     * reporting instead of a hardcoded count that drifts as tools change.
+     * Returns the REAL number of (tools, resources, prompts) actually registered, reusing the
+     * counts recorded during server creation when already started (instead of allocating an extra
+     * throwaway [Server]).
      */
     fun registeredCounts(): Triple<Int, Int, Int> {
-        val s = createMcpServer()
-        return Triple(s.tools.size, s.resources.size, s.prompts.size)
+        return lastRegisteredCounts ?: createMcpServer().let {
+            Triple(it.tools.size, it.resources.size, it.prompts.size)
+        }
     }
 
     /**
@@ -159,8 +173,10 @@ class McpServerManager(
      * param — NOT '/sse'.
      */
     fun start() {
-        startTransport("Primary SSE", ssePort) { sseServer = it }
-        startTransport("Secondary SSE", httpPort) { httpServer = it }
+        val primaryServer = createMcpServer()
+        val secondaryServer = createMcpServer()
+        startTransport("Primary SSE", ssePort, primaryServer) { sseServer = it }
+        startTransport("Secondary SSE", httpPort, secondaryServer) { httpServer = it }
     }
 
     /**
@@ -177,6 +193,7 @@ class McpServerManager(
     private fun startTransport(
         label: String,
         port: Int,
+        mcpServer: Server,
         assign: (EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>) -> Unit
     ) {
         scope.launch {
@@ -193,9 +210,9 @@ class McpServerManager(
                     )
                     return@launch
                 }
-                val mcpServer = createMcpServer()
                 val server = embeddedServer(CIO, port = port, host = bindHost) {
                     installLocalhostSecurity(listOf(port), allowedSecurityHosts())
+                    install(HttpRequestLifecycle) { cancelCallOnClose = true }
                     val sessions = ConcurrentHashMap<String, SseServerTransport>()
                     // Hand-rolled equivalent of the SDK's `mcp(serverFactory())` so we OWN each
                     // per-session SseServerTransport AND the SSE GET coroutine's Job — the SDK's
@@ -221,10 +238,11 @@ class McpServerManager(
                 server.start(wait = false)
                 assign(server)
 
+                val displayHost = SecurityConfig.formatHostForAuthority(bindHost)
                 if (verifyListening(port)) {
                     logging.logToOutput(
-                        "Raijin: $label listening: Streamable HTTP at http://$bindHost:$port$STREAMABLE_HTTP_PATH, " +
-                            "legacy SSE at http://$bindHost:$port/ (not '/sse')"
+                        "Raijin: $label listening: Streamable HTTP at http://$displayHost:$port$STREAMABLE_HTTP_PATH, " +
+                            "legacy SSE at http://$displayHost:$port/ (not '/sse')"
                     )
                 } else {
                     logging.logToError(
@@ -234,7 +252,7 @@ class McpServerManager(
                                 if (port == ssePort) PortPolicy.PREF_SSE_PORT else PortPolicy.PREF_HTTP_PORT
                             )
                         else
-                        "Raijin: $label transport reported start() but $bindHost:$port is NOT listening. " +
+                        "Raijin: $label transport reported start() but $displayHost:$port is NOT listening. " +
                             "This is the GitHub issue #2/#3 symptom — almost always a JAR built with Java 22+ " +
                             "(Kotlin/Ktor/MCP-SDK incompatibility). Rebuild with a JDK 17-21 (NOT Burp's bundled Java 25)."
                     )
@@ -268,15 +286,41 @@ class McpServerManager(
         mcpServer: Server,
         sessions: ConcurrentHashMap<String, SseServerTransport>
     ) {
+        if (sessions.size >= MAX_SSE_SESSIONS) {
+            runCatching {
+                send(ServerSentEvent(event = "error", data = "Maximum concurrent SSE sessions ($MAX_SSE_SESSIONS) reached"))
+            }
+            runCatching { close() }
+            return
+        }
+        val sessionJob = coroutineContext.job
         val raw = SseServerTransport("", this)
-        val tx = TimeoutSseTransport(raw, coroutineContext.job, sendTimeoutMs, logging)
+        val tx = TimeoutSseTransport(raw, sessionJob, sendTimeoutMs, logging)
         sessions[raw.sessionId] = raw
+        var mcpSession: io.modelcontextprotocol.kotlin.sdk.server.ServerSession? = null
+        val heartbeatJob = launch {
+            while (isActive) {
+                delay(SSE_HEARTBEAT_INTERVAL_MS)
+                runWithSendTimeout(sendTimeoutMs, sessionJob, onTimeout = {
+                    logging.logToError("Raijin: SSE heartbeat stalled >${sendTimeoutMs}ms; closing dead session ${raw.sessionId}")
+                }) {
+                    send(ServerSentEvent(comments = "keepalive"))
+                }
+            }
+        }
         try {
             val session = mcpServer.createSession(tx)   // responses flow through the bounded send
-            session.onClose { sessions.remove(raw.sessionId) }
+            mcpSession = session
+            session.onClose {
+                sessions.remove(raw.sessionId)
+                heartbeatJob.cancel()
+            }
             awaitCancellation()                         // keep the SSE stream open until torn down
         } finally {
+            heartbeatJob.cancel()
             sessions.remove(raw.sessionId)
+            runCatching { mcpSession?.close() }
+            runCatching { tx.close() }
         }
     }
 

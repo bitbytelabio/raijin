@@ -6,6 +6,7 @@ import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.HttpRequestResponse
+import io.bitbytelab.raijin.core.BodyText
 import io.bitbytelab.raijin.core.HighlightColorName
 import io.bitbytelab.raijin.safety.RequestHygiene
 import kotlinx.serialization.json.*
@@ -71,7 +72,13 @@ class OrganizerBridge(private val api: MontoyaApi) {
      *   [IllegalArgumentException] thrown by [List.take].
      * @return JSON object containing the matching Organizer items.
      */
-    fun getItems(urlPrefix: String?, maxResults: Int): JsonObject {
+    fun getItems(
+        urlPrefix: String?,
+        maxResults: Int,
+        includeRequest: Boolean = false,
+        includeResponse: Boolean = false,
+        maxResponseLength: Int? = null
+    ): JsonObject {
         if (maxResults < 0) {
             return buildJsonObject {
                 put("error", "max_results must be non-negative (got $maxResults)")
@@ -97,6 +104,7 @@ class OrganizerBridge(private val api: MontoyaApi) {
                     addJsonObject {
                         // Read every field independently: a single failing accessor
                         // must not discard the whole item.
+                        runCatching { item.id() }.getOrNull()?.let { put("id", it) }
                         safeUrl(item)?.let { put("url", it) }
                         runCatching { item.request()?.method() }.getOrNull()?.let { put("method", it) }
 
@@ -107,12 +115,43 @@ class OrganizerBridge(private val api: MontoyaApi) {
                             runCatching { service.secure() }.getOrNull()?.let { put("use_tls", it) }
                         }
 
+                        val ann = runCatching { item.annotations() }.getOrNull()
+                        if (ann != null) {
+                            runCatching { if (ann.hasNotes()) ann.notes() else null }.getOrNull()?.let { put("notes", it) }
+                            runCatching { if (ann.hasHighlightColor()) ann.highlightColor().name else null }
+                                .getOrNull()?.let { put("highlight", it) }
+                        }
+
                         val hasResponse = runCatching { item.hasResponse() }.getOrDefault(false)
                         if (hasResponse) {
                             val resp = runCatching { item.response() }.getOrNull()
                             if (resp != null) {
                                 runCatching { resp.statusCode().toInt() }.getOrNull()?.let { put("status_code", it) }
                                 runCatching { resp.body().length() }.getOrNull()?.let { put("response_length", it) }
+                            }
+                        }
+
+                        if (includeRequest) {
+                            val reqText = runCatching { item.request()?.toString() }.getOrNull()
+                            if (reqText != null) {
+                                val r = BodyText.render(reqText, maxResponseLength, label = "request body")
+                                put("request", r.text)
+                                if (r.binary) put("request_binary", true)
+                                if (r.truncated) put("request_truncated", true)
+                            }
+                        }
+
+                        if (includeResponse && hasResponse) {
+                            val resp = runCatching { item.response() }.getOrNull()
+                            if (resp != null) {
+                                val mime = runCatching { resp.mimeType().name }.getOrNull()
+                                val respText = runCatching { resp.toString() }.getOrNull()
+                                if (respText != null) {
+                                    val r = BodyText.render(respText, maxResponseLength, mime, "response body")
+                                    put("response", r.text)
+                                    if (r.binary) put("response_binary", true)
+                                    if (r.truncated) put("response_truncated", true)
+                                }
                             }
                         }
                     }

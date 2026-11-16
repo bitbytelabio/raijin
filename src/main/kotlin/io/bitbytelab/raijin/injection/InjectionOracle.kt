@@ -43,9 +43,33 @@ object InjectionOracle {
      * jitter while rejecting normal responses.
      */
     fun timeDelayed(baselineMs: Long, probeMs: Long, expectedDelaySec: Int): Boolean {
-        if (expectedDelaySec <= 0) return false
+        if (expectedDelaySec <= 0 || baselineMs < 0 || probeMs <= 0) return false
         val threshold = (expectedDelaySec * 1000L * 0.7).toLong()
         return (probeMs - baselineMs) >= threshold && probeMs >= threshold
+    }
+
+    /**
+     * Status-guarded overload of [timeDelayed]: rejects failed/timed-out requests (`status <= 0`)
+     * so a connection timeout (which takes 30s and returns status 0) never fires a false positive.
+     */
+    fun timeDelayed(
+        baselineStatus: Int,
+        baselineMs: Long,
+        probeStatus: Int,
+        probeMs: Long,
+        expectedDelaySec: Int
+    ): Boolean {
+        if (baselineStatus <= 0 || probeStatus <= 0) return false
+        return timeDelayed(baselineMs, probeMs, expectedDelaySec)
+    }
+
+    /**
+     * Returns [fileMarker] only if the marker was NOT already present in [baselineBody],
+     * preventing false positives on pages that naturally mention `[fonts]` or `[extensions]`.
+     */
+    fun novelFileMarker(baselineBody: String, probeBody: String): String? {
+        val marker = fileMarker(probeBody) ?: return null
+        return if (fileMarker(baselineBody) == marker) null else marker
     }
 
     /**

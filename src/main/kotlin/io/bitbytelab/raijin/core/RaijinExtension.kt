@@ -24,6 +24,21 @@ class RaijinExtension : BurpExtension {
     private lateinit var eventBus: EventBus
     private lateinit var stateManager: StateManager
     private lateinit var uiTab: RaijinTab
+    private var activeBridges: BridgeFactory.Bridges? = null
+
+    companion object {
+        /**
+         * Stable per-project storage key for [ActivityStore] and [FindingsStore].
+         * Named projects keep their exact name for compatibility; unnamed / temporary
+         * projects disambiguate via Montoya `project().id()` so distinct sessions don't collide.
+         */
+        fun projectKey(api: MontoyaApi): String {
+            val name = try { api.project().name().orEmpty().trim() } catch (_: Exception) { "" }
+            if (name.isNotEmpty()) return name
+            val id = try { api.project().id().orEmpty().trim() } catch (_: Exception) { "" }
+            return if (id.isNotEmpty()) "temp-$id" else "default"
+        }
+    }
 
     override fun initialize(api: MontoyaApi) {
         this.api = api
@@ -49,9 +64,11 @@ class RaijinExtension : BurpExtension {
             try { if (::uiTab.isInitialized) uiTab.dispose() } catch (e: Exception) { api.logging().logToError("Raijin: uiTab dispose failed: ${e.message}") }
             try { if (::dashboardServer.isInitialized) dashboardServer.stop() } catch (e: Exception) { api.logging().logToError("Raijin: dashboard stop failed: ${e.message}") }
             try { if (::serverManager.isInitialized) serverManager.stop() } catch (e: Exception) { api.logging().logToError("Raijin: server stop failed: ${e.message}") }
+            try { activeBridges?.shutdown() } catch (e: Exception) { api.logging().logToError("Raijin: bridges shutdown failed: ${e.message}") }
+            try { io.bitbytelab.raijin.safety.BoundedHttp.shutdown() } catch (e: Exception) { api.logging().logToError("Raijin: BoundedHttp shutdown failed: ${e.message}") }
             try { TurboModule.uninstall() } catch (e: Exception) { api.logging().logToError("Raijin: turbo shutdown failed: ${e.message}") }
             try { HttpPipelineConnectionRegistry.shutdownAll() } catch (e: Exception) { api.logging().logToError("Raijin: pipeline registry shutdown failed: ${e.message}") }
-            try { eventBus.clear() } catch (_: Exception) {}
+            try { eventBus.clearAll() } catch (_: Exception) {}
             try { stateManager.cleanup() } catch (_: Exception) {}
             api.logging().logToOutput("Raijin: Extension unloaded")
         }
@@ -61,7 +78,7 @@ class RaijinExtension : BurpExtension {
         // on every reload, wiping the dashboard). Repopulates the Swing tab (via the deque) AND
         // the web dashboard (by re-seeding the EventBus ring buffer with the historical events).
         try {
-            val projectName = try { api.project().name() } catch (_: Exception) { "" }
+            val projectName = projectKey(api)
             // Persistence is operator-controlled (pref mcp_persist_activity, default ON — issue #8).
             // When OFF, don't restore the saved history and don't write new entries (session-only).
             ActivityStore.enabled =
@@ -71,12 +88,16 @@ class RaijinExtension : BurpExtension {
                 stateManager.restoreMcpActivity(restored)
                 restored.asReversed().forEach { e -> eventBus.emit("tool.called", ActivityStore.toEventData(e)) }
                 ActivityStore.compact(ActivityStore.MAX_LINES)
-                api.logging().logToOutput("Raijin: restored ${restored.size} dashboard activity entries (project: ${projectName.ifEmpty { "default" }}); persistence ON → ${ActivityStore.path()}")
+                api.logging().logToOutput("Raijin: restored ${restored.size} dashboard activity entries (project: $projectName); persistence ON → ${ActivityStore.path()}")
+                ActivityStore.lastError?.let { api.logging().logToError("Raijin: ActivityStore warning: $it") }
             } else {
                 api.logging().logToOutput("Raijin: MCP activity persistence is OFF (session only) — toggle it on the Server tab")
             }
             // Listener is always registered; ActivityStore.append() no-ops while persistence is OFF.
-            stateManager.mcpActivityListeners.add { entry -> ActivityStore.append(entry, projectName) }
+            stateManager.mcpActivityListeners.add { entry ->
+                ActivityStore.append(entry, projectName)
+                ActivityStore.lastError?.let { api.logging().logToError("Raijin: ActivityStore write failed: $it") }
+            }
         } catch (e: Exception) {
             api.logging().logToError("Raijin: activity restore failed: ${e.message}")
         }
@@ -87,10 +108,17 @@ class RaijinExtension : BurpExtension {
         // historical findings_add calls, making it look like the findings vanished for no
         // reason. FindingsBridge.add() appends new ones via the listener below.
         try {
-            val projectName = try { api.project().name() } catch (_: Exception) { "" }
+            val projectName = projectKey(api)
             val restoredFindings = FindingsStore.load(projectName)
             if (restoredFindings.isNotEmpty()) stateManager.restoreFindings(restoredFindings)
-            stateManager.findingsListeners.add { f -> FindingsStore.append(f, projectName) }
+            stateManager.findingsListeners.add { f ->
+                FindingsStore.append(f, projectName)
+                FindingsStore.lastError?.let { err -> api.logging().logToError("Raijin: FindingsStore append error: $err") }
+            }
+            stateManager.findingsRemoveListeners.add { _ ->
+                FindingsStore.replaceProject(projectName, stateManager.findings.toList())
+                FindingsStore.lastError?.let { err -> api.logging().logToError("Raijin: FindingsStore sync error: $err") }
+            }
             api.logging().logToOutput(
                 "Raijin: restored ${restoredFindings.size} agent finding(s) (project: ${projectName.ifEmpty { "default" }}); store → ${FindingsStore.path()}"
             )
@@ -118,7 +146,7 @@ class RaijinExtension : BurpExtension {
         val bindHost = bindDecision.effectiveHost
 
         // Create all bridge instances via factory
-        val bridges = BridgeFactory.createAll(api, eventBus, stateManager)
+        val bridges = BridgeFactory.createAll(api, eventBus, stateManager).also { activeBridges = it }
 
         // Initialize the MCP + dashboard servers. From here on a socket may be bound, so if ANY
         // later init step throws we must stop them (see the early unload handler above) — otherwise
@@ -135,6 +163,9 @@ class RaijinExtension : BurpExtension {
         val ssePort = port("raijin.ssePort", PortPolicy.PREF_SSE_PORT, PortPolicy.DEFAULT_SSE)
         val httpPort = port("raijin.httpPort", PortPolicy.PREF_HTTP_PORT, PortPolicy.DEFAULT_HTTP)
         val dashboardPort = port("raijin.dashboardPort", PortPolicy.PREF_DASHBOARD_PORT, PortPolicy.DEFAULT_DASHBOARD)
+        PortPolicy.duplicatePortMessages(ssePort, httpPort, dashboardPort).forEach { msg ->
+            api.logging().logToError(msg)
+        }
 
         serverManager = McpServerManager(
             bridges = bridges,

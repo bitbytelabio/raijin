@@ -139,4 +139,28 @@ class HttpFuzzPlanTest {
         assertNotNull(msg)
         assertTrue(msg.contains("positions[1]"))
     }
+
+    @Test
+    fun `sniper marker mode strips inactive markers from other positions`() {
+        val base = "GET /?a=§one§&b=§two§ HTTP/1.1"
+        val res = HttpFuzzPlan.plan(base, null, listOf("X"), null) as HttpFuzzPlan.Result.Ok
+        assertEquals(2, res.requests.size)
+        assertEquals("GET /?a=X&b=two HTTP/1.1", res.requests[0].request)
+        assertEquals("GET /?a=one&b=X HTTP/1.1", res.requests[1].request)
+    }
+
+    @Test
+    fun `odd marker count and overlapping offset positions are rejected`() {
+        val oddOne = HttpFuzzPlan.plan("GET /?a=§one HTTP/1.1", null, listOf("X"), null)
+        assertTrue(oddOne is HttpFuzzPlan.Result.Error)
+        assertTrue(oddOne.message.contains("Odd number"), oddOne.message)
+
+        val oddThree = HttpFuzzPlan.plan("GET /?a=§one§&b=§two HTTP/1.1", null, listOf("X"), null)
+        assertTrue(oddThree is HttpFuzzPlan.Result.Error)
+        assertTrue(oddThree.message.contains("Odd number"), oddThree.message)
+
+        val overlap = HttpFuzzPlan.plan("0123456789", listOf(1 to 5, 3 to 7), listOf("X"), null)
+        assertTrue(overlap is HttpFuzzPlan.Result.Error)
+        assertTrue(overlap.message.contains("overlaps"), overlap.message)
+    }
 }

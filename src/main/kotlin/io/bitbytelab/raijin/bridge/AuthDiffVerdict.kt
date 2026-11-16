@@ -8,11 +8,31 @@ package io.bitbytelab.raijin.bridge
  */
 object AuthDiffVerdict {
 
-    data class LevelResult(val name: String, val status: Int, val body: String, val contentType: String? = null) {
+    private val AUTH_REDIRECT_PATTERN = Regex(
+        "(?i)(?:^|/)(?:login|signin|sign-in|log-in|auth|sso|oauth|cas|saml|session|unauthorized|unauthenticated)(?:[/?#.]|$)|^https?://(?:login|auth|sso)\\."
+    )
+
+    internal fun isAuthRedirect(location: String?): Boolean {
+        if (location.isNullOrBlank()) return false
+        return AUTH_REDIRECT_PATTERN.containsMatchIn(location.trim())
+    }
+
+    data class LevelResult(
+        val name: String,
+        val status: Int,
+        val body: String,
+        val contentType: String? = null,
+        val location: String? = null
+    ) {
         /** Levels named none/unauth/anonymous are treated as the lower-privilege baseline. */
         val isAuthLevel: Boolean
             get() = !name.equals("none", true) && !name.equals("unauth", true) && !name.equals("anonymous", true)
-        val isSuccess: Boolean get() = status in 200..399
+        val isSuccess: Boolean
+            get() = when {
+                status in 200..299 -> true
+                status in 300..399 -> !isAuthRedirect(location)
+                else -> false
+            }
     }
 
     data class Finding(val severity: String, val id: String, val detail: String)
@@ -54,7 +74,14 @@ object AuthDiffVerdict {
         // flagging it the same as a leaked protected endpoint.
         if (allSameStatus && allSimilar) {
             val target = results.first()
-            if (StaticAssetHeuristic.looksStatic(target.contentType, url)) {
+            if (!target.isSuccess) {
+                findings.add(
+                    Finding(
+                        "info", "all_identical_non_success",
+                        "All auth levels return the same non-success status (${target.status}) and near-identical bodies — endpoint appears to deny or fail uniformly across identities."
+                    )
+                )
+            } else if (StaticAssetHeuristic.looksStatic(target.contentType, url)) {
                 findings.add(
                     Finding(
                         "info", "all_identical_static_asset",
@@ -92,7 +119,7 @@ object AuthDiffVerdict {
                 val a = results[i]
                 val b = results[j]
                 if (a.name.equals(b.name, true)) continue
-                if (a.status != b.status || !a.isSuccess) continue
+                if (a.status != b.status || !a.isSuccess || !b.isSuccess) continue
                 if (similarity(a.body, b.body) < unauthMatchThreshold) continue
                 matchedNames.add(a.name)
                 matchedNames.add(b.name)

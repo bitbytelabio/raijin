@@ -3,9 +3,9 @@ package io.bitbytelab.raijin.tools.session
 import io.bitbytelab.raijin.bridge.HttpBridge
 import io.bitbytelab.raijin.bridge.SessionBridge
 import io.bitbytelab.raijin.state.StateManager
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -58,54 +58,29 @@ object SessionTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val ruleName = args["rule_name"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: rule_name"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: rule_name")
                 val scope = args["scope"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: scope"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: scope")
                 val scopePattern = args["scope_pattern"]?.jsonPrimitive?.contentOrNull
                 val extractFrom = args["extract_from"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: extract_from"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: extract_from")
                 val extractHeaderName = args["extract_header_name"]?.jsonPrimitive?.contentOrNull
                 val extractRegex = args["extract_regex"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: extract_regex"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: extract_regex")
                 val injectInto = args["inject_into"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: inject_into"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: inject_into")
                 val injectName = args["inject_name"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: inject_name"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: inject_name")
                 val injectValueTemplate = args["inject_value_template"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: inject_value_template"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: inject_value_template")
                 val enabled = args["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
 
-                val result = bridge.createTokenRule(
+                toolJsonResult(bridge.createTokenRule(
                     ruleName, scope, scopePattern, extractFrom, extractHeaderName,
                     extractRegex, injectInto, injectName, injectValueTemplate, enabled
-                )
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                ))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -118,13 +93,9 @@ object SessionTools {
             inputSchema = ToolSchema(properties = buildJsonObject {}, required = emptyList())
         ) { _ ->
             try {
-                val result = bridge.listRules()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.listRules())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -144,17 +115,10 @@ object SessionTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val ruleName = args["rule_name"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: rule_name"}""")),
-                        isError = true
-                    )
-                val result = bridge.removeRule(ruleName)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                    ?: return@addTool toolError("Missing required parameter: rule_name")
+                toolJsonResult(bridge.removeRule(ruleName))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

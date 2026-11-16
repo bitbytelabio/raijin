@@ -60,10 +60,11 @@ internal object HttpPipelineFraming {
         idleTimeoutMs: Long,
         totalDeadlineAtMs: Long,
         maxResponseBytes: Int = DEFAULT_MAX_RESPONSE_BYTES,
+        expectNoBody: Boolean = false,
     ): Outcome {
         val input = socket.getInputStream()
         val readBuf = ByteArray(65536)
-        var buffer = carry.toString()
+        val buffer = StringBuilder(carry.toString())
         carry.setLength(0)
         var bytesRead = 0
 
@@ -98,21 +99,26 @@ internal object HttpPipelineFraming {
             var headerEnd = buffer.indexOf("\r\n\r\n")
             while (headerEnd == -1) {
                 when (val r = readMore()) {
-                    is ReadResult.Data -> buffer += String(readBuf, 0, r.len, Charsets.ISO_8859_1)
-                    ReadResult.Eof -> return if (buffer.isEmpty()) {
-                        Outcome.Eof(buffer, bytesRead)
-                    } else {
-                        Outcome.Malformed("connection closed before headers completed", buffer, bytesRead)
+                    is ReadResult.Data -> {
+                        if (buffer.length + r.len > maxResponseBytes) {
+                            return Outcome.Malformed("response headers exceeded $maxResponseBytes byte cap", buffer.toString(), bytesRead)
+                        }
+                        buffer.append(String(readBuf, 0, r.len, Charsets.ISO_8859_1))
                     }
-                    ReadResult.TimedOut -> return Outcome.TimedOut(buffer, if (totalExceeded()) "total" else "idle", bytesRead)
-                    is ReadResult.Errored -> return Outcome.Reset(buffer, r.message, bytesRead)
+                    ReadResult.Eof -> return if (buffer.isEmpty()) {
+                        Outcome.Eof(buffer.toString(), bytesRead)
+                    } else {
+                        Outcome.Malformed("connection closed before headers completed", buffer.toString(), bytesRead)
+                    }
+                    ReadResult.TimedOut -> return Outcome.TimedOut(buffer.toString(), if (totalExceeded()) "total" else "idle", bytesRead)
+                    is ReadResult.Errored -> return Outcome.Reset(buffer.toString(), r.message, bytesRead)
                 }
                 headerEnd = buffer.indexOf("\r\n\r\n")
             }
 
             val headerSection = buffer.substring(0, headerEnd)
             if (!headerSection.startsWith("HTTP/")) {
-                return Outcome.Malformed("response did not start with HTTP/: '${headerSection.take(80)}'", buffer, bytesRead)
+                return Outcome.Malformed("response did not start with HTTP/: '${headerSection.take(80)}'", buffer.toString(), bytesRead)
             }
             val lines = headerSection.split("\r\n")
             val statusLine = lines[0]
@@ -121,7 +127,7 @@ internal object HttpPipelineFraming {
             if (statusCode in 100..199) {
                 // 1xx informational (e.g. 100-continue) is absorbed transparently and does not
                 // count as a response — keep reading for the real one.
-                buffer = buffer.substring(headerEnd + 4)
+                buffer.delete(0, headerEnd + 4)
                 continue
             }
 
@@ -144,9 +150,9 @@ internal object HttpPipelineFraming {
                 it.first.equals("Connection", ignoreCase = true) && it.second.contains("close", ignoreCase = true)
             }
 
-            buffer = buffer.substring(headerEnd + 4)
+            buffer.delete(0, headerEnd + 4)
 
-            if (statusCode == 204 || statusCode == 304) {
+            if (expectNoBody || statusCode == 204 || statusCode == 304) {
                 carry.append(buffer)
                 return Outcome.Ok(Response(statusLine, statusCode, headers, "", "no-body", connectionCloseHeader, warnings), bytesRead)
             }
@@ -155,23 +161,69 @@ internal object HttpPipelineFraming {
                 val body = StringBuilder()
                 try {
                     while (true) {
-                        var chunk = nextChunk(buffer)
-                        while (chunk == null || buffer.length < chunk.second + 2) {
+                        var chunk = nextChunk(buffer, maxResponseBytes)
+                        while (chunk == null) {
                             when (val r = readMore()) {
-                                is ReadResult.Data -> buffer += String(readBuf, 0, r.len, Charsets.ISO_8859_1)
+                                is ReadResult.Data -> {
+                                    if (body.length + buffer.length + r.len > maxResponseBytes) {
+                                        return Outcome.Malformed("response exceeded $maxResponseBytes byte cap", body.toString(), bytesRead)
+                                    }
+                                    buffer.append(String(readBuf, 0, r.len, Charsets.ISO_8859_1))
+                                }
                                 ReadResult.Eof -> return Outcome.Eof(body.toString(), bytesRead)
                                 ReadResult.TimedOut -> return Outcome.TimedOut(body.toString(), if (totalExceeded()) "total" else "idle", bytesRead)
                                 is ReadResult.Errored -> return Outcome.Reset(body.toString(), r.message, bytesRead)
                             }
-                            chunk = nextChunk(buffer)
+                            chunk = nextChunk(buffer, maxResponseBytes)
                         }
                         val (skip, end) = chunk
-                        body.append(buffer.substring(skip, end))
-                        buffer = buffer.substring(end + 2)
-                        if (end == skip) break // zero-length terminal chunk
-                        if (body.length > maxResponseBytes) {
+                        val chunkLen = end - skip
+                        if (chunkLen == 0) {
+                            // Zero-length terminal chunk: drop `0[;ext]\r\n` and consume trailers until `\r\n` or `...\r\n\r\n`
+                            buffer.delete(0, skip)
+                            while (true) {
+                                val bufStr = buffer.toString()
+                                if (bufStr.startsWith("\r\n")) {
+                                    buffer.delete(0, 2)
+                                    break
+                                }
+                                val trailerEnd = bufStr.indexOf("\r\n\r\n")
+                                if (trailerEnd >= 0) {
+                                    buffer.delete(0, trailerEnd + 4)
+                                    break
+                                }
+                                when (val r = readMore()) {
+                                    is ReadResult.Data -> {
+                                        if (body.length + buffer.length + r.len > maxResponseBytes) {
+                                            return Outcome.Malformed("chunk trailers exceeded $maxResponseBytes byte cap", body.toString(), bytesRead)
+                                        }
+                                        buffer.append(String(readBuf, 0, r.len, Charsets.ISO_8859_1))
+                                    }
+                                    ReadResult.Eof -> return Outcome.Eof(body.toString(), bytesRead)
+                                    ReadResult.TimedOut -> return Outcome.TimedOut(body.toString(), if (totalExceeded()) "total" else "idle", bytesRead)
+                                    is ReadResult.Errored -> return Outcome.Reset(body.toString(), r.message, bytesRead)
+                                }
+                            }
+                            break
+                        }
+                        while (buffer.length < end + 2) {
+                            when (val r = readMore()) {
+                                is ReadResult.Data -> {
+                                    if (body.length + buffer.length + r.len > maxResponseBytes) {
+                                        return Outcome.Malformed("response exceeded $maxResponseBytes byte cap", body.toString(), bytesRead)
+                                    }
+                                    buffer.append(String(readBuf, 0, r.len, Charsets.ISO_8859_1))
+                                }
+                                ReadResult.Eof -> return Outcome.Eof(body.toString(), bytesRead)
+                                ReadResult.TimedOut -> return Outcome.TimedOut(body.toString(), if (totalExceeded()) "total" else "idle", bytesRead)
+                                is ReadResult.Errored -> return Outcome.Reset(body.toString(), r.message, bytesRead)
+                            }
+                        }
+                        if (body.length + chunkLen > maxResponseBytes) {
                             return Outcome.Malformed("response exceeded $maxResponseBytes byte cap", body.toString(), bytesRead)
                         }
+                        body.append(buffer.substring(skip, end))
+                        buffer.delete(0, end + 2)
                     }
                 } catch (e: ChunkParseException) {
                     return Outcome.Malformed(e.message ?: "invalid chunked encoding", body.toString(), bytesRead)
@@ -180,18 +232,27 @@ internal object HttpPipelineFraming {
                 return Outcome.Ok(Response(statusLine, statusCode, headers, body.toString(), "chunked", connectionCloseHeader, warnings), bytesRead)
             }
 
-            val contentLength = headers.firstOrNull { it.first.equals("Content-Length", ignoreCase = true) }
-                ?.second?.trim()?.toIntOrNull()
-            if (contentLength != null) {
-                if (contentLength > maxResponseBytes) {
-                    return Outcome.Malformed("declared Content-Length $contentLength exceeds $maxResponseBytes byte cap", "", bytesRead)
+            val rawClHeader = headers.firstOrNull { it.first.equals("Content-Length", ignoreCase = true) }?.second?.trim()
+            if (rawClHeader != null) {
+                val parsedCl = rawClHeader.toLongOrNull()
+                if (parsedCl == null || parsedCl < 0L) {
+                    return Outcome.Malformed("invalid Content-Length '$rawClHeader'", "", bytesRead)
                 }
+                if (parsedCl > maxResponseBytes) {
+                    return Outcome.Malformed("declared Content-Length $parsedCl exceeds $maxResponseBytes byte cap", "", bytesRead)
+                }
+                val contentLength = parsedCl.toInt()
                 while (buffer.length < contentLength) {
                     when (val r = readMore()) {
-                        is ReadResult.Data -> buffer += String(readBuf, 0, r.len, Charsets.ISO_8859_1)
-                        ReadResult.Eof -> return Outcome.Eof(buffer, bytesRead)
-                        ReadResult.TimedOut -> return Outcome.TimedOut(buffer, if (totalExceeded()) "total" else "idle", bytesRead)
-                        is ReadResult.Errored -> return Outcome.Reset(buffer, r.message, bytesRead)
+                        is ReadResult.Data -> {
+                            if (buffer.length + r.len > maxResponseBytes) {
+                                return Outcome.Malformed("response exceeded $maxResponseBytes byte cap", buffer.toString(), bytesRead)
+                            }
+                            buffer.append(String(readBuf, 0, r.len, Charsets.ISO_8859_1))
+                        }
+                        ReadResult.Eof -> return Outcome.Eof(buffer.toString(), bytesRead)
+                        ReadResult.TimedOut -> return Outcome.TimedOut(buffer.toString(), if (totalExceeded()) "total" else "idle", bytesRead)
+                        is ReadResult.Errored -> return Outcome.Reset(buffer.toString(), r.message, bytesRead)
                     }
                 }
                 val body = buffer.substring(0, contentLength)
@@ -203,13 +264,16 @@ internal object HttpPipelineFraming {
             // response came back the normal way" signal a 0.CL-style probe cares about — EOF here
             // is the expected terminator, not an error.
             val body = StringBuilder(buffer)
+            if (body.length > maxResponseBytes) {
+                return Outcome.Malformed("response exceeded $maxResponseBytes byte cap", body.toString(), bytesRead)
+            }
             while (true) {
                 when (val r = readMore()) {
                     is ReadResult.Data -> {
-                        body.append(String(readBuf, 0, r.len, Charsets.ISO_8859_1))
-                        if (body.length > maxResponseBytes) {
+                        if (body.length + r.len > maxResponseBytes) {
                             return Outcome.Malformed("response exceeded $maxResponseBytes byte cap", body.toString(), bytesRead)
                         }
+                        body.append(String(readBuf, 0, r.len, Charsets.ISO_8859_1))
                     }
                     ReadResult.Eof -> return Outcome.Ok(
                         Response(statusLine, statusCode, headers, body.toString(), "close-delimited", true, warnings),
@@ -223,12 +287,22 @@ internal object HttpPipelineFraming {
     }
 
     /** (skipBytes, endOfChunkDataOffset) for the next chunk in [buf], or null if not enough data buffered yet. */
-    private fun nextChunk(buf: String): Pair<Int, Int>? {
+    private fun nextChunk(buf: StringBuilder, maxResponseBytes: Int): Pair<Int, Int>? {
         val sizeLineEnd = buf.indexOf("\r\n")
         if (sizeLineEnd == -1) return null
         val sizeToken = buf.substring(0, sizeLineEnd).split(";").first().trim()
-        val size = sizeToken.toIntOrNull(16) ?: throw ChunkParseException("invalid chunk size '$sizeToken'")
+        if (sizeToken.isEmpty() || !sizeToken.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+            throw ChunkParseException("invalid chunk size '$sizeToken'")
+        }
+        val sizeLong = sizeToken.toLongOrNull(16) ?: throw ChunkParseException("invalid chunk size '$sizeToken'")
+        if (sizeLong < 0L || sizeLong > maxResponseBytes) {
+            throw ChunkParseException("chunk size $sizeLong out of bounds (max $maxResponseBytes)")
+        }
+        val size = sizeLong.toInt()
         val skip = sizeLineEnd + 2
+        if (skip.toLong() + size.toLong() + 2L > Int.MAX_VALUE.toLong()) {
+            throw ChunkParseException("chunk frame offset overflow")
+        }
         return skip to (skip + size)
     }
 }

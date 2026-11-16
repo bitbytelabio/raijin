@@ -56,4 +56,22 @@ class GQLSchemaTest {
         assertTrue(schema.sdlSchema.contains("type User"))
         assertTrue(schema.sdlSchema.contains("type Account"))
     }
+
+    @Test
+    fun `operationAsText handles enum descriptions ending in trailing newline without throwing`() {
+        val enumSdl = """
+            "Enum doc with trailing newline\n"
+            enum Role {
+                ADMIN
+                USER
+            }
+            type Query {
+                role: Role
+            }
+        """.trimIndent()
+        val schema = GQLSchema(enumSdl)
+        val text = schema.operationAsText("role", GQLSchema.OperationType.QUERY)
+        requireNotNull(text)
+        assertTrue(text.contains("query role {"), text)
+    }
 }

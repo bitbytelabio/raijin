@@ -1,9 +1,9 @@
 package io.bitbytelab.raijin.tools.project
 
 import io.bitbytelab.raijin.bridge.ProjectBridge
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -21,13 +21,9 @@ object ProjectTools {
             )
         ) { _ ->
             try {
-                val result = bridge.getInfo()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.getInfo())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

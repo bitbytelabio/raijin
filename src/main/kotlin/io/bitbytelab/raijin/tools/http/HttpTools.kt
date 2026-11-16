@@ -9,6 +9,8 @@ import io.bitbytelab.raijin.core.asBodyString
 import io.bitbytelab.raijin.core.asLongSafe
 import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.state.TrafficRule
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
@@ -920,9 +922,9 @@ Use \r\n for line endings in the request string. Runs sequentially (one request 
                 val gateDelay = args["gate_delay"]?.jsonPrimitive?.longOrNull ?: 100L
 
                 val result = bridge.raceCondition(reqStr, host, port, useTls, count, payloads, httpMode, maxResponseLength, gateDelay)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(result)
             } catch (e: Exception) {
-                CallToolResult(content = listOf(TextContent("""{"error":"${e.message}"}""")), isError = true)
+                toolError(e.message ?: "Unknown error")
             }
         }
     }
@@ -935,6 +937,7 @@ Use \r\n for line endings in the request string. Runs sequentially (one request 
         return buildJsonObject {
             put("rule_id", rule.ruleId)
             put("direction", rule.direction)
+            put("action", rule.action)
             put("enabled", rule.enabled)
             if (rule.matchUrl != null) put("match_url", rule.matchUrl)
             if (rule.matchHost != null) put("match_host", rule.matchHost)
@@ -946,6 +949,7 @@ Use \r\n for line endings in the request string. Runs sequentially (one request 
                     rule.modifyReplaceHeader.forEach { (k, v) -> put(k, v) }
                 })
             }
+            if (rule.spoofResponse != null) put("spoof_response", rule.spoofResponse)
         }
     }
 }

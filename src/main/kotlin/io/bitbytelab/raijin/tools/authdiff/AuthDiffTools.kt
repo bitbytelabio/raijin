@@ -3,9 +3,9 @@ package io.bitbytelab.raijin.tools.authdiff
 import io.bitbytelab.raijin.bridge.BridgeFactory
 import io.bitbytelab.raijin.core.asJsonObjectList
 import io.bitbytelab.raijin.core.asStringList
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -33,21 +33,20 @@ The tool automatically strips auth headers for "none"/"unauth" levels. Analyzes 
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val reqStr = args["request"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Parameter 'request' is required"}""")), isError = true)
+                    ?: return@addTool toolError("Parameter 'request' is required")
                 val host = args["host"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Parameter 'host' is required"}""")), isError = true)
+                    ?: return@addTool toolError("Parameter 'host' is required")
                 val port = args["port"]?.jsonPrimitive?.intOrNull ?: 443
                 val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull
                     ?: args["tls"]?.jsonPrimitive?.booleanOrNull
                     ?: (port == 443)
                 val authLevels = args["auth_levels"].asJsonObjectList()
-                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Parameter 'auth_levels' is required (array of auth level objects)"}""")), isError = true)
+                    ?: return@addTool toolError("Parameter 'auth_levels' is required (array of auth level objects)")
                 val compareFields = args["compare_fields"].asStringList()
 
-                val result = bridges.analysis.authDiff(reqStr, host, port, useTls, authLevels, compareFields)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridges.analysis.authDiff(reqStr, host, port, useTls, authLevels, compareFields))
             } catch (e: Exception) {
-                CallToolResult(content = listOf(TextContent("""{"error":"${e.message}"}""")), isError = true)
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

@@ -17,9 +17,11 @@ import java.time.Instant
  */
 class FindingsBridge(private val stateManager: StateManager) {
 
+    private val lock = Any()
+
     /**
      * Records a finding, or reports it as a duplicate of an existing one (same type+url+location).
-     * [cvssScore] must be blank or a number 0.0–10.0; [owaspCategory] is normalized to its
+     * [cvssScore] must be blank or a finite number 0.0–10.0; [owaspCategory] is normalized to its
      * canonical OWASP Top 10 2021 form when recognized (see [Owasp2021]).
      */
     fun add(
@@ -39,44 +41,46 @@ class FindingsBridge(private val stateManager: StateManager) {
         val score = cvssScore.trim()
         if (score.isNotEmpty()) {
             val v = score.toDoubleOrNull()
-            if (v == null || v < 0.0 || v > 10.0) {
+            if (v == null || !v.isFinite() || v < 0.0 || v > 10.0) {
                 return buildJsonObject {
-                    put("error", "Invalid cvss_score '$cvssScore': must be a number between 0.0 and 10.0 (e.g. 8.1)")
+                    put("error", "Invalid cvss_score '$cvssScore': must be a finite number between 0.0 and 10.0 (e.g. 8.1)")
                 }
             }
         }
-        val key = dedupKey(type, url, location)
-        val existing = stateManager.findings.firstOrNull { dedupKey(it.type, it.url, it.location) == key }
-        if (existing != null) {
-            return buildJsonObject {
-                put("duplicate", true)
-                put("id", existing.id)
-                put("note", "Matches an existing finding; not added again.")
+        synchronized(lock) {
+            val key = dedupKey(type, url, location)
+            val existing = stateManager.findings.firstOrNull { dedupKey(it.type, it.url, it.location) == key }
+            if (existing != null) {
+                return buildJsonObject {
+                    put("duplicate", true)
+                    put("id", existing.id)
+                    put("note", "Matches an existing finding; not added again.")
+                }
             }
-        }
-        val id = stateManager.generateId("finding")
-        val finding = StoredFinding(
-            id, type, severity, url, location, detail, evidence, Instant.now().toString(),
-            cvssScore = score,
-            cvssVector = cvssVector.trim(),
-            owaspCategory = Owasp2021.normalize(owaspCategory),
-            stepsToReproduce = stepsToReproduce.trim(),
-            request = request,
-            response = response
-        )
-        stateManager.addFinding(finding)
-        return buildJsonObject {
-            put("duplicate", false)
-            put("id", id)
-            put("owasp_category", finding.owaspCategory)
-            put("total_findings", stateManager.findings.size)
+            val id = stateManager.generateId("finding")
+            val finding = StoredFinding(
+                id, type, severity, url, location, detail, evidence, Instant.now().toString(),
+                cvssScore = score,
+                cvssVector = cvssVector.trim(),
+                owaspCategory = Owasp2021.normalize(owaspCategory),
+                stepsToReproduce = stepsToReproduce.trim(),
+                request = request,
+                response = response
+            )
+            stateManager.addFinding(finding)
+            return buildJsonObject {
+                put("duplicate", false)
+                put("id", id)
+                put("owasp_category", finding.owaspCategory)
+                put("total_findings", stateManager.findings.size)
+            }
         }
     }
 
     /** Removes a finding by id. */
-    fun remove(id: String): JsonObject {
+    fun remove(id: String): JsonObject = synchronized(lock) {
         val removed = stateManager.removeFinding(id)
-        return buildJsonObject {
+        buildJsonObject {
             put("id", id)
             put("removed", removed)
             if (!removed) put("error", "Finding not found: $id")

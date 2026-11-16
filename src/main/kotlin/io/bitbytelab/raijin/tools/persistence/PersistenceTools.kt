@@ -1,9 +1,9 @@
 package io.bitbytelab.raijin.tools.persistence
 
 import io.bitbytelab.raijin.bridge.PersistenceBridge
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -28,22 +28,12 @@ object PersistenceTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val key = args["key"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: key"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: key")
                 val value = args["value"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: value"}""")),
-                        isError = true
-                    )
-                val result = bridge.store(key, value)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                    ?: return@addTool toolError("Missing required parameter: value")
+                toolJsonResult(bridge.store(key, value))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -63,17 +53,10 @@ object PersistenceTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val key = args["key"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: key"}""")),
-                        isError = true
-                    )
-                val result = bridge.get(key)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                    ?: return@addTool toolError("Missing required parameter: key")
+                toolJsonResult(bridge.get(key))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -93,17 +76,10 @@ object PersistenceTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val key = args["key"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: key"}""")),
-                        isError = true
-                    )
-                val result = bridge.delete(key)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                    ?: return@addTool toolError("Missing required parameter: key")
+                toolJsonResult(bridge.delete(key))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -116,13 +92,9 @@ object PersistenceTools {
             inputSchema = ToolSchema(properties = buildJsonObject {}, required = emptyList())
         ) { _ ->
             try {
-                val result = bridge.list()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.list())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -143,22 +115,12 @@ object PersistenceTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val key = args["key"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: key"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: key")
                 val value = args["value"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: value"}""")),
-                        isError = true
-                    )
-                val result = bridge.preferenceStore(key, value)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                    ?: return@addTool toolError("Missing required parameter: value")
+                toolJsonResult(bridge.preferenceStore(key, value))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -178,17 +140,10 @@ object PersistenceTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val key = args["key"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: key"}""")),
-                        isError = true
-                    )
-                val result = bridge.preferenceGet(key)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                    ?: return@addTool toolError("Missing required parameter: key")
+                toolJsonResult(bridge.preferenceGet(key))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -207,17 +162,10 @@ object PersistenceTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val key = args["key"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: key"}""")),
-                        isError = true
-                    )
-                val result = bridge.preferenceDelete(key)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                    ?: return@addTool toolError("Missing required parameter: key")
+                toolJsonResult(bridge.preferenceDelete(key))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

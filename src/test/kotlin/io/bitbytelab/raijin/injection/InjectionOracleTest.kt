@@ -34,4 +34,15 @@ class InjectionOracleTest {
         assertTrue(InjectionOracle.timeDelayed(baselineMs = 120, probeMs = 5300, expectedDelaySec = 5))
         assertFalse(InjectionOracle.timeDelayed(baselineMs = 120, probeMs = 350, expectedDelaySec = 5))
     }
+
+    @Test
+    fun `status-guarded helpers never treat failed zero-status probes or baseline markers as hits`() {
+        assertFalse(InjectionOracle.timeDelayed(baselineStatus = 200, baselineMs = 100, probeStatus = 0, probeMs = 6000, expectedDelaySec = 5))
+        assertFalse(InjectionOracle.timeDelayed(baselineStatus = 0, baselineMs = 100, probeStatus = 200, probeMs = 6000, expectedDelaySec = 5))
+        assertTrue(InjectionOracle.timeDelayed(baselineStatus = 200, baselineMs = 100, probeStatus = 200, probeMs = 5200, expectedDelaySec = 5))
+
+        val passwdBody = "root:x:0:0:root:/root:/bin/bash\n"
+        assertNull(InjectionOracle.novelFileMarker(baselineBody = passwdBody, probeBody = passwdBody))
+        assertEquals("unix-passwd", InjectionOracle.novelFileMarker(baselineBody = "normal page", probeBody = passwdBody))
+    }
 }

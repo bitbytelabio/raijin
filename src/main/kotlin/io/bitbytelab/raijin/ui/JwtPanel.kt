@@ -20,6 +20,7 @@ import javax.swing.JTextArea
 import javax.swing.JTextField
 import javax.swing.SwingUtilities
 import javax.swing.border.EmptyBorder
+import java.util.concurrent.CompletableFuture
 
 /**
  * The JWT tab: decode/analyze a token, sign it, run the `jwt_attack` attack modes, and manage
@@ -96,11 +97,15 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
         val overrides = overridesText?.trim()?.takeIf { it.isNotEmpty() }?.let {
             try { Json.parseToJsonElement(it) as? JsonObject } catch (_: Exception) { null }
         }
-        val result = bridge.attack(
-            token = token, mode = mode, secret = secret, publicKey = publicKey, wordlist = wordlist,
-            overrides = overrides, alg = alg, keyId = keyId, enc = enc, header = header, url = url
-        )
-        show(result)
+        output.foreground = RaijinTheme.muted()
+        output.text = "Running $mode..."
+        CompletableFuture.runAsync {
+            val result = bridge.attack(
+                token = token, mode = mode, secret = secret, publicKey = publicKey, wordlist = wordlist,
+                overrides = overrides, alg = alg, keyId = keyId, enc = enc, header = header, url = url
+            )
+            SwingUtilities.invokeLater { show(result) }
+        }
     }
 
     private fun refreshKeyRing() {
@@ -339,9 +344,18 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
                 val size = sizeOrCrv.toIntOrNull()
                 val crv = if (size == null) sizeOrCrv.ifBlank { null } else null
                 val id = genIdField.text.ifBlank { null }
-                val result = bridge.keys(action = "generate", kty = kty, size = size, crv = crv, keyId = id)
-                show(result)
-                refreshKeyRing(); refreshKeyRingCombos()
+                isEnabled = false
+                output.foreground = RaijinTheme.muted()
+                output.text = "Generating $kty key..."
+                CompletableFuture.runAsync {
+                    val result = bridge.keys(action = "generate", kty = kty, size = size, crv = crv, keyId = id)
+                    SwingUtilities.invokeLater {
+                        isEnabled = true
+                        show(result)
+                        refreshKeyRing()
+                        refreshKeyRingCombos()
+                    }
+                }
             }
         }
         val genBar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4)).apply {

@@ -1,8 +1,8 @@
 package io.bitbytelab.raijin.tools.repeater
 
 import io.bitbytelab.raijin.bridge.RepeaterBridge
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
@@ -31,30 +31,17 @@ object RepeaterTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: request"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: request")
                 val host = args["host"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: host"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: host")
                 val port = args["port"]?.jsonPrimitive?.intOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: port"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: port")
                 val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull ?: false
                 val tabName = args["tab_name"]?.jsonPrimitive?.contentOrNull
 
-                val result = bridge.sendToRepeater(rawRequest, host, port, useTls, tabName)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.sendToRepeater(rawRequest, host, port, useTls, tabName))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

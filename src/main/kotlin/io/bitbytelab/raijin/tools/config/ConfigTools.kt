@@ -2,9 +2,9 @@ package io.bitbytelab.raijin.tools.config
 
 import io.bitbytelab.raijin.bridge.BurpSuiteBridge
 import io.bitbytelab.raijin.bridge.ConfigBridge
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -39,13 +39,9 @@ object ConfigTools {
             )
         ) { _ ->
             try {
-                val result = bridge.listProxyListeners()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.listProxyListeners())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -72,22 +68,15 @@ object ConfigTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val listenerInterface = args["interface"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: interface"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: interface")
                 val tls = args["tls"]?.jsonPrimitive?.booleanOrNull ?: false
                 val redirectHost = args["redirect_host"]?.jsonPrimitive?.contentOrNull
                 val redirectPort = args["redirect_port"]?.jsonPrimitive?.intOrNull
                 val certificate = args["certificate"]?.jsonPrimitive?.contentOrNull
 
-                val result = bridge.addProxyListener(listenerInterface, tls, redirectHost, redirectPort, certificate)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.addProxyListener(listenerInterface, tls, redirectHost, redirectPort, certificate))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -107,17 +96,10 @@ object ConfigTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val listenerInterface = args["interface"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: interface"}""")),
-                        isError = true
-                    )
-                val result = bridge.removeProxyListener(listenerInterface)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                    ?: return@addTool toolError("Missing required parameter: interface")
+                toolJsonResult(bridge.removeProxyListener(listenerInterface))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -144,30 +126,17 @@ object ConfigTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val type = args["type"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: type"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: type")
                 val match = args["match"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: match"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: match")
                 val replace = args["replace"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: replace"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: replace")
                 val comment = args["comment"]?.jsonPrimitive?.contentOrNull
                 val enabled = args["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
 
-                val result = bridge.addMatchReplaceRule(type, match, replace, comment, enabled)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.addMatchReplaceRule(type, match, replace, comment, enabled))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -183,13 +152,9 @@ object ConfigTools {
             )
         ) { _ ->
             try {
-                val result = bridge.listMatchReplaceRules()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.listMatchReplaceRules())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -209,17 +174,10 @@ object ConfigTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val ruleIndex = args["rule_index"]?.jsonPrimitive?.intOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: rule_index"}""")),
-                        isError = true
-                    )
-                val result = bridge.removeMatchReplaceRule(ruleIndex)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                    ?: return@addTool toolError("Missing required parameter: rule_index")
+                toolJsonResult(bridge.removeMatchReplaceRule(ruleIndex))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -249,27 +207,17 @@ object ConfigTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val host = args["host"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: host"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: host")
                 val port = args["port"]?.jsonPrimitive?.intOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: port"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: port")
                 val proxyType = args["type"]?.jsonPrimitive?.contentOrNull ?: "HTTP"
                 val authUser = args["auth_user"]?.jsonPrimitive?.contentOrNull
                 val authPass = args["auth_pass"]?.jsonPrimitive?.contentOrNull
                 val destinationHost = args["destination_host"]?.jsonPrimitive?.contentOrNull
 
-                val result = bridge.setUpstreamProxy(host, port, proxyType, authUser, authPass, destinationHost)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.setUpstreamProxy(host, port, proxyType, authUser, authPass, destinationHost))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

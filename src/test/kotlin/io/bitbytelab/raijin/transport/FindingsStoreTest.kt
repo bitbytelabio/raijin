@@ -117,4 +117,35 @@ class FindingsStoreTest {
         assertEquals("", f.response)
         assertEquals("P", proj)
     }
+
+    @Test fun `FindingsFileStore replaceProject removes deleted findings and keeps other projects across reload`() {
+        val tempFile = java.io.File.createTempFile("raijin-findings-test", ".jsonl")
+        try {
+            tempFile.delete()
+            val store = FindingsFileStore(tempFile)
+            val a1 = finding("finding-001", url = "https://a.example/1")
+            val a2 = finding("finding-002", url = "https://a.example/2")
+            val b1 = finding("finding-001", url = "https://b.example/1")
+
+            store.append(a1, "ProjA")
+            store.append(a2, "ProjA")
+            store.append(b1, "ProjB")
+            assertEquals(listOf("finding-001", "finding-002"), store.load("ProjA").map { it.id })
+
+            // Simulate FindingsBridge.remove updating persisted store for ProjA
+            store.replaceProject("ProjA", listOf(a2))
+
+            // Reload from a fresh store instance (no resurrected finding-001)
+            val reloaded = FindingsFileStore(tempFile)
+            assertEquals(listOf("finding-002"), reloaded.load("ProjA").map { it.id })
+            assertEquals(listOf("finding-001"), reloaded.load("ProjB").map { it.id })
+
+            // Removing the last finding for ProjA leaves ProjB intact
+            reloaded.replaceProject("ProjA", emptyList())
+            assertEquals(emptyList(), FindingsFileStore(tempFile).load("ProjA"))
+            assertEquals(listOf("finding-001"), FindingsFileStore(tempFile).load("ProjB").map { it.id })
+        } finally {
+            tempFile.delete()
+        }
+    }
 }

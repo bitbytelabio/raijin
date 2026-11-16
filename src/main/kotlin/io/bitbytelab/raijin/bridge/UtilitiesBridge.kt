@@ -430,109 +430,7 @@ class UtilitiesBridge(private val api: MontoyaApi) {
      * @return JSON object with original value, final decoded value, and
      *         an array of decoding steps taken.
      */
-    fun decodeSmart(data: String, maxDepth: Int): JsonObject {
-        val steps = mutableListOf<JsonObject>()
-        var current = data
-        var depth = 0
-
-        while (depth < maxDepth) {
-            var changed = false
-
-            // 1. Try base64 decode
-            if (!changed) {
-                try {
-                    // Check if it looks like base64 (length divisible by 4 or padded,
-                    // and contains only valid chars)
-                    val cleaned = current.trim()
-                    if (cleaned.length >= 4 && cleaned.matches(Regex("^[A-Za-z0-9+/=\\-_]+$"))) {
-                        val decoded = try {
-                            String(Base64.getDecoder().decode(cleaned), Charsets.UTF_8)
-                        } catch (_: Exception) {
-                            // Try URL-safe base64
-                            String(Base64.getUrlDecoder().decode(cleaned), Charsets.UTF_8)
-                        }
-                        // Check if the result is valid UTF-8 and different from input
-                        if (decoded != current && decoded.all { it.code < 0xFFFD && !it.isISOControl() || it == '\n' || it == '\r' || it == '\t' }) {
-                            steps.add(buildJsonObject {
-                                put("step", depth + 1)
-                                put("encoding", "base64")
-                                put("input", current)
-                                put("output", decoded)
-                            })
-                            current = decoded
-                            changed = true
-                        }
-                    }
-                } catch (_: Exception) {
-                    // Not valid base64
-                }
-            }
-
-            // 2. Try URL decode
-            if (!changed) {
-                try {
-                    if (current.contains('%')) {
-                        val decoded = java.net.URLDecoder.decode(current, "UTF-8")
-                        if (decoded != current) {
-                            steps.add(buildJsonObject {
-                                put("step", depth + 1)
-                                put("encoding", "url")
-                                put("input", current)
-                                put("output", decoded)
-                            })
-                            current = decoded
-                            changed = true
-                        }
-                    }
-                } catch (_: Exception) {
-                    // Not valid URL encoding
-                }
-            }
-
-            // 3. Try hex decode
-            if (!changed) {
-                try {
-                    val trimmed = current.trim()
-                    if (trimmed.length >= 2 &&
-                        trimmed.length % 2 == 0 &&
-                        trimmed.matches(Regex("^[0-9a-fA-F]+$"))
-                    ) {
-                        val decoded = trimmed.chunked(2)
-                            .map { it.toInt(16).toByte() }
-                            .toByteArray()
-                        val decodedStr = String(decoded, Charsets.UTF_8)
-                        if (decodedStr != current && decodedStr.all { it.code < 0xFFFD && !it.isISOControl() || it == '\n' || it == '\r' || it == '\t' }) {
-                            steps.add(buildJsonObject {
-                                put("step", depth + 1)
-                                put("encoding", "hex")
-                                put("input", current)
-                                put("output", decodedStr)
-                            })
-                            current = decodedStr
-                            changed = true
-                        }
-                    }
-                } catch (_: Exception) {
-                    // Not valid hex
-                }
-            }
-
-            // If no decoding step produced a change, stop
-            if (!changed) break
-
-            depth++
-        }
-
-        return buildJsonObject {
-            put("original", data)
-            put("decoded", current)
-            put("layers", depth)
-            putJsonArray("steps") {
-                steps.forEach { add(it) }
-            }
-            put("fully_decoded", depth == 0 || current == data)
-        }
-    }
+    fun decodeSmart(data: String, maxDepth: Int): JsonObject = decodeSmartPure(data, maxDepth)
 
     // Shell execution (shellExecute / util_shell_execute) was removed in 2.0.6.
     // It was a raw ProcessBuilder mis-documented as "Burp's safe shell API" and,
@@ -540,6 +438,93 @@ class UtilitiesBridge(private val api: MontoyaApi) {
     // from any website the operator visited. Do not reintroduce it.
 
     companion object {
+        private val BASE64_PATTERN = Regex("^[A-Za-z0-9+/=\\-_]+$")
+        private val HEX_PATTERN = Regex("^[0-9a-fA-F]+$")
+
+        private fun isPrintableDecoded(s: String): Boolean =
+            s.all { (it.code != 0xFFFD && !it.isISOControl()) || it == '\n' || it == '\r' || it == '\t' }
+
+        private fun decodeOneLayer(current: String): Pair<String, String>? {
+            // 1. Try base64 decode
+            try {
+                val cleaned = current.trim()
+                if (cleaned.length >= 4 && cleaned.matches(BASE64_PATTERN)) {
+                    val decoded = try {
+                        String(Base64.getDecoder().decode(cleaned), Charsets.UTF_8)
+                    } catch (_: Exception) {
+                        String(Base64.getUrlDecoder().decode(cleaned), Charsets.UTF_8)
+                    }
+                    if (decoded != current && isPrintableDecoded(decoded)) {
+                        return "base64" to decoded
+                    }
+                }
+            } catch (_: Exception) {
+                // Not valid base64
+            }
+
+            // 2. Try URL decode
+            try {
+                if (current.contains('%')) {
+                    val decoded = java.net.URLDecoder.decode(current, "UTF-8")
+                    if (decoded != current) {
+                        return "url" to decoded
+                    }
+                }
+            } catch (_: Exception) {
+                // Not valid URL encoding
+            }
+
+            // 3. Try hex decode
+            try {
+                val trimmed = current.trim()
+                if (trimmed.length >= 2 && trimmed.length % 2 == 0 && trimmed.matches(HEX_PATTERN)) {
+                    val decoded = trimmed.chunked(2)
+                        .map { it.toInt(16).toByte() }
+                        .toByteArray()
+                    val decodedStr = String(decoded, Charsets.UTF_8)
+                    if (decodedStr != current && isPrintableDecoded(decodedStr)) {
+                        return "hex" to decodedStr
+                    }
+                }
+            } catch (_: Exception) {
+                // Not valid hex
+            }
+
+            return null
+        }
+
+        /** Pure multi-layer decoder used by [decodeSmart]; unit-testable without Burp API. */
+        fun decodeSmartPure(data: String, maxDepth: Int): JsonObject {
+            val steps = mutableListOf<JsonObject>()
+            var current = data
+            var depth = 0
+            val cap = maxDepth.coerceAtLeast(0)
+
+            while (depth < cap) {
+                val next = decodeOneLayer(current) ?: break
+                val (encoding, decoded) = next
+                steps.add(buildJsonObject {
+                    put("step", depth + 1)
+                    put("encoding", encoding)
+                    put("input", current)
+                    put("output", decoded)
+                })
+                current = decoded
+                depth++
+            }
+
+            val fullyDecoded = depth < cap || decodeOneLayer(current) == null
+
+            return buildJsonObject {
+                put("original", data)
+                put("decoded", current)
+                put("layers", depth)
+                putJsonArray("steps") {
+                    steps.forEach { add(it) }
+                }
+                put("fully_decoded", fullyDecoded)
+            }
+        }
         /**
          * Validates that [decodedBytes] plausibly holds a compressed stream of the
          * declared [type] before it is handed to Burp for decompression. Rejects empty

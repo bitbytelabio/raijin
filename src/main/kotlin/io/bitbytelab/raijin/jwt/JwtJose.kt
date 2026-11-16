@@ -1,8 +1,10 @@
 package io.bitbytelab.raijin.jwt
 
 import com.nimbusds.jose.EncryptionMethod
+import com.nimbusds.jose.JOSEException
 import com.nimbusds.jose.JOSEObjectType
 import com.nimbusds.jose.JWEAlgorithm
+import com.nimbusds.jose.JWECryptoParts
 import com.nimbusds.jose.JWEDecrypter
 import com.nimbusds.jose.JWEEncrypter
 import com.nimbusds.jose.JWEHeader
@@ -24,6 +26,8 @@ import com.nimbusds.jose.crypto.X25519Decrypter
 import com.nimbusds.jose.crypto.X25519Encrypter
 import com.nimbusds.jose.crypto.factories.DefaultJWSSignerFactory
 import com.nimbusds.jose.crypto.factories.DefaultJWSVerifierFactory
+import com.nimbusds.jose.crypto.impl.CriticalHeaderParamsDeferral
+import com.nimbusds.jose.crypto.impl.ECDHCryptoProvider
 import com.nimbusds.jose.jca.JCAAware
 import com.nimbusds.jose.jca.JCAContext
 import com.nimbusds.jose.jwk.Curve
@@ -35,12 +39,20 @@ import com.nimbusds.jose.jwk.RSAKey
 import com.nimbusds.jose.util.Base64URL
 import com.nimbusds.jwt.JWTClaimsSet
 import com.nimbusds.jwt.SignedJWT
+import org.bouncycastle.crypto.agreement.X448Agreement
+import org.bouncycastle.crypto.generators.X448KeyPairGenerator
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
 import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
 import org.bouncycastle.crypto.params.Ed448PrivateKeyParameters
 import org.bouncycastle.crypto.params.Ed448PublicKeyParameters
+import org.bouncycastle.crypto.params.X448KeyGenerationParameters
+import org.bouncycastle.crypto.params.X448PrivateKeyParameters
+import org.bouncycastle.crypto.params.X448PublicKeyParameters
 import org.bouncycastle.crypto.signers.Ed25519Signer
 import org.bouncycastle.crypto.signers.Ed448Signer
+import java.security.SecureRandom
+import javax.crypto.SecretKey
+import javax.crypto.spec.SecretKeySpec
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -190,6 +202,8 @@ object JwtJose {
     }
 
     private fun verifyEd(token: String, jwk: OctetKeyPair): Boolean {
+        val parsed = try { parseSigned(token) } catch (_: Exception) { return false }
+        if (parsed.header.algorithm != JWSAlgorithm.EdDSA) return false
         val parts = token.split('.')
         if (parts.size != 3) return false
         val input = "${parts[0]}.${parts[1]}".toByteArray(Charsets.US_ASCII)
@@ -282,6 +296,7 @@ object JwtJose {
                     }
                     X25519Encrypter(public)
                 }
+                Curve.X448 -> X448Encrypter(public)
                 else -> throw IllegalArgumentException("Curve ${public.curve.name} cannot encrypt")
             }
             is OctetSequenceKey -> if (alg == JWEAlgorithm.DIR) DirectEncrypter(public) else AESEncrypter(public)
@@ -299,6 +314,7 @@ object JwtJose {
                 }
                 X25519Decrypter(jwk)
             }
+            Curve.X448 -> X448Decrypter(jwk)
             else -> throw IllegalArgumentException("Curve ${jwk.curve.name} cannot decrypt")
         }
         is OctetSequenceKey -> if (header.algorithm == JWEAlgorithm.DIR) DirectDecrypter(jwk) else AESDecrypter(jwk)
@@ -344,5 +360,70 @@ object JwtJose {
         is ECKey, is OctetKeyPair -> "ECDH-ES"
         is OctetSequenceKey -> "dir"
         else -> throw IllegalArgumentException("Key type ${jwk.keyType} cannot encrypt")
+    }
+
+    private fun x448SharedSecret(publicBytes: ByteArray, privateBytes: ByteArray): SecretKey {
+        if (publicBytes.size != X448PrivateKeyParameters.KEY_SIZE || privateBytes.size != X448PrivateKeyParameters.KEY_SIZE) {
+            throw JOSEException("Invalid X448 key length (expected ${X448PrivateKeyParameters.KEY_SIZE} bytes)")
+        }
+        val agreement = X448Agreement()
+        agreement.init(X448PrivateKeyParameters(privateBytes, 0))
+        val secret = ByteArray(agreement.agreementSize)
+        agreement.calculateAgreement(X448PublicKeyParameters(publicBytes, 0), secret, 0)
+        if (secret.all { it == 0.toByte() }) {
+            throw JOSEException("X448 shared secret is all-zero (low-order public key)")
+        }
+        return SecretKeySpec(secret, "AES")
+    }
+
+    private class X448Encrypter(private val publicKey: OctetKeyPair) :
+        ECDHCryptoProvider(publicKey.curve), JWEEncrypter {
+        init {
+            if (publicKey.curve != Curve.X448) throw JOSEException("X448Encrypter requires crv=X448")
+            if (publicKey.isPrivate) throw JOSEException("X448Encrypter requires a public key")
+        }
+
+        override fun supportedEllipticCurves(): Set<Curve> = setOf(Curve.X448)
+
+        override fun encrypt(header: JWEHeader, clearText: ByteArray): JWECryptoParts {
+            val gen = X448KeyPairGenerator()
+            gen.init(X448KeyGenerationParameters(SecureRandom()))
+            val pair = gen.generateKeyPair()
+            val ephPubBytes = (pair.public as X448PublicKeyParameters).encoded
+            val ephPrivBytes = (pair.private as X448PrivateKeyParameters).encoded
+            val ephPublicKey = OctetKeyPair.Builder(Curve.X448, Base64URL.encode(ephPubBytes)).build()
+            val updatedHeader = JWEHeader.Builder(header).ephemeralPublicKey(ephPublicKey).build()
+            val z = x448SharedSecret(publicKey.decodedX, ephPrivBytes)
+            return encryptWithZ(updatedHeader, z, clearText)
+        }
+    }
+
+    private class X448Decrypter(private val privateKey: OctetKeyPair) :
+        ECDHCryptoProvider(privateKey.curve), JWEDecrypter {
+        private val critPolicy = CriticalHeaderParamsDeferral()
+
+        init {
+            if (privateKey.curve != Curve.X448) throw JOSEException("X448Decrypter requires crv=X448")
+            if (!privateKey.isPrivate) throw JOSEException("X448Decrypter requires a private key")
+        }
+
+        override fun supportedEllipticCurves(): Set<Curve> = setOf(Curve.X448)
+
+        override fun decrypt(
+            header: JWEHeader,
+            encryptedKey: Base64URL?,
+            iv: Base64URL?,
+            cipherText: Base64URL?,
+            authTag: Base64URL?,
+        ): ByteArray {
+            critPolicy.ensureHeaderPasses(header)
+            val epk = header.ephemeralPublicKey as? OctetKeyPair
+                ?: throw JOSEException("Missing ephemeral public key epk JWE header parameter")
+            if (epk.curve != Curve.X448) {
+                throw JOSEException("Curve of ephemeral public key does not match curve of private key")
+            }
+            val z = x448SharedSecret(epk.decodedX, privateKey.decodedD)
+            return decryptWithZ(header, z, encryptedKey, iv, cipherText, authTag)
+        }
     }
 }

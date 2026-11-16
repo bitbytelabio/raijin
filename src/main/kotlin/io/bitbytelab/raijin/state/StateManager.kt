@@ -49,7 +49,7 @@ data class ProxyRule(
     val modifyBodyReplacement: String? = null,
     val tagComment: String? = null,
     val tagHighlight: String? = null,
-    var enabled: Boolean = true
+    @Volatile var enabled: Boolean = true
 )
 
 /**
@@ -75,7 +75,7 @@ data class TrafficRule(
     val modifyAddHeader: String? = null,
     val modifyRemoveHeader: String? = null,
     val modifyReplaceHeader: Map<String, String>? = null,
-    var enabled: Boolean = true,
+    @Volatile var enabled: Boolean = true,
     /**
      * "modify" (default, header add/remove/replace above), "drop", or "spoof_response".
      * drop/spoof_response only apply to direction="request" — they short-circuit before
@@ -84,7 +84,9 @@ data class TrafficRule(
      */
     val action: String = "modify",
     /** Raw HTTP response text to spoof when [action] is "spoof_response". */
-    val spoofResponse: String? = null
+    val spoofResponse: String? = null,
+    /** Optional set of Montoya ToolType names (e.g. "SCANNER") restricting which Burp tools trigger this rule. */
+    val toolFilter: Set<String>? = null
 )
 
 /**
@@ -114,8 +116,8 @@ data class SessionRule(
     val injectInto: String,
     val injectName: String,
     val injectValueTemplate: String,
-    var enabled: Boolean = true,
-    var lastExtractedValue: String? = null
+    @Volatile var enabled: Boolean = true,
+    @Volatile var lastExtractedValue: String? = null
 )
 
 /**
@@ -134,18 +136,37 @@ data class WebSocketConnection(
     val connectionId: String,
     val url: String,
     val createdAt: String,
-    var status: String = "connected",
+    @Volatile var status: String = "connected",
     val messagesSent: AtomicLong = AtomicLong(0),
     val messagesReceived: AtomicLong = AtomicLong(0),
-    val messages: CopyOnWriteArrayList<WebSocketMessage> = CopyOnWriteArrayList()
+    val messages: java.util.ArrayDeque<WebSocketMessage> = java.util.ArrayDeque()
 ) {
-    /** Appends [message], evicting the oldest beyond [MAX_MESSAGES] so a busy socket can't exhaust memory. */
+    /** Appends [message] under monitor lock, evicting the oldest beyond [MAX_MESSAGES]. */
     fun record(message: WebSocketMessage) {
-        messages.add(message)
-        while (messages.size > MAX_MESSAGES) {
-            try { messages.removeAt(0) } catch (_: Exception) { break }
+        synchronized(this) {
+            messages.addLast(message)
+            while (messages.size > MAX_MESSAGES) {
+                messages.removeFirst()
+            }
         }
     }
+
+    /** Atomically allocates the next monotonic index and records the built message in index order. */
+    fun recordIndexed(counter: AtomicLong, buildMessage: (Long) -> WebSocketMessage): WebSocketMessage {
+        synchronized(this) {
+            val idx = counter.getAndIncrement()
+            val msg = buildMessage(idx)
+            messages.addLast(msg)
+            while (messages.size > MAX_MESSAGES) {
+                messages.removeFirst()
+            }
+            return msg
+        }
+    }
+
+    fun snapshotMessages(): List<WebSocketMessage> = synchronized(this) { messages.toList() }
+
+    fun messageCount(): Int = synchronized(this) { messages.size }
 
     companion object { const val MAX_MESSAGES = 2000 }
 }
@@ -188,7 +209,9 @@ data class ScanTask(
      *  Burp's own Crawl.requestCount()/statusMessage() can be unreliable (see
      *  ScannerBridge.safeRequestCount's comment), so scanner_task_status diffs the current
      *  count against this as a heuristic for crawl progress. */
-    val sitemapBaselineCount: Int? = null
+    val sitemapBaselineCount: Int? = null,
+    /** Audit tasks only: temporary traffic rule ID created for auth header injection, cleaned up when deleted/finished. */
+    val authRuleId: String? = null
 )
 
 /**
@@ -229,7 +252,7 @@ data class WebSocketInterceptRule(
     val modifyRegex: String? = null,
     val modifyReplacement: String? = null,
     val tagComment: String? = null,
-    var enabled: Boolean = true
+    @Volatile var enabled: Boolean = true
 )
 
 /**
@@ -380,6 +403,9 @@ class StateManager {
     /** Listeners notified when the agent records a finding (durable persistence). */
     val findingsListeners = CopyOnWriteArrayList<(StoredFinding) -> Unit>()
 
+    /** Listeners notified when the agent removes a finding (durable persistence sync). */
+    val findingsRemoveListeners = CopyOnWriteArrayList<(String) -> Unit>()
+
     /** Adds a recorded finding and notifies [findingsListeners] (e.g. the durable store). */
     fun addFinding(f: StoredFinding) {
         findings.add(f)
@@ -389,7 +415,15 @@ class StateManager {
     }
 
     /** Removes a finding by id. Returns true if one was found and removed. */
-    fun removeFinding(id: String): Boolean = findings.removeIf { it.id == id }
+    fun removeFinding(id: String): Boolean {
+        val removed = findings.removeIf { it.id == id }
+        if (removed) {
+            findingsRemoveListeners.forEach { listener ->
+                try { listener(id) } catch (_: Exception) {}
+            }
+        }
+        return removed
+    }
 
     /**
      * Seeds the findings from the durable store on startup WITHOUT notifying
@@ -418,6 +452,9 @@ class StateManager {
     /** Names of dynamically registered payload processors. */
     val registeredPayloadProcessors = CopyOnWriteArrayList<String>()
 
+    /** Montoya [Registration] handles for Intruder payload processors registered via MCP. */
+    val intruderRegistrations = ConcurrentHashMap<String, Registration>()
+
     /** Rules for WebSocket message interception. */
     val websocketInterceptRules = CopyOnWriteArrayList<WebSocketInterceptRule>()
 
@@ -427,6 +464,7 @@ class StateManager {
     /** Flagged mismatches recorded by [autorizeRules] taps, newest first. */
     val autorizeMatches = ConcurrentLinkedDeque<AutorizeMatch>()
     private val autorizeMatchIdCounter = AtomicLong(0)
+    private val autorizeMatchCount = java.util.concurrent.atomic.AtomicInteger(0)
     private val maxAutorizeMatches = 2000
 
     /**
@@ -465,21 +503,39 @@ class StateManager {
             response = response,
         )
         autorizeMatches.addFirst(entry)
-        while (autorizeMatches.size > maxAutorizeMatches) {
-            autorizeMatches.pollLast()
+        autorizeMatchCount.incrementAndGet()
+        while (autorizeMatchCount.get() > maxAutorizeMatches) {
+            if (autorizeMatches.pollLast() != null) autorizeMatchCount.decrementAndGet() else break
         }
         return entry
     }
 
+    /** Clears seen-request dedup keys (either all or for a specific [ruleId]). */
+    fun clearAutorizeSeen(ruleId: String? = null) {
+        if (ruleId == null) autorizeSeen.clear() else autorizeSeen.keys.removeIf { it.startsWith("$ruleId|") }
+    }
+
     /** Clears matches (optionally scoped to one rule) and, when [resetSeen] is true, the dedup guard too. */
     fun clearAutorizeMatches(ruleId: String?, resetSeen: Boolean) {
-        if (ruleId == null) autorizeMatches.clear() else autorizeMatches.removeAll { it.ruleId == ruleId }
-        if (resetSeen) autorizeSeen.clear()
+        if (ruleId == null) {
+            autorizeMatches.clear()
+            autorizeMatchCount.set(0)
+        } else {
+            val iter = autorizeMatches.iterator()
+            while (iter.hasNext()) {
+                if (iter.next().ruleId == ruleId) {
+                    iter.remove()
+                    autorizeMatchCount.decrementAndGet()
+                }
+            }
+        }
+        if (resetSeen) clearAutorizeSeen(ruleId)
     }
 
     /** Recent MCP tool call activity entries for the native Burp UI tab. */
     val mcpActivity = ConcurrentLinkedDeque<McpActivityEntry>()
     private val mcpActivityIdCounter = AtomicLong(0)
+    private val mcpActivityCount = java.util.concurrent.atomic.AtomicInteger(0)
 
     /** Listeners notified when new MCP activity entries are added. */
     val mcpActivityListeners = CopyOnWriteArrayList<(McpActivityEntry) -> Unit>()
@@ -489,7 +545,10 @@ class StateManager {
 
     /** Clears all in-memory MCP activity (Activity-tab "Delete Saved History"). Issue #8. */
     fun clearMcpActivity() {
-        mcpActivity.clear()
+        while (mcpActivity.pollFirst() != null) {
+            mcpActivityCount.decrementAndGet()
+        }
+        mcpActivityCount.set(0)
     }
 
     /**
@@ -523,8 +582,9 @@ class StateManager {
             requestResponse = requestResponse
         )
         mcpActivity.addFirst(entry)
-        while (mcpActivity.size > maxMcpActivityEntries) {
-            mcpActivity.pollLast()
+        mcpActivityCount.incrementAndGet()
+        while (mcpActivityCount.get() > maxMcpActivityEntries) {
+            if (mcpActivity.pollLast() != null) mcpActivityCount.decrementAndGet() else break
         }
         mcpActivityListeners.forEach { listener ->
             try { listener(entry) } catch (_: Exception) {}
@@ -572,6 +632,8 @@ class StateManager {
         scanTasks.clear()
         collaboratorClients.clear()
         findings.clear()
+        findingsListeners.clear()
+        findingsRemoveListeners.clear()
         registeredScanChecks.clear()
         // Deregister any live scan checks before dropping their handles so
         // they don't keep running after the extension unloads.
@@ -579,6 +641,10 @@ class StateManager {
             try { reg.deregister() } catch (_: Exception) {}
         }
         scanCheckRegistrations.clear()
+        intruderRegistrations.values.forEach { reg ->
+            try { reg.deregister() } catch (_: Exception) {}
+        }
+        intruderRegistrations.clear()
         registeredPayloadProcessors.clear()
         websocketInterceptRules.clear()
         mcpActivity.clear()

@@ -4,17 +4,22 @@ import burp.api.montoya.logging.Logging
 import io.bitbytelab.raijin.bridge.BridgeFactory
 import io.bitbytelab.raijin.core.BuildInfo
 import io.bitbytelab.raijin.core.ConnectionInfo
+import io.bitbytelab.raijin.events.BurpEvent
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.state.StateManager
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.cio.*
 import io.ktor.server.engine.*
+import io.ktor.server.http.*
 import io.ktor.server.plugins.cors.routing.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.sse.*
+import io.ktor.sse.ServerSentEvent
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.serialization.json.*
 import java.time.Instant
 
@@ -36,6 +41,7 @@ class DashboardServer(
                 server = embeddedServer(CIO, port = port, host = bindHost) {
                     // Host-header allowlist + locked CORS.
                     installLocalhostSecurity(listOf(port), allowedSecurityHosts())
+                    install(HttpRequestLifecycle) { cancelCallOnClose = true }
                     install(SSE)
 
                     routing {
@@ -49,28 +55,38 @@ class DashboardServer(
                             else call.respondBytes(bytes, ContentType.Image.PNG)
                         }
 
-                        // SSE event stream
+                        // SSE event stream: bounded queue drops oldest events on slow clients + 15s keepalive heartbeat
                         sse("/events") {
-                            val subId = eventBus.subscribe(emptyList()) { event ->
-                                launch {
-                                    try {
-                                        send(io.ktor.sse.ServerSentEvent(
-                                            data = buildJsonObject {
-                                                put("id", event.id)
-                                                put("type", event.type)
-                                                put("timestamp", event.timestamp)
-                                                put("data", event.data)
-                                            }.toString(),
-                                            event = event.type
-                                        ))
-                                    } catch (_: Exception) {}
-                                }
+                            val queue = Channel<BurpEvent>(capacity = 256, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+                            val subId = eventBus.subscribeInternal(emptyList()) { event ->
+                                queue.trySend(event)
                             }
                             try {
-                                // Keep connection alive
-                                while (true) { delay(30000) }
+                                while (isActive) {
+                                    val event = withTimeoutOrNull(15_000L) { queue.receive() }
+                                    if (event == null) {
+                                        send(ServerSentEvent(comments = "keepalive"))
+                                    } else {
+                                        send(
+                                            ServerSentEvent(
+                                                data = buildJsonObject {
+                                                    put("id", event.id)
+                                                    put("type", event.type)
+                                                    put("timestamp", event.timestamp)
+                                                    put("data", event.data)
+                                                }.toString(),
+                                                event = event.type
+                                            )
+                                        )
+                                    }
+                                }
+                            } catch (_: CancellationException) {
+                                throw CancellationException("SSE client disconnected")
+                            } catch (_: Exception) {
+                                // Client disconnected or write failed; unsubscribe cleanly in finally
                             } finally {
                                 eventBus.unsubscribe(subId)
+                                queue.close()
                             }
                         }
 
@@ -110,10 +126,10 @@ class DashboardServer(
                             }
 
                             get("/events/recent") {
-                                val limit = call.parameters["limit"]?.toIntOrNull() ?: 50
-                                val events = eventBus.getEvents(sinceId = 0, maxEvents = limit)
+                                val limit = (call.parameters["limit"]?.toIntOrNull() ?: 50).coerceIn(0, 500)
+                                val events = eventBus.getRecentEvents(limit)
                                 call.respondText(buildJsonArray {
-                                    events.takeLast(limit).forEach { evt ->
+                                    events.forEach { evt ->
                                         add(buildJsonObject {
                                             put("id", evt.id)
                                             put("type", evt.type)
@@ -125,12 +141,30 @@ class DashboardServer(
                             }
 
                             get("/proxy/recent") {
-                                val limit = call.parameters["limit"]?.toIntOrNull() ?: 50
+                                val limit = (call.parameters["limit"]?.toIntOrNull() ?: 50).coerceIn(0, 500)
+                                val includeBodies = call.parameters["include_bodies"]?.toBooleanStrictOrNull() == true ||
+                                    call.parameters["full"]?.toBooleanStrictOrNull() == true
                                 try {
-                                    val history = bridges.proxy.getHistory(0, limit, null, null, null, null, false, true, true, null)
+                                    val history = bridges.proxy.getHistory(
+                                        startIndex = 0,
+                                        count = limit,
+                                        host = null,
+                                        method = null,
+                                        statusCode = null,
+                                        mimeType = null,
+                                        inScopeOnly = false,
+                                        includeRequest = includeBodies,
+                                        includeResponse = includeBodies,
+                                        statusCodeRange = null,
+                                        maxResponseLength = 4000
+                                    )
                                     call.respondText(history.toString(), ContentType.Application.Json)
                                 } catch (e: Exception) {
-                                    call.respondText("""{"error":"${e.message?.replace("\"", "'")}"}""", ContentType.Application.Json)
+                                    call.respondText(
+                                        buildJsonObject { put("error", e.message ?: "Unknown error") }.toString(),
+                                        ContentType.Application.Json,
+                                        HttpStatusCode.InternalServerError
+                                    )
                                 }
                             }
 

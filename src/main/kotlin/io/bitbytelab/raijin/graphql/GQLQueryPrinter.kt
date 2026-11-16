@@ -166,7 +166,8 @@ class GQLQueryPrinter(
                 description.add("(enum):")
             } else {
                 description[0] = "(enum) ${description[0]}"
-                if (!setOf('.', '!', '?', ':', ';').contains(description.last().last())) {
+                val lastLine = description.last()
+                if (lastLine.isNotEmpty() && !setOf('.', '!', '?', ':', ';').contains(lastLine.last())) {
                     description.add("${description.removeLast()}:")
                 }
             }

@@ -2,9 +2,9 @@ package io.bitbytelab.raijin.tools.passiveintel
 
 import io.bitbytelab.raijin.bridge.PassiveIntelBridge
 import io.bitbytelab.raijin.core.asStringList
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -38,10 +38,9 @@ Available categories: aws_access_key, aws_secret_key, google_api_key, github_tok
                 val categories = args["categories"].asStringList()
                 val hostFilter = args["host_filter"]?.jsonPrimitive?.contentOrNull
 
-                val result = bridge.extractIntel(maxItems, inScopeOnly, categories, hostFilter)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.extractIntel(maxItems, inScopeOnly, categories, hostFilter))
             } catch (e: Exception) {
-                CallToolResult(content = listOf(TextContent("""{"error":"${e.message}"}""")), isError = true)
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

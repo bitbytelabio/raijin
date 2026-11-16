@@ -1,11 +1,16 @@
 package io.bitbytelab.raijin.tools.organizer
 
 import io.bitbytelab.raijin.bridge.OrganizerBridge
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
-import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.server.Server
-import kotlinx.serialization.json.*
+import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 
 object OrganizerTools {
 
@@ -21,11 +26,11 @@ object OrganizerTools {
                 "number, required), use_tls (boolean, whether to use HTTPS, default false).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("request") { put("type", "string"); put("description", "Raw HTTP request string") }
-                    putJsonObject("response") { put("type", "string"); put("description", "Raw HTTP response string") }
-                    putJsonObject("host") { put("type", "string"); put("description", "Target hostname") }
-                    putJsonObject("port") { put("type", "integer"); put("description", "Target port number") }
-                    putJsonObject("use_tls") { put("type", "boolean"); put("description", "Whether to use HTTPS, default false") }
+                    put("request", buildJsonObject { put("type", "string"); put("description", "Raw HTTP request string") })
+                    put("response", buildJsonObject { put("type", "string"); put("description", "Raw HTTP response string") })
+                    put("host", buildJsonObject { put("type", "string"); put("description", "Target hostname") })
+                    put("port", buildJsonObject { put("type", "integer"); put("description", "Target port number") })
+                    put("use_tls", buildJsonObject { put("type", "boolean"); put("description", "Whether to use HTTPS, default false") })
                 },
                 required = listOf("request", "host", "port")
             )
@@ -33,44 +38,32 @@ object OrganizerTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: request"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: request")
                 val host = args["host"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: host"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: host")
                 val port = args["port"]?.jsonPrimitive?.intOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: port"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: port")
                 val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull ?: false
                 val response = args["response"]?.jsonPrimitive?.contentOrNull
 
-                val result = bridge.send(rawRequest, response, host, port, useTls)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.send(rawRequest, response, host, port, useTls))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
         server.addTool(
             name = "organizer_get_items",
             description = "Retrieve items from Burp Suite's Organizer tool. Returns a list " +
-                "of bookmarked requests with metadata including URL, method, host, port, " +
-                "and response status code. Parameters: url_prefix (optional string, filter " +
-                "items whose URL contains this prefix), max_results (optional integer, " +
-                "maximum number of items to return, default 100).",
+                "of bookmarked requests with id, URL, method, host, port, notes, highlight, " +
+                "and response status code (plus optional request/response bodies).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("url_prefix") { put("type", "string"); put("description", "Filter items whose URL contains this prefix") }
-                    putJsonObject("max_results") { put("type", "integer"); put("description", "Maximum number of items to return, default 100") }
+                    put("url_prefix", buildJsonObject { put("type", "string"); put("description", "Filter items whose URL contains this prefix") })
+                    put("max_results", buildJsonObject { put("type", "integer"); put("description", "Maximum number of items to return, default 100") })
+                    put("include_request", buildJsonObject { put("type", "boolean"); put("description", "Include full request text (default false)") })
+                    put("include_response", buildJsonObject { put("type", "boolean"); put("description", "Include full response text (default false)") })
+                    put("max_response_length", buildJsonObject { put("type", "integer"); put("description", "Truncate request/response text at N characters") })
                 },
                 required = emptyList()
             )
@@ -79,14 +72,13 @@ object OrganizerTools {
                 val args = request.params.arguments ?: emptyMap()
                 val urlPrefix = args["url_prefix"]?.jsonPrimitive?.contentOrNull
                 val maxResults = args["max_results"]?.jsonPrimitive?.intOrNull ?: 100
+                val includeRequest = args["include_request"]?.jsonPrimitive?.booleanOrNull ?: false
+                val includeResponse = args["include_response"]?.jsonPrimitive?.booleanOrNull ?: false
+                val maxResponseLength = args["max_response_length"]?.jsonPrimitive?.intOrNull
 
-                val result = bridge.getItems(urlPrefix, maxResults)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.getItems(urlPrefix, maxResults, includeRequest, includeResponse, maxResponseLength))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -95,9 +87,9 @@ object OrganizerTools {
             description = "Set notes and/or a highlight color on an Organizer item by id (from organizer_get_items).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("id") { put("type", "integer"); put("description", "Organizer item id, from organizer_get_items") }
-                    putJsonObject("notes") { put("type", "string"); put("description", "Note text to set") }
-                    putJsonObject("highlight") { put("type", "string"); put("description", "RED|ORANGE|YELLOW|GREEN|CYAN|BLUE|PINK|MAGENTA|GRAY|NONE (NONE clears it)") }
+                    put("id", buildJsonObject { put("type", "integer"); put("description", "Organizer item id, from organizer_get_items") })
+                    put("notes", buildJsonObject { put("type", "string"); put("description", "Note text to set") })
+                    put("highlight", buildJsonObject { put("type", "string"); put("description", "RED|ORANGE|YELLOW|GREEN|CYAN|BLUE|PINK|MAGENTA|GRAY|NONE (NONE clears it)") })
                 },
                 required = listOf("id")
             )
@@ -105,13 +97,12 @@ object OrganizerTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val id = args["id"]?.jsonPrimitive?.intOrNull
-                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Missing required parameter: id"}""")), isError = true)
+                    ?: return@addTool toolError("Missing required parameter: id")
                 val notes = args["notes"]?.jsonPrimitive?.contentOrNull
                 val highlight = args["highlight"]?.jsonPrimitive?.contentOrNull
-                val result = bridge.annotate(id, notes, highlight)
-                CallToolResult(content = listOf(TextContent(result.toString())), isError = result["error"] != null)
+                toolJsonResult(bridge.annotate(id, notes, highlight))
             } catch (e: Exception) {
-                CallToolResult(content = listOf(TextContent("""{"error":"${e.message}"}""")), isError = true)
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
+import io.bitbytelab.raijin.core.BodyText
 import io.bitbytelab.raijin.safety.ScopeGate
 import kotlinx.serialization.json.*
 import java.net.InetSocketAddress
@@ -115,18 +116,24 @@ class HttpPipelineBridge(api: MontoyaApi) {
             }
 
             val wanted = maxResponses ?: specs.size
+            val requestMethods = specs.map { extractRequestMethod(it.bytes) }
             val totalDeadline = System.currentTimeMillis() + totalTimeoutMs
             val carry = StringBuilder()
             val responses = mutableListOf<JsonObject>()
             var bytesReceived = 0L
             var closeReason = "max_responses"
             var errorMessage: String? = null
+            var sawConnectionClose = false
 
             for (i in 0 until wanted) {
-                val outcome = HttpPipelineFraming.readOne(socket, carry, idleTimeoutMs, totalDeadline)
+                val isHead = requestMethods.getOrNull(i)?.equals("HEAD", ignoreCase = true) == true
+                val outcome = HttpPipelineFraming.readOne(socket, carry, idleTimeoutMs, totalDeadline, expectNoBody = isHead)
                 bytesReceived += outcome.bytesReadFromSocket
                 when (outcome) {
-                    is HttpPipelineFraming.Outcome.Ok -> responses += serializeResponse(i, outcome.response, maxResponseLength)
+                    is HttpPipelineFraming.Outcome.Ok -> {
+                        if (outcome.response.connectionCloseHeader) sawConnectionClose = true
+                        responses += serializeResponse(i, outcome.response, maxResponseLength)
+                    }
                     is HttpPipelineFraming.Outcome.Eof -> { closeReason = "fin"; break }
                     is HttpPipelineFraming.Outcome.TimedOut -> { closeReason = if (outcome.kind == "total") "total_timeout" else "idle"; break }
                     is HttpPipelineFraming.Outcome.Reset -> { closeReason = "rst"; errorMessage = outcome.message; break }
@@ -134,10 +141,8 @@ class HttpPipelineBridge(api: MontoyaApi) {
                 }
             }
 
-            // Only offer connection reuse when every requested response framed cleanly — a broken
-            // or ambiguous read leaves the socket's framing state indeterminate, so it is not safe
-            // to hand back to a later call.
-            val keepAlive = keepOpen && closeReason == "max_responses"
+            // Only offer connection reuse when every requested response framed cleanly AND the server did not send Connection: close.
+            val keepAlive = keepOpen && closeReason == "max_responses" && !sawConnectionClose
             val resultConnectionId = if (keepAlive) (connectionId ?: UUID.randomUUID().toString()) else null
 
             if (keepAlive) {
@@ -210,11 +215,18 @@ class HttpPipelineBridge(api: MontoyaApi) {
         plain.connect(InetSocketAddress(host, port), connectTimeoutMs)
         if (!useTls) return plain
         val ssl = trustAllSslSocketFactory().createSocket(plain, host, port, true) as SSLSocket
+        ssl.soTimeout = connectTimeoutMs
         val params = ssl.sslParameters
         params.applicationProtocols = arrayOf("http/1.1")
         ssl.sslParameters = params
         ssl.startHandshake()
         return ssl
+    }
+
+    private fun extractRequestMethod(bytes: ByteArray): String? {
+        val text = String(bytes, 0, minOf(bytes.size, 32), Charsets.ISO_8859_1)
+        val sp = text.indexOf(' ')
+        return if (sp > 0) text.substring(0, sp) else null
     }
 
     private fun trustAllSslSocketFactory(): SSLSocketFactory {
@@ -240,12 +252,10 @@ class HttpPipelineBridge(api: MontoyaApi) {
         put("headers", buildJsonArray {
             r.headers.forEach { (name, value) -> add(buildJsonObject { put("name", name); put("value", value) }) }
         })
-        val body = if (maxResponseLength != null && maxResponseLength > 0 && r.body.length > maxResponseLength) {
-            r.body.take(maxResponseLength) + "... [truncated, full length: ${r.body.length}]"
-        } else {
-            r.body
-        }
-        put("body", body)
+        val renderedBody = BodyText.render(r.body, maxResponseLength)
+        put("body", renderedBody.text)
+        if (renderedBody.isBinary) put("body_encoding", "base64")
+        if (renderedBody.truncated) put("body_truncated", true)
         if (r.warnings.isNotEmpty()) put("warnings", buildJsonArray { r.warnings.forEach { add(it) } })
     }
 }

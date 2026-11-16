@@ -134,6 +134,7 @@ object ToolConsolidation {
                 "token_rule_list" to "session_list_rules",
                 "token_rule_remove" to "session_remove_rule",
             ),
+            renames = mapOf("traffic_rule_set" to RULE_ACTION),
         ),
         Group(
             "http_state", "Burp cookie jar: read, set and delete cookies.",
@@ -287,6 +288,9 @@ object ToolConsolidation {
         members.forEach { (action, rt) ->
             rt.tool.inputSchema.properties?.forEach { (name, def) ->
                 val pub = publicParam(g, action, name)
+                if (pub == "action") {
+                    error("Tool group '${g.tool}', action '$action' declares parameter '$name' that collides with dispatch parameter 'action'; add a rename.")
+                }
                 params.getOrPut(pub) { (def as? JsonObject ?: JsonObject(emptyMap())) to mutableListOf() }.second += action
             }
         }

@@ -68,11 +68,12 @@ fun evalJython(code: String, baseRequest: String, rawRequest: ByteArray, endpoin
         handler.baseRequest = baseRequest
         handler.rawRequest = rawRequest
         pyInterp.set("target", Target(baseRequest, rawRequest, endpoint, baseInput))
-        val savedWords = Utils.witnessedWords.savedWords
-        if (savedWords.isEmpty()) {
-            savedWords.add("To use this wordlist, enable 'learn observed words'")
+        // Copy observed words instead of mutating shared Utils.witnessedWords.savedWords with placeholder text
+        val observedWords = Utils.witnessedWords.savedWords.toMutableSet()
+        if (observedWords.isEmpty()) {
+            observedWords.add("To use this wordlist, enable 'learn observed words'")
         }
-        pyInterp.set("wordlists", Wordlist(Bruteforce(), Utils.witnessedWords.savedWords, Utils.getClipboard()))
+        pyInterp.set("wordlists", Wordlist(Bruteforce(), observedWords, Utils.getClipboard()))
         pyInterp.set("turboTypes", TurboPython.types())
         pyInterp.exec("class _TurboNamespace(object):\n    pass\nturbo = _TurboNamespace()\nfor _n, _t in turboTypes.items():\n    setattr(turbo, _n, _t)\ndel _n, _t")
         pyInterp.set("handler", handler)
@@ -120,6 +121,8 @@ fun evalJython(code: String, baseRequest: String, rawRequest: ByteArray, endpoin
         Utils.out(stackTrace)
 
         handler.abort()
+    } finally {
+        runCatching { pyInterp.close() }
     }
 }
 
@@ -374,20 +377,24 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
 
             class ToggleRun(): ActionListener {
                 override fun actionPerformed(e: ActionEvent?) {
+                    val action = button.text
                     thread {
                         when {
-                            button.text == "Halt" -> {
+                            action == "Halt" -> {
                                 handler.abort()
-                                button.text = "Configure"
+                                SwingUtilities.invokeLater { button.text = "Configure" }
                             }
-                            button.text == "Configure" -> {
+                            action == "Configure" -> {
                                 handler.abort()
-                                requestTable?.clear()
-                                resultStore?.clear()
+                                val rt = requestTable
+                                val rs = resultStore
                                 handler = RunHandler()
                                 resultStore = null
                                 requestTable = null
                                 SwingUtilities.invokeLater {
+                                    rt?.dispose()
+                                    rt?.clear()
+                                    rs?.clear()
                                     panel.add(button, BorderLayout.SOUTH)
                                     pane.bottomComponent = panel
                                     pane.setDividerLocation(0.25)
@@ -398,25 +405,28 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
                                 }
                             }
                             else -> {
-                                // Build service/target from UI inputs
+                                // Read UI inputs on EDT or snapshot safely, build engine off EDT
                                 val inputHost = hostField.text.trim().ifEmpty { initialService.host }
                                 val inputPort = try { portField.text.trim().toInt() } catch (ex: Exception) { initialService.port }
                                 val inputProtocol = (protocolCombo.selectedItem?.toString() ?: (if (initialService.secure) "https" else "http")).lowercase()
                                 val newService = TurboService(inputHost, inputPort, inputProtocol == "https")
 
-                                resultStore = ResultStore()
-                                TurboModule.runManager.adopt(handler, resultStore!!, "GUI")
-                                requestTable = RequestTable(resultStore!!, newService, handler)
-                                SwingUtilities.invokeLater {
+                                val localStore = ResultStore()
+                                resultStore = localStore
+                                TurboModule.runManager.adopt(handler, localStore, "GUI")
+                                var localTable: RequestTable? = null
+                                SwingUtilities.invokeAndWait {
+                                    localTable = RequestTable(localStore, newService, handler)
+                                    requestTable = localTable
                                     button.text = "Halt"
                                     val requestPanel = JPanel(BorderLayout())
                                     panel.remove(button)
-                                    requestPanel.add(requestTable, BorderLayout.CENTER)
+                                    requestPanel.add(localTable, BorderLayout.CENTER)
                                     requestPanel.add(button, BorderLayout.SOUTH)
                                     pane.bottomComponent = requestPanel
                                     button.requestFocusInWindow()
                                     pane.rootPane.defaultButton = button
-                                    title = "Raijin Turbo - " + inputHost
+                                    title = "Raijin Turbo - $inputHost - running"
                                 }
                                 var script = textEditor.text
 
@@ -436,8 +446,7 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
                                 // enforce /r/n line endings
                                 script = script.replace("\r\n", "\n")
                                 script = script.replace("\n", "\r\n")
-                                title += " - running"
-                                evalJython(script, baseRequest, messageBytes, target, inputHost, baseInput, resultStore!!, handler, reqs, requestTable)
+                                evalJython(script, baseRequest, messageBytes, target, inputHost, baseInput, localStore, handler, reqs, localTable)
                             }
                         }
                     }
@@ -467,6 +476,7 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
             this.addWindowListener(object : WindowAdapter() {
                 override fun windowClosing(e: WindowEvent) {
                     handler.abort()
+                    requestTable?.dispose()
                     requestTable?.clear()
                     e.window.dispose()
                 }

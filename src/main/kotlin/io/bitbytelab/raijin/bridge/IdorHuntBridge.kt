@@ -174,7 +174,7 @@ class IdorHuntBridge(private val api: MontoyaApi) {
                 req = req.withRemovedHeader("Authorization").withRemovedHeader("Cookie")
                     .withRemovedHeader("X-API-Key").withRemovedHeader("X-Auth-Token")
             }
-            val result = BoundedHttp.send(api, req)
+            val result = BoundedHttp.sendInternal(api, req)
             val resp = result?.response()
             (resp?.statusCode()?.toInt() ?: 0) to (resp?.bodyToString() ?: "")
         } catch (e: Exception) {

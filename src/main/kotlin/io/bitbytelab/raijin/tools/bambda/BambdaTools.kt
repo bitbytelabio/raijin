@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.tools.bambda
 
 import io.bitbytelab.raijin.bridge.BambdaBridge
+import io.bitbytelab.raijin.tools.toolError
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
@@ -31,16 +32,10 @@ object BambdaTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val script = args["script"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: script"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: script")
 
                 if (script.isBlank()) {
-                    return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Script cannot be empty"}""")),
-                        isError = true
-                    )
+                    return@addTool toolError("Script cannot be empty")
                 }
 
                 val name = args["name"]?.jsonPrimitive?.contentOrNull
@@ -57,10 +52,7 @@ object BambdaTools {
                     isError = importFailed
                 )
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

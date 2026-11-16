@@ -37,7 +37,6 @@ import kotlinx.serialization.json.*
 import java.time.Instant
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.regex.Pattern
 
 /**
  * Bridge wrapping the Montoya Proxy API.
@@ -61,6 +60,13 @@ class ProxyBridge(
      * Montoya callback dispatch; its futures are intentionally never awaited (see [maybeAutorize]).
      */
     private val autorizeExecutor: ExecutorService = Executors.newVirtualThreadPerTaskExecutor()
+    private val autorizeSemaphore = java.util.concurrent.Semaphore(10)
+    private val autorizePendingCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Shuts down background executors on extension unload. */
+    fun shutdown() {
+        autorizeExecutor.shutdownNow()
+    }
 
     // ---------------------------------------------------------------
     // History retrieval
@@ -119,29 +125,37 @@ class ProxyBridge(
         }
 
         val filter = ProxyHistoryFilter { item ->
-            if (inScopeOnly && !item.request().isInScope()) return@ProxyHistoryFilter false
-            if (host != null && !item.host().contains(host, ignoreCase = true)) return@ProxyHistoryFilter false
-            if (method != null && !item.method().equals(method, ignoreCase = true)) return@ProxyHistoryFilter false
-            if (statusCode != null && item.hasResponse()) {
-                if (item.response().statusCode().toInt() != statusCode) return@ProxyHistoryFilter false
+            try {
+                if (inScopeOnly && !item.request().isInScope()) return@ProxyHistoryFilter false
+                val itemHost = try { item.host() } catch (_: Exception) { null }
+                if (host != null && (itemHost == null || !itemHost.contains(host, ignoreCase = true))) return@ProxyHistoryFilter false
+                val itemMethod = try { item.method() } catch (_: Exception) { null }
+                if (method != null && (itemMethod == null || !itemMethod.equals(method, ignoreCase = true))) return@ProxyHistoryFilter false
+                if (statusCode != null) {
+                    if (!item.hasResponse() || item.response().statusCode().toInt() != statusCode) return@ProxyHistoryFilter false
+                }
+                if (resolvedRange != null) {
+                    if (!item.hasResponse()) return@ProxyHistoryFilter false
+                    val sc = item.response().statusCode().toInt()
+                    if (!resolvedRange.contains(sc)) return@ProxyHistoryFilter false
+                }
+                if (resolvedMimeType != null && item.mimeType() != resolvedMimeType) {
+                    return@ProxyHistoryFilter false
+                }
+                true
+            } catch (_: Exception) {
+                false
             }
-            if (resolvedRange != null && item.hasResponse()) {
-                val sc = item.response().statusCode().toInt()
-                if (!resolvedRange.contains(sc)) return@ProxyHistoryFilter false
-            }
-            if (resolvedMimeType != null && item.mimeType() != resolvedMimeType) {
-                return@ProxyHistoryFilter false
-            }
-            true
         }
 
+        val safeStart = startIndex.coerceAtLeast(0)
         val allItems = api.proxy().history(filter)
         val totalFiltered = allItems.size
-        val slice = allItems.drop(startIndex).take(count.coerceIn(0, 1000))
+        val slice = allItems.drop(safeStart).take(count.coerceIn(0, 1000))
 
         return buildJsonObject {
             put("total_filtered", totalFiltered)
-            put("start_index", startIndex)
+            put("start_index", safeStart)
             put("returned", slice.size)
             put("items", buildJsonArray {
                 slice.forEach { item ->
@@ -173,11 +187,13 @@ class ProxyBridge(
         includeResponse: Boolean = false,
         maxResponseLength: Int? = null
     ): JsonObject {
-        val flags = if (caseSensitive) 0 else Pattern.CASE_INSENSITIVE
-        val compiledPattern = Pattern.compile(pattern, flags)
+        val ignoreCase = !caseSensitive
+        SafeRegex.validate(pattern, ignoreCase = ignoreCase)?.let { err ->
+            return buildJsonObject { put("error", "Invalid regex pattern: $err") }
+        }
 
         val filter = ProxyHistoryFilter { item ->
-            if (inScopeOnly && !item.request().isInScope()) return@ProxyHistoryFilter false
+            if (inScopeOnly && !runCatching { item.request().isInScope() }.getOrDefault(false)) return@ProxyHistoryFilter false
 
             val t = ProxyHistorySearch.targets(searchIn)
 
@@ -186,16 +202,15 @@ class ProxyBridge(
                 // Match against the fully-reconstructed URL (scheme+host+path+query),
                 // which the request text does not expose as one contiguous string.
                 val url = try { item.request().url() } catch (_: Exception) { "" }
-                found = compiledPattern.matcher(url).find()
+                found = SafeRegex.containsMatchIn(pattern, url, ignoreCase = ignoreCase)
             }
             if (!found && t.request) {
-                // Request text only. item.contains(pattern) inherits
-                // HttpRequestResponse.contains, which matches BOTH request and
-                // response, so a request-only search must inspect the request text.
-                found = compiledPattern.matcher(item.request().toString()).find()
+                val reqText = try { item.request().toString() } catch (_: Exception) { "" }
+                found = SafeRegex.containsMatchIn(pattern, reqText, ignoreCase = ignoreCase)
             }
             if (!found && t.response && item.hasResponse()) {
-                found = compiledPattern.matcher(item.response().toString()).find()
+                val respText = try { item.response().toString() } catch (_: Exception) { "" }
+                found = SafeRegex.containsMatchIn(pattern, respText, ignoreCase = ignoreCase)
             }
             found
         }
@@ -248,13 +263,14 @@ class ProxyBridge(
             true
         }
 
+        val safeStart = startIndex.coerceAtLeast(0)
         val allItems = api.proxy().webSocketHistory(filter)
         val totalFiltered = allItems.size
-        val slice = allItems.drop(startIndex).take(count.coerceIn(0, 1000))
+        val slice = allItems.drop(safeStart).take(count.coerceIn(0, 1000))
 
         return buildJsonObject {
             put("total_filtered", totalFiltered)
-            put("start_index", startIndex)
+            put("start_index", safeStart)
             put("returned", slice.size)
             put("items", buildJsonArray {
                 slice.forEach { item -> add(serializeWebSocketItem(item)) }
@@ -275,14 +291,17 @@ class ProxyBridge(
         direction: String?,
         maxResults: Int
     ): JsonObject {
-        val compiledPattern = Pattern.compile(pattern, Pattern.CASE_INSENSITIVE)
+        SafeRegex.validate(pattern, ignoreCase = true)?.let { err ->
+            return buildJsonObject { put("error", "Invalid regex pattern: $err") }
+        }
         val dirFilter = direction?.let {
             try { Direction.valueOf(it.uppercase()) } catch (_: Exception) { null }
         }
 
         val filter = ProxyWebSocketHistoryFilter { item ->
             if (dirFilter != null && item.direction() != dirFilter) return@ProxyWebSocketHistoryFilter false
-            item.contains(compiledPattern)
+            val payloadText = try { item.payload().toString() } catch (_: Exception) { "" }
+            SafeRegex.containsMatchIn(pattern, payloadText, ignoreCase = true)
         }
 
         val matches = api.proxy().webSocketHistory(filter)
@@ -559,30 +578,49 @@ class ProxyBridge(
      * caller — this runs on Burp's proxy handler thread for every single response.
      */
     private fun maybeAutorize(response: InterceptedResponse) {
-        if (stateManager.autorizeRules.none { it.enabled }) return
+        val rules = stateManager.autorizeRules
+        if (rules.none { it.enabled }) return
         try {
             val request = response.request() ?: return
             val url = request.url()
             val method = request.method()
+            val originalContentType = try { response.headerValue("Content-Type") } catch (_: Exception) { null }
+
+            val matching = rules.filter { rule ->
+                rule.enabled && autorizeRuleMatches(rule, request, method, url, originalContentType)
+            }
+            if (matching.isEmpty()) return
+
+            // Serialize heavy strings ONLY after confirming at least one rule matches.
             val originalStatus = response.statusCode().toInt()
             val originalBody = response.bodyToString()
-            val originalContentType = try { response.headerValue("Content-Type") } catch (_: Exception) { null }
+            val originalLocation = try { response.headerValue("Location") } catch (_: Exception) { null }
             val rawRequest = request.toString()
             val rawResponse = response.toString()
 
-            for (rule in stateManager.autorizeRules) {
-                if (!rule.enabled || !autorizeRuleMatches(rule, request, method, url, originalContentType)) continue
+            for (rule in matching) {
                 val seenKey = "${rule.ruleId}|$method|${url.substringBefore('?')}"
                 if (!stateManager.autorizeSeenOnce(seenKey)) continue
+                if (autorizePendingCount.incrementAndGet() > 100) {
+                    autorizePendingCount.decrementAndGet()
+                    continue
+                }
 
                 autorizeExecutor.submit {
                     try {
-                        autorizeReplayAndAssess(
-                            rule, request, method, url, originalStatus, originalBody, originalContentType,
-                            rawRequest, rawResponse,
-                        )
+                        autorizeSemaphore.acquire()
+                        try {
+                            autorizeReplayAndAssess(
+                                rule, request, method, url, originalStatus, originalBody, originalContentType,
+                                originalLocation, rawRequest, rawResponse,
+                            )
+                        } finally {
+                            autorizeSemaphore.release()
+                        }
                     } catch (_: Exception) {
                         // Best-effort background check; a failure here must never surface as a proxy error.
+                    } finally {
+                        autorizePendingCount.decrementAndGet()
                     }
                 }
             }
@@ -596,9 +634,8 @@ class ProxyBridge(
         if (rule.methods != null && method.uppercase() !in rule.methods) return false
         if (rule.excludeUrlRegex != null && SafeRegex.containsMatchIn(rule.excludeUrlRegex, url, ignoreCase = true)) return false
         if (rule.includeHostPattern != null) {
-            val hostPattern = rule.includeHostPattern.replace("*", ".*")
             val host = try { request.httpService().host() } catch (_: Exception) { "" }
-            if (!SafeRegex.matches(hostPattern, host, ignoreCase = true)) return false
+            if (!SafeRegex.matchesHostPattern(rule.includeHostPattern, host)) return false
         }
         if (rule.inScopeOnly) {
             val inScope = try { api.scope().isInScope(url) } catch (_: Exception) { true }
@@ -623,6 +660,7 @@ class ProxyBridge(
         originalStatus: Int,
         originalBody: String,
         originalContentType: String?,
+        originalLocation: String?,
         rawRequest: String,
         rawResponse: String,
     ) {
@@ -630,7 +668,9 @@ class ProxyBridge(
         // replay send, independent of rule.inScopeOnly (which only filters which traffic is tapped).
         if (scopeGate.deny(url) != null) return
 
-        val levels = mutableListOf(AuthDiffVerdict.LevelResult("captured", originalStatus, originalBody, originalContentType))
+        val levels = mutableListOf(
+            AuthDiffVerdict.LevelResult("captured", originalStatus, originalBody, originalContentType, originalLocation)
+        )
         for (identity in rule.identities) {
             val name = identity["name"]?.jsonPrimitive?.contentOrNull ?: "unknown"
             val headerName = identity["header_name"]?.jsonPrimitive?.contentOrNull
@@ -648,7 +688,7 @@ class ProxyBridge(
                     .withRemovedHeader("X-Auth-Token")
             }
 
-            val sent = try { BoundedHttp.send(api, mutated) } catch (_: Exception) { null } ?: continue
+            val sent = try { BoundedHttp.sendInternal(api, mutated) } catch (_: Exception) { null } ?: continue
             val resp = sent.response() ?: continue
             levels.add(
                 AuthDiffVerdict.LevelResult(
@@ -656,6 +696,7 @@ class ProxyBridge(
                     try { resp.statusCode().toInt() } catch (_: Exception) { 0 },
                     try { resp.bodyToString() } catch (_: Exception) { "" },
                     try { resp.headerValue("Content-Type") } catch (_: Exception) { null },
+                    try { resp.headerValue("Location") } catch (_: Exception) { null },
                 )
             )
         }
@@ -697,8 +738,7 @@ class ProxyBridge(
      */
     private fun matchesRequestRule(rule: ProxyRule, request: InterceptedRequest): Boolean {
         if (rule.matchHost != null) {
-            val hostPattern = rule.matchHost.replace("*", ".*")
-            if (!SafeRegex.matches(hostPattern, request.httpService().host(), ignoreCase = true)) {
+            if (!SafeRegex.matchesHostPattern(rule.matchHost, request.httpService().host())) {
                 return false
             }
         }
@@ -733,17 +773,14 @@ class ProxyBridge(
      */
     private fun matchesResponseRule(rule: ProxyRule, response: InterceptedResponse): Boolean {
         if (rule.matchHost != null) {
-            val host = try { response.request()?.httpService()?.host() } catch (_: Exception) { null }
-            if (host != null) {
-                val hostPattern = rule.matchHost.replace("*", ".*")
-                if (!SafeRegex.matches(hostPattern, host, ignoreCase = true)) {
-                    return false
-                }
+            val host = try { response.request()?.httpService()?.host() } catch (_: Exception) { null } ?: return false
+            if (!SafeRegex.matchesHostPattern(rule.matchHost, host)) {
+                return false
             }
         }
         if (rule.matchUrl != null) {
-            val url = try { response.request()?.url() } catch (_: Exception) { null }
-            if (url != null && !SafeRegex.containsMatchIn(rule.matchUrl, url, ignoreCase = true)) {
+            val url = try { response.request()?.url() } catch (_: Exception) { null } ?: return false
+            if (!SafeRegex.containsMatchIn(rule.matchUrl, url, ignoreCase = true)) {
                 return false
             }
         }

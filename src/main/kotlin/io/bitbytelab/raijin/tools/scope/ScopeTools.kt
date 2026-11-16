@@ -1,9 +1,9 @@
 package io.bitbytelab.raijin.tools.scope
 
 import io.bitbytelab.raijin.bridge.ScopeBridge
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -26,18 +26,11 @@ object ScopeTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val url = args["url"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: url"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: url")
 
-                val result = bridge.check(url)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.check(url))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -57,18 +50,11 @@ object ScopeTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val url = args["url"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: url"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: url")
 
-                val result = bridge.include(url)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.include(url))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -88,18 +74,11 @@ object ScopeTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val url = args["url"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: url"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: url")
 
-                val result = bridge.exclude(url)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.exclude(url))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -114,13 +93,9 @@ object ScopeTools {
             )
         ) { _ ->
             try {
-                val result = bridge.getConfig()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.getConfig())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -135,9 +110,9 @@ object ScopeTools {
             )
         ) { _ ->
             try {
-                CallToolResult(content = listOf(TextContent(bridge.list().toString())))
+                toolJsonResult(bridge.list())
             } catch (e: Exception) {
-                CallToolResult(content = listOf(TextContent("""{"error":"${e.message}"}""")), isError = true)
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -158,13 +133,12 @@ object ScopeTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val list = args["list"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Missing required parameter: list"}""")), isError = true)
+                    ?: return@addTool toolError("Missing required parameter: list")
                 val index = args["index"]?.jsonPrimitive?.intOrNull
-                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Missing required parameter: index"}""")), isError = true)
-                val result = bridge.remove(list, index)
-                CallToolResult(content = listOf(TextContent(result.toString())), isError = result["error"] != null)
+                    ?: return@addTool toolError("Missing required parameter: index")
+                toolJsonResult(bridge.remove(list, index))
             } catch (e: Exception) {
-                CallToolResult(content = listOf(TextContent("""{"error":"${e.message}"}""")), isError = true)
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

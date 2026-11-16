@@ -1,6 +1,10 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
+import io.bitbytelab.raijin.core.BodyText
+import io.bitbytelab.raijin.safety.InterruptibleCharSequence
+import io.bitbytelab.raijin.safety.RegexTimeoutException
+import io.bitbytelab.raijin.safety.SafeRegex
 import kotlinx.serialization.json.*
 
 class PassiveIntelBridge(private val api: MontoyaApi) {
@@ -92,12 +96,15 @@ class PassiveIntelBridge(private val api: MontoyaApi) {
                 }
             }
             if (hostFilter != null) {
-                val hostRegex = Regex(hostFilter, RegexOption.IGNORE_CASE)
+                SafeRegex.validate(hostFilter, ignoreCase = true)?.let { err ->
+                    return buildJsonObject { put("error", "Invalid host_filter regex: $err") }
+                }
                 items = items.filter {
-                    try { hostRegex.containsMatchIn(it.finalRequest().httpService().host()) } catch (_: Exception) { false }
+                    val h = try { it.finalRequest().httpService().host() } catch (_: Exception) { "" }
+                    SafeRegex.containsMatchIn(hostFilter, h, ignoreCase = true)
                 }
             }
-            items = items.takeLast(maxItems)
+            items = items.takeLast(maxItems.coerceAtLeast(0))
 
             // Select patterns to use
             val activePatterns = if (categories != null && categories.isNotEmpty()) {
@@ -109,17 +116,30 @@ class PassiveIntelBridge(private val api: MontoyaApi) {
             // Scan
             val findings = mutableMapOf<String, MutableList<JsonObject>>()
             var itemsScanned = 0
+            val maxBodyScanChars = 200_000
 
             for (item in items) {
                 itemsScanned++
                 val url = try { item.finalRequest().url() } catch (_: Exception) { continue }
                 val host = try { item.finalRequest().httpService().host() } catch (_: Exception) { "" }
 
-                // Scan request
-                val requestText = try { item.finalRequest().toString() } catch (_: Exception) { "" }
-                // Scan response
+                // Scan request (capped & binary-guarded)
+                val rawReqText = try { item.finalRequest().toString() } catch (_: Exception) { "" }
+                val requestText = if (BodyText.isProbablyBinary(rawReqText)) "" else rawReqText.take(maxBodyScanChars)
+                // Scan response (skip binary MIME/content & cap size)
                 val responseText = try {
-                    if (item.hasResponse()) item.originalResponse().toString() else ""
+                    if (!item.hasResponse()) {
+                        ""
+                    } else {
+                        val resp = item.originalResponse()
+                        val mime = try { resp.mimeType().name } catch (_: Exception) { null }
+                        if (BodyText.isBinaryMime(mime)) {
+                            ""
+                        } else {
+                            val raw = resp.toString()
+                            if (BodyText.isProbablyBinary(raw)) "" else raw.take(maxBodyScanChars)
+                        }
+                    }
                 } catch (_: Exception) { "" }
 
                 for ((patternName, regex) in activePatterns) {
@@ -136,8 +156,24 @@ class PassiveIntelBridge(private val api: MontoyaApi) {
                                 put("host", host)
                             })
                         }
-                        for (match in regex.findAll(requestText)) addMatch(match.value, "request")
-                        for (match in regex.findAll(responseText)) addMatch(match.value, "response")
+                        if (requestText.isNotEmpty()) {
+                            val deadline = System.nanoTime() + 500_000_000L
+                            val guardedReq = InterruptibleCharSequence(requestText) { System.nanoTime() > deadline }
+                            for (match in regex.findAll(guardedReq)) {
+                                guardedReq.disarm()
+                                addMatch(match.value, "request")
+                            }
+                        }
+                        if (responseText.isNotEmpty()) {
+                            val deadline = System.nanoTime() + 500_000_000L
+                            val guardedResp = InterruptibleCharSequence(responseText) { System.nanoTime() > deadline }
+                            for (match in regex.findAll(guardedResp)) {
+                                guardedResp.disarm()
+                                addMatch(match.value, "response")
+                            }
+                        }
+                    } catch (_: RegexTimeoutException) {
+                        // Timed out on this item/pattern; continue cleanly
                     } catch (_: Exception) {
                         // Skip this pattern on failure, continue with others
                     }

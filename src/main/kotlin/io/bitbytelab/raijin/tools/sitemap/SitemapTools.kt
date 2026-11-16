@@ -2,9 +2,9 @@ package io.bitbytelab.raijin.tools.sitemap
 
 import io.bitbytelab.raijin.bridge.SitemapBridge
 import io.bitbytelab.raijin.core.asStringList
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -55,17 +55,13 @@ object SitemapTools {
                 val searchIn = args["search_in"]?.jsonPrimitive?.contentOrNull
                 val noteContains = args["note_contains"]?.jsonPrimitive?.contentOrNull
 
-                val result = bridge.query(
+                toolJsonResult(bridge.query(
                     urlPrefix, searchPattern, maxResults, includeRequest, includeResponse,
                     onlyWithResponse, statusCodeRange, mime, excludeNoise, excludePattern,
                     inScopeOnly, searchIn, noteContains
-                )
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                ))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -87,19 +83,12 @@ object SitemapTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val url = args["url"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Parameter 'url' is required"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Parameter 'url' is required")
                 val notes = args["notes"]?.jsonPrimitive?.contentOrNull
                 val highlight = args["highlight"]?.jsonPrimitive?.contentOrNull
-                val result = bridge.annotate(url, notes, highlight)
-                CallToolResult(content = listOf(TextContent(result.toString())), isError = result["error"] != null)
+                toolJsonResult(bridge.annotate(url, notes, highlight))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -122,13 +111,9 @@ object SitemapTools {
                 val urlPrefix = args["url_prefix"]?.jsonPrimitive?.contentOrNull
                 val severity = args["severity"]?.jsonPrimitive?.contentOrNull
 
-                val result = bridge.getIssues(urlPrefix, severity)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.getIssues(urlPrefix, severity))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -152,30 +137,17 @@ object SitemapTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: request"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: request")
                 val rawResponse = args["response"]?.jsonPrimitive?.contentOrNull
                 val host = args["host"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: host"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: host")
                 val port = args["port"]?.jsonPrimitive?.intOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: port"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: port")
                 val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull ?: false
 
-                val result = bridge.addRequest(rawRequest, rawResponse, host, port, useTls)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.addRequest(rawRequest, rawResponse, host, port, useTls))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -205,41 +177,22 @@ object SitemapTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val name = args["name"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: name"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: name")
                 val detail = args["detail"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: detail"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: detail")
                 val remediation = args["remediation"]?.jsonPrimitive?.contentOrNull
                 val severity = args["severity"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: severity"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: severity")
                 val confidence = args["confidence"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: confidence"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: confidence")
                 val url = args["url"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Missing required parameter: url"}""")),
-                        isError = true
-                    )
+                    ?: return@addTool toolError("Missing required parameter: url")
                 val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
                 val rawResponse = args["response"]?.jsonPrimitive?.contentOrNull
 
-                val result = bridge.addIssue(name, detail, remediation, severity, confidence, url, rawRequest, rawResponse)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.addIssue(name, detail, remediation, severity, confidence, url, rawRequest, rawResponse))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent("""{"error":"${e.message}"}""")),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

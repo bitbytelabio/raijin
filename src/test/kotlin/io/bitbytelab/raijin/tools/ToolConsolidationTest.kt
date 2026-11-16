@@ -126,15 +126,48 @@ class ToolConsolidationTest {
     @Test
     fun `rule action parameter is renamed so it does not clash with dispatch action`() {
         val legacy = server()
-        ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach { fake(legacy, it, emptyList(), "action", "pattern") }
+        val ruleActionMembers = setOf(
+            "proxy_set_request_rule",
+            "proxy_set_response_rule",
+            "http_set_traffic_rule",
+            "websocket_set_intercept_rule"
+        )
+        ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach { name ->
+            if (name in ruleActionMembers) fake(legacy, name, emptyList(), "action", "pattern")
+            else fake(legacy, name, emptyList(), "pattern")
+        }
         ToolConsolidation.KEEP.forEach { fake(legacy, it) }
         val target = server()
         ToolConsolidation.apply(legacy, target)
 
-        val props = target.tools.getValue("proxy_rule").tool.inputSchema.properties!!
-        assertTrue("rule_action" in props)
-        val r = call(target, "proxy_rule", buildJsonObject { put("action", "set_request_rule"); put("rule_action", "drop") })
-        assertEquals("""proxy_set_request_rule:{"action":"drop"}""", text(r))
+        val proxyProps = target.tools.getValue("proxy_rule").tool.inputSchema.properties!!
+        assertTrue("rule_action" in proxyProps)
+        val pr = call(target, "proxy_rule", buildJsonObject { put("action", "set_request_rule"); put("rule_action", "drop") })
+        assertEquals("""proxy_set_request_rule:{"action":"drop"}""", text(pr))
+
+        val httpProps = target.tools.getValue("http_rule").tool.inputSchema.properties!!
+        assertTrue("rule_action" in httpProps)
+        val hr = call(target, "http_rule", buildJsonObject { put("action", "traffic_rule_set"); put("rule_action", "spoof_response") })
+        assertEquals("""http_set_traffic_rule:{"action":"spoof_response"}""", text(hr))
+
+        val wsProps = target.tools.getValue("websocket").tool.inputSchema.properties!!
+        assertTrue("rule_action" in wsProps)
+        val wr = call(target, "websocket", buildJsonObject { put("action", "set_intercept_rule"); put("rule_action", "drop") })
+        assertEquals("""websocket_set_intercept_rule:{"action":"drop"}""", text(wr))
+    }
+
+    @Test
+    fun `apply rejects group member declaring unrenamed action parameter`() {
+        val legacy = server()
+        ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach { name ->
+            if (name == "scope_check") fake(legacy, name, emptyList(), "action") else fake(legacy, name)
+        }
+        ToolConsolidation.KEEP.forEach { fake(legacy, it) }
+        val target = server()
+        val ex = kotlin.test.assertFailsWith<IllegalStateException> {
+            ToolConsolidation.apply(legacy, target)
+        }
+        assertTrue("action" in (ex.message ?: ""), ex.message)
     }
 
     @Test

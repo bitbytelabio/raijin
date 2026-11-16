@@ -15,6 +15,7 @@ import io.bitbytelab.raijin.core.ProxyHistorySearch
 import io.bitbytelab.raijin.core.ServiceParts
 import io.bitbytelab.raijin.core.StatusCodeRange
 import io.bitbytelab.raijin.safety.RequestHygiene
+import io.bitbytelab.raijin.safety.SafeRegex
 import kotlinx.serialization.json.*
 import burp.api.montoya.core.HighlightColor
 
@@ -67,9 +68,17 @@ class SitemapBridge(private val api: MontoyaApi) {
             StatusCodeRange.Result.None -> null
         }
         val mimeLower = mime?.map { it.lowercase() }
-        val extraExclude = excludePattern?.let { Regex(it, RegexOption.IGNORE_CASE) }
+        if (excludePattern != null) {
+            SafeRegex.validate(excludePattern, ignoreCase = true)?.let { err ->
+                return buildJsonObject { put("error", "Invalid exclude_pattern regex: $err") }
+            }
+        }
         val targets = ProxyHistorySearch.targets(searchIn)
-        val searchRegex = searchPattern?.let { Regex(it, RegexOption.IGNORE_CASE) }
+        if (searchPattern != null) {
+            SafeRegex.validate(searchPattern, ignoreCase = true)?.let { err ->
+                return buildJsonObject { put("error", "Invalid search_pattern regex: $err") }
+            }
+        }
 
         var matched = all.asSequence()
         if (onlyWithResponse) matched = matched.filter { it.hasResponse() }
@@ -81,19 +90,21 @@ class SitemapBridge(private val api: MontoyaApi) {
             mimeLower.any { it == stated || it == inferred }
         }
         if (excludeNoise) matched = matched.filter { entry -> !defaultNoisePattern.containsMatchIn(entry.request()?.url() ?: "") }
-        if (extraExclude != null) matched = matched.filter { entry -> !extraExclude.containsMatchIn(entry.request()?.url() ?: "") }
+        if (excludePattern != null) matched = matched.filter { entry ->
+            !SafeRegex.containsMatchIn(excludePattern, entry.request()?.url() ?: "", ignoreCase = true)
+        }
         if (inScopeOnly) matched = matched.filter { entry ->
             try { api.scope().isInScope(entry.request()?.url() ?: "") } catch (_: Exception) { false }
         }
         if (noteContains != null) matched = matched.filter { entry ->
             (try { entry.annotations()?.notes() } catch (_: Exception) { null })?.contains(noteContains, ignoreCase = true) == true
         }
-        if (searchRegex != null) matched = matched.filter { entry ->
+        if (searchPattern != null) matched = matched.filter { entry ->
             val req = entry.request()
             val resp = entry.response()
-            (targets.url && searchRegex.containsMatchIn(req?.url() ?: "")) ||
-                (targets.request && req != null && searchRegex.containsMatchIn(req.toString())) ||
-                (targets.response && resp != null && searchRegex.containsMatchIn(resp.toString()))
+            (targets.url && SafeRegex.containsMatchIn(searchPattern, req?.url() ?: "", ignoreCase = true)) ||
+                (targets.request && req != null && SafeRegex.containsMatchIn(searchPattern, req.toString(), ignoreCase = true)) ||
+                (targets.response && resp != null && SafeRegex.containsMatchIn(searchPattern, resp.toString(), ignoreCase = true))
         }
 
         val matchedList = matched.toList()
