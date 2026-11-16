@@ -4,7 +4,9 @@ import io.bitbytelab.raijin.bridge.IdorHuntBridge
 import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.core.asBooleanSafe
 import io.bitbytelab.raijin.core.asBoundedInt
+import io.bitbytelab.raijin.core.asClampedInt
 import io.bitbytelab.raijin.core.asJsonObjectList
+import io.bitbytelab.raijin.core.withClampReport
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
@@ -42,7 +44,7 @@ object IdorTools {
                         put("type", "array"); putJsonObject("items") { put("type", "object") }
                         put("description", "At least 2: [{name, header_name?, header_value?, headers?, remove_headers?, object_id?, canary?}]; an identity's headers replace the request's own, name none/unauth/anonymous strips every credential header. object_id = a resource that identity owns; canary = a token only in that identity's own data (enables confirmed-grade verdicts). The first identity is the primary one (it replays the id transformations).")
                     }
-                    putJsonObject("id_value") { put("type", "string"); put("description", "Optional: the object-id value in 'request' to swap (else auto-detected). It must stand alone as a path segment, a parameter/cookie/header value or a JSON value") }
+                    putJsonObject("id_value") { put("type", "string"); put("description", "Optional: the object-id value in 'request' to swap (else auto-detected). It must stand alone as a path segment, a parameter/cookie/header value or a JSON value, or begin a path segment before a character that is not a letter or digit (42 in /users/42-alice)") }
                     putJsonObject("id_location") {
                         put("type", "string")
                         putJsonArray("enum") { ID_LOCATIONS.forEach { add(it) } }
@@ -52,7 +54,7 @@ object IdorTools {
                     putJsonObject("transforms") { put("type", "boolean"); put("description", "Also replay the id-transformation set (encodings/neighbours/type-juggle) under the primary identity (default false)") }
                     putJsonObject("enumerate") {
                         put("type", "integer"); put("minimum", 0); put("maximum", IdorHuntBridge.MAX_TRANSFORMS)
-                        put("description", "Optional neighbour/transform replay count (0=off, at most ${IdorHuntBridge.MAX_TRANSFORMS})")
+                        put("description", "Optional neighbour/transform replay count (0=off); a larger value is clamped to ${IdorHuntBridge.MAX_TRANSFORMS} and reported as enumerate_clamped_to")
                     }
                 },
                 required = listOf("request", "host", "identities")
@@ -74,10 +76,13 @@ object IdorTools {
                 EnumValidation.error(idLocation, ID_LOCATIONS.toSet(), "id_location")?.let { return@addTool toolJsonResult(it) }
                 val idName = args.string("id_name")?.takeIf { it.isNotEmpty() }
                 val transforms = args["transforms"].asBooleanSafe() ?: false
-                val enumerate = args["enumerate"].asBoundedInt("enumerate", 0, IdorHuntBridge.MAX_TRANSFORMS)
-                    .getOrElse { return@addTool toolError(it.message ?: "Invalid enumerate") } ?: 0
+                val enumerate = args["enumerate"].asClampedInt("enumerate", 0, IdorHuntBridge.MAX_TRANSFORMS)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid enumerate") }
 
-                toolJsonResult(bridge.hunt(req, host, port, useTls, identities, idLocation, idValue, transforms, enumerate, idName))
+                toolJsonResult(
+                    bridge.hunt(req, host, port, useTls, identities, idLocation, idValue, transforms, enumerate?.value ?: 0, idName)
+                        .withClampReport("enumerate", enumerate)
+                )
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }

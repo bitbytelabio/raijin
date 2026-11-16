@@ -340,15 +340,26 @@ object IdorHunt {
 
     /**
      * The part of [segment] to keep after the id when the segment holds [value] (`""` for a whole
-     * segment, `.json` for `1002.json`), or null when it holds something else.
+     * segment, `.json` for `1002.json`), or null when it holds something else. With [prefix] the
+     * segment may also begin with [value] ([startsWithId]: `-alice` for `42` in `42-alice`).
      */
-    private fun segmentSuffix(segment: String, value: String): String? {
+    private fun segmentSuffix(segment: String, value: String, prefix: Boolean = false): String? {
         if (segment == value || decodePath(segment) == value) return ""
         val end = segmentIdEnd(segment)
-        if (end == segment.length) return null
-        val id = segment.substring(0, end)
-        return if (id == value || decodePath(id) == value) segment.substring(end) else null
+        if (end < segment.length) {
+            val id = segment.substring(0, end)
+            if (id == value || decodePath(id) == value) return segment.substring(end)
+        }
+        return if (prefix && startsWithId(segment, value)) segment.substring(value.length) else null
     }
+
+    /**
+     * True when [segment] begins with [value] and the next character is not a letter or digit, so
+     * the value ends there: `42` begins `42-alice` and `42_draft`, but not `420` or `42alice`.
+     */
+    private fun startsWithId(segment: String, value: String): Boolean =
+        value.isNotEmpty() && segment.length > value.length && segment.startsWith(value) &&
+            !segment[value.length].isLetterOrDigit()
 
     /**
      * One value of a request that sits between parameter boundaries.
@@ -455,10 +466,14 @@ object IdorHunt {
      * Chooses the reference to swap.
      *
      *  1. A pin by [idValue] and/or [idName] (optionally within [idLocation]) must be found at a
-     *     parameter boundary of the request: null when it is not, never a guess.
+     *     parameter boundary of the request: null when it is not, never a guess. A pinned value
+     *     that stands nowhere on its own may begin a path segment ([startsWithId]): `42` of
+     *     `/users/42-alice`.
      *  2. Otherwise the id one of the identities says it owns ([ownedIds]), when the request holds
      *     it in a path segment or an id-named parameter.
      *  3. Otherwise the strongest auto-detected reference (within [idLocation] when given).
+     *  4. Otherwise an owned id in a parameter that is not named like one (`page=1`), but never in
+     *     a header: there a lone `1` is a flag such as `Upgrade-Insecure-Requests` or `DNT`.
      *
      * Where one value sits in several places, a path segment wins over a query parameter, over a
      * body field, over a cookie, over a header; among path segments the last one wins, so the
@@ -487,6 +502,10 @@ object IdorHunt {
             (p.location == "query" || p.location == "body-form") && decodeQuery(p.value) == value -> p
             else -> null
         }
+        // [p] when it is a path segment that only begins with [value] (`42` of `42-alice`).
+        fun beginning(p: Param, value: String): Param? =
+            if (p.location != "path" || !startsWithId(p.whole, value)) null
+            else Param(p.location, p.name, value, p.index, p.hint, p.whole)
         fun named(p: Param, name: String) = when (p.location) {
             "path" -> name.toIntOrNull() == p.index || name.equals(p.name, true)
             "header" -> p.name.equals(name, true)
@@ -501,8 +520,10 @@ object IdorHunt {
         )?.toRef()
 
         if (idValue != null || idName != null) {
-            val pinned = if (idValue == null) all else all.mapNotNull { holding(it, idValue) }
-            return best(pinned.filter { idName == null || named(it, idName) })
+            fun pinned(match: (Param) -> Param?) = all.mapNotNull(match).filter { idName == null || named(it, idName) }
+            if (idValue == null) return best(pinned { it })
+            // A value standing on its own wins over a path segment that merely begins with it.
+            return best(pinned { holding(it, idValue) }.ifEmpty { pinned { beginning(it, idValue) } })
         }
         // An owned id counts on its own where ids live (a path segment, an id-named parameter);
         // an id-less match such as `page=1` for the owned id `1` only when nothing else is found.
@@ -511,7 +532,7 @@ object IdorHunt {
         return locateRefs(rawRequest)
             .filter { idLocation == null || it.location.equals(idLocation, true) }
             .maxWithOrNull(compareBy<ObjectRef>({ classify(it.value).confidence }, { it.index }))
-            ?: best(owned)
+            ?: best(owned.filter { it.location != "header" })
     }
 
     private const val PATH_RESERVED = "?#"
@@ -584,7 +605,8 @@ object IdorHunt {
             if (segment.isEmpty()) return@joinToString segment
             n++
             if (ref.index >= 0 && ref.index != n) return@joinToString segment
-            val suffix = segmentSuffix(segment, ref.value) ?: return@joinToString segment
+            // Only a ref that names its segment may be the start of it (a pinned `42` of `42-alice`).
+            val suffix = segmentSuffix(segment, ref.value, prefix = ref.index >= 0) ?: return@joinToString segment
             changed = true
             percentEncode(newValue, PATH_RESERVED) + suffix
         }
@@ -794,7 +816,7 @@ object IdorHunt {
     /**
      * What a transformed-id response is measured against.
      * @param ownBody the reader's response to the unmodified request (its own object); null when
-     *   that request was not served.
+     *   that request was not served, and then only a canary can grade a response.
      * @param missBody a 2xx answer to an id that cannot exist (servers that say "not found" with
      *   a 200); null when unknown ids are refused by status.
      * @param readerCanary a string only in the reader's own data.
@@ -829,6 +851,9 @@ object IdorHunt {
      * placed by similarity (own view, "no such object" answer, another identity's own view) and
      * a cross-user read is only confirmed by a canary: data that belongs to another identity, and
      * is not part of the reader's own view, actually appears in it.
+     *
+     * Without the reader's own view ([TransformBaseline.ownBody] is null) a response cannot be
+     * placed by similarity, so it is `info` at most unless a canary grades it.
      */
     fun assessTransform(
         reader: String,
@@ -879,6 +904,14 @@ object IdorHunt {
         if (miss != null && similarity(body, miss) >= MISS_SIMILARITY) {
             return verdict("not_found_like", "none", false, "$probe returned $status, but the body is the server's answer for an id that does not exist.")
         }
+        // With no own view to hold it against, a page on the same template as another identity's
+        // view, or one unlike anything, says nothing about whose object was served.
+        if (own == null) {
+            return verdict(
+                "own_view_missing", "info", false,
+                "$probe returned $status, but '$reader's own view is missing (the unmodified request was not served), so the response is not placed against it or the other identities' views — only a canary could show whose data this is."
+            )
+        }
 
         val closest = baseline.others
             .mapNotNull { other -> other.ownView?.let { other to similarity(body, it) } }
@@ -892,7 +925,7 @@ object IdorHunt {
             )
         }
         // Without a usable canary of the reader, a near-copy of its own view is taken as its own object.
-        val ownCanaryUsable = own != null && containsCanary(own, baseline.readerCanary)
+        val ownCanaryUsable = containsCanary(own, baseline.readerCanary)
         if (!ownCanaryUsable && simOwn != null && simOwn >= OWN_VIEW_SIMILARITY) {
             return verdict("own_object", "info", false, "$probe returned a body $simOwn% similar to '$reader's own view — the same object, or a look-alike that only a canary can tell apart.")
         }

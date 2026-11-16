@@ -54,6 +54,64 @@ class SubscriptionEndpointTest {
     }
 
     @Test
+    fun `a host with an underscore, such as a Docker service, is read from the authority`() {
+        val docker = parse("ws://graphql_api:4000/graphql?x=1")
+        assertEquals("graphql_api", docker.host)
+        assertEquals(4000, docker.port)
+        assertFalse(docker.secure)
+        assertEquals("ws://graphql_api:4000/graphql?x=1", docker.wsUrl)
+        assertEquals("http://graphql_api:4000/graphql?x=1", docker.httpUrl)
+        assertTrue("Host: graphql_api:4000\r\n" in docker.upgradeRequest("graphql-ws", emptyMap(), "a2V5"))
+
+        // as for any host: the user info is dropped, and the default port is not written
+        val withUser = parse("HTTPS://user:pw@my_api.internal")
+        assertEquals("my_api.internal", withUser.host)
+        assertEquals(443, withUser.port)
+        assertEquals("wss://my_api.internal/", withUser.wsUrl)
+        assertTrue("Host: my_api.internal\r\n" in withUser.upgradeRequest("graphql-ws", emptyMap(), "a2V5"))
+        assertEquals("ws://graphql_api/x", parse("ws://graphql_api:/x").wsUrl)
+        assertEquals("ws://graphql_api/x", parse("ws://graphql_api:80/x").wsUrl)
+    }
+
+    @Test
+    fun `user info never reaches an IPv6 authority`() {
+        val endpoint = parse("ws://u:p@[::1]:4000/g")
+        assertEquals("::1", endpoint.host)
+        assertEquals("ws://[::1]:4000/g", endpoint.wsUrl)
+        assertTrue("Host: [::1]:4000\r\n" in endpoint.upgradeRequest("graphql-ws", emptyMap(), "a2V5"))
+    }
+
+    @Test
+    fun `a port outside 1 to 65535 and a malformed authority are refused`() {
+        fun message(url: String) = SubscriptionEndpoint.parse(url).exceptionOrNull()?.message.orEmpty()
+        for (url in listOf("ws://graphql_api:0/", "ws://graphql_api:65536/", "ws://graphql_api:99999999999/", "ws://api.example.com:0/", "wss://api.example.com:70000/")) {
+            assertTrue("out of range" in message(url), "$url -> ${message(url)}")
+        }
+        assertTrue("invalid port" in message("ws://graphql_api:4000:5/"), message("ws://graphql_api:4000:5/"))
+        assertTrue("invalid host" in message("ws://bad;host/"), message("ws://bad;host/"))
+        assertTrue("invalid host" in message("ws://a_b%20c/"), message("ws://a_b%20c/"))
+        assertTrue("missing host" in message("ws://user@/graphql"), message("ws://user@/graphql"))
+    }
+
+    @Test
+    fun `an anonymous session keeps only the caller headers that identify nobody`() {
+        val caller = linkedMapOf(
+            "Authorization" to "Bearer t",
+            "Cookie" to "sid=1",
+            "x-hasura-admin-secret" to "s3cret",
+            "apikey" to "k",
+            "X-Forwarded-For" to "127.0.0.1",
+            " Origin " to "https://app.example.com",
+            "User-Agent" to "probe/1.0",
+            "host" to "internal.example.com",
+        )
+        assertEquals(
+            mapOf(" Origin " to "https://app.example.com", "User-Agent" to "probe/1.0", "host" to "internal.example.com"),
+            SubscriptionEndpoint.anonymousHeaders(caller),
+        )
+    }
+
+    @Test
     fun `the upgrade request asks for the given subprotocol`() {
         val request = parse("wss://api.example.com/graphql?v=2").upgradeRequest("graphql-transport-ws", emptyMap(), "dGhlIHNhbXBsZSBub25jZQ==")
         assertEquals(

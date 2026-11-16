@@ -5,9 +5,11 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class OpenApiServersTest {
 
@@ -202,6 +204,26 @@ class OpenApiServersTest {
 
         val unusable = json("""{"openapi": "3.0.3", "servers": [{"url": "wss://stream.example.com"}]}""").jsonObject
         assertEquals("https://docs.example.com/", OpenApiServers.openApi3(unusable, "https://docs.example.com/specs/openapi.json")?.url)
+    }
+
+    @Test
+    fun `a rejected http(s) server is an error, never the document's own host`() {
+        val document = "https://docs.example.com/specs/openapi.json"
+        for (url in listOf("http://notahost", "https://bad host.com", "https://[::1]:8443/api", "http://api.example.com:70000", "//cdn/x")) {
+            val failure = assertFailsWith<IllegalArgumentException>(url) { serverOf(url, document) }
+            val message = failure.message.orEmpty()
+            assertTrue("No usable server URL" in message && "'$url'" in message && "base_url" in message, message)
+            val root = json("""{"openapi": "3.0.3", "servers": [{"url": "$url"}]}""").jsonObject
+            assertFailsWith<IllegalArgumentException>(url) { OpenApiServers.openApi3(root, document) }
+        }
+        val template = assertFailsWith<IllegalArgumentException> { serverOf("https://{tenant}.example.com", document) }
+        assertTrue("{variable} without a default" in template.message.orEmpty(), template.message)
+
+        // another entry that is usable is still taken
+        val servers = json("""[{"url": "http://notahost"}, {"url": "https://api.example.com"}]""")
+        assertEquals("https://api.example.com", OpenApiServers.fromServers(servers, document)?.url)
+        val relative = json("""[{"url": "https://{undeclared}.example.com"}, {"url": "/api"}]""")
+        assertEquals("https://docs.example.com/api", OpenApiServers.fromServers(relative, document)?.url)
     }
 
     // --- Swagger 2 host / basePath / schemes ---

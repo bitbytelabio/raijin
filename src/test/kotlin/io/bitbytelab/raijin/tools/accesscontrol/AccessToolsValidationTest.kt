@@ -164,13 +164,24 @@ class AccessToolsValidationTest {
     }
 
     @Test
-    fun `idor_hunt rejects out-of-range numbers and unknown locations`() {
-        assertRejected("idor_hunt", hunt.having("enumerate", "26"), "'enumerate'", "0 and 25")
-        assertRejected("idor_hunt", hunt.having("enumerate", "-1"), "'enumerate'")
+    fun `idor_hunt rejects bad numbers, unknown locations and missing parts`() {
+        assertRejected("idor_hunt", hunt.having("enumerate", "\"many\""), "'enumerate'", "integer")
         assertRejected("idor_hunt", hunt.having("port", "0"), "'port'", "1 and 65535")
         assertRejected("idor_hunt", hunt.having("id_location", "\"body\""), "'id_location'", "body-json", "path")
         assertRejected("idor_hunt", hunt.having("identities", "[{\"name\":\"alice\"}]"), "identities", ">=2")
         assertRejected("idor_hunt", hunt.without("request"), "'request'")
+    }
+
+    @Test
+    fun `idor_hunt clamps an enumerate count outside 0 to 25 and says so`() {
+        // A pinned id the request does not hold ends the hunt before anything is sent.
+        val pinned = hunt.having("id_value", "\"31337\"")
+        for ((given, used) in listOf("26" to 25, "50" to 25, "-1" to 0)) {
+            val result = json(call("idor_hunt", pinned.having("enumerate", given)))
+            assertEquals(used, result["enumerate_clamped_to"]?.jsonPrimitive?.int, "$given: $result")
+            assertTrue("Nothing was sent" in result.getValue("error").jsonPrimitive.content, result.toString())
+        }
+        assertFalse("enumerate_clamped_to" in json(call("idor_hunt", pinned.having("enumerate", "25"))))
     }
 
     @Test

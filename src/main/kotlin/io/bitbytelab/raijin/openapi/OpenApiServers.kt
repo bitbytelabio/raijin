@@ -18,6 +18,9 @@ internal object OpenApiServers {
     private val HOST = Regex("[A-Za-z0-9._-]+")
     private val VARIABLE = Regex("\\{([^{}]+)\\}")
 
+    /** A server URL that names its host: `http(s)://host...`, or `//host...` taking the document's scheme. */
+    private val NAMES_HTTP_HOST = Regex("^(?i:https?:)?//")
+
     /**
      * Joins a base path and an operation path with exactly one slash between them, so a base path of
      * `/` (or a server URL ending in `/`) does not produce `//pets`.
@@ -45,15 +48,34 @@ internal object OpenApiServers {
         return ServerUrl(scheme, host, port, rest.substring(end).substringBefore('?').substringBefore('#'))
     }
 
-    /** The first entry of an OpenAPI 3 `servers` array that yields a usable URL. */
-    fun fromServers(servers: JsonElement?, documentUrl: String?): ServerUrl? =
-        (servers as? JsonArray)?.firstNotNullOfOrNull { entry ->
-            (entry as? JsonObject)?.let {
-                absolute(substitute(it["url"].asText().orEmpty(), it["variables"] as? JsonObject), documentUrl)
-            }
-        }
+    /**
+     * The first entry of an OpenAPI 3 `servers` array that yields a usable URL; null when there is no
+     * such entry, so the caller falls back to the server it would use without one.
+     *
+     * @throws IllegalArgumentException when no entry is usable but one names an http(s) host (an
+     *   absolute `http(s)://` URL, or a `//host` one): that host was rejected, and falling back would
+     *   send the requests, and the scope entry, to a host the document does not name.
+     */
+    fun fromServers(servers: JsonElement?, documentUrl: String?): ServerUrl? {
+        val urls = (servers as? JsonArray)?.mapNotNull { entry ->
+            (entry as? JsonObject)?.let { substitute(it["url"].asText().orEmpty(), it["variables"] as? JsonObject) }
+        }.orEmpty()
+        urls.firstNotNullOfOrNull { absolute(it, documentUrl) }?.let { return it }
+        val rejected = urls.map { it.trim() }.firstOrNull { NAMES_HTTP_HOST.containsMatchIn(it) } ?: return null
+        val reason = if (VARIABLE.containsMatchIn(rejected)) "holds a {variable} without a default or enum value"
+            else "is not an http(s) URL with a dotted host name or localhost and a port from 1 to 65535"
+        throw IllegalArgumentException(
+            "No usable server URL: '${rejected.take(200)}' $reason, and the requests are not sent to another host " +
+                "in its place. Pass base_url to choose the target."
+        )
+    }
 
-    /** Root server of an OpenAPI 3 document; without usable `servers` it is `/` on the document's own host. */
+    /**
+     * Root server of an OpenAPI 3 document: its first usable `servers` entry, else `/` on the
+     * document's own host when no entry names an http(s) host.
+     *
+     * @throws IllegalArgumentException as [fromServers] does.
+     */
     fun openApi3(root: JsonObject, documentUrl: String?): ServerUrl? =
         fromServers(root["servers"], documentUrl) ?: absolute("/", documentUrl)
 

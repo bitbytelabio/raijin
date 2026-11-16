@@ -1,5 +1,11 @@
 package io.bitbytelab.raijin.bridge
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+
 /**
  * Pure broken-access-control verdict for auth-diff results. Improves on the old
  * inline check (which only flagged an exact `status == 200` match) by reasoning
@@ -318,6 +324,9 @@ object AuthDiffVerdict {
  * Deliberately narrow, because a response wrongly taken for a denial hides a real finding:
  *  - a denial *message* is only recognised in a short body (an error document, not a data page
  *    that happens to mention the word);
+ *  - in a JSON body only the envelope speaks: a 401/403 code at its top level, or denial words in
+ *    a top-level error, message or detail field. The same words in data (`[{"state":"session_expired"}]`,
+ *    a message nested in `data`) are content that was served, not a refusal;
  *  - a login *page* needs a password field AND a login title or login form target, so a
  *    "create user" or "change password" page is not mistaken for one.
  */
@@ -354,6 +363,13 @@ object AuthDenialHeuristic {
         "(?i)\"(?:code|status|status_?code|err(?:or)?_?(?:code|no)?)\"\\s*:\\s*\"?40[13]\"?\\s*[,}]"
     )
 
+    /** The [DENIAL_CODE] field names, as [fieldName] spells them. */
+    private val CODE_FIELDS = setOf("code", "status", "statuscode", "err", "error", "errcode", "errno", "errorcode", "errorno")
+    private val DENIAL_CODES = setOf("401", "403")
+
+    /** Top-level JSON fields whose own text (a string, or an array of strings) can say access was refused. */
+    private val MESSAGE_FIELDS = setOf("message", "messages", "msg", "detail", "details")
+
     private val PASSWORD_FIELD = Regex("(?i)<input\\b[^>]*\\btype\\s*=\\s*[\"']?password\\b")
     private val LOGIN_TITLE = Regex(
         "(?i)<title\\b[^>]*>[^<]*\\b(?:log[ -]?[io]n|sign[ -]?[io]n|authenticat\\w*|single sign[ -]on)\\b[^<]*</title>"
@@ -365,11 +381,73 @@ object AuthDenialHeuristic {
     /** True when [body] reads as a refusal: a short denial message or a login page. */
     fun looksDenied(body: String): Boolean = isDenialMessage(body) || isLoginPage(body)
 
-    /** A short body (JSON error, plain text, small error page) that says access was refused. */
+    /**
+     * A short body (JSON error, plain text, small error page) that says access was refused. A JSON
+     * body is judged by its envelope only ([isJsonRefusal]).
+     */
     fun isDenialMessage(body: String): Boolean {
         val text = body.trim()
         if (text.isEmpty() || text.length > MESSAGE_MAX_CHARS) return false
+        if (text.startsWith("{") || text.startsWith("[")) {
+            parseJson(text)?.let { return isJsonRefusal(it) }
+            // JSON lines (a document per line) are records, not an error envelope.
+            if (text.lines().all { it.isBlank() || parseJson(it.trim()) != null }) return false
+        }
         return DENIAL_PHRASE.containsMatchIn(text) || DENIAL_CODE.containsMatchIn(text)
+    }
+
+    private fun parseJson(text: String): JsonElement? = try {
+        Json.parseToJsonElement(text)
+    } catch (_: Exception) {
+        null
+    }
+
+    /**
+     * A JSON document is a refusal when its top-level object carries a 401/403 code, or denial
+     * words in an error field (`error`, `errors`, `error_description`, `fault`..., searched through
+     * whatever they hold) or in the text of a message / detail field. Anything else is data,
+     * whatever its words: a top-level array, a `state` or `status` value, a message nested in
+     * another object.
+     */
+    private fun isJsonRefusal(document: JsonElement): Boolean {
+        val envelope = document as? JsonObject ?: return false
+        return envelope.any { (key, value) ->
+            val name = fieldName(key)
+            when {
+                name in CODE_FIELDS && isDenialCode(value) -> true
+                name == "err" || name.startsWith("error") || name.startsWith("fault") -> errorSaysDenied(value)
+                name in MESSAGE_FIELDS -> texts(value).any { DENIAL_PHRASE.containsMatchIn(it) }
+                else -> false
+            }
+        }
+    }
+
+    /** An error value read whole: denial words in any of its strings, or a 401/403 under a code field. */
+    private fun errorSaysDenied(error: JsonElement): Boolean {
+        val pending = ArrayDeque<JsonElement>().apply { add(error) }
+        while (pending.isNotEmpty()) {
+            when (val element = pending.removeLast()) {
+                is JsonObject -> for ((key, value) in element) {
+                    if (fieldName(key) in CODE_FIELDS && isDenialCode(value)) return true
+                    pending.add(value)
+                }
+                is JsonArray -> pending.addAll(element)
+                is JsonPrimitive -> if (element.isString && DENIAL_PHRASE.containsMatchIn(element.content)) return true
+            }
+        }
+        return false
+    }
+
+    /** `status_code`, `statusCode` and `Status-Code` all read `statuscode`. */
+    private fun fieldName(key: String): String = key.lowercase().filter { it != '_' && it != '-' }
+
+    private fun isDenialCode(value: JsonElement): Boolean = (value as? JsonPrimitive)?.content?.trim() in DENIAL_CODES
+
+    /** A string, or the strings of an array: the text a message field carries itself. */
+    private fun texts(value: JsonElement): List<String> = when (value) {
+        is JsonPrimitive -> if (value.isString) listOf(value.content) else emptyList()
+        is JsonArray -> value.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content }
+        else -> emptyList()
     }
 
     /** An HTML page with a password field that is titled, or posts, as a login. */

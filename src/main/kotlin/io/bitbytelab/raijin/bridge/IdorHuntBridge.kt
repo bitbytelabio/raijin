@@ -97,7 +97,7 @@ class IdorHuntBridge(private val api: MontoyaApi) {
                 idName?.let { "id_name '$it'" },
                 idLocation?.let { "id_location '$it'" }
             ).joinToString(", ")
-            return err("No object reference matches $pin: the value must stand alone as a path segment, a query/form/cookie/header value or a JSON value of the request. Nothing was sent.")
+            return err("No object reference matches $pin: the value must stand alone as a path segment, a query/form/cookie/header value or a JSON value of the request, or begin a path segment before a character that is not a letter or digit (42 of /users/42-alice). Nothing was sent.")
         }
 
         return try {
@@ -148,8 +148,9 @@ class IdorHuntBridge(private val api: MontoyaApi) {
 
                 // What the transformed ids are measured against: the reader's own object, the
                 // server's answer for an id that cannot exist, and the other identities' own views.
+                // A login page or a denial served with 200 is no own view either.
                 val own = send(base, reader)
-                val ownBody = if (own.served) own.body else null
+                val ownBody = if (own.served && !AuthDenialHeuristic.looksDenied(own.body)) own.body else null
                 val missRequest = IdorHunt.applySwap(base, ref, IdorHunt.missProbeValue(ref.value, cls))
                 val miss = if (missRequest != base) send(missRequest, reader) else null
                 val missBody = if (miss != null && miss.served && miss.body.isNotBlank() &&
@@ -168,6 +169,15 @@ class IdorHuntBridge(private val api: MontoyaApi) {
                 transformBaseline = buildJsonObject {
                     put("reader", reader.name)
                     put("own_status", own.status)
+                    put("own_view", ownBody != null)
+                    if (ownBody == null) {
+                        put(
+                            "own_view_note",
+                            "The unmodified request did not give '${reader.name}' its own object (status ${own.status}" +
+                                (if (own.served) ", a login page or denial message" else "") +
+                                "), so transformed ids are not compared by similarity: only a canary can grade them above info."
+                        )
+                    }
                     miss?.let { put("unknown_id_status", it.status) }
                     put("unknown_id_fingerprinted", missBody != null)
                     put("identities_with_own_view", buildJsonArray { others.filter { it.ownView != null }.forEach { add(it.name) } })

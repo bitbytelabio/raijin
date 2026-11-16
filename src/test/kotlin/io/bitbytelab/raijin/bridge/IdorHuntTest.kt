@@ -313,6 +313,26 @@ class IdorHuntTest {
         assertEquals("GET /u/c%20d$tail", IdorHunt.applySwap(encoded, decoded, "c d"))
     }
 
+    @Test fun `a pinned value may begin a path segment when no letter or digit follows it`() {
+        val req = "GET /users/42-alice$tail"
+        val ref = assertNotNull(IdorHunt.resolveRef(req, idValue = "42"))
+        assertEquals(Triple("path", "42", 1), Triple(ref.location, ref.value, ref.index))
+        assertEquals("GET /users/1002-alice$tail", IdorHunt.applySwap(req, ref, "1002"))
+
+        val withExtension = "GET /users/42_alice.json$tail"
+        val pinned = assertNotNull(IdorHunt.resolveRef(withExtension, idValue = "42"))
+        assertEquals("GET /users/7_alice.json$tail", IdorHunt.applySwap(withExtension, pinned, "7"))
+
+        // a letter or a digit after it makes another value
+        assertNull(IdorHunt.resolveRef("GET /users/42alice$tail", idValue = "42"))
+        assertNull(IdorHunt.resolveRef("GET /users/420-x$tail", idValue = "42"))
+        // a segment holding the value on its own wins over one that only begins with it
+        assertEquals(1, assertNotNull(IdorHunt.resolveRef("GET /users/42/posts/42-draft$tail", idValue = "42")).index)
+        // detection never cuts an id out of a segment, and neither does a ref that names no segment
+        assertNull(IdorHunt.resolveRef("GET /products/1-click-buy$tail", ownedIds = listOf("1")))
+        assertEquals(req, IdorHunt.applySwap(req, IdorHunt.ObjectRef("path", "segment", "42", IdFormat.INT), "1002"))
+    }
+
     @Test fun `an id an identity owns is preferred over guessing`() {
         val req = "GET /orgs/7/items/900?page=41$tail"
         assertEquals("900", assertNotNull(IdorHunt.resolveRef(req)).value)
@@ -320,6 +340,18 @@ class IdorHuntTest {
         // an owned id that only matches a non-id parameter does not beat a detected reference
         assertEquals("900", assertNotNull(IdorHunt.resolveRef(req, ownedIds = listOf("41"))).value)
         assertEquals("900", assertNotNull(IdorHunt.resolveRef(req, ownedIds = listOf("31337"))).value)
+    }
+
+    @Test fun `an owned id is never taken from a header that is not named like an id`() {
+        val flags = "GET /account HTTP/1.1\r\nHost: x.com\r\nUpgrade-Insecure-Requests: 1\r\nDNT: 1\r\nCookie: session=abc\r\n\r\n"
+        assertNull(IdorHunt.resolveRef(flags, ownedIds = listOf("1", "2")))
+
+        // an id-named header still holds it, and so does a query parameter that is not named like one
+        val named = "GET /account HTTP/1.1\r\nHost: x.com\r\nUpgrade-Insecure-Requests: 1\r\nX-Account-Id: 1\r\n\r\n"
+        assertEquals("X-Account-Id", assertNotNull(IdorHunt.resolveRef(named, ownedIds = listOf("1", "2"))).name)
+        val slug = "GET /profile?u=alice HTTP/1.1\r\nHost: x.com\r\nUpgrade-Insecure-Requests: 1\r\n\r\n"
+        val bySlug = assertNotNull(IdorHunt.resolveRef(slug, ownedIds = listOf("alice", "bob")))
+        assertEquals("query" to "u", bySlug.location to bySlug.name)
     }
 
     @Test fun `json references are named by path and literals are not references`() {
@@ -495,6 +527,24 @@ class IdorHuntTest {
         val v = transform(200, "team TEAM-CANARY other", shared)
         assertEquals("unverified_object", v.id)
         assertNull(v.matchedIdentity)
+    }
+
+    @Test fun `without the reader's own view a response is not placed by similarity`() {
+        val noOwnView = baseline.copy(ownBody = null, others = listOf(IdorHunt.OtherIdentity("bob", null, bobView)))
+        // another object built on the same template as bob's view, with no canary to place it
+        val sameTemplate = { a: String, b: String -> if (a == b) 100.0 else 92.0 }
+        val lookAlike = transform(200, "{\"owner\":\"carol\",\"id\":1004}", noOwnView, sameTemplate)
+        assertEquals("own_view_missing", lookAlike.id)
+        assertEquals("info", lookAlike.severity)
+        assertFalse(lookAlike.candidate)
+        assertNull(lookAlike.matchedIdentity)
+        // nor is an object unlike anything a medium candidate
+        assertEquals("own_view_missing", transform(200, "{\"owner\":\"carol\",\"id\":1004}", noOwnView).id)
+
+        // a canary is evidence of its own: it still confirms a cross-identity read
+        val confirmed = transform(200, bobView, baseline.copy(ownBody = null))
+        assertEquals("confirmed_cross_identity_read", confirmed.id)
+        assertEquals("critical", confirmed.severity)
     }
 
     @Test fun `the unknown-id probe keeps the shape of the id and does not collide with it`() {

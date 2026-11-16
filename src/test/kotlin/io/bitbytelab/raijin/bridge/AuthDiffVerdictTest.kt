@@ -236,6 +236,41 @@ class AuthDiffVerdictTest {
         data.forEach { assertFalse(AuthDenialHeuristic.looksDenied(it), it.take(120)) }
     }
 
+    @Test
+    fun `denial words in json data are content, only the envelope's error, message or detail refuses`() {
+        val data = listOf(
+            "[{\"state\":\"session_expired\"}]",
+            "{\"state\":\"session_expired\",\"id\":7}",
+            "{\"sessions\":[{\"id\":1,\"status\":\"expired\",\"note\":\"session expired\"}]}",
+            "{\"data\":{\"message\":\"Please log in to see the attachment\"}}",
+            "{\"jobs\":[{\"id\":3,\"error\":\"token expired\"}]}",
+            "{\"logs\":[{\"status\":403,\"path\":\"/admin\"}]}",
+            "{\"message\":{\"from\":\"bob\",\"text\":\"not allowed here\"}}",
+            // JSON lines are records too
+            "{\"id\":1}\n{\"state\":\"unauthorized\"}"
+        )
+        data.forEach { assertFalse(AuthDenialHeuristic.looksDenied(it), it) }
+
+        val refusals = listOf(
+            "{\"error\":{\"code\":401,\"message\":\"Request had invalid authentication credentials.\"}}",
+            "{\"errors\":[{\"status\":\"403\",\"title\":\"Forbidden\"}]}",
+            "{\"Message\":\"User is not authorized to access this resource\"}",
+            "{\"messages\":[\"Session expired\"]}",
+            "{\"fault\":{\"faultstring\":\"Invalid ApiKey\"}}",
+            "{\"statusCode\":403,\"message\":\"x\"}",
+            "{\"Error-Code\":\"401\"}"
+        )
+        refusals.forEach { assertTrue(AuthDenialHeuristic.looksDenied(it), it) }
+    }
+
+    @Test
+    fun `short json data every identity reads alike is exposure, not a refusal`() {
+        val data = "[{\"state\":\"session_expired\"}]"
+        val f = AuthDiffVerdict.assess(listOf(lr("admin", 200, data), lr("low_priv", 200, data)), sim)
+        assertEquals(listOf("all_identical"), f.map { it.id })
+        assertEquals("critical", f.single().severity)
+    }
+
     // ---- redirects to authenticate ----
 
     @Test

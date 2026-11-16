@@ -9,7 +9,6 @@ import burp.api.montoya.websocket.TextMessage
 import burp.api.montoya.websocket.extension.ExtensionWebSocket
 import burp.api.montoya.websocket.extension.ExtensionWebSocketMessageHandler
 import io.bitbytelab.raijin.core.BodyText
-import io.bitbytelab.raijin.core.SensitiveHeaders
 import io.bitbytelab.raijin.graphql.BatchAttack
 import io.bitbytelab.raijin.graphql.EngineFingerprinter
 import io.bitbytelab.raijin.graphql.GQLSchema
@@ -73,7 +72,12 @@ class GraphQlBridge(private val api: MontoyaApi) {
      * credentials already observed on the wire instead of supplying them by hand.
      */
     private fun autoHeadersForHost(url: String): Map<String, String> {
-        val host = try { java.net.URI(url).host } catch (_: Exception) { null } ?: return emptyMap()
+        // A host with an underscore (a Docker service) is left out of URI.host; the authority keeps it.
+        val host = try {
+            java.net.URI(url).let { it.host ?: it.rawAuthority?.substringAfterLast('@')?.substringBefore(':') }
+        } catch (_: Exception) {
+            null
+        }?.takeIf { it.isNotEmpty() } ?: return emptyMap()
         return try {
             val filter = ProxyHistoryFilter { it.host().equals(host, ignoreCase = true) }
             api.proxy().history(filter).lastOrNull()
@@ -426,8 +430,10 @@ class GraphQlBridge(private val api: MontoyaApi) {
      * whether `connection_init` needs credentials, and whether an operation can be started. See
      * [SubscriptionProbe] for the sessions it runs.
      *
-     * Credentials are the caller's identity headers ([SensitiveHeaders]) and [connectionPayload];
-     * the anonymous sessions are sent without either.
+     * Credentials are the caller's headers and [connectionPayload]. The anonymous sessions send
+     * neither: of the headers they keep only those that identify nobody
+     * ([SubscriptionEndpoint.anonymousHeaders]: Host, Origin, User-Agent), since a credential can
+     * hide under any name (`x-hasura-admin-secret`, `apikey`).
      *
      * @param subscriptionQuery operation to start after `connection_ack`; null lets the probe pick one.
      * @param waitMs bound on each wait for a server message.
@@ -445,7 +451,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
         val check = scopeGate.check(endpoint.httpUrl)
         check.deny?.let { return it }
         val identified = resolveHeaders(endpoint.httpUrl, headers, autoHeaders)
-        val anonymous = identified.filterKeys { !SensitiveHeaders.isSensitive(it) }
+        val anonymous = SubscriptionEndpoint.anonymousHeaders(identified)
         val result = try {
             SubscriptionProbe(
                 open = { protocol, authenticated -> openSocket(endpoint, protocol, if (authenticated) identified else anonymous) },
