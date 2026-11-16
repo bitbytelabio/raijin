@@ -1,247 +1,268 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
+import burp.api.montoya.collaborator.Interaction
+import burp.api.montoya.collaborator.InteractionType
+import burp.api.montoya.core.BurpSuiteEdition
+import burp.api.montoya.core.ByteArray as BurpByteArray
 import burp.api.montoya.http.HttpService
+import burp.api.montoya.http.message.HttpRequestResponse
 import burp.api.montoya.http.message.requests.HttpRequest
-import io.bitbytelab.raijin.core.TextSimilarity
-import io.bitbytelab.raijin.injection.InjectionOracle
+import io.bitbytelab.raijin.injection.FuzzTemplate
+import io.bitbytelab.raijin.injection.InjectionClass
+import io.bitbytelab.raijin.injection.InjectionProbe
+import io.bitbytelab.raijin.injection.Observation
+import io.bitbytelab.raijin.injection.OobChannel
+import io.bitbytelab.raijin.injection.OobHub
+import io.bitbytelab.raijin.injection.PayloadEncoding
 import io.bitbytelab.raijin.safety.BoundedHttp
 import io.bitbytelab.raijin.safety.RequestHygiene
 import io.bitbytelab.raijin.safety.ScopeGate
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
-import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 
 /**
- * Guided injection probe with confirmation oracles — turns raw fuzzing into
- * confirmed findings. Mark the injection point with the FUZZ keyword; for each
- * vuln class it injects class-specific payloads and confirms via
- * [InjectionOracle] (SQL error fingerprints, SSTI math-evaluation, file markers,
- * time-delay, boolean-differential). Scope-gated. Blind/OOB classes (SSRF, blind cmdi)
- * are out of scope here — pair collaborator_* with http_fuzz for those.
+ * Guided injection probe with confirmation oracles. The caller marks the injection point with
+ * the FUZZ keyword; [InjectionProbe] sends class-specific payloads and reports only what an
+ * oracle confirmed against a baseline, with the evidence. This bridge supplies the Burp side:
+ * the scope gate, the HTTP exchange, and the Collaborator client behind the out-of-band checks
+ * (blind SSRF, XXE and command injection), which are skipped with a reason when Burp has none.
  */
 class InjectionBridge(private val api: MontoyaApi) {
 
     private val scopeGate = ScopeGate(api)
+    private val oobLock = Any()
+    private var oobHub: OobHub? = null
 
-    private data class Probe(val body: String, val status: Int, val elapsedMs: Long)
+    /**
+     * @param classes subset of [InjectionClass.accepted]; null or empty tests every class.
+     * @param delaySeconds sleep asked of time-based payloads. Raise it for a target with jitter
+     *   or one that clamps short sleeps.
+     * @param encoding a [PayloadEncoding] id; null encodes each FUZZ for its position.
+     * @param baseValue benign value the baseline carries at FUZZ and appended payloads keep as
+     *   their prefix. The parameter's real value makes TRUE conditions reproduce the normal page.
+     * @param oob false skips the Collaborator checks.
+     * @param oobWaitSeconds how long to wait for out-of-band interactions after the last probe.
+     * @param timeBudgetSeconds no new probe starts after this long; unfinished classes are reported.
+     */
+    fun probe(
+        request: String,
+        host: String,
+        port: Int,
+        useTls: Boolean,
+        classes: List<String>?,
+        delaySeconds: Int = 5,
+        encoding: String? = null,
+        baseValue: String = "1",
+        oob: Boolean = true,
+        oobWaitSeconds: Int = 5,
+        timeBudgetSeconds: Int = 300,
+    ): JsonObject {
+        val target = (if (useTls) "https" else "http") + "://$host:$port"
+        scopeGate.deny("$target/")?.let { return it }
+        return try {
+            val selection = InjectionClass.select(classes)
+            selection.error?.let { return failure(it) }
+            val mode = PayloadEncoding.fromId(encoding ?: PayloadEncoding.AUTO.id)
+                ?: return failure("Parameter 'encoding' has invalid value '$encoding'. Allowed: ${PayloadEncoding.ids.joinToString(", ")}")
+            outOfRange("delay_seconds", delaySeconds, DELAY_SECONDS)?.let { return failure(it) }
+            outOfRange("oob_wait_seconds", oobWaitSeconds, OOB_WAIT_SECONDS)?.let { return failure(it) }
+            outOfRange("time_budget_seconds", timeBudgetSeconds, TIME_BUDGET_SECONDS)?.let { return failure(it) }
+            val template = FuzzTemplate.parse(RequestHygiene.normalizeCrlf(request))
+            if (!template.hasMarker) return failure(InjectionProbe.NO_MARKER)
 
-    private fun send(service: HttpService, raw: String): Probe = try {
-        val start = System.nanoTime()
-        val result = BoundedHttp.send(api, HttpRequest.httpRequest(service, RequestHygiene.normalizeCrlf(raw)))
-        val ms = (System.nanoTime() - start) / 1_000_000
-        val resp = result?.response()
-        Probe(resp?.bodyToString() ?: "", resp?.statusCode()?.toInt() ?: 0, ms)
-    } catch (_: Exception) {
-        Probe("", 0, 0)
+            val service = HttpService.httpService(host, port, useTls)
+            val wantsOob = selection.classes.any { it in InjectionProbe.OOB_CLASSES }
+            val (hub, oobProblem) = when {
+                !wantsOob -> null to null
+                !oob -> null to "disabled by the caller (oob=false)"
+                else -> collaborator()
+            }
+            val channel = hub?.channel()
+            val report = try {
+                InjectionProbe(
+                    template,
+                    InjectionProbe.Settings(
+                        classes = selection.classes,
+                        encoding = mode,
+                        baseValue = baseValue,
+                        delaySeconds = delaySeconds,
+                        targetHost = host,
+                        oobWaitMs = oobWaitSeconds * 1000L,
+                        timeBudgetMs = timeBudgetSeconds * 1000L,
+                        oobUnavailable = oobProblem,
+                    ),
+                    oob = channel,
+                ) { raw, timeoutMs -> exchange(service, raw, timeoutMs) }.run()
+            } finally {
+                if (hub != null && channel != null) hub.release(channel)
+            }
+            // Also when this call ran no out-of-band check: an earlier call's interactions may have arrived since.
+            val late = synchronized(oobLock) { oobHub }?.late().orEmpty()
+
+            buildJsonObject {
+                put("target", target)
+                if (report.error == null) {
+                    putJsonArray("injection_context") { template.contexts.forEach { add(it.id) } }
+                    put("encoding", mode.id)
+                    put("base_value", baseValue)
+                    put("delay_seconds", delaySeconds)
+                }
+                report.toJson().forEach { (key, value) -> put(key, value) }
+                if (wantsOob && report.error == null) {
+                    putJsonObject("oob") {
+                        put("available", hub != null)
+                        if (oobProblem != null) put("unavailable_reason", oobProblem)
+                        if (hub != null) {
+                            put("probes_sent", report.oobProbes)
+                            put("waited_seconds", oobWaitSeconds)
+                        }
+                    }
+                }
+                if (late.isNotEmpty()) {
+                    // Interactions for payloads of earlier calls that arrived after those calls returned.
+                    putJsonArray("late_oob_interactions") {
+                        for ((purpose, oobHost, interaction) in late) {
+                            addJsonObject {
+                                put("probe", purpose)
+                                put("oob_host", oobHost)
+                                put("type", interaction.type)
+                                put("client_ip", interaction.clientIp)
+                                put("timestamp", interaction.timestamp)
+                                if (interaction.detail.isNotEmpty()) put("detail", interaction.detail)
+                            }
+                        }
+                    }
+                }
+                if (report.error == null) put("note", NOTE)
+            }
+        } catch (e: Exception) {
+            failure("Injection probe failed: ${e.message}")
+        }
     }
 
-    private fun finding(cls: String, technique: String, detail: String, payload: String): JsonObject = buildJsonObject {
-        put("class", cls)
-        put("technique", technique)
-        put("severity", "high")
-        put("detail", detail)
-        put("payload", payload)
+    private fun failure(message: String): JsonObject = buildJsonObject { put("error", message) }
+
+    private fun outOfRange(name: String, value: Int, range: IntRange): String? =
+        if (value in range) null else "Parameter '$name' must be between ${range.first} and ${range.last} (got $value)"
+
+    /**
+     * One bounded exchange. The request goes out as explicit bytes in the charset its
+     * Content-Length was counted in ([RequestHygiene.wireCharset]). No response within
+     * [timeoutMs] is status 0, which no oracle accepts.
+     */
+    private fun exchange(service: HttpService, raw: String, timeoutMs: Long): Observation {
+        val started = System.nanoTime()
+        val result = try {
+            val bytes = raw.toByteArray(RequestHygiene.wireCharset(raw))
+            BoundedHttp.send(api, HttpRequest.httpRequest(service, BurpByteArray.byteArray(*bytes)), timeoutMs)
+        } catch (_: Exception) {
+            null
+        }
+        val wallMs = (System.nanoTime() - started) / 1_000_000
+        val response = try { result?.response() } catch (_: Exception) { null } ?: return Observation(status = 0, elapsedMs = wallMs)
+        return try {
+            val body = response.bodyToString()
+            Observation(
+                status = response.statusCode().toInt(),
+                headers = response.headers().map { it.name() to it.value() },
+                body = if (body.length > MAX_BODY) body.substring(0, MAX_BODY) else body,
+                elapsedMs = burpElapsedMs(result) ?: wallMs,
+            )
+        } catch (_: Exception) {
+            Observation(status = 0, elapsedMs = wallMs)
+        }
     }
 
     /**
-     * @param delaySeconds Sleep duration for time-based SQLi payloads (default 5). Raise this
-     *   for a target with network jitter, a lab that only counts a longer sleep as solved, or
-     *   a WAF that clamps/rate-limits short sleeps.
+     * Burp's own request-sent-to-response-end time, which leaves out connection setup and the
+     * wait for a worker thread, so a slow handshake does not look like an injected delay.
      */
-    fun probe(request: String, host: String, port: Int, useTls: Boolean, classes: List<String>?, delaySeconds: Int = 5): JsonObject {
-        scopeGate.deny((if (useTls) "https" else "http") + "://$host:$port/")?.let { return it }
-        return try {
-            val service = HttpService.httpService(host, port, useTls)
-            val base = RequestHygiene.normalizeCrlf(request)
-            if (!base.contains("FUZZ")) {
-                return buildJsonObject { put("error", "Mark the injection point with the FUZZ keyword in the request string.") }
-            }
+    private fun burpElapsedMs(result: HttpRequestResponse?): Long? = try {
+        result?.timingData()?.orElse(null)?.timeBetweenRequestSentAndEndOfResponse()?.toMillis()
+    } catch (_: Exception) {
+        null
+    }
 
-            val active = classes?.map { it.lowercase() }?.takeIf { it.isNotEmpty() } ?: listOf("sqli", "ssti", "lfi")
-            val baseline = send(service, preparePayloadRequest(base, "1"))
-            var probesSent = 1
-            val findings = mutableListOf<JsonObject>()
-
-            for (cls in active) {
-                when (cls) {
-                    "sqli" -> {
-                        for (p in listOf("'", "\"", "')", "1'\"")) {
-                            val r = send(service, preparePayloadRequest(base, p)); probesSent++
-                            if (r.status <= 0) continue
-                            val dbms = InjectionOracle.sqlError(r.body)
-                            if (dbms != null && InjectionOracle.sqlError(baseline.body) == null) {
-                                findings.add(finding("sqli", "error-based", "SQL error signature (DBMS=$dbms) via payload $p", p))
-                                break
-                            }
-                        }
-
-                        if (baseline.status > 0) {
-                            // Comment-truncation, concatenation-breakout, and unquoted numeric shapes.
-                            val timingPayloads = listOf(
-                                "' AND SLEEP($delaySeconds)-- -", "1) AND SLEEP($delaySeconds)-- -",
-                                " AND SLEEP($delaySeconds)", " OR SLEEP($delaySeconds)-- -",
-                                "';WAITFOR DELAY '0:0:$delaySeconds'-- -", ";WAITFOR DELAY '0:0:$delaySeconds'-- -",
-                                "' AND pg_sleep($delaySeconds)-- -", " AND pg_sleep($delaySeconds)",
-                                "x'||pg_sleep($delaySeconds)||'", "'||pg_sleep($delaySeconds)||'",
-                                "x' AND SLEEP($delaySeconds) AND 'x'='x", "x';WAITFOR DELAY '0:0:$delaySeconds'--",
-                                "'||(SELECT CASE WHEN (1=1) THEN DBMS_PIPE.RECEIVE_MESSAGE('a',$delaySeconds) ELSE 1 END FROM dual)||'"
-                            )
-                            val thresholdMs = (delaySeconds * 1000L * 0.7).toLong()
-                            for (p in timingPayloads) {
-                                val r = send(service, preparePayloadRequest(base, p)); probesSent++
-                                if (InjectionOracle.timeDelayed(baseline.status, baseline.elapsedMs, r.status, r.elapsedMs, delaySeconds)) {
-                                    // Re-verify against a fresh fast baseline control to rule out transient network jitter.
-                                    val ctrl = send(service, preparePayloadRequest(base, "1")); probesSent++
-                                    if (ctrl.status > 0 && ctrl.elapsedMs < thresholdMs * 0.7) {
-                                        val confirm = send(service, preparePayloadRequest(base, p)); probesSent++
-                                        if (InjectionOracle.timeDelayed(ctrl.status, ctrl.elapsedMs, confirm.status, confirm.elapsedMs, delaySeconds)) {
-                                            findings.add(finding(
-                                                "sqli", "time-based",
-                                                "response delayed ~${delaySeconds}s twice via $p (baseline ${ctrl.elapsedMs}ms, probe1 ${r.elapsedMs}ms, probe2 ${confirm.elapsedMs}ms)",
-                                                p
-                                            ))
-                                            break
-                                        }
-                                    }
-                                }
-                            }
-
-                            val boolPairs = listOf(
-                                "' AND '1'='1" to "' AND '1'='2",
-                                "' OR '1'='1" to "' OR '1'='2",
-                                "x' AND '1'='1" to "x' AND '1'='2",
-                                "'||('1'='1')||'" to "'||('1'='2')||'",
-                                " AND 1=1" to " AND 1=2",
-                                " OR 1=1" to " OR 1=2"
-                            )
-                            for ((truePayload, falsePayload) in boolPairs) {
-                                val trueR = send(service, preparePayloadRequest(base, truePayload)); probesSent++
-                                if (trueR.status <= 0) continue
-                                val falseR = send(service, preparePayloadRequest(base, falsePayload)); probesSent++
-                                if (falseR.status <= 0) continue
-                                if (InjectionOracle.booleanDifferential(baseline.body, trueR.body, falseR.body, TextSimilarity::dice)) {
-                                    findings.add(
-                                        finding(
-                                            "sqli", "boolean-differential",
-                                            "response diverges between TRUE ($truePayload) and FALSE ($falsePayload) conditions " +
-                                                "— one matches the baseline, the other does not",
-                                            "$truePayload | $falsePayload"
-                                        )
-                                    )
-                                    break
-                                }
-                            }
-                        }
+    /**
+     * The shared Collaborator hub, created on first use, or the reason there is none (Community
+     * Edition, Collaborator disabled). A client that stops issuing payloads is dropped, so the
+     * next call creates one for the current Collaborator settings.
+     */
+    private fun collaborator(): Pair<OobHub?, String?> = synchronized(oobLock) {
+        oobHub?.let { return@synchronized it to null }
+        val edition = try { api.burpSuite().version().edition() } catch (_: Exception) { null }
+        if (edition == BurpSuiteEdition.COMMUNITY_EDITION) {
+            return@synchronized null to "Burp Collaborator needs Burp Suite Professional (this is Community Edition)"
+        }
+        try {
+            val client = api.collaborator().createClient()
+            val hub = OobHub(
+                generate = {
+                    try {
+                        client.generatePayload().let { OobChannel.Payload(it.id().toString(), it.toString()) }
+                    } catch (e: Exception) {
+                        synchronized(oobLock) { oobHub = null }
+                        null
                     }
-                    "ssti" -> {
-                        for (p in listOf("{{1337*1337}}", "\${1337*1337}", "<%= 1337*1337 %>", "#{1337*1337}", "\${{1337*1337}}")) {
-                            val r = send(service, preparePayloadRequest(base, p)); probesSent++
-                            if (r.status <= 0) continue
-                            if (InjectionOracle.evaluatedTo(r.body, "1787569") && !InjectionOracle.evaluatedTo(baseline.body, "1787569")) {
-                                findings.add(finding("ssti", "math-eval", "template evaluated 1337*1337=1787569 via $p", p)); break
-                            }
-                        }
-                    }
-                    "lfi", "traversal" -> {
-                        for (p in listOf("../../../../etc/passwd", "/etc/passwd", "....//....//....//etc/passwd", "..\\..\\..\\..\\windows\\win.ini")) {
-                            val r = send(service, preparePayloadRequest(base, p)); probesSent++
-                            if (r.status <= 0) continue
-                            val marker = InjectionOracle.novelFileMarker(baseline.body, r.body)
-                            if (marker != null) { findings.add(finding("lfi", marker, "file contents disclosed ($marker) via $p", p)); break }
-                        }
-                    }
-                }
-            }
-
-            buildJsonObject {
-                put("target", "${if (useTls) "https" else "http"}://$host:$port")
-                put("classes_tested", buildJsonArray { active.forEach { add(it) } })
-                put("delay_seconds", delaySeconds)
-                put("probes_sent", probesSent)
-                put("confirmed_count", findings.size)
-                put("findings", buildJsonArray { findings.forEach { add(it) } })
-                put(
-                    "note",
-                    "Confirmed via deterministic oracles (SQL errors, template math-eval, file markers, time delay, " +
-                        "boolean-differential). FUZZ works anywhere in the raw request, including inside a header line " +
-                        "such as 'Cookie: TrackingId=FUZZ'. For blind/OOB (SSRF, blind cmdi) pair collaborator_* with http_fuzz."
-                )
-            }
+                },
+                fetch = { client.allInteractions.map(::describe) },
+            )
+            oobHub = hub
+            hub to null
+        } catch (e: UnsupportedOperationException) {
+            null to "Burp Collaborator is not available in this edition of Burp Suite"
+        } catch (e: IllegalStateException) {
+            null to "Burp Collaborator is disabled in the project settings (${e.message})"
         } catch (e: Exception) {
-            buildJsonObject { put("error", "Injection probe failed: ${e.message}") }
+            null to "a Burp Collaborator client could not be created (${e.message})"
         }
     }
 
+    private fun describe(interaction: Interaction): OobChannel.Interaction {
+        val type = interaction.type()
+        val detail = try {
+            when (type) {
+                InteractionType.HTTP -> interaction.httpDetails().orElse(null)?.requestResponse()?.request()?.let { "${it.method()} ${it.path()}" }
+                InteractionType.DNS -> interaction.dnsDetails().orElse(null)?.queryType()?.name
+                else -> null
+            }
+        } catch (_: Exception) {
+            null
+        }
+        return OobChannel.Interaction(
+            payloadId = interaction.id().toString(),
+            type = type.name.lowercase(),
+            clientIp = try { interaction.clientIp()?.hostAddress } catch (_: Exception) { null } ?: "",
+            timestamp = try { interaction.timeStamp()?.toString() } catch (_: Exception) { null } ?: "",
+            detail = detail ?: "",
+        )
+    }
+
     companion object {
+        val DELAY_SECONDS = 1..30
+        val OOB_WAIT_SECONDS = 0..60
+        val TIME_BUDGET_SECONDS = 10..3600
+
+        /** Response bodies are compared up to this many characters. */
+        private const val MAX_BODY = 500_000
+
+        private const val NOTE =
+            "Each finding was confirmed by an oracle against the baseline (the same request with base_value at FUZZ) and " +
+                "carries its evidence. To re-check one, put evidence.sent_payload at FUZZ as it is (it is already encoded " +
+                "for that position), or send evidence.request when the probe rewrote the request. confidence: certain = " +
+                "the response holds proof, firm = behaviour reproduced under controls, tentative = a precondition only."
+
         /**
-         * Substitutes [payload] into [normalizedRequest] at `FUZZ` with context-appropriate
-         * escaping (request-line breaks/spaces/delimiters vs JSON string literal) and updates
-         * `Content-Length` if present. Pure helper for unit testing.
+         * [payload] substituted at every `FUZZ` of [normalizedRequest] in the encoding its
+         * position needs, with Content-Length updated ([FuzzTemplate]).
          */
-        internal fun preparePayloadRequest(normalizedRequest: String, payload: String): String {
-            val firstLineEnd = normalizedRequest.indexOf("\r\n")
-            val headerEnd = normalizedRequest.indexOf("\r\n\r\n")
-            val reqLineFuzz = firstLineEnd > 0 && normalizedRequest.substring(0, firstLineEnd).contains("FUZZ")
-            val bodyStart = if (headerEnd >= 0) headerEnd + 4 else -1
-            val isJson = headerEnd >= 0 &&
-                normalizedRequest.substring(0, headerEnd).contains("application/json", ignoreCase = true)
-
-            val encoded = when {
-                reqLineFuzz -> encodeRequestLinePayload(payload)
-                isJson && bodyStart >= 0 && isInsideJsonString(normalizedRequest, bodyStart) ->
-                    escapeJsonStringContent(payload)
-                else -> payload
-            }
-            val replaced = normalizedRequest.replace("FUZZ", encoded)
-            return RequestHygiene.fixContentLength(replaced, utf8Body = true).request
-        }
-
-        private fun encodeRequestLinePayload(payload: String): String = buildString(payload.length) {
-            for (ch in payload) {
-                when (ch) {
-                    ' ' -> append("%20")
-                    '&' -> append("%26")
-                    '#' -> append("%23")
-                    '+' -> append("%2B")
-                    '\r' -> append("%0D")
-                    '\n' -> append("%0A")
-                    else -> append(ch)
-                }
-            }
-        }
-
-        private fun isInsideJsonString(request: String, bodyStart: Int): Boolean {
-            val fuzzIdx = request.indexOf("FUZZ", startIndex = bodyStart)
-            if (fuzzIdx < 0) return false
-            val before = request.substring(bodyStart, fuzzIdx)
-            var inQuotes = false
-            var escaped = false
-            for (ch in before) {
-                if (escaped) {
-                    escaped = false
-                } else if (ch == '\\') {
-                    escaped = true
-                } else if (ch == '"') {
-                    inQuotes = !inQuotes
-                }
-            }
-            return inQuotes
-        }
-
-        private fun escapeJsonStringContent(payload: String): String = buildString(payload.length) {
-            for (ch in payload) {
-                when (ch) {
-                    '\\' -> append("\\\\")
-                    '"' -> append("\\\"")
-                    '\n' -> append("\\n")
-                    '\r' -> append("\\r")
-                    '\t' -> append("\\t")
-                    else -> append(ch)
-                }
-            }
-        }
+        internal fun preparePayloadRequest(normalizedRequest: String, payload: String): String =
+            FuzzTemplate.parse(normalizedRequest).render(payload)
     }
 }
