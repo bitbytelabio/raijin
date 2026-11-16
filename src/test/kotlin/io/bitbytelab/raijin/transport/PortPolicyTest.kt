@@ -96,4 +96,19 @@ class PortPolicyTest {
         assertEquals(3, setOf(a.ssePort, a.httpPort, a.dashboardPort).size, a.toString())
         assertTrue(listOf(a.ssePort, a.httpPort, a.dashboardPort).all { it in 1..65535 })
     }
+
+    @Test fun `a moved listener never takes another listener's configured port`() {
+        // mcp_sse_port=9877, the obvious way around PortSwigger's MCP Server on 9876.
+        val a = PortPolicy.resolveDistinct(9877, 9877, 9878)
+        assertEquals(listOf(9877, 9879, 9878), listOf(a.ssePort, a.httpPort, a.dashboardPort))
+        val message = a.messages.single()
+        assertTrue(PortPolicy.PREF_HTTP_PORT in message && "uses 9879" in message, message)
+        assertFalse(PortPolicy.PREF_DASHBOARD_PORT in message, message)
+    }
+
+    @Test fun `a listener whose default is configured for another one skips it`() {
+        val a = PortPolicy.resolveDistinct(9876, 9876, 9877)
+        assertEquals(listOf(9876, 9878, 9877), listOf(a.ssePort, a.httpPort, a.dashboardPort))
+        assertEquals(1, a.messages.size)
+    }
 }

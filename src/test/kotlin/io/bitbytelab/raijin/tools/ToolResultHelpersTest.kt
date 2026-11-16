@@ -148,6 +148,24 @@ class ToolResultHelpersTest {
     }
 
     @Test
+    fun `util_decode_smart clamps max_depth and says so instead of refusing it`() {
+        val server = utilitiesServer()
+        val b64 = Base64.getEncoder().encodeToString("plain".toByteArray())
+
+        val deep = callUtil(server, "util_decode_smart", buildJsonObject { put("data", b64); put("max_depth", 1000) })
+        assertFalse(deep.isError == true)
+        assertEquals("plain", parsed(deep)["decoded"]?.jsonPrimitive?.content)
+        assertEquals(100, parsed(deep)["max_depth_clamped_to"]?.jsonPrimitive?.int)
+
+        val none = callUtil(server, "util_decode_smart", buildJsonObject { put("data", b64); put("max_depth", 0) })
+        assertEquals(0, parsed(none)["layers"]?.jsonPrimitive?.int)
+        assertEquals(null, parsed(none)["max_depth_clamped_to"], "0 is in range")
+
+        val integral = callUtil(server, "util_decode_smart", buildJsonObject { put("data", b64); put("max_depth", 5.0) })
+        assertEquals(1, parsed(integral)["layers"]?.jsonPrimitive?.int)
+    }
+
+    @Test
     fun `util_jwt_decode keeps claims with quotes, backslashes and newlines intact`() {
         val server = utilitiesServer()
         val enc = Base64.getUrlEncoder().withoutPadding()
@@ -168,7 +186,7 @@ class ToolResultHelpersTest {
             "util_random_string" to buildJsonObject { put("length", 0) },
             "util_random_bytes" to buildJsonObject { put("length", "many") },
             "util_random_bytes" to buildJsonObject { },
-            "util_decode_smart" to buildJsonObject { put("data", "x"); put("max_depth", 1000) },
+            "util_decode_smart" to buildJsonObject { put("data", "x"); put("max_depth", 1.5) },
             "util_jwt_decode" to buildJsonObject { put("token", "not\"a\\jwt") },
             "util_base64_decode" to buildJsonObject { },
         )

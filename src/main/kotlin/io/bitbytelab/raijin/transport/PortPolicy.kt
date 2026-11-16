@@ -69,14 +69,18 @@ object PortPolicy {
      * Makes the three ports distinct so no listener is doomed to a bind failure against another
      * Raijin listener. Ports are claimed in the order primary, secondary, dashboard; a listener whose
      * port is already claimed moves to its own default when that is free, otherwise to the next free
-     * port above its configured one. Every move is reported, naming the preference to fix.
+     * port above its configured one. A moved listener never takes a port another listener is
+     * configured for, so only the listeners that share a port move. Every move is reported, naming
+     * the preference to fix.
      */
     fun resolveDistinct(ssePort: Int, httpPort: Int, dashboardPort: Int): Assignment {
+        val reserved = setOf(ssePort, httpPort, dashboardPort)
         val claimed = mutableSetOf<Int>()
         val messages = mutableListOf<String>()
         fun claim(label: String, prefKey: String, configured: Int, default: Int): Int {
             if (claimed.add(configured)) return configured
-            val moved = if (default !in claimed) default else nextFree(configured, claimed)
+            val taken = claimed + reserved
+            val moved = if (default !in taken) default else nextFree(configured, taken)
             claimed += moved
             messages += "Raijin: port $configured is configured for more than one listener; the $label " +
                 "listener uses $moved for this session. Set distinct ports ('$prefKey') to silence this."

@@ -5,7 +5,9 @@ import io.bitbytelab.raijin.bridge.SitemapBridge
 import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.core.asBooleanSafe
 import io.bitbytelab.raijin.core.asBoundedInt
+import io.bitbytelab.raijin.core.asClampedInt
 import io.bitbytelab.raijin.core.asStringList
+import io.bitbytelab.raijin.core.withClampReport
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
@@ -16,6 +18,8 @@ object SitemapTools {
 
     private val SEARCH_IN = listOf("url", "request", "response", "all")
     private val SEVERITIES = listOf("HIGH", "MEDIUM", "LOW", "INFORMATION")
+    /** An issue the operator marked as a false positive keeps that as its severity, so it can be filtered on. */
+    private val ISSUE_FILTER_SEVERITIES = SEVERITIES + "FALSE_POSITIVE"
     private val CONFIDENCES = listOf("CERTAIN", "FIRM", "TENTATIVE")
     private const val MAX_RESULTS = 10_000
 
@@ -41,7 +45,8 @@ object SitemapTools {
                     putJsonObject("note_contains") { put("type", "string"); put("description", "Substring match against the entry's annotation notes, e.g. '[MCP]' to find http_send_* traffic") }
                     putJsonObject("max_results") {
                         put("type", "integer"); put("minimum", 0); put("maximum", MAX_RESULTS)
-                        put("description", "Maximum entries to return, default 100 (see 'matched' in the response for the true total)")
+                        put("description", "Maximum entries to return, default 100, 0 for counts only; a larger value is clamped to $MAX_RESULTS " +
+                            "and reported as max_results_clamped_to (see 'matched' in the response for the true total)")
                     }
                     putJsonObject("include_request") { put("type", "boolean"); put("description", "Include full request text, default false") }
                     putJsonObject("include_response") { put("type", "boolean"); put("description", "Include full response text, default false") }
@@ -59,8 +64,8 @@ object SitemapTools {
                 val args = request.params.arguments ?: emptyMap()
                 val urlPrefix = args["url_prefix"]?.jsonPrimitive?.contentOrNull
                 val searchPattern = args["search_pattern"]?.jsonPrimitive?.contentOrNull
-                val maxResults = args["max_results"].asBoundedInt("max_results", 0, MAX_RESULTS)
-                    .getOrElse { return@addTool toolError(it.message ?: "Invalid max_results") } ?: 100
+                val maxResults = args["max_results"].asClampedInt("max_results", 0, MAX_RESULTS)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid max_results") }
                 val includeRequest = args["include_request"].asBooleanSafe() ?: false
                 val includeResponse = args["include_response"].asBooleanSafe() ?: false
                 val onlyWithResponse = args["only_with_response"].asBooleanSafe() ?: false
@@ -74,10 +79,10 @@ object SitemapTools {
                 val noteContains = args["note_contains"]?.jsonPrimitive?.contentOrNull
 
                 toolJsonResult(bridge.query(
-                    urlPrefix, searchPattern, maxResults, includeRequest, includeResponse,
+                    urlPrefix, searchPattern, maxResults?.value ?: 100, includeRequest, includeResponse,
                     onlyWithResponse, statusCodeRange, mime, excludeNoise, excludePattern,
                     inScopeOnly, searchIn, noteContains
-                ))
+                ).withClampReport("max_results", maxResults))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -119,13 +124,13 @@ object SitemapTools {
             description = "Retrieve audit issues from the Burp Suite site map. Returns scanner-reported " +
                 "vulnerabilities with severity, confidence, and affected URLs. Parameters: " +
                 "url_prefix (optional, filter issues by URL prefix), severity (optional, " +
-                "filter by severity: HIGH, MEDIUM, LOW, INFORMATION).",
+                "filter by severity: HIGH, MEDIUM, LOW, INFORMATION, FALSE_POSITIVE).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("url_prefix") { put("type", "string"); put("description", "Filter issues by URL prefix") }
                     putJsonObject("severity") {
                         put("type", "string")
-                        putJsonArray("enum") { SEVERITIES.forEach { add(it) } }
+                        putJsonArray("enum") { ISSUE_FILTER_SEVERITIES.forEach { add(it) } }
                         put("description", "Filter by severity")
                     }
                 },
@@ -136,7 +141,7 @@ object SitemapTools {
                 val args = request.params.arguments ?: emptyMap()
                 val urlPrefix = args["url_prefix"]?.jsonPrimitive?.contentOrNull
                 val severity = args["severity"]?.jsonPrimitive?.contentOrNull
-                EnumValidation.error(severity, SEVERITIES.toSet(), "severity")?.let { return@addTool toolJsonResult(it) }
+                EnumValidation.error(severity, ISSUE_FILTER_SEVERITIES.toSet(), "severity")?.let { return@addTool toolJsonResult(it) }
 
                 toolJsonResult(bridge.getIssues(urlPrefix, severity))
             } catch (e: Exception) {

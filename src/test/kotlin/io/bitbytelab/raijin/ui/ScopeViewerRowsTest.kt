@@ -43,4 +43,32 @@ class ScopeViewerRowsTest {
         )
         assertEquals(emptyList<List<Any?>>(), ScopeViewerPanel.rowsOf(obj("""{"error":"Failed to list scope rules"}""")))
     }
+
+    private fun row(list: String, index: Int, rule: String, enabled: Boolean = true) = listOf<Any?>(list, index, enabled, rule)
+
+    @Test
+    fun `a reload keeps the selection on the same rule, not the first rule of its list`() {
+        val before = listOf(row("Include", 0, "https://a.test"), row("Include", 1, "https://b.test"), row("Exclude", 0, "https://a.test"))
+        val after = listOf(
+            row("Include", 0, "https://new.test"),
+            row("Include", 1, "https://a.test"),
+            row("Include", 2, "https://b.test", enabled = false),
+            row("Exclude", 0, "https://a.test"),
+        )
+
+        assertEquals(2, ScopeViewerPanel.sameRuleRow(before, 1, after), "moved down a row and disabled, still the same rule")
+        assertEquals(3, ScopeViewerPanel.sameRuleRow(before, 2, after), "the exclude rule, not the include rule with the same text")
+        assertEquals(-1, ScopeViewerPanel.sameRuleRow(before, -1, after), "nothing was selected")
+        val removed = after.filterNot { it[0] == "Include" && it[3] == "https://a.test" }
+        assertEquals(-1, ScopeViewerPanel.sameRuleRow(before, 0, removed), "the selected rule is gone")
+    }
+
+    @Test
+    fun `repeated rules keep which repeat was selected`() {
+        val before = listOf(row("Include", 0, "https://a.test"), row("Include", 1, "https://a.test"))
+        val after = listOf(row("Include", 0, "https://z.test"), row("Include", 1, "https://a.test"), row("Include", 2, "https://a.test"))
+
+        assertEquals(1, ScopeViewerPanel.sameRuleRow(before, 0, after))
+        assertEquals(2, ScopeViewerPanel.sameRuleRow(before, 1, after))
+    }
 }

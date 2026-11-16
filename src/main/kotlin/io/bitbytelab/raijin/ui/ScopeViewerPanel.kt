@@ -35,6 +35,7 @@ internal class ScopeViewerPanel(
     private val table = JTable(model)
     private val status = TintedLabel(" ") { RaijinTheme.muted() }
     private var loadedOnce = false
+    private var shownRows: List<List<Any?>> = emptyList()
     private val subscription: String
 
     init {
@@ -80,7 +81,13 @@ internal class ScopeViewerPanel(
             return
         }
         val rows = rowsOf(result)
-        model.update(rows, table)
+        val selected = table.selectedRow.let { if (it >= 0) table.convertRowIndexToModel(it) else -1 }
+        if (model.update(rows)) {
+            val row = sameRuleRow(shownRows, selected, rows)
+            shownRows = rows
+            val viewRow = if (row >= 0) table.convertRowIndexToView(row) else -1
+            if (viewRow >= 0) table.setRowSelectionInterval(viewRow, viewRow)
+        }
         val included = rows.count { it[0] == INCLUDE }
         status.text = "Include rules: $included · Exclude rules: ${rows.size - included}"
         status.tint = { RaijinTheme.muted() }
@@ -104,6 +111,27 @@ internal class ScopeViewerPanel(
                         )
                     )
                 }
+            }
+        }
+
+        /**
+         * The row of [next] holding the rule shown at [row] of [previous], or -1. A rule is known by
+         * its list, its text and which repeat of that text it is, so the selection stays on it when
+         * Burp adds, removes or toggles other rules: its index and enabled state can change, that key
+         * does not.
+         */
+        fun sameRuleRow(previous: List<List<Any?>>, row: Int, next: List<List<Any?>>): Int {
+            val key = ruleKeys(previous).getOrNull(row) ?: return -1
+            return ruleKeys(next).indexOf(key)
+        }
+
+        private fun ruleKeys(rows: List<List<Any?>>): List<Triple<Any?, Any?, Int>> {
+            val repeats = HashMap<Pair<Any?, Any?>, Int>()
+            return rows.map { r ->
+                val listAndRule = r[0] to r[3]
+                val nth = repeats.getOrDefault(listAndRule, 0)
+                repeats[listAndRule] = nth + 1
+                Triple(r[0], r[3], nth)
             }
         }
 

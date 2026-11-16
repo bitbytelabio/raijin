@@ -3,6 +3,8 @@ package io.bitbytelab.raijin.tools.utilities
 import io.bitbytelab.raijin.bridge.UtilitiesBridge
 import io.bitbytelab.raijin.core.asBoundedInt
 import io.bitbytelab.raijin.core.asBooleanSafe
+import io.bitbytelab.raijin.core.asClampedInt
+import io.bitbytelab.raijin.core.withClampReport
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.server.Server
@@ -323,11 +325,12 @@ object UtilitiesTools {
                 "(base64, URL encoding, hex) iteratively until stable or max depth is " +
                 "reached. fully_decoded is true when no further layer could be decoded. " +
                 "Parameters: data (required, the encoded data string), " +
-                "max_depth (optional integer 1-$MAX_DECODE_DEPTH, default 10, maximum decoding iterations).",
+                "max_depth (optional integer 0-$MAX_DECODE_DEPTH, default 10, maximum decoding iterations; " +
+                "a larger value is clamped and reported as max_depth_clamped_to).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     string("data", "The encoded data string")
-                    integer("max_depth", "Maximum decoding iterations (default 10)", 1, MAX_DECODE_DEPTH)
+                    integer("max_depth", "Maximum decoding iterations (default 10)", 0, MAX_DECODE_DEPTH)
                 },
                 required = listOf("data")
             )
@@ -336,10 +339,10 @@ object UtilitiesTools {
                 val args = request.params.arguments ?: emptyMap()
                 val data = args["data"]?.jsonPrimitive?.contentOrNull
                     ?: return@addTool toolError("Missing required parameter: data")
-                val maxDepth = args["max_depth"].asBoundedInt("max_depth", 1, MAX_DECODE_DEPTH)
-                    .getOrElse { return@addTool toolError(it.message ?: "Invalid max_depth") } ?: 10
+                val maxDepth = args["max_depth"].asClampedInt("max_depth", 0, MAX_DECODE_DEPTH)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid max_depth") }
 
-                toolJsonResult(bridge.decodeSmart(data, maxDepth))
+                toolJsonResult(bridge.decodeSmart(data, maxDepth?.value ?: 10).withClampReport("max_depth", maxDepth))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }

@@ -1,6 +1,8 @@
 package io.bitbytelab.raijin.core
 
 import kotlinx.serialization.json.*
+import java.math.BigDecimal
+import java.math.RoundingMode
 
 /**
  * Robust JSON argument extraction helpers for MCP tool parameters.
@@ -245,22 +247,20 @@ fun JsonElement?.asBodyString(): String? {
 
 /**
  * Extract a Long from a JsonElement that might be:
- * - A JsonPrimitive number
- * - A JsonPrimitive numeric string
- * - null
+ * - A JsonPrimitive integral number, however it is written (`50`, `50.0`, `5e1`)
+ * - A JsonPrimitive numeric string of the same
+ * Returns null when absent, JSON null, fractional, non-numeric or outside the Long range. Nothing is
+ * rounded: `50.0000000000000001` is fractional, and `9007199254740993e0` keeps its last digit.
  */
 fun JsonElement?.asLongSafe(): Long? {
-    if (this == null) return null
-    return when (this) {
-        is JsonPrimitive -> this.longOrNull ?: this.contentOrNull?.toLongOrNull()
-        else -> null
-    }
+    val text = numberText() ?: return null
+    text.toLongOrNull()?.let { return it }
+    val n = integralOrNull(text) ?: return null
+    return if (n in LONG_RANGE) n.longValueExact() else null
 }
 
 /**
- * Extract an Int from a JsonElement that might be:
- * - A JsonPrimitive integral number
- * - A JsonPrimitive numeric string
+ * Extract an Int from a JsonElement the way [asLongSafe] reads a Long.
  * Returns null when absent, JSON null, fractional, non-numeric or outside the Int range.
  */
 fun JsonElement?.asIntSafe(): Int? =
@@ -273,12 +273,66 @@ fun JsonElement?.asIntSafe(): Int? =
  */
 fun JsonElement?.asBoundedInt(name: String, min: Int, max: Int): Result<Int?> {
     if (this == null || this is JsonNull) return Result.success(null)
-    val n = asIntSafe()
-        ?: return Result.failure(IllegalArgumentException("Parameter '$name' must be an integer (got $this)"))
-    if (n !in min..max) {
-        return Result.failure(IllegalArgumentException("Parameter '$name' must be between $min and $max (got $n)"))
+    val n = integralArg(name).getOrElse { return Result.failure(it) }
+    if (n < BigDecimal.valueOf(min.toLong()) || n > BigDecimal.valueOf(max.toLong())) {
+        return Result.failure(IllegalArgumentException("Parameter '$name' must be between $min and $max (got ${numberText()})"))
     }
-    return Result.success(n)
+    return Result.success(n.intValueExact())
+}
+
+/**
+ * An integer argument read by [asClampedInt]: the [value] the tool uses, and whether the caller's
+ * value lay outside the accepted range and was moved to its nearest end.
+ */
+data class ClampedInt(val value: Int, val clamped: Boolean)
+
+/**
+ * Reads an integer tool argument [name] clamped into [min]..[max], for limits where an oversized or
+ * negative value should still run rather than fail. Success holds null when the argument is absent
+ * or JSON null (the caller applies its default); failure carries a caller-facing
+ * [IllegalArgumentException] for a value that is not an integer. Report a clamp with
+ * [withClampReport], so the caller learns the value that was used.
+ */
+fun JsonElement?.asClampedInt(name: String, min: Int, max: Int): Result<ClampedInt?> {
+    if (this == null || this is JsonNull) return Result.success(null)
+    val n = integralArg(name).getOrElse { return Result.failure(it) }
+    val bound = when {
+        n < BigDecimal.valueOf(min.toLong()) -> min
+        n > BigDecimal.valueOf(max.toLong()) -> max
+        else -> return Result.success(ClampedInt(n.intValueExact(), clamped = false))
+    }
+    return Result.success(ClampedInt(bound, clamped = true))
+}
+
+/** This result plus `<name>_clamped_to` when [arg] was clamped, naming the value the tool used instead. */
+fun JsonObject.withClampReport(name: String, arg: ClampedInt?): JsonObject =
+    if (arg?.clamped == true) JsonObject(this + ("${name}_clamped_to" to JsonPrimitive(arg.value))) else this
+
+private val LONG_RANGE = BigDecimal.valueOf(Long.MIN_VALUE)..BigDecimal.valueOf(Long.MAX_VALUE)
+
+/** The text of a number or string argument, trimmed and unquoted once; null for JSON null and non-primitives. */
+private fun JsonElement?.numberText(): String? {
+    val p = this as? JsonPrimitive ?: return null
+    if (p is JsonNull) return null
+    return p.content.trim().removeSurrounding("\"")
+}
+
+/** This argument's exact integral value, or the caller-facing error naming [name]. */
+private fun JsonElement.integralArg(name: String): Result<BigDecimal> =
+    numberText()?.let(::integralOrNull)?.let { Result.success(it) }
+        ?: Result.failure(IllegalArgumentException("Parameter '$name' must be an integer (got $this)"))
+
+/**
+ * The exact value of [text] when it is an integral decimal number (`50`, `-7`, `50.0`, `5e1`), else
+ * null. Nothing is rounded. A fraction is only looked for in a value of at least 1, so the check
+ * divides by a power of ten no longer than [text], and a huge exponent costs nothing.
+ */
+private fun integralOrNull(text: String): BigDecimal? {
+    text.toLongOrNull()?.let { return BigDecimal.valueOf(it) }
+    val n = text.toBigDecimalOrNull() ?: return null
+    val whole = n.signum() == 0 || n.scale() <= 0 ||
+        (n.precision() > n.scale() && n.setScale(0, RoundingMode.DOWN).compareTo(n) == 0)
+    return if (whole) n else null
 }
 
 /**

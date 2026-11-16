@@ -4,6 +4,7 @@ import io.ktor.http.parametersOf
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -94,11 +95,18 @@ class SecurityAllowlistTest {
     }
 
     @Test fun `the auth cookie carries a token digest, never the token`() {
-        val v = SecurityConfig.authCookieValue("my-token")
+        val ports = listOf(9876, 9877)
+        val v = SecurityConfig.authCookieValue("my-token", ports)
         assertFalse(v.contains("my-token"))
-        assertEquals(v, SecurityConfig.authCookieValue("my-token"))
-        assertFalse(v == SecurityConfig.authCookieValue("my-token2"))
+        assertEquals(v, SecurityConfig.authCookieValue("my-token", ports))
+        assertNotEquals(v, SecurityConfig.authCookieValue("my-token2", ports))
         assertTrue(v.all { it.isLetterOrDigit() || it == '-' || it == '_' }, "cookie-safe characters only: $v")
+    }
+
+    @Test fun `the auth cookie names its listener's ports, in any order`() {
+        val v = SecurityConfig.authCookieValue("my-token", listOf(9876, 9877))
+        assertEquals(v, SecurityConfig.authCookieValue("my-token", listOf(9877, 9876)))
+        assertNotEquals(v, SecurityConfig.authCookieValue("my-token", listOf(9878)), "a cookie for one listener opens no other")
     }
 
     @Test fun `the post-login redirect drops the token and cannot leave the server`() {

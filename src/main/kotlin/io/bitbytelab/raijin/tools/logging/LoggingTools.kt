@@ -21,14 +21,15 @@ object LoggingTools {
             description = "Write a message to Burp Suite's extension output or error log stream. " +
                 "Messages appear in the Extensions > Output/Errors tab. " +
                 "Parameters: message (string, the text to log), " +
-                "level (string, 'output' for normal output or 'error' for error stream; defaults to 'output').",
+                "level (string, 'output' for normal output or 'error' for error stream; defaults to 'output'; " +
+                "any other level, e.g. 'info', goes to the output stream).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("message") { put("type", "string"); put("description", "The text to log") }
                     putJsonObject("level") {
                         put("type", "string")
                         putJsonArray("enum") { MESSAGE_LEVELS.forEach { add(it) } }
-                        put("description", "'output' for normal output or 'error' for error stream, default 'output'")
+                        put("description", "'output' for normal output or 'error' for error stream, default 'output'; any other level goes to output")
                     }
                 },
                 required = listOf("message")
@@ -38,8 +39,9 @@ object LoggingTools {
                 val args = request.params.arguments ?: emptyMap()
                 val message = args["message"]?.jsonPrimitive?.contentOrNull
                     ?: return@addTool toolError("Missing required parameter: message")
+                // Not validated: every level but 'error' has always gone to the output stream, and the
+                // merged `log` tool advertises the event levels too.
                 val level = args["level"]?.jsonPrimitive?.contentOrNull ?: "output"
-                EnumValidation.error(level, MESSAGE_LEVELS.toSet(), "level")?.let { return@addTool toolJsonResult(it) }
 
                 toolJsonResult(bridge.logMessage(message, level))
             } catch (e: Exception) {

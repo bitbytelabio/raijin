@@ -162,10 +162,9 @@ object SecurityConfig {
     /**
      * The [AUTH_COOKIE] value for [token] on the listener serving [ports]: a digest, so the cookie never
      * carries the token. A browser sends a host's cookies to every port on it (RFC 6265 §8.5), so the digest
-     * names the listener: a cookie that leaks to another service on the host opens no other listener. No
-     * listener serves an empty [ports], so none accepts the value made without them.
+     * names the listener: a cookie that leaks to another service on the host opens no other listener.
      */
-    internal fun authCookieValue(token: String, ports: List<Int> = emptyList()): String = Base64.getUrlEncoder().withoutPadding()
+    internal fun authCookieValue(token: String, ports: List<Int>): String = Base64.getUrlEncoder().withoutPadding()
         .encodeToString(sha256("raijin-auth-cookie\u0000${ports.sorted().joinToString(",")}\u0000$token"))
 
     /** [path] plus [query] without the token parameter: where a browser lands after a `?token=` visit. */

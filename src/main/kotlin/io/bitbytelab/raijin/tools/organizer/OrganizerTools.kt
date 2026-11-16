@@ -2,8 +2,11 @@ package io.bitbytelab.raijin.tools.organizer
 
 import burp.api.montoya.core.HighlightColor
 import io.bitbytelab.raijin.bridge.OrganizerBridge
+import io.bitbytelab.raijin.core.BodyText
 import io.bitbytelab.raijin.core.asBooleanSafe
 import io.bitbytelab.raijin.core.asBoundedInt
+import io.bitbytelab.raijin.core.asClampedInt
+import io.bitbytelab.raijin.core.withClampReport
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.server.Server
@@ -72,13 +75,13 @@ object OrganizerTools {
                     putJsonObject("url_prefix") { put("type", "string"); put("description", "Filter items whose URL contains this text (case-insensitive)") }
                     putJsonObject("max_results") {
                         put("type", "integer"); put("minimum", 0); put("maximum", MAX_RESULTS)
-                        put("description", "Maximum number of items to return, default 100")
+                        put("description", "Maximum number of items to return, default 100; a larger value is clamped to $MAX_RESULTS and reported as max_results_clamped_to")
                     }
                     putJsonObject("include_request") { put("type", "boolean"); put("description", "Include full request text (default false)") }
                     putJsonObject("include_response") { put("type", "boolean"); put("description", "Include full response text (default false)") }
                     putJsonObject("max_response_length") {
                         put("type", "integer"); put("minimum", 0)
-                        put("description", "Truncate request/response text at N characters")
+                        put("description", "Truncate request/response text at N characters; 0 keeps the default (${BodyText.DEFAULT_MAX_LENGTH})")
                     }
                 },
                 required = emptyList()
@@ -87,14 +90,18 @@ object OrganizerTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val urlPrefix = args["url_prefix"]?.jsonPrimitive?.contentOrNull
-                val maxResults = args["max_results"].asBoundedInt("max_results", 0, MAX_RESULTS)
-                    .getOrElse { return@addTool toolError(it.message ?: "Invalid max_results") } ?: 100
+                val maxResults = args["max_results"].asClampedInt("max_results", 0, MAX_RESULTS)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid max_results") }
                 val includeRequest = args["include_request"].asBooleanSafe() ?: false
                 val includeResponse = args["include_response"].asBooleanSafe() ?: false
-                val maxResponseLength = args["max_response_length"].asBoundedInt("max_response_length", 0, Int.MAX_VALUE)
+                val maxResponseLength = args["max_response_length"].asClampedInt("max_response_length", 0, Int.MAX_VALUE)
                     .getOrElse { return@addTool toolError(it.message ?: "Invalid max_response_length") }
 
-                toolJsonResult(bridge.getItems(urlPrefix, maxResults, includeRequest, includeResponse, maxResponseLength))
+                toolJsonResult(
+                    bridge.getItems(urlPrefix, maxResults?.value ?: 100, includeRequest, includeResponse, maxResponseLength?.value)
+                        .withClampReport("max_results", maxResults)
+                        .withClampReport("max_response_length", maxResponseLength)
+                )
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }

@@ -48,6 +48,8 @@ import javax.swing.table.DefaultTableModel
  *
  * Every timer, listener, subscription and worker the tab starts is released by [dispose], so a
  * reload leaves nothing running (and leaves listeners it does not own, such as persistence, alone).
+ * The one exception is added by [dispose] itself: the trackers that keep queued store writes'
+ * snapshots current until StateManager.cleanup(), which removes them (see [findingsSnapshot]).
  */
 class RaijinTab(
     private val api: MontoyaApi,
@@ -62,6 +64,23 @@ class RaijinTab(
         const val MAX_TABLE_ROWS = 2000
         private val TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
         private val FINDING_TIME_FORMAT = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss")
+
+        /**
+         * Findings as a queued store write saves them: frozen when [tasks] are disposed, which on unload
+         * happens before the extension clears [state] (see [StoreSnapshot]). The tracking listeners go
+         * ahead of the store's own, as [StoreSnapshot] requires; StateManager.cleanup() removes them.
+         */
+        internal fun findingsSnapshot(tasks: UiTasks, state: StateManager): StoreSnapshot<StoredFinding, String> =
+            tasks.storeSnapshot({ state.findings.toList() }, { it.id }, newestFirst = false) { added, removed ->
+                state.findingsListeners.add(0, added)
+                state.findingsRemoveListeners.add(0, removed)
+            }
+
+        /** MCP activity as a queued store write saves it, newest first like the live deque; see [findingsSnapshot]. */
+        internal fun activitySnapshot(tasks: UiTasks, state: StateManager): StoreSnapshot<McpActivityEntry, Long> =
+            tasks.storeSnapshot({ state.mcpActivity.toList() }, { it.id }, newestFirst = true) { added, _ ->
+                state.mcpActivityListeners.add(0, added)
+            }
     }
 
     private val mainPanel = JPanel(BorderLayout(0, 0))
@@ -73,6 +92,8 @@ class RaijinTab(
     // dispose() runs these newest first; the background pool is registered first, so it stops last.
     private val disposer = Disposer { what, e -> api.logging().logToError("Raijin UI: releasing $what failed: ${e.message}") }
     private val tasks = UiTasks { desc, e -> reportBackgroundError(desc, e) }
+    private val savedFindings = findingsSnapshot(tasks, stateManager)
+    private val savedActivity = activitySnapshot(tasks, stateManager)
 
     // Fetch buttons captured so tabs can lazily auto-load on first view.
     private var proxyFetchButton: JButton? = null
@@ -285,11 +306,12 @@ class RaijinTab(
             ActivityStore.enabled = enabled
             api.persistence().preferences().setBoolean("mcp_persist_activity", enabled)
             // Flush on enable: save what's already in memory. The store takes the snapshot under its
-            // file lock, so a write racing this one cannot be overwritten with older data.
+            // file lock, so a write racing this one cannot be overwritten with older data; once the tab
+            // is disposed it is the frozen copy, so a write still queued at unload never saves a cleared list.
             if (enabled) {
                 val project = currentProject()
                 tasks.persist("Save MCP activity") {
-                    ActivityStore.flushProject(project) { stateManager.mcpActivity.toList() }
+                    ActivityStore.flushProject(project) { savedActivity.read() }
                     ActivityStore.lastError?.let { api.logging().logToError("Raijin: saving MCP activity failed: $it") }
                 }
             }
@@ -1020,9 +1042,10 @@ class RaijinTab(
      */
     private fun syncFindingsStore() {
         val project = currentProject()
-        // Snapshotted under the store's file lock, so a removal racing this write cannot resurrect a finding.
+        // Snapshotted under the store's file lock, so a removal racing this write cannot resurrect a finding;
+        // a write still queued at unload saves the copy frozen at dispose, not the cleared list.
         tasks.persist("Save findings") {
-            FindingsStore.replaceProject(project) { stateManager.findings.toList() }
+            FindingsStore.replaceProject(project) { savedFindings.read() }
             FindingsStore.lastError?.let { api.logging().logToError("Raijin: saving findings failed: $it") }
         }
     }
