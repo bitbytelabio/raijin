@@ -158,6 +158,39 @@ class OpenApiDocumentTest {
     }
 
     @Test
+    fun `an alias bomb of long text is refused by its size, not its value count`() {
+        // About 65 KB of YAML: a 64 KiB scalar aliased 64 times on each of three levels is 16 GiB of text
+        // once expanded, yet only some 266 thousand values.
+        val scalars = buildString {
+            append("openapi: 3.0.3\npaths: {}\n")
+            append("x-s: &s \"").append("A".repeat(64 * 1024)).append("\"\n")
+            for ((level, inner) in listOf("l1" to "s", "l2" to "l1", "l3" to "l2")) {
+                append("x-$level: &$level [").append(List(64) { "*$inner" }.joinToString(", ")).append("]\n")
+            }
+            append("x-example: *l3\n")
+        }
+        assertTrue(scalars.length < 70_000)
+        val message = parseError(scalars)
+        assertTrue("MiB of text" in message, message)
+
+        // The same text as a mapping key.
+        val keys = buildString {
+            append("x-k: &k\n  ? ").append("K".repeat(64 * 1024)).append("\n  : 1\n")
+            append("x-l1: &l1 [").append(List(64) { "*k" }.joinToString(", ")).append("]\n")
+            append("x-l2: [").append(List(64) { "*l1" }.joinToString(", ")).append("]\n")
+        }
+        assertTrue("MiB of text" in parseError(keys))
+    }
+
+    @Test
+    fun `textLength is the compact JSON length, counted no further than just past its limit`() {
+        val element = json("""{"a": [1, "two", null, true, {"q\"uote": "tab\tnew\nline\u0001"}], "": {}, "e": []}""")
+        val full = element.toString().length.toLong()
+        assertEquals(full, element.textLength(Long.MAX_VALUE))
+        assertTrue(element.textLength(5) in 6 until full)
+    }
+
+    @Test
     fun `aliases that chain into a deep structure are refused`() {
         // No line nests deeper than two levels, yet the expanded value is 300 lists deep.
         val chain = buildString {

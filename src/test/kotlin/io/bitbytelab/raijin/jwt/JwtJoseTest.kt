@@ -1,6 +1,9 @@
 package io.bitbytelab.raijin.jwt
 
 import io.bitbytelab.raijin.bridge.JwtBridge
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -8,6 +11,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -142,5 +146,25 @@ class JwtJoseTest {
         val forged = Jwt.forgeNone(token)
         assertTrue(forged.all { it.endsWith(".") })
         assertNull(Jwt.decode("not a jwt"))
+    }
+
+    @Test
+    fun `password decrypt refuses a PBES2 count above the bound before deriving a key`() {
+        val sealed = JwtJose.encryptPassword("for the password holder", "hunter2", null, null)
+        assertEquals("for the password holder", JwtJose.decryptPassword(sealed, "hunter2"))
+
+        // The target writes the header. Nimbus 9.21 would run PBKDF2 p2c times before it checks the tag.
+        val parts = sealed.split('.')
+        val header = Json.parseToJsonElement(Jwt.b64UrlDecode(parts[0]).decodeToString()).jsonObject
+        val hostile = JsonObject(header + ("p2c" to JsonPrimitive(1_000_001)))
+        val forged = (listOf(Jwt.b64UrlEncode(hostile.toString())) + parts.drop(1)).joinToString(".")
+        val failure = assertFailsWith<IllegalArgumentException> { JwtJose.decryptPassword(forged, "hunter2") }
+        assertTrue("p2c" in failure.message.orEmpty(), failure.message)
+
+        // jwt_attack(mode=decrypt) reports it as the tool error.
+        val bridge = JwtBridge(load = { null }, save = null)
+        val imported = bridge.keys(action = "import", password = "hunter2")["imported"]!!.jsonArray.single().jsonObject
+        val result = bridge.attack(forged, "decrypt", null, null, null, null, null, keyId = imported["key_id"]!!.jsonPrimitive.content)
+        assertTrue("p2c" in result["error"]?.jsonPrimitive?.content.orEmpty(), result.toString())
     }
 }

@@ -212,7 +212,7 @@ class DashboardServer(
                     }
                 }.also { it.start(wait = false) }
 
-                logging.logToOutput("Raijin: Dashboard server started on http://$bindHost:$port")
+                logging.logToOutput("Raijin: Dashboard server started on ${DashboardApi.dashboardUrl(bindHost, port)}")
             } catch (e: Exception) {
                 logging.logToError("Raijin: Dashboard server failed: ${e.message}")
             }
@@ -392,9 +392,12 @@ internal object DashboardApi {
     fun isoInstant(text: String): String =
         runCatching { ZonedDateTime.parse(text).toInstant().toString() }.getOrDefault(text)
 
+    /** The dashboard's base URL on [host], an IPv6 literal bracketed. */
+    fun dashboardUrl(host: String, port: Int): String = "http://${SecurityConfig.formatHostForAuthority(host)}:$port"
+
     fun info(version: String, host: String, dashboardPort: Int, primaryMcpPort: Int, secondaryMcpPort: Int): JsonObject {
         val primaryUrl = ConnectionInfo.mcpUrl(primaryMcpPort, host)
-        val dashboardUrl = "http://$host:$dashboardPort"
+        val dashboard = dashboardUrl(host, dashboardPort)
         return buildJsonObject {
             put("version", version)
             put("bind_host", host)
@@ -405,8 +408,8 @@ internal object DashboardApi {
             }
             put("primary_mcp_url", primaryUrl)
             put("secondary_mcp_url", ConnectionInfo.mcpUrl(secondaryMcpPort, host))
-            put("dashboard_url", dashboardUrl)
-            put("proxy_history_url", "$dashboardUrl/api/proxy/recent?limit=$DEFAULT_LIMIT")
+            put("dashboard_url", dashboard)
+            put("proxy_history_url", "$dashboard/api/proxy/recent?limit=$DEFAULT_LIMIT")
             putJsonObject("mcp_client_config") {
                 putJsonObject("mcpServers") {
                     putJsonObject(ConnectionInfo.SERVER_NAME) {

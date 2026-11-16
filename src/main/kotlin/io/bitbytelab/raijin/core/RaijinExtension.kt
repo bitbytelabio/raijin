@@ -252,17 +252,24 @@ class RaijinExtension : BurpExtension {
      */
     private fun rebindServers(requestedHost: String, allowRemoteBind: Boolean): RebindOutcome {
         val d = BindHostPolicy.resolve(requestedHost, allowRemoteBind)
-        // Before the new listeners open, so an exposed bind is never served without its token.
-        logRemoteAccess(applyRemoteAccess(d.exposed))
+        val access = RemoteAccess.resolveFromPreferences(api.persistence().preferences(), d.exposed)
+        // A listener answers until it has stopped. The stricter settings hold while the three move: the new
+        // ones before an exposed bind opens, the old ones until an exposed bind has closed.
+        RemoteAccess.install(RemoteAccess.duringRebind(RemoteAccess.current, access.config, d.exposed))
         ConnectionInfo.publish(ConnectionInfo.endpoints.copy(host = d.effectiveHost))
         val boundOk = try {
             val ok = serverManager.rebind(d.effectiveHost)
             dashboardServer.rebind(d.effectiveHost)
+            // Every old listener has stopped: the settings for the new bind apply from here on.
+            RemoteAccess.install(access.config, d.exposed)
             ok
         } catch (e: Exception) {
-            api.logging().logToError("Raijin: live rebind to ${d.effectiveHost} failed: ${e.message}")
+            api.logging().logToError(
+                "Raijin: live rebind to ${d.effectiveHost} failed: ${e.message}; the stricter access settings stay in force"
+            )
             false
         }
+        logRemoteAccess(remoteAccessLines(access, d.exposed))
         if (d.downgraded) {
             api.logging().logToOutput("Raijin: ⚠ ${d.message}")
         }
@@ -286,8 +293,11 @@ class RaijinExtension : BurpExtension {
      * [exposed], saves a generated token and installs the result. Returns (level, message) lines to
      * log; none of them contains the token.
      */
-    private fun applyRemoteAccess(exposed: Boolean): List<Pair<String, String>> {
-        val resolved = RemoteAccess.applyFromPreferences(api.persistence().preferences(), exposed)
+    private fun applyRemoteAccess(exposed: Boolean): List<Pair<String, String>> =
+        remoteAccessLines(RemoteAccess.applyFromPreferences(api.persistence().preferences(), exposed), exposed)
+
+    /** (level, message) lines describing [resolved] for a bind that is [exposed]; none of them contains the token. */
+    private fun remoteAccessLines(resolved: RemoteAccess.Resolved, exposed: Boolean): List<Pair<String, String>> {
         val config = resolved.config
         val lines = mutableListOf<Pair<String, String>>()
         if (config.authRequired) {

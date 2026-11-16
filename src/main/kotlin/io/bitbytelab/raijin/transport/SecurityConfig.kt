@@ -31,14 +31,18 @@ import java.util.concurrent.atomic.AtomicReference
  *     `X-Forwarded-For`.
  *  4. **Bearer token** — required once a listener is exposed or the operator opts in:
  *     `Authorization: Bearer <token>`, or for a browser a one-time `?token=` that sets an HttpOnly
- *     `SameSite=Strict` cookie. Anything else gets `401`. CORS preflights pass (browsers never attach
- *     credentials to them); the CORS plugin answers them, so they never reach a route.
+ *     `SameSite=Strict` cookie good for that listener only. Anything else gets `401`. A CORS preflight
+ *     passes without it (browsers never attach credentials to one) only when the CORS plugin answers
+ *     it before any route runs; any other `OPTIONS` needs the token as well.
  *
  * Extra allowed hosts (MagicDNS names, reverse-proxy names) join the Host and Origin allowlists.
  */
 object SecurityConfig {
     /** Cookie set after a `?token=` visit; it holds a digest of the token, never the token itself. */
     const val AUTH_COOKIE = "raijin_auth"
+
+    /** How long a browser keeps [AUTH_COOKIE] before the `?token=` link is needed again: twelve hours. */
+    internal const val AUTH_COOKIE_MAX_AGE_SECONDS = 12 * 60 * 60
 
     /** Query parameter a browser can use once instead of the `Authorization` header. */
     const val TOKEN_QUERY_PARAM = "token"
@@ -155,9 +159,14 @@ object SecurityConfig {
         return MessageDigest.isEqual(sha256(presented), sha256(expected))
     }
 
-    /** The [AUTH_COOKIE] value for [token]: a digest, so the cookie never carries the token. */
-    internal fun authCookieValue(token: String): String =
-        Base64.getUrlEncoder().withoutPadding().encodeToString(sha256("raijin-auth-cookie\u0000$token"))
+    /**
+     * The [AUTH_COOKIE] value for [token] on the listener serving [ports]: a digest, so the cookie never
+     * carries the token. A browser sends a host's cookies to every port on it (RFC 6265 §8.5), so the digest
+     * names the listener: a cookie that leaks to another service on the host opens no other listener. No
+     * listener serves an empty [ports], so none accepts the value made without them.
+     */
+    internal fun authCookieValue(token: String, ports: List<Int> = emptyList()): String = Base64.getUrlEncoder().withoutPadding()
+        .encodeToString(sha256("raijin-auth-cookie\u0000${ports.sorted().joinToString(",")}\u0000$token"))
 
     /** [path] plus [query] without the token parameter: where a browser lands after a `?token=` visit. */
     internal fun withoutTokenParam(path: String, query: Parameters): String {
@@ -177,7 +186,7 @@ internal class RemoteAccessPolicy(val config: RemoteAccess.Config, ports: List<I
     /** Null when no source allowlist is configured; invalid entries are dropped, the list stays active. */
     private val ipRanges = config.allowedIps.takeIf { it.isNotEmpty() }?.mapNotNull(SourceAddressPolicy::parseRange)
     private val token = config.token?.takeIf { it.isNotEmpty() }
-    val cookieValue: String? = token?.let(SecurityConfig::authCookieValue)
+    val cookieValue: String? = token?.let { SecurityConfig.authCookieValue(it, ports) }
     val extraHosts: Set<String>
     val extraOrigins: Set<String>
 
@@ -202,7 +211,8 @@ internal class RemoteAccessPolicy(val config: RemoteAccess.Config, ports: List<I
  * Installs Host validation, locked CORS and the remote-access checks (source allowlist, bearer
  * token) on this [Application]; see [SecurityConfig].
  *
- * @param ports ports that, combined with [hosts], define the valid Host / Origin allowlist.
+ * @param ports the listener's ports: with [hosts] they define the valid Host / Origin allowlist, and
+ *   the browser cookie this listener sets is good on them only.
  * @param hosts the allowed bind hosts; loopback names are always allowed as well. A non-loopback
  *   value is only ever passed after [BindHostPolicy] has confirmed the operator opted into
  *   network exposure.
@@ -270,8 +280,8 @@ fun Application.installLocalhostSecurity(
             return@intercept finish()
         }
 
-        // 4. Bearer token once remote access requires it. A CORS preflight carries no credentials;
-        //    its Origin passed step 3, so the CORS plugin answers it before any route runs.
+        // 4. Bearer token once remote access requires it. A CORS preflight carries no credentials, and
+        //    one the CORS plugin answers never reaches a route; any other OPTIONS is checked like the rest.
         if (policy.config.authRequired && !call.isCorsPreflight()) {
             val authorization = call.request.headers[HttpHeaders.Authorization]
             val cookie = call.request.cookies[SecurityConfig.AUTH_COOKIE, CookieEncoding.RAW]
@@ -303,6 +313,7 @@ fun Application.installLocalhostSecurity(
                             name = SecurityConfig.AUTH_COOKIE,
                             value = value,
                             encoding = CookieEncoding.RAW,
+                            maxAge = SecurityConfig.AUTH_COOKIE_MAX_AGE_SECONDS,
                             path = "/",
                             httpOnly = true,
                             extensions = mapOf("SameSite" to "Strict"),
@@ -322,10 +333,41 @@ fun Application.installLocalhostSecurity(
     }
 }
 
+/**
+ * A preflight the CORS plugin answers before any route runs: `OPTIONS` with `Access-Control-Request-Method`
+ * and exactly one `Origin` that CORS takes as well-formed (step 3 has allowed its value). CORS hands an
+ * `OPTIONS` with several `Origin` headers or a malformed one to the routes as it is.
+ */
 private fun ApplicationCall.isCorsPreflight(): Boolean =
     request.httpMethod == HttpMethod.Options &&
-        request.headers[HttpHeaders.Origin] != null &&
-        request.headers[HttpHeaders.AccessControlRequestMethod] != null
+        request.headers[HttpHeaders.AccessControlRequestMethod] != null &&
+        request.headers.getAll(HttpHeaders.Origin)?.singleOrNull()?.let(::corsReadsOrigin) == true
+
+/**
+ * Ktor CORS' own test of an `Origin` (its internal `isValidOrigin`): `scheme://host[:port]`, an optional
+ * trailing `/`, no `%` anywhere. CORS ignores a request whose `Origin` fails it.
+ */
+private fun corsReadsOrigin(origin: String): Boolean {
+    if (origin == "null") return true
+    if (origin.isEmpty() || '%' in origin) return false
+    val separator = origin.indexOf("://")
+    if (separator <= 0 || !origin[0].isLetter()) return false
+    if (!origin.substring(0, separator).all { it.isLetterOrDigit() || it == '+' || it == '-' || it == '.' }) return false
+    val host = separator + 3
+    val port = if (origin.getOrNull(host) == '[') {
+        val close = origin.indexOf(']', host)
+        if (close < 0) return false
+        origin.indexOf(':', close).let { if (it < 0) origin.length else it + 1 }
+    } else {
+        val end = origin.indexOfAny(charArrayOf(':', '/', '?'), host)
+        when {
+            end < 0 || origin[end] == '/' -> origin.length
+            origin[end] == '?' -> return false
+            else -> end + 1
+        }
+    }
+    return (port until origin.length).all { origin[it].isDigit() || (it == origin.lastIndex && origin[it] == '/') }
+}
 
 private suspend fun ApplicationCall.rejectJson(status: HttpStatusCode, error: String, hint: String? = null) {
     respondText(

@@ -104,6 +104,47 @@ class RemoteAccessTest {
         assertEquals(listOf("192.168.56.1"), RemoteAccess.current.allowedIps)
     }
 
+    @Test fun `resolving saves a generated token without installing anything`() {
+        val p = FakePrefs()
+        val before = RemoteAccess.current to RemoteAccess.exposed
+        val r = RemoteAccess.resolveFromPreferences(p.prefs, exposed = true, sysProp = noProps)
+        assertTrue(r.config.authRequired && r.generatedToken)
+        assertEquals(r.config.token, p.strings[RemoteAccess.PREF_AUTH_TOKEN])
+        assertEquals(before, RemoteAccess.current to RemoteAccess.exposed)
+    }
+
+    // ---- a live rebind: what applies while the listeners move ----------------
+
+    private val exposedConfig = RemoteAccess.Config(authRequired = true, token = "old", allowedIps = listOf("192.168.56.1"))
+
+    @Test fun `leaving an exposed bind keeps its token until every listener has moved`() {
+        // The old exposed listeners answer until they stop: loopback's no-token settings must wait.
+        assertEquals(exposedConfig, RemoteAccess.duringRebind(exposedConfig, RemoteAccess.Config(), nextExposed = false))
+        val optedIn = RemoteAccess.Config(authRequired = true, token = "new")
+        assertEquals(exposedConfig, RemoteAccess.duringRebind(exposedConfig, optedIn, nextExposed = false))
+    }
+
+    @Test fun `moving to an exposed bind takes its settings before the listeners open`() {
+        val next = RemoteAccess.Config(authRequired = true, token = "new")
+        assertEquals(next, RemoteAccess.duringRebind(RemoteAccess.Config(), next, nextExposed = true))
+        assertEquals(next, RemoteAccess.duringRebind(exposedConfig, next, nextExposed = true))
+    }
+
+    @Test fun `a loopback move with no token in force takes the new settings at once`() {
+        val optedIn = RemoteAccess.Config(authRequired = true, token = "new")
+        assertEquals(optedIn, RemoteAccess.duringRebind(RemoteAccess.Config(), optedIn, nextExposed = false))
+        val hosts = RemoteAccess.Config(allowedHosts = listOf("burp.internal"))
+        assertEquals(hosts, RemoteAccess.duringRebind(RemoteAccess.Config(), hosts, nextExposed = false))
+    }
+
+    @Test fun `install records the exposure with the settings`() {
+        RemoteAccess.install(exposedConfig, exposed = true)
+        assertEquals(exposedConfig, RemoteAccess.current)
+        assertTrue(RemoteAccess.exposed)
+        RemoteAccess.install(RemoteAccess.Config())
+        assertTrue(RemoteAccess.exposed, "an install without an exposure keeps the recorded one")
+    }
+
     @Test fun `list settings split on commas, whitespace and semicolons`() {
         assertEquals(listOf("a", "b", "c"), RemoteAccess.parseList(" a, b;c\n a "))
         assertTrue(RemoteAccess.parseList(null).isEmpty())

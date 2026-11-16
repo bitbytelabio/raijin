@@ -11,9 +11,13 @@
 #     https://<VM-IP>:9443/mcp (MCP), https://<VM-IP>:9444 (dashboard)
 #
 # Raijin answers "403 invalid Host header" to any Host it does not know (its anti DNS-rebinding
-# check), so every upstream rewrites Host to the loopback address Raijin listens on. Raijin's
-# ports default to 9876 (MCP primary), 9877 (MCP secondary) and 9878 (dashboard); change the
-# numbers below if you changed mcp_sse_port / mcp_http_port / mcp_dashboard_port.
+# check), so every upstream rewrites Host to the loopback address Raijin listens on. That rewrite
+# hides the Host the client sent, so Caddy has to check it: every site address names its hosts
+# (127.0.0.1 and localhost in Profile A, the VM address in Profile B), and a request for any other
+# Host, such as a DNS-rebound name (http://rebind.example:9902 resolving to 127.0.0.1), never
+# reaches Raijin. Never proxy from a host-less address such as http://:9902: it accepts every Host.
+# Raijin's ports default to 9876 (MCP primary), 9877 (MCP secondary) and 9878 (dashboard); change
+# the numbers below if you changed mcp_sse_port / mcp_http_port / mcp_dashboard_port.
 #
 # Install (Linux): sudo cp configs/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
 # Or run it in the foreground: caddy run --config configs/Caddyfile
@@ -43,19 +47,26 @@
 
 # ---- Profile A: local proxy ------------------------------------------------------------------
 
-http://:9900 {
+http://127.0.0.1:9900, http://localhost:9900 {
 	bind 127.0.0.1
 	import raijin 9876
 }
 
-http://:9901 {
+http://127.0.0.1:9901, http://localhost:9901 {
 	bind 127.0.0.1
 	import raijin 9877
 }
 
-http://:9902 {
+http://127.0.0.1:9902, http://localhost:9902 {
 	bind 127.0.0.1
 	import raijin 9878
+}
+
+# Every other Host on these ports gets a 403 from Caddy. Caddy matches host-less addresses last,
+# so this block never shadows the named sites above.
+http://:9900, http://:9901, http://:9902 {
+	bind 127.0.0.1
+	respond "invalid Host header" 403
 }
 
 # ---- Profile B: Burp in a VM, MCP clients on the host machine ---------------------------------

@@ -34,6 +34,12 @@ class ImportPlan(
 
 /** Turns an OpenAPI 3.x / Swagger 2.0 document into one request per operation, with example parameters and body. */
 object OpenApiImport {
+    /** Text one parameter value or request body example may make, its name counted once for every item it spreads into. */
+    internal const val MAX_EXAMPLE_CHARS = 1L shl 20
+
+    /** Text the requests of one import may hold together, the examples measured on the way included: 64 MiB. */
+    internal const val MAX_PLAN_CHARS = 64L shl 20
+
     private val METHODS = listOf("get", "post", "put", "delete", "patch", "options", "head", "trace")
     private val PATH_PARAMETER = Regex("\\{([^{}/]+)\\}")
 
@@ -58,7 +64,8 @@ object OpenApiImport {
         val server: ServerUrl,
         /** The caller chose the server: per-path and per-operation `servers` do not apply. */
         val pinned: Boolean,
-        val documentUrl: String?
+        val documentUrl: String?,
+        val budget: TextBudget
     )
 
     /**
@@ -66,7 +73,8 @@ object OpenApiImport {
      *
      * @param baseUrl replaces every server URL of the document when given.
      * @param documentUrl where the document was served from; relative server URLs resolve against it.
-     * @throws IllegalArgumentException when this is not an OpenAPI / Swagger document, or no server URL can be worked out.
+     * @throws IllegalArgumentException when this is not an OpenAPI / Swagger document, no server URL can be worked out,
+     *   or the requests would hold more than [MAX_PLAN_CHARS] of text.
      */
     fun plan(doc: OpenApiDocument, baseUrl: String? = null, documentUrl: String? = null): ImportPlan {
         val root = doc.root
@@ -86,7 +94,7 @@ object OpenApiImport {
             "No usable server URL in the document: it has to be an absolute http(s) URL with a dotted host name or " +
                 "localhost, or a relative one that spec_url can resolve. Pass base_url to choose the target."
         )
-        val context = Context(doc, swagger2, server, pinned = override != null, documentUrl = documentUrl)
+        val context = Context(doc, swagger2, server, pinned = override != null, documentUrl = documentUrl, budget = TextBudget(MAX_PLAN_CHARS))
         val warnings = ArrayList<String>()
         val requests = ArrayList<PlannedRequest>()
         for ((path, declared) in root["paths"] as? JsonObject ?: JsonObject(emptyMap())) {
@@ -96,8 +104,10 @@ object OpenApiImport {
                 val operation = item[method] as? JsonObject ?: continue
                 try {
                     requests.add(request(context, path, item, method, operation))
+                } catch (e: PlanTooLargeException) {
+                    throw e
                 } catch (e: Exception) {
-                    warnings.add("${method.uppercase()} $path was skipped: ${e.message ?: e.javaClass.simpleName}")
+                    warnings.add(context.budget.take("${method.uppercase()} $path was skipped: ${e.message ?: e.javaClass.simpleName}"))
                 }
             }
         }
@@ -105,17 +115,19 @@ object OpenApiImport {
             version = if (swagger2) "Swagger $swagger" else "OpenAPI $openApi",
             server = server,
             requests = requests,
-            securitySchemes = securitySchemes(doc),
+            securitySchemes = securitySchemes(doc).also(context.budget::chargeText),
             warnings = warnings
         )
     }
 
     private fun request(context: Context, path: String, item: JsonObject, method: String, operation: JsonObject): PlannedRequest {
         val doc = context.doc
+        val budget = context.budget
         val server = if (context.pinned) context.server else
             OpenApiServers.fromServers(operation["servers"], context.documentUrl)
                 ?: OpenApiServers.fromServers(item["servers"], context.documentUrl)
                 ?: context.server
+        budget.take(server.url)
 
         val query = ArrayList<String>()
         val headers = ArrayList<Pair<String, String>>()
@@ -131,24 +143,27 @@ object OpenApiImport {
                 bodyParameter = parameter
                 continue
             }
-            val value = parameterValue(parameter, doc)
+            val value = parameterValue(parameter, doc, budget)
+            // Measured before any text is made from it: spread by its style, an example can outgrow the document.
+            budget.admit("the example of parameter '$name'", name, value)
             val style = ParameterStyle.of(parameter, location, context.swagger2)
             when (location) {
                 "query" -> {
                     queryParameters++
                     val reserved = (parameter["allowReserved"] as? JsonPrimitive)?.booleanOrNull == true
                     formPairs(name, value, style) { percentEncode(it, if (reserved) RESERVED_IN_QUERY else "") }
-                        .mapTo(query) { (key, text) -> "$key=$text" }
+                        .mapTo(query) { (key, text) -> budget.take("$key=$text") }
                 }
-                "path" -> pathValues[name] = pathText(name, value, style) { percentEncode(it) }
+                "path" -> pathValues[name] = budget.take(pathText(name, value, style) { percentEncode(it) })
                 // A line break in an example must not split the header it is sent in.
                 "header" -> if (name.lowercase() !in TRANSPORT_HEADERS) {
                     headers.add(
-                        RequestHygiene.stripControl(name) to RequestHygiene.stripControl(pathText(name, value, style) { it })
+                        budget.take(RequestHygiene.stripControl(name)) to
+                            budget.take(RequestHygiene.stripControl(pathText(name, value, style) { it }))
                     )
                 }
                 "cookie" -> formPairs(name, value, style) { percentEncode(it, COOKIE_SAFE) }
-                    .mapTo(cookies) { (key, text) -> "$key=$text" }
+                    .mapTo(cookies) { (key, text) -> budget.take("$key=$text") }
                 "formData" -> formData.add(FormField(name, value, style, file = parameter["type"].asText() == "file"))
             }
         }
@@ -157,19 +172,35 @@ object OpenApiImport {
         // Any method may carry the body its operation declares (DELETE included).
         val declaredBody = bodyParameter
         val body = when {
-            !context.swagger2 -> doc.deref(operation["requestBody"])?.let { OpenApiBodies.fromRequestBody(it, doc) }
-            declaredBody != null -> OpenApiBodies.fromBodyParameter(declaredBody, consumes(context, operation), doc)
-            formData.isNotEmpty() -> OpenApiBodies.fromFormData(formData, consumes(context, operation))
+            !context.swagger2 -> doc.deref(operation["requestBody"])?.let { OpenApiBodies.fromRequestBody(it, doc, budget) }
+            declaredBody != null -> OpenApiBodies.fromBodyParameter(declaredBody, consumes(context, operation), doc, budget)
+            formData.isNotEmpty() -> OpenApiBodies.fromFormData(formData, consumes(context, operation), budget)
             else -> null
         }
-        if (body != null) headers.removeAll { it.first.equals("Content-Type", ignoreCase = true) }
+        if (body != null) {
+            budget.charge(body.contentType.length.toLong() + body.text.length)
+            headers.removeAll { it.first.equals("Content-Type", ignoreCase = true) }
+        }
 
-        // The template may carry a fragment (dropped) or a literal query (kept) besides its `{placeholders}`.
+        // The template may carry a fragment (dropped) or a literal query (kept) besides its `{placeholders}`;
+        // a placeholder may come back any number of times.
         val template = path.substringBefore('#')
-        val filled = PATH_PARAMETER.replace(template.substringBefore('?')) { pathValues[it.groupValues[1]] ?: UNDECLARED_PATH_VALUE }
+        val filled = PATH_PARAMETER.replace(template.substringBefore('?')) {
+            budget.take(pathValues[it.groupValues[1]] ?: UNDECLARED_PATH_VALUE)
+        }
         template.substringAfter('?', "").takeIf { it.isNotEmpty() }?.let { query.add(0, it) }
-        val target = percentEncode(OpenApiServers.joinPaths(server.basePath, filled), PATH_LITERALS) +
-            if (query.isEmpty()) "" else "?" + query.joinToString("&")
+        val target = budget.take(
+            percentEncode(OpenApiServers.joinPaths(server.basePath, filled), PATH_LITERALS) +
+                if (query.isEmpty()) "" else "?" + query.joinToString("&")
+        )
+
+        // The endpoint list repeats these for every request, and `$ref`-shared path items repeat requests.
+        val operationId = operation["operationId"].asText() ?: "$method $path"
+        val summary = operation["summary"].asText().orEmpty()
+        val tags = (operation["tags"] as? JsonArray)?.mapNotNull { it.asText() }.orEmpty()
+        val security = (operation["security"] ?: doc.root["security"]) as? JsonArray
+        budget.charge(operationId.length.toLong() + summary.length + tags.sumOf { it.length.toLong() })
+        security?.let(budget::chargeText)
 
         return PlannedRequest(
             method = method.uppercase(),
@@ -177,11 +208,11 @@ object OpenApiImport {
             target = target,
             headers = headers,
             body = body,
-            operationId = operation["operationId"].asText() ?: "$method $path",
-            summary = operation["summary"].asText().orEmpty(),
-            tags = (operation["tags"] as? JsonArray)?.mapNotNull { it.asText() }.orEmpty(),
+            operationId = operationId,
+            summary = summary,
+            tags = tags,
             queryParameters = queryParameters,
-            security = (operation["security"] ?: doc.root["security"]) as? JsonArray
+            security = security
         )
     }
 
@@ -205,7 +236,7 @@ object OpenApiImport {
     }
 
     /** The value a parameter is sent with: its own `example(s)`, else one generated from its schema. */
-    private fun parameterValue(parameter: JsonObject, doc: OpenApiDocument): JsonElement {
+    private fun parameterValue(parameter: JsonObject, doc: OpenApiDocument, budget: TextBudget): JsonElement {
         (parameter["example"].orAbsent() ?: doc.exampleValue(parameter["examples"]) ?: parameter["x-example"].orAbsent())
             ?.let { return it }
         parameter["schema"].orAbsent()?.let { return OpenApiSchema.example(it, doc) }
@@ -214,7 +245,9 @@ object OpenApiImport {
             val value = media["example"].orAbsent()
                 ?: doc.exampleValue(media["examples"])
                 ?: OpenApiSchema.example(media["schema"], doc)
-            return value as? JsonPrimitive ?: JsonPrimitive(value.toString())
+            if (value is JsonPrimitive) return value
+            budget.admit("the example of parameter '${parameter["name"].asText()}'", "", value)
+            return JsonPrimitive(value.toString())
         }
         // Swagger 2: the parameter itself carries `type`, `format`, `enum`, `default` and `items`.
         return OpenApiSchema.example(parameter, doc)
@@ -263,3 +296,48 @@ object OpenApiImport {
         }
     }
 }
+
+/**
+ * The text the requests of one import may still hold. The model shares a value reused through `$ref`s or YAML
+ * aliases rather than copying it, so a small document can expand into more text than the heap holds: every
+ * example is charged as it is measured and every text as it is made, and running out fails the whole import.
+ */
+internal class TextBudget(private var left: Long) {
+    fun charge(length: Long) {
+        left -= length
+        if (left < 0) throw PlanTooLargeException()
+    }
+
+    /** [text], charged. */
+    fun take(text: String): String = text.also { charge(it.length.toLong()) }
+
+    /** Charges the JSON text of [element], measured no further than what is left. */
+    fun chargeText(element: JsonElement) = charge(element.textLength(left))
+
+    /** Fails the import once a text still being written has outgrown what is left. */
+    fun check(length: Int) {
+        if (length > left) throw PlanTooLargeException()
+    }
+
+    /**
+     * Refuses [value] (an [IllegalArgumentException] naming [what]) when its text as the parameter or form
+     * field [name] could pass [OpenApiImport.MAX_EXAMPLE_CHARS], a style repeating the name for every item it
+     * spreads; what was measured is charged either way.
+     */
+    fun admit(what: String, name: String, value: JsonElement) {
+        val items = when (value) {
+            is JsonArray -> value.size
+            is JsonObject -> value.size
+            else -> 0
+        }
+        val length = value.textLength(OpenApiImport.MAX_EXAMPLE_CHARS) + (items + 1L) * name.length
+        charge(minOf(length, OpenApiImport.MAX_EXAMPLE_CHARS))
+        require(length <= OpenApiImport.MAX_EXAMPLE_CHARS) { "$what is larger than ${OpenApiImport.MAX_EXAMPLE_CHARS shr 20} MiB" }
+    }
+}
+
+/** The import ran out of [TextBudget]: it fails as a whole, before anything reaches Burp. */
+internal class PlanTooLargeException : IllegalArgumentException(
+    "The requests planned from this document come to more than ${OpenApiImport.MAX_PLAN_CHARS shr 20} MiB of text " +
+        "(examples reused through $REF or YAML aliases multiply it); nothing was imported"
+)

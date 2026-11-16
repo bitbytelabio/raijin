@@ -25,7 +25,7 @@ internal object OpenApiBodies {
     private enum class Kind { JSON, FORM, MULTIPART, XML, TEXT, OTHER }
 
     /** Body for an OpenAPI 3 Request Body Object (already dereferenced); null when it declares no content. */
-    fun fromRequestBody(requestBody: JsonObject, doc: OpenApiDocument): PlannedBody? {
+    fun fromRequestBody(requestBody: JsonObject, doc: OpenApiDocument, budget: TextBudget): PlannedBody? {
         val content = requestBody["content"] as? JsonObject ?: return null
         val (mediaType, declared) = content.entries.minByOrNull { kindOf(it.key).ordinal } ?: return null
         val media = declared as? JsonObject ?: JsonObject(emptyMap())
@@ -33,24 +33,24 @@ internal object OpenApiBodies {
         val value = media["example"].orAbsent()
             ?: doc.exampleValue(media["examples"])
             ?: schema?.let { OpenApiSchema.example(it, doc) }
-        return render(mediaType, value, schema, media["encoding"] as? JsonObject, doc)
+        return render(mediaType, value, schema, media["encoding"] as? JsonObject, doc, budget)
     }
 
     /** Body for a Swagger 2 `in: body` parameter, in the JSON (else XML, else first) type the operation consumes. */
-    fun fromBodyParameter(parameter: JsonObject, consumes: List<String>, doc: OpenApiDocument): PlannedBody {
+    fun fromBodyParameter(parameter: JsonObject, consumes: List<String>, doc: OpenApiDocument, budget: TextBudget): PlannedBody {
         val mediaType = consumes
             .filter { kindOf(it) != Kind.FORM && kindOf(it) != Kind.MULTIPART }
             .minByOrNull { kindOf(it).ordinal } ?: "application/json"
         val schema = parameter["schema"].orAbsent()
-        return render(mediaType, schema?.let { OpenApiSchema.example(it, doc) }, schema, null, doc)
+        return render(mediaType, schema?.let { OpenApiSchema.example(it, doc) }, schema, null, doc, budget)
     }
 
     /** Body for Swagger 2 `in: formData` parameters: multipart when a file is uploaded or only multipart is consumed. */
-    fun fromFormData(fields: List<FormField>, consumes: List<String>): PlannedBody {
+    fun fromFormData(fields: List<FormField>, consumes: List<String>, budget: TextBudget): PlannedBody {
         val kinds = consumes.map { kindOf(it) }
         val asMultipart = fields.any { it.file } || (Kind.MULTIPART in kinds && Kind.FORM !in kinds)
-        return if (asMultipart) PlannedBody("multipart/form-data; boundary=$BOUNDARY", multipart(fields))
-        else PlannedBody("application/x-www-form-urlencoded", urlEncoded(fields))
+        return if (asMultipart) PlannedBody("multipart/form-data; boundary=$BOUNDARY", multipart(fields, budget))
+        else PlannedBody("application/x-www-form-urlencoded", urlEncoded(fields, budget))
     }
 
     private fun kindOf(mediaType: String): Kind {
@@ -70,8 +70,12 @@ internal object OpenApiBodies {
         value: JsonElement?,
         schema: JsonElement?,
         encoding: JsonObject?,
-        doc: OpenApiDocument
+        doc: OpenApiDocument,
+        budget: TextBudget
     ): PlannedBody {
+        // Measured before any text is made: an example shared through `$ref`s or YAML aliases can be far
+        // longer than the document.
+        if (value != null) budget.admit("the request body example", "", value)
         val kind = kindOf(mediaType)
         // A media type range cannot be sent as a Content-Type: name the concrete type the body is written in.
         val contentType = if ('*' !in mediaType) mediaType else when (kind) {
@@ -85,13 +89,13 @@ internal object OpenApiBodies {
             // A form example written as one string is already encoded.
             Kind.FORM -> PlannedBody(
                 contentType,
-                if (value is JsonPrimitive) value.asFieldText() else urlEncoded(fields(value, schema, encoding, doc))
+                if (value is JsonPrimitive) value.asFieldText() else urlEncoded(fields(value, schema, encoding, doc), budget)
             )
             Kind.MULTIPART -> PlannedBody(
                 contentType.substringBefore(';').trim() + "; boundary=$BOUNDARY",
-                multipart(fields(value, schema, encoding, doc))
+                multipart(fields(value, schema, encoding, doc), budget)
             )
-            Kind.XML -> PlannedBody(contentType, xmlText(value, schema, doc))
+            Kind.XML -> PlannedBody(contentType, xmlText(value, schema, doc, budget))
             Kind.TEXT, Kind.OTHER -> PlannedBody(contentType, value?.asFieldText() ?: "test")
         }
     }
@@ -142,11 +146,21 @@ internal object OpenApiBodies {
             OpenApiSchema.keyword(parts, "contentMediaType") != null ||
             OpenApiSchema.keyword(parts, "type").asText() == "file"
 
-    private fun urlEncoded(fields: List<FormField>): String =
-        fields.flatMap { formPairs(it.name, it.value, it.style, ::formEncode) }
-            .joinToString("&") { (name, value) -> "$name=$value" }
+    /** The fields as `name=value` pairs; each field is measured before its style spreads it. */
+    private fun urlEncoded(fields: List<FormField>, budget: TextBudget): String {
+        val out = StringBuilder()
+        for (field in fields) {
+            budget.admit("the example of form field '${field.name}'", field.name, field.value)
+            for ((name, value) in formPairs(field.name, field.value, field.style, ::formEncode)) {
+                if (out.isNotEmpty()) out.append('&')
+                out.append(name).append('=').append(value)
+            }
+            budget.check(out.length)
+        }
+        return out.toString()
+    }
 
-    private fun multipart(fields: List<FormField>): String = buildString {
+    private fun multipart(fields: List<FormField>, budget: TextBudget): String = buildString {
         for (field in fields) {
             val value = field.value
             // An array is sent as one part per item, all under the field's name.
@@ -162,6 +176,8 @@ internal object OpenApiBodies {
                 }
                 if (type != null) append("Content-Type: ").append(type).append("\r\n")
                 append("\r\n").append(item.asFieldText()).append("\r\n")
+                // Every part repeats the field's name and content type.
+                budget.check(length)
             }
         }
         append("--").append(BOUNDARY).append("--\r\n")
@@ -170,14 +186,14 @@ internal object OpenApiBodies {
     /** A field name inside the quoted `name="..."` of a part header, escaped the way browsers do. */
     private fun quoted(name: String): String = name.replace("\"", "%22").replace("\r", "%0D").replace("\n", "%0A")
 
-    private fun xmlText(value: JsonElement?, schema: JsonElement?, doc: OpenApiDocument): String {
+    private fun xmlText(value: JsonElement?, schema: JsonElement?, doc: OpenApiDocument, budget: TextBudget): String {
         // An example that is already an XML document is sent as written.
         if (value is JsonPrimitive && value.isString && value.content.trimStart().startsWith("<")) return value.content
         val parts = OpenApiSchema.parts(schema, doc)
         val out = StringBuilder("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
         // A document has one root: a top-level array is wrapped, its items named after their own schema.
         val rootItem = refName(OpenApiSchema.keyword(parts, "items")) ?: "item"
-        writeXml(out, refName(schema) ?: "root", value ?: JsonNull, parts, doc, rootItem)
+        writeXml(out, refName(schema) ?: "root", value ?: JsonNull, parts, doc, budget, rootItem)
         return out.toString()
     }
 
@@ -196,8 +212,11 @@ internal object OpenApiBodies {
         value: JsonElement,
         parts: List<JsonObject>,
         doc: OpenApiDocument,
+        budget: TextBudget,
         rootItem: String? = null
     ) {
+        // The schema's names and namespaces repeat on every element, so the text can outgrow its example.
+        budget.check(out.length)
         val hints = OpenApiSchema.keyword(parts, "xml") as? JsonObject
         if (value is JsonArray) {
             val wrapper = if (rootItem != null || hints.flag("wrapped")) xmlName(name, hints) else null
@@ -205,7 +224,7 @@ internal object OpenApiBodies {
             val itemName = rootItem ?: if (wrapper != null) hints?.get("name").asText() ?: name else name
             val itemParts = OpenApiSchema.parts(OpenApiSchema.keyword(parts, "items"), doc)
             if (wrapper != null) out.append('<').append(wrapper).append('>')
-            for (item in value) writeXml(out, itemName, item, itemParts, doc)
+            for (item in value) writeXml(out, itemName, item, itemParts, doc, budget)
             if (wrapper != null) out.append("</").append(wrapper).append('>')
             return
         }
@@ -227,7 +246,7 @@ internal object OpenApiBodies {
                 out.append(' ').append(attribute).append("=\"").append(escapeXml(item.asFieldText())).append('"')
             }
             out.append('>')
-            for ((key, item) in elements) writeXml(out, key, item, schemas.getValue(key), doc)
+            for ((key, item) in elements) writeXml(out, key, item, schemas.getValue(key), doc, budget)
         } else {
             out.append('>').append(escapeXml(value.asFieldText()))
         }

@@ -72,6 +72,12 @@ object JwtJose {
     private const val PBES_SALT_BYTES = 16
     private const val PBES_ITERATIONS = 1000
 
+    /**
+     * Highest PBES2 iteration count (`p2c`) [decryptPassword] accepts. Nimbus 9.21 runs PBKDF2 over
+     * whatever count the token's header names before it checks anything (CVE-2023-52428).
+     */
+    private const val MAX_PBES2_COUNT = 1_000_000
+
     /** JWS `alg` values the signing modes take. */
     val JWS_ALGS: List<String> = listOf(
         "HS256", "HS384", "HS512", "RS256", "RS384", "RS512", "PS256", "PS384", "PS512",
@@ -264,6 +270,11 @@ object JwtJose {
 
     fun decryptPassword(token: String, password: String): String {
         val obj = JWEObject.parse(token)
+        val count = obj.header.pbeS2Count
+        require(count <= MAX_PBES2_COUNT) {
+            "The token asks for $count PBES2 iterations (p2c); more than $MAX_PBES2_COUNT is refused " +
+                "before deriving a key (CVE-2023-52428)"
+        }
         obj.decrypt(PasswordBasedDecrypter(password.toByteArray(Charsets.UTF_8)))
         return obj.payload.toString()
     }

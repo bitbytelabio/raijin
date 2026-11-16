@@ -178,6 +178,31 @@ class SecurityInterceptorTest {
         }
     }
 
+    @Test fun `with a token required a preflight CORS does not answer needs it too`() {
+        withServer(RemoteAccess.Config(authRequired = true, token = token)) { port ->
+            // CORS answers only an OPTIONS with exactly one well-formed Origin and leaves any other to the routes.
+            // Each Origin below passes the allowlist (it reads past an IPv6 zone index).
+            for (origins in listOf(
+                "Origin: http://127.0.0.1:$port\r\nOrigin: http://127.0.0.1:$port\r\n",
+                "Origin: http://[::1%25lo0]:$port\r\n"
+            )) {
+                val r = raw(
+                    port,
+                    "OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1:$port\r\n${origins}Access-Control-Request-Method: POST\r\n" +
+                        "Connection: close\r\n\r\n"
+                )
+                assertEquals(401, status(r), r)
+                assertTrue(r.contains("WWW-Authenticate: Bearer", ignoreCase = true), r)
+            }
+            val answered = raw(
+                port,
+                "OPTIONS / HTTP/1.1\r\nHost: 127.0.0.1:$port\r\nOrigin: http://127.0.0.1:$port\r\n" +
+                    "Access-Control-Request-Method: POST\r\nConnection: close\r\n\r\n"
+            )
+            assertEquals(200, status(answered), "a preflight CORS answers needs no token: $answered")
+        }
+    }
+
     @Test fun `with a token required the bearer opens the stream`() {
         withServer(RemoteAccess.Config(authRequired = true, token = token)) { port ->
             val r = raw(port, "GET / HTTP/1.1\r\nHost: 127.0.0.1:$port\r\nAuthorization: Bearer $token\r\n\r\n")

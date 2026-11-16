@@ -145,6 +145,15 @@ class DashboardServerTest {
         assertTrue(info["claude_code_command"]!!.jsonPrimitive.content.endsWith("http://127.0.0.1:19876/mcp"))
     }
 
+    @Test fun `info brackets an IPv6 bind host in every URL`() {
+        val info = DashboardApi.info("1.2.3", "fd7a:115c:a1e0::1", 9878, 9876, 9877)
+        assertEquals("fd7a:115c:a1e0::1", info["bind_host"]?.jsonPrimitive?.content)
+        assertEquals("http://[fd7a:115c:a1e0::1]:9878", info["dashboard_url"]?.jsonPrimitive?.content)
+        assertEquals("http://[fd7a:115c:a1e0::1]:9878/api/proxy/recent?limit=${DashboardApi.DEFAULT_LIMIT}", info["proxy_history_url"]?.jsonPrimitive?.content)
+        assertEquals("http://[fd7a:115c:a1e0::1]:9876/mcp", info["primary_mcp_url"]?.jsonPrimitive?.content)
+        assertEquals("http://[::1]:9878", DashboardApi.dashboardUrl("::1", 9878))
+    }
+
     // ---- static assets -------------------------------------------------------
 
     @Test fun `static assets are served with their content types`() {

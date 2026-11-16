@@ -28,6 +28,40 @@ internal fun JsonElement?.asText(): String? = (this as? JsonPrimitive)?.contentO
 internal fun JsonElement?.orAbsent(): JsonElement? = this?.takeUnless { it is JsonNull }
 
 /**
+ * Length of the element as compact JSON text, counted no further than just past [limit]. A value reused
+ * through `$ref`s or YAML aliases is shared, not copied, in the model, so its text can be far longer than
+ * the document it came from.
+ */
+internal fun JsonElement.textLength(limit: Long): Long {
+    var length = 0L
+    fun add(count: Long): Boolean {
+        length += count
+        return length <= limit
+    }
+    fun walk(element: JsonElement): Boolean = when (element) {
+        is JsonObject -> add(1L + maxOf(element.size, 1)) &&
+            element.all { (key, value) -> add(quotedLength(key, limit) + 1) && walk(value) }
+        is JsonArray -> add(1L + maxOf(element.size, 1)) && element.all { walk(it) }
+        is JsonPrimitive -> add(if (element.isString) quotedLength(element.content, limit) else element.content.length.toLong())
+    }
+    walk(this)
+    return length
+}
+
+/** Length of [text] as a JSON string literal, escapes included; not scanned once it is longer than [limit]. */
+private fun quotedLength(text: String, limit: Long): Long {
+    var length = text.length + 2L
+    if (text.length > limit) return length
+    for (char in text) {
+        when {
+            char == '"' || char == '\\' -> length += 1
+            char < ' ' -> length += if (char in "\b\t\n\u000C\r") 1 else 5
+        }
+    }
+    return length
+}
+
+/**
  * A parsed OpenAPI 3.x / Swagger 2.0 document: the JSON model of a JSON or YAML source, plus the
  * same-document `$ref` lookup every other part of the import resolves references through.
  */
@@ -154,6 +188,9 @@ class OpenApiDocument(val root: JsonObject) {
 private const val MAX_ERROR_LENGTH = 400
 private const val MAX_YAML_VALUES = 10_000_000L
 
+/** Text the YAML document may expand to, scalars and mapping keys together: 64 MiB. */
+private const val MAX_YAML_CHARS = 64L shl 20
+
 /** JSON Pointer token escapes (RFC 6901): `~1` is `/` and `~0` is `~`, decoded in that order. */
 private fun unescape(token: String): String = token.replace("~1", "/").replace("~0", "~")
 
@@ -202,40 +239,47 @@ private class CoreSchemaResolver : Resolver() {
 }
 
 /**
- * Converts a composed YAML node graph to the JSON model. An aliased collection is converted once and
- * shared, so anchors cost nothing, while the value count and the depth are still those of the tree
- * with every alias expanded: an alias bomb is refused here rather than blown up by a later walk.
- * Mapping keys are taken as their literal text, `<<` merge keys are applied, tags other than the JSON
- * types are read as plain data.
+ * Converts a composed YAML node graph to the JSON model. An aliased node is converted once and shared,
+ * so anchors cost nothing, while the value count, the text (scalars and mapping keys) and the depth are
+ * still those of the tree with every alias expanded: an alias bomb, including one that repeats a long
+ * scalar, is refused here rather than blown up by a later walk or rendering. Mapping keys are taken as
+ * their literal text, `<<` merge keys are applied, tags other than the JSON types are read as plain data.
  */
 private class YamlToJson {
-    private class Shared(val element: JsonElement, val values: Long, val height: Int)
+    private class Shared(val element: JsonElement, val values: Long, val chars: Long, val height: Int)
 
     private val shared = IdentityHashMap<Node, Shared>()
     private val open = IdentityHashMap<Node, Unit>()
     private var values = 0L
+    private var chars = 0L
 
     /** Collection levels in the element [convert] returned last. */
     private var height = 0
 
     fun convert(node: Node, depth: Int = 1): JsonElement {
-        count(1)
-        if (node is ScalarNode) {
-            height = 0
-            return scalar(node)
-        }
         shared[node]?.let {
-            count(it.values - 1)
+            count(it.values, it.chars)
             requireDepth(depth + it.height - 1)
             height = it.height
             return it.element
         }
+        if (node is ScalarNode) {
+            val length = node.value.length.toLong()
+            count(1, length)
+            height = 0
+            val element = scalar(node)
+            // Only an anchored scalar can be aliased: its text is then read once, however often it is repeated.
+            if (node.anchor != null) shared[node] = Shared(element, 1, length, 0)
+            return element
+        }
+        count(1, 0)
         requireDepth(depth)
         if (open.put(node, Unit) != null) { // an alias to a collection it sits inside
             height = 0
             return JsonNull
         }
-        val before = values
+        val valuesBefore = values
+        val charsBefore = chars
         var tallest = 0
         val element: JsonElement = try {
             if (node is MappingNode) {
@@ -243,6 +287,7 @@ private class YamlToJson {
                 val merges = ArrayList<JsonObject>()
                 for (tuple in node.value) {
                     val key = tuple.keyNode
+                    if (key is ScalarNode) count(0, key.value.length.toLong())
                     val value = convert(tuple.valueNode, depth + 1)
                     tallest = maxOf(tallest, height)
                     if (key.tag == Tag.MERGE) {
@@ -263,7 +308,7 @@ private class YamlToJson {
             open.remove(node)
         }
         height = tallest + 1
-        shared[node] = Shared(element, values - before + 1, height)
+        shared[node] = Shared(element, values - valuesBefore + 1, chars - charsBefore, height)
         return element
     }
 
@@ -280,10 +325,14 @@ private class YamlToJson {
 
     private fun integer(text: String): Number? = text.toLongOrNull() ?: text.toBigIntegerOrNull()
 
-    private fun count(added: Long) {
-        values += added
+    private fun count(addedValues: Long, addedChars: Long) {
+        values += addedValues
+        chars += addedChars
         require(values <= MAX_YAML_VALUES) {
             "The YAML document expands to more than $MAX_YAML_VALUES values (aliases nested too deeply)"
+        }
+        require(chars <= MAX_YAML_CHARS) {
+            "The YAML document expands to more than ${MAX_YAML_CHARS shr 20} MiB of text (aliases repeat too much of it)"
         }
     }
 

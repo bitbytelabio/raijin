@@ -37,9 +37,9 @@ class RemoteAuthPolicyTest {
     /** Test-only header naming the socket peer, so one app can play many client addresses. */
     private val peerHeader = "X-Test-Peer"
 
-    private fun ApplicationTestBuilder.mount(config: () -> RemoteAccess.Config) = application {
+    private fun ApplicationTestBuilder.mount(listenerPort: Int = port, config: () -> RemoteAccess.Config) = application {
         installLocalhostSecurity(
-            ports = listOf(port),
+            ports = listOf(listenerPort),
             hosts = listOf("127.0.0.1", "localhost"),
             remoteAccess = config,
             sourceAddress = { call -> call.request.headers[peerHeader] ?: "127.0.0.1" }
@@ -155,6 +155,21 @@ class RemoteAuthPolicyTest {
         assertEquals(HttpStatusCode.Forbidden, r.status)
     }
 
+    @Test fun `a preflight the CORS plugin passes on to the routes still needs the token`() = testApplication {
+        mount { authOn }
+        // The allowlist reads past an IPv6 zone index and blanks around the authority; CORS refuses an Origin
+        // holding a `%` or a non-digit after the port and leaves the request to the routes. (Two Origin headers
+        // do the same: see SecurityInterceptorTest, since this client joins repeated headers into one.)
+        for (origin in listOf("http://[::1%25lo0]:$port", "http://127.0.0.1:$port /")) {
+            val r = client.options("/mcp") {
+                header(HttpHeaders.Host, "127.0.0.1:$port")
+                header(HttpHeaders.Origin, origin)
+                header(HttpHeaders.AccessControlRequestMethod, "POST")
+            }
+            assertEquals(HttpStatusCode.Unauthorized, r.status, "$origin: ${r.bodyAsText()}")
+        }
+    }
+
     @Test fun `token query sets an HttpOnly SameSite cookie that authenticates later requests`() = testApplication {
         mount { authOn }
         val first = getAt("/api/stats?token=$token")
@@ -163,6 +178,7 @@ class RemoteAuthPolicyTest {
         assertTrue(setCookie.startsWith("${SecurityConfig.AUTH_COOKIE}="), setCookie)
         assertTrue(setCookie.contains("HttpOnly", ignoreCase = true), setCookie)
         assertTrue(setCookie.contains("SameSite=Strict", ignoreCase = true), setCookie)
+        assertTrue(setCookie.contains("Max-Age=${SecurityConfig.AUTH_COOKIE_MAX_AGE_SECONDS}"), setCookie)
         assertFalse(setCookie.contains(token), "the cookie carries a digest, never the token")
 
         val cookie = setCookie.substringBefore(';')
@@ -172,6 +188,26 @@ class RemoteAuthPolicyTest {
             getAt("/events", headers = mapOf(HttpHeaders.Cookie to "${SecurityConfig.AUTH_COOKIE}=forged")).status
         )
         assertEquals(HttpStatusCode.Unauthorized, getAt("/api/stats?token=wrong").status)
+    }
+
+    @Test fun `a cookie minted on one listener port opens no other`() {
+        // A browser sends a host's cookies to every port on it, so the dashboard's cookie reaches other services
+        // there; replayed against an MCP listener it must not authenticate.
+        val dashboardPort = 9878
+        var cookie = ""
+        testApplication {
+            mount(dashboardPort) { authOn }
+            cookie = assertNotNull(getAt("/?token=$token", host = "127.0.0.1:$dashboardPort").headers[HttpHeaders.SetCookie])
+                .substringBefore(';')
+            val reused = getAt("/events", host = "127.0.0.1:$dashboardPort", headers = mapOf(HttpHeaders.Cookie to cookie))
+            assertEquals(HttpStatusCode.OK, reused.status)
+        }
+        testApplication {
+            mount { authOn }
+            val replayed = getAt("/mcp", headers = mapOf(HttpHeaders.Cookie to cookie))
+            assertEquals(HttpStatusCode.Unauthorized, replayed.status)
+            assertTrue(replayed.headers[HttpHeaders.WWWAuthenticate].orEmpty().contains("invalid_token"))
+        }
     }
 
     @Test fun `a page load with the token redirects to the same URL without it`() = testApplication {

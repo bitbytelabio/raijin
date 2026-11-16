@@ -47,12 +47,14 @@ object RemoteAccess {
     var current: Config = Config()
         private set
 
-    /** Whether the listeners bind a non-loopback address; recorded by [applyFromPreferences]. */
+    /** Whether the listeners bind a non-loopback address; recorded by [install]. */
     @Volatile
     var exposed: Boolean = false
         private set
 
-    fun install(config: Config) {
+    /** Installs [config] for the next request, for listeners whose bind is [exposed]. */
+    fun install(config: Config, exposed: Boolean = this.exposed) {
+        this.exposed = exposed
         current = config
     }
 
@@ -62,6 +64,13 @@ object RemoteAccess {
      * Safe to call from any thread.
      */
     fun applyFromPreferences(
+        prefs: Preferences,
+        exposed: Boolean,
+        sysProp: (String) -> String? = System::getProperty,
+    ): Resolved = resolveFromPreferences(prefs, exposed, sysProp).also { install(it.config, exposed) }
+
+    /** [applyFromPreferences] without the install: for a rebind, which installs once the listeners have moved. */
+    fun resolveFromPreferences(
         prefs: Preferences,
         exposed: Boolean,
         sysProp: (String) -> String? = System::getProperty,
@@ -76,10 +85,18 @@ object RemoteAccess {
         )
         val token = resolved.config.token
         if (resolved.generatedToken && token != null) runCatching { prefs.setString(PREF_AUTH_TOKEN, token) }
-        this.exposed = exposed
-        install(resolved.config)
         return resolved
     }
+
+    /**
+     * What the listeners enforce while they rebind from [previous] to [next]. A listener answers until it
+     * has stopped, so a move to a bind that is not exposed keeps [previous] (its token, its allowlists)
+     * while that requires a token: an exposed listener never answers without one. [next] is installed
+     * once every listener has moved. A move to an exposed bind takes [next] at once, so the new
+     * listeners never answer without their own token.
+     */
+    fun duringRebind(previous: Config, next: Config, nextExposed: Boolean): Config =
+        if (!nextExposed && previous.authRequired) previous else next
 
     /** Re-applies the saved settings for the current exposure, e.g. after the Server tab changed them. */
     fun reapply(prefs: Preferences): Resolved = applyFromPreferences(prefs, exposed)
