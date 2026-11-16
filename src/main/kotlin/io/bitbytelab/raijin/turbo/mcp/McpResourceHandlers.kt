@@ -26,19 +26,23 @@ fun Request.toSummaryMap(): Map<String, Any?> = mapOf(
 
 class McpResourceHandlers(
     private val manager: RunManager,
-    private val organizerProvider: OrganizerProvider? = null,
     private val desyncMode: () -> Boolean = { false }
 ) {
 
+    /** Every file in resources/turbo-docs/, by name without `.md`. */
     val docTopics = mapOf(
+        "index" to "Overview of the docs and where to start",
         "api-quickstart" to "Quick reference for scripting",
         "engines" to "Engine types (AUTO, THREADED, BURP, BURP2, HTTP3)",
         "settings" to "Complete parameter reference",
         "race-conditions" to "Race condition testing with gates",
         "response-processing" to "Handling and filtering responses",
         "decorators" to "Response decorator reference",
+        "performance" to "Tuning for requests per second: engine choice, concurrency, request and response size",
         "misc" to "Wordlists and utilities",
-        "desync-techniques" to "HTTP request smuggling: obfuscation technique catalog and canary confirmation"
+        "desync-techniques" to "HTTP request smuggling: obfuscation technique catalog and canary confirmation",
+        "montoya-api-examples" to "Montoya API patterns for Burp extension code",
+        "resources" to "Links to the Montoya API docs, source and example extensions"
     )
 
     // Auto-discovered from resources/examples/
@@ -55,6 +59,9 @@ class McpResourceHandlers(
         "ratelimit", "recursive",
         "specialWordlists", "test", "timing", "timingAttackWithState"
     )
+
+    /** Names [getExample] accepts, sorted. */
+    val exampleNames: List<String> get() = discoveredExamples.sorted()
 
     private fun runNotFoundError(runId: String): Map<String, Any?> {
         val error = if (manager.isEvicted(runId)) "evicted" else "not_found"
@@ -98,29 +105,40 @@ class McpResourceHandlers(
         return mapOf("script" to run.handler.code)
     }
 
+    /**
+     * One page of a run's results. Without [sortBy] they follow the order the script set with
+     * `table.setSortOrder(...)`, else id; [descending] defaults to that order's direction, else true.
+     * An unknown [sortBy] is an error listing [SORT_FIELDS]; a negative [limit] or [offset] counts as 0.
+     */
     fun getResults(
         runId: String,
-        sortBy: String,
-        descending: Boolean,
+        sortBy: String?,
+        descending: Boolean?,
         limit: Int,
         offset: Int
     ): Map<String, Any?> {
+        val requestedField = sortBy?.trim()?.takeIf { it.isNotEmpty() }?.let { name ->
+            SortField.entries.firstOrNull { it.name.equals(name, ignoreCase = true) }
+                ?: return mapOf("error" to "Unknown sort_by '$sortBy'", "valid_sort_fields" to SORT_FIELDS)
+        }
         val run = manager.getRun(runId)
             ?: return runNotFoundError(runId)
 
-        val sortField = try {
-            SortField.valueOf(sortBy.uppercase())
-        } catch (e: IllegalArgumentException) {
-            SortField.ID
-        }
+        val scriptOrder = run.store.sortOrder().takeIf { requestedField == null }
+        val field = requestedField ?: scriptOrder?.field ?: SortField.ID
+        val reversed = descending ?: scriptOrder?.descending ?: true
+        val results = run.store.getResults(field, reversed, limit.coerceAtLeast(0), offset.coerceAtLeast(0))
 
-        val results = run.store.getResults(sortField, descending, limit, offset)
-
-        return mapOf(
+        val response = mutableMapOf<String, Any?>(
             "results" to results.map { it.toSummaryMap() },
             "total_count" to run.store.count(),
-            "status_codes" to run.store.getUniqueStatusCodes()
+            "status_codes" to run.store.getUniqueStatusCodes(),
+            "sort_by" to field.name.lowercase(),
+            "descending" to reversed
         )
+        if (scriptOrder != null) response["sort_source"] = "script"
+        if (limit < 0 || offset < 0) response["note"] = "Negative limit/offset counted as 0"
+        return response
     }
 
     fun getRequestDetail(
@@ -205,104 +223,6 @@ class McpResourceHandlers(
             .joinToString("\r\n")
     }
 
-    // Organizer resources
-
-    fun listOrganizerItems(
-        domain: String? = null,
-        page: Int = 1,
-        searchNotes: String? = null,
-        searchRequest: String? = null,
-        searchResponse: String? = null
-    ): Map<String, Any> {
-        val allItems = organizerProvider?.getItems() ?: emptyList()
-        var filteredItems = allItems
-
-        // Apply domain filter
-        if (domain != null) {
-            filteredItems = filteredItems.filter { it.host == domain }
-        }
-
-        // Apply search filters (case-insensitive)
-        if (searchNotes != null) {
-            filteredItems = filteredItems.filter { it.notes.contains(searchNotes, ignoreCase = true) }
-        }
-        if (searchRequest != null) {
-            filteredItems = filteredItems.filter { it.request.contains(searchRequest, ignoreCase = true) }
-        }
-        if (searchResponse != null) {
-            filteredItems = filteredItems.filter { it.response.contains(searchResponse, ignoreCase = true) }
-        }
-
-        val hasFilters = domain != null || searchNotes != null || searchRequest != null || searchResponse != null
-
-        // Apply sorting and pagination only when filtering
-        return if (hasFilters) {
-            // Sort by timestamp descending (nulls last), then by ID descending as tiebreaker
-            val sortedItems = filteredItems.sortedWith(
-                compareByDescending<OrganizerItemData> { it.timeRequestSent }
-                    .thenByDescending { it.id }
-            )
-
-            val pageSize = 10
-            val totalPages = (sortedItems.size + pageSize - 1) / pageSize
-            val startIndex = (page - 1) * pageSize
-            val pagedItems = sortedItems.drop(startIndex).take(pageSize)
-
-            mapOf(
-                "count" to sortedItems.size,
-                "page" to page,
-                "page_size" to pageSize,
-                "total_pages" to totalPages,
-                "items" to pagedItems.map { mapOf("id" to it.id) }
-            )
-        } else {
-            mapOf(
-                "count" to filteredItems.size,
-                "items" to filteredItems.map { mapOf("id" to it.id) }
-            )
-        }
-    }
-
-    fun getOrganizerItem(id: Int, bodyLimit: Int = 100): Map<String, Any?> {
-        val items = organizerProvider?.getItemsByIds(setOf(id)) ?: emptyList()
-        val item = items.firstOrNull()
-            ?: return mapOf("error" to "not_found")
-
-        val (headers, body) = splitResponse(item.response)
-        val truncatedBody = TruncatedHttpBody(body, bodyLimit)
-
-        return mapOf(
-            "id" to item.id,
-            "request" to item.request,
-            "response_headers" to filterHeaders(headers),
-            "notes" to item.notes,
-            "host" to item.host,
-            "port" to item.port,
-            "secure" to item.secure
-        ) + truncatedBody.toResponseFields()
-    }
-
-    fun getOrganizerItems(ids: Set<Int>, bodyLimit: Int = 100): Map<String, Any?> {
-        val items = organizerProvider?.getItemsByIds(ids) ?: emptyList()
-
-        return mapOf(
-            "items" to items.map { item ->
-                val (headers, body) = splitResponse(item.response)
-                val truncatedBody = TruncatedHttpBody(body, bodyLimit)
-
-                mapOf(
-                    "id" to item.id,
-                    "request" to item.request,
-                    "response_headers" to filterHeaders(headers),
-                    "notes" to item.notes,
-                    "host" to item.host,
-                    "port" to item.port,
-                    "secure" to item.secure
-                ) + truncatedBody.toResponseFields()
-            }
-        )
-    }
-
     // Documentation resources
 
     fun getDoc(topic: String): Map<String, Any?> {
@@ -358,5 +278,10 @@ class McpResourceHandlers(
             if (file.exists()) return file.readText()
         }
         return null
+    }
+
+    companion object {
+        /** Values `sort_by` accepts. */
+        val SORT_FIELDS: List<String> = SortField.entries.map { it.name.lowercase() }
     }
 }

@@ -154,8 +154,8 @@ object ToolRegistry {
         // Analysis tools: cross-bridge analysis and reporting
         AnalysisTools.register(server, bridges)
 
-        // Config tools: get/set project and user config
-        ConfigTools.register(server, bridges.burpSuite)
+        // Config tools: proxy listeners, match/replace rules, upstream proxy
+        ConfigTools.register(server, bridges.config)
 
         // Session tools: session rules, token extraction/injection
         SessionTools.register(server, bridges.http, stateManager)

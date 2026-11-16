@@ -4,6 +4,7 @@ import burp.api.montoya.MontoyaApi
 import io.bitbytelab.raijin.bridge.AiBridge
 import io.bitbytelab.raijin.bridge.BurpSuiteBridge
 import io.bitbytelab.raijin.bridge.ComparerBridge
+import io.bitbytelab.raijin.bridge.ConfigBridge
 import io.bitbytelab.raijin.bridge.DecoderBridge
 import io.bitbytelab.raijin.bridge.FindingsBridge
 import io.bitbytelab.raijin.bridge.LoggingBridge
@@ -256,7 +257,7 @@ class ToolConsolidationTest {
         val api = nullApi()
         UtilitiesTools.register(s, UtilitiesBridge(api))
         LoggingTools.register(s, LoggingBridge(api))
-        ConfigTools.register(s, BurpSuiteBridge(api))
+        ConfigTools.register(s, ConfigBridge(api))
         BurpSuiteTools.register(s, BurpSuiteBridge(api))
         ProjectTools.register(s, ProjectBridge(api))
         PersistenceTools.register(s, PersistenceBridge(api))

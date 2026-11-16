@@ -1,11 +1,19 @@
 package io.bitbytelab.raijin.tools.turbo
 
 import io.bitbytelab.raijin.bridge.TurboBridge
+import io.bitbytelab.raijin.core.EnumValidation
+import io.bitbytelab.raijin.core.asBodyString
+import io.bitbytelab.raijin.core.asBooleanSafe
+import io.bitbytelab.raijin.core.asIntSafe
+import io.bitbytelab.raijin.core.asLongSafe
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
+import io.bitbytelab.raijin.turbo.mcp.McpResourceHandlers
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
@@ -21,32 +29,42 @@ import kotlinx.serialization.json.*
  */
 object TurboTools {
 
-    private fun obj(vararg props: Pair<String, Pair<String, String>>) = buildJsonObject {
-        props.forEach { (name, typeAndDesc) ->
-            putJsonObject(name) { put("type", typeAndDesc.first); put("description", typeAndDesc.second) }
-        }
+    private val SEARCH_IN = listOf("responses", "labels", "all")
+
+    private fun prop(type: String, description: String, enum: List<String>? = null) = buildJsonObject {
+        put("type", type)
+        put("description", description)
+        if (enum != null) putJsonArray("enum") { enum.forEach { add(it) } }
     }
 
-    private fun ok(value: Any?) = CallToolResult(content = listOf(TextContent(TurboBridge.toJson(value).toString())))
+    private fun obj(vararg props: Pair<String, JsonObject>) = buildJsonObject {
+        props.forEach { (name, schema) -> put(name, schema) }
+    }
 
-    private fun err(message: String) = CallToolResult(
-        content = listOf(TextContent(buildJsonObject { put("error", message) }.toString())),
-        isError = true
-    )
+    private fun CallToolRequest.arg(name: String): JsonElement? = params.arguments?.get(name)
+    private fun CallToolRequest.str(name: String): String? = (arg(name) as? JsonPrimitive)?.contentOrNull
+    private fun CallToolRequest.int(name: String): Int? = arg(name).asIntSafe()
+    private fun CallToolRequest.long(name: String): Long? = arg(name).asLongSafe()
+    private fun CallToolRequest.bool(name: String): Boolean? = arg(name).asBooleanSafe()
 
-    private fun CallToolRequest.str(name: String): String? = params.arguments?.get(name)?.jsonPrimitive?.contentOrNull
-    private fun CallToolRequest.int(name: String): Int? = params.arguments?.get(name)?.jsonPrimitive?.intOrNull
-    private fun CallToolRequest.long(name: String): Long? = params.arguments?.get(name)?.jsonPrimitive?.longOrNull
-    private fun CallToolRequest.bool(name: String): Boolean? = params.arguments?.get(name)?.jsonPrimitive?.booleanOrNull
+    /** A required string argument, or a tool error naming it when it is absent or blank. */
+    private inline fun CallToolRequest.required(name: String, onMissing: (CallToolResult) -> Nothing): String =
+        str(name)?.takeIf { it.isNotBlank() } ?: onMissing(toolError("Missing required parameter: $name"))
 
-    /** Runs [block] off the MCP dispatcher (handlers block on the engine) and maps failures to tool errors. */
+    /**
+     * Runs [block] off the MCP dispatcher (handlers block on the engine) and maps failures to tool
+     * errors. A handler result carrying an `error` key comes back flagged as an error.
+     */
     private suspend fun guarded(block: () -> Any?): CallToolResult = try {
-        ok(withContext(Dispatchers.IO) { block() })
+        toolJsonResult(TurboBridge.toJson(withContext(Dispatchers.IO) { block() }))
+    } catch (e: CancellationException) {
+        throw e
     } catch (e: Exception) {
-        err(e.message ?: e.toString())
+        toolError(e.message ?: e.toString())
     }
 
     fun register(server: Server, bridge: TurboBridge) {
+        val runId = "run_id" to prop("string", "Run id")
 
         server.addTool(
             name = "turbo_start_run",
@@ -56,23 +74,25 @@ object TurboTools {
                 "Read turbo_get_docs('api-quickstart') and turbo_list_examples first.",
             inputSchema = ToolSchema(
                 properties = obj(
-                    "script" to ("string" to "Python script code that controls the run (defines queueRequests(target, wordlists))"),
-                    "base_request" to ("string" to "Base HTTP request template; mark injection points with %s"),
-                    "endpoint" to ("string" to "Target endpoint URL, e.g. https://example.com"),
-                    "base_input" to ("string" to "Input data fed to the script (e.g. wordlist content)"),
-                    "timeout_ms" to ("integer" to "How long to wait, default 55000. After that the run keeps going and a run_id is returned."),
-                    "normalize_line_endings" to ("boolean" to "Normalize mixed \\n and \\r\\n to \\r\\n. Default true."),
+                    "script" to prop("string", "Python script code that controls the run (defines queueRequests(target, wordlists))"),
+                    "base_request" to prop("string", "Base HTTP request template; mark injection points with %s"),
+                    "endpoint" to prop("string", "Target endpoint URL, e.g. https://example.com"),
+                    "base_input" to prop("string", "Input data fed to the script (e.g. wordlist content)"),
+                    "timeout_ms" to prop("integer", "How long to wait, default 55000. After that the run keeps going and a run_id is returned."),
+                    "normalize_line_endings" to prop("boolean", "Normalize mixed \\n and \\r\\n to \\r\\n. Default true."),
                 ),
                 required = listOf("script", "base_request", "endpoint")
             )
         ) { req ->
+            val script = req.required("script") { return@addTool it }
+            val endpoint = req.required("endpoint") { return@addTool it }
             guarded {
                 bridge.tools.startRun(
-                    script = req.str("script") ?: "",
-                    baseRequest = req.str("base_request") ?: "",
-                    endpoint = req.str("endpoint") ?: "",
-                    baseInput = req.str("base_input") ?: "",
-                    timeoutMs = req.long("timeout_ms") ?: 55000,
+                    script = script,
+                    baseRequest = req.arg("base_request").asBodyString() ?: "",
+                    endpoint = endpoint,
+                    baseInput = req.arg("base_input").asBodyString() ?: "",
+                    timeoutMs = (req.long("timeout_ms") ?: 55000L).coerceAtLeast(0L),
                     normalizeLineEndings = req.bool("normalize_line_endings") ?: true
                 )
             }
@@ -81,17 +101,19 @@ object TurboTools {
         server.addTool(
             name = "turbo_stop_run",
             description = "Stop a Turbo run. Aborts it but keeps the results.",
-            inputSchema = ToolSchema(properties = obj("run_id" to ("string" to "Run id")), required = listOf("run_id"))
+            inputSchema = ToolSchema(properties = obj(runId), required = listOf("run_id"))
         ) { req ->
-            guarded { bridge.tools.stopRun(req.str("run_id") ?: "") }
+            val id = req.required("run_id") { return@addTool it }
+            guarded { bridge.tools.stopRun(id) }
         }
 
         server.addTool(
             name = "turbo_delete_run",
             description = "Delete a Turbo run and all its results. Also stops it if it is still executing.",
-            inputSchema = ToolSchema(properties = obj("run_id" to ("string" to "Run id")), required = listOf("run_id"))
+            inputSchema = ToolSchema(properties = obj(runId), required = listOf("run_id"))
         ) { req ->
-            guarded { bridge.tools.deleteRun(req.str("run_id") ?: "") }
+            val id = req.required("run_id") { return@addTool it }
+            guarded { bridge.tools.deleteRun(id) }
         }
 
         server.addTool(
@@ -101,21 +123,23 @@ object TurboTools {
                 "turbo_run_status (optionally wait=true) or turbo_list_runs to recover the run_id later.",
             inputSchema = ToolSchema(
                 properties = obj(
-                    "script" to ("string" to "Python script code that controls the run (defines queueRequests(target, wordlists))"),
-                    "base_request" to ("string" to "Base HTTP request template; mark injection points with %s"),
-                    "endpoint" to ("string" to "Target endpoint URL, e.g. https://example.com"),
-                    "base_input" to ("string" to "Input data fed to the script (e.g. wordlist content)"),
-                    "normalize_line_endings" to ("boolean" to "Normalize mixed \\n and \\r\\n to \\r\\n. Default true."),
+                    "script" to prop("string", "Python script code that controls the run (defines queueRequests(target, wordlists))"),
+                    "base_request" to prop("string", "Base HTTP request template; mark injection points with %s"),
+                    "endpoint" to prop("string", "Target endpoint URL, e.g. https://example.com"),
+                    "base_input" to prop("string", "Input data fed to the script (e.g. wordlist content)"),
+                    "normalize_line_endings" to prop("boolean", "Normalize mixed \\n and \\r\\n to \\r\\n. Default true."),
                 ),
                 required = listOf("script", "base_request", "endpoint")
             )
         ) { req ->
+            val script = req.required("script") { return@addTool it }
+            val endpoint = req.required("endpoint") { return@addTool it }
             guarded {
                 bridge.tools.startRunAsync(
-                    script = req.str("script") ?: "",
-                    baseRequest = req.str("base_request") ?: "",
-                    endpoint = req.str("endpoint") ?: "",
-                    baseInput = req.str("base_input") ?: "",
+                    script = script,
+                    baseRequest = req.arg("base_request").asBodyString() ?: "",
+                    endpoint = endpoint,
+                    baseInput = req.arg("base_input").asBodyString() ?: "",
                     normalizeLineEndings = req.bool("normalize_line_endings") ?: true
                 )
             }
@@ -137,35 +161,42 @@ object TurboTools {
                 "status message. Set wait=true to long-poll until the run completes (up to 50 s).",
             inputSchema = ToolSchema(
                 properties = obj(
-                    "run_id" to ("string" to "Run id"),
-                    "wait" to ("boolean" to "Long-poll until the run completes (up to 50 s). Default false."),
+                    runId,
+                    "wait" to prop("boolean", "Long-poll until the run completes (up to 50 s). Default false."),
                 ),
                 required = listOf("run_id")
             )
         ) { req ->
-            guarded { bridge.resources.getRunStatus(req.str("run_id") ?: "", if (req.bool("wait") == true) 50_000L else 0L) }
+            val id = req.required("run_id") { return@addTool it }
+            guarded { bridge.resources.getRunStatus(id, if (req.bool("wait") == true) 50_000L else 0L) }
         }
 
         server.addTool(
             name = "turbo_run_results",
             description = "Paginated results of a Turbo run. Timing: ttfb = time to first byte, ttlb = time to last byte " +
-                "(microseconds). sort_by: id|status|length|time|ttfb|ttlb|wordcount|anomaly_rank|arrival|payload|label|queue_id|connection_id.",
+                "(microseconds). Without sort_by, results follow the order the script set with table.setSortOrder(...), " +
+                "else id (arrival order). The response names the sort_by and descending it applied.",
             inputSchema = ToolSchema(
                 properties = obj(
-                    "run_id" to ("string" to "Run id"),
-                    "sort_by" to ("string" to "Sort field, default id"),
-                    "descending" to ("boolean" to "Default true"),
-                    "limit" to ("integer" to "Default 100"),
-                    "offset" to ("integer" to "Default 0"),
+                    runId,
+                    "sort_by" to prop(
+                        "string",
+                        "Sort field. Default: the script's table.setSortOrder order, else id",
+                        McpResourceHandlers.SORT_FIELDS
+                    ),
+                    "descending" to prop("boolean", "Default: the script's sort direction, else true"),
+                    "limit" to prop("integer", "Default 100"),
+                    "offset" to prop("integer", "Default 0"),
                 ),
                 required = listOf("run_id")
             )
         ) { req ->
+            val id = req.required("run_id") { return@addTool it }
             guarded {
                 bridge.resources.getResults(
-                    runId = req.str("run_id") ?: "",
-                    sortBy = req.str("sort_by") ?: "id",
-                    descending = req.bool("descending") ?: true,
+                    runId = id,
+                    sortBy = req.str("sort_by"),
+                    descending = req.bool("descending"),
                     limit = req.int("limit") ?: 100,
                     offset = req.int("offset") ?: 0
                 )
@@ -174,24 +205,27 @@ object TurboTools {
 
         server.addTool(
             name = "turbo_run_result",
-            description = "Full request and response of one result of a Turbo run. Response bodies are truncated to " +
-                "body_limit lines; set export=true to write the complete exchange to a file instead.",
+            description = "Full request and response of one result of a Turbo run. The response body is cut to its " +
+                "first body_limit lines (response_body_truncated, response_body_total_lines and " +
+                "response_body_total_length describe the whole body); set export=true to write the complete " +
+                "exchange to files instead.",
             inputSchema = ToolSchema(
                 properties = obj(
-                    "run_id" to ("string" to "Run id"),
-                    "id" to ("integer" to "Result id (from turbo_run_results)"),
-                    "body_limit" to ("integer" to "Max body lines, default 100"),
-                    "export" to ("boolean" to "Export the full exchange to a file. Default false."),
+                    runId,
+                    "id" to prop("integer", "Result id (from turbo_run_results)"),
+                    "body_limit" to prop("integer", "Max response body lines, default 100; 0 returns the whole body"),
+                    "export" to prop("boolean", "Export the full exchange to files. Default false."),
                 ),
                 required = listOf("run_id", "id")
             )
         ) { req ->
-            val id = req.int("id") ?: return@addTool err("Missing required parameter: id")
+            val run = req.required("run_id") { return@addTool it }
+            val id = req.int("id") ?: return@addTool toolError("Missing required parameter: id (an integer)")
             guarded {
                 bridge.resources.getRequestDetail(
-                    runId = req.str("run_id") ?: "",
+                    runId = run,
                     requestId = id,
-                    bodyLimit = req.int("body_limit") ?: 100,
+                    bodyLimit = (req.int("body_limit") ?: 100).coerceAtLeast(0),
                     exportFile = req.bool("export") ?: false
                 )
             }
@@ -200,9 +234,10 @@ object TurboTools {
         server.addTool(
             name = "turbo_run_script",
             description = "The Python script a Turbo run was started with.",
-            inputSchema = ToolSchema(properties = obj("run_id" to ("string" to "Run id")), required = listOf("run_id"))
+            inputSchema = ToolSchema(properties = obj(runId), required = listOf("run_id"))
         ) { req ->
-            guarded { bridge.resources.getRunScript(req.str("run_id") ?: "") }
+            val id = req.required("run_id") { return@addTool it }
+            guarded { bridge.resources.getRunScript(id) }
         }
 
         server.addTool(
@@ -210,14 +245,19 @@ object TurboTools {
             description = "Search the responses (or labels) of a Turbo run for a substring; returns matching result ids.",
             inputSchema = ToolSchema(
                 properties = obj(
-                    "run_id" to ("string" to "Run id"),
-                    "query" to ("string" to "Substring to look for"),
-                    "search_in" to ("string" to "responses | labels | all (default)"),
+                    runId,
+                    "query" to prop("string", "Substring to look for"),
+                    "search_in" to prop("string", "Where to look (default all)", SEARCH_IN),
                 ),
                 required = listOf("run_id", "query")
             )
         ) { req ->
-            guarded { bridge.tools.searchResponses(req.str("run_id") ?: "", req.str("query") ?: "", req.str("search_in") ?: "all") }
+            val id = req.required("run_id") { return@addTool it }
+            val query = req.str("query")?.takeIf { it.isNotEmpty() }
+                ?: return@addTool toolError("Missing required parameter: query")
+            val searchIn = req.str("search_in")?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: "all"
+            EnumValidation.error(searchIn, SEARCH_IN.toSet(), "search_in")?.let { return@addTool toolJsonResult(it) }
+            guarded { bridge.tools.searchResponses(id, query, searchIn) }
         }
 
         server.addTool(
@@ -225,24 +265,32 @@ object TurboTools {
             description = "Save results from a Turbo run to Burp's Organizer with notes (the run id and script are appended to the notes).",
             inputSchema = ToolSchema(
                 properties = obj(
-                    "run_id" to ("string" to "Run id"),
-                    "items" to ("string" to "JSON array of {\"request_id\": int, \"notes\": string}"),
+                    runId,
+                    "items" to prop("string", "JSON array of {\"request_id\": int, \"notes\": string}"),
                 ),
                 required = listOf("run_id", "items")
             )
         ) { req ->
-            guarded { bridge.tools.saveToOrganizer(req.str("run_id") ?: "", req.str("items") ?: "[]") }
+            val id = req.required("run_id") { return@addTool it }
+            // An agent may pass the array itself rather than its JSON text; both mean the same.
+            val items = req.arg("items").asBodyString()?.takeIf { it.isNotBlank() }
+                ?: return@addTool toolError("Missing required parameter: items")
+            guarded { bridge.tools.saveToOrganizer(id, items) }
         }
 
         server.addTool(
             name = "turbo_get_docs",
-            description = "Documentation for writing Turbo scripts. Call with no topic to list topics " +
-                "(api-quickstart, engines, settings, race-conditions, response-processing, decorators, misc).",
-            inputSchema = ToolSchema(properties = obj("topic" to ("string" to "Doc topic; omit to list")))
+            description = "Documentation for writing Turbo scripts. Call with no topic to list the topics and what " +
+                "each covers; start with index or api-quickstart.",
+            inputSchema = ToolSchema(
+                properties = obj(
+                    "topic" to prop("string", "Doc topic; omit to list", bridge.resources.docTopics.keys.toList())
+                )
+            )
         ) { req ->
-            val topic = req.str("topic")
+            val topic = req.str("topic")?.trim()
             guarded {
-                if (topic.isNullOrBlank()) mapOf("topics" to bridge.resources.docTopics)
+                if (topic.isNullOrEmpty()) mapOf("topics" to bridge.resources.docTopics)
                 else bridge.resources.getDoc(topic)
             }
         }
@@ -250,7 +298,7 @@ object TurboTools {
         server.addTool(
             name = "turbo_list_examples",
             description = "List the example Turbo scripts (race conditions, HTTP/2, HTTP/3, desync, rate limits, ...).",
-            inputSchema = ToolSchema(properties = buildJsonObject {})
+            inputSchema = ToolSchema(properties = obj())
         ) {
             guarded { bridge.resources.listExamples() }
         }
@@ -258,9 +306,15 @@ object TurboTools {
         server.addTool(
             name = "turbo_get_example",
             description = "Source of an example Turbo script by name (see turbo_list_examples).",
-            inputSchema = ToolSchema(properties = obj("name" to ("string" to "Example name, e.g. race-single-packet-attack")), required = listOf("name"))
+            inputSchema = ToolSchema(
+                properties = obj(
+                    "name" to prop("string", "Example name, e.g. race-single-packet-attack", bridge.resources.exampleNames)
+                ),
+                required = listOf("name")
+            )
         ) { req ->
-            guarded { bridge.resources.getExample(req.str("name") ?: "") }
+            val name = req.required("name") { return@addTool it }
+            guarded { bridge.resources.getExample(name.trim()) }
         }
     }
 }

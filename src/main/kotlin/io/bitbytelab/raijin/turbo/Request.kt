@@ -42,7 +42,6 @@ open class Request(val template: String, val words: List<String?>, val learnBori
     var pauseBefore: Int = 0
     var pauseTime: Int = 1000
     var pauseMarkers: List<String> = emptyList()
-    var delayCompletion: Long = 0L
     var endpointOverride: String? = null
     var montoyaReq: HttpRequestResponse? = null
     var autoFixContentLength: Boolean = true

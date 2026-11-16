@@ -303,7 +303,6 @@ abstract class RequestEngine(
         request.pauseBefore = pauseBefore
         request.pauseTime = pauseTime
         request.pauseMarkers = pauseMarkers
-        request.delayCompletion = delay
         request.endpointOverride = endpoint
         request.autoFixContentLength = fixContentLength
         request.connectionId = connectionId

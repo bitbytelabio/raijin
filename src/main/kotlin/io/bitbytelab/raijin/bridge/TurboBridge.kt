@@ -18,9 +18,8 @@ import kotlinx.serialization.json.JsonPrimitive
  * GUI, so a run started by an agent is visible in the Turbo tab and vice versa.
  */
 class TurboBridge(val manager: RunManager = TurboModule.runManager) {
-    private val organizer = BurpOrganizerProvider()
-    val tools = McpToolHandlers(manager, organizer, BurpCollaboratorProvider())
-    val resources = McpResourceHandlers(manager, organizer) { TurboSettings.desyncAgent }
+    val tools = McpToolHandlers(manager, BurpOrganizerProvider(), BurpCollaboratorProvider())
+    val resources = McpResourceHandlers(manager) { TurboSettings.desyncAgent }
 
     companion object {
         /** Converts the handler result maps (String/Number/Boolean/List/Map/null) to JSON. */

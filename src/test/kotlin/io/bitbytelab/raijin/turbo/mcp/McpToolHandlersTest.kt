@@ -16,29 +16,6 @@ class McpToolHandlersTest {
     }
 
     @Test
-    fun `setOrganizerNotes updates notes on item`() {
-        val fakeOrganizer = FakeOrganizerProvider(listOf(
-            FakeOrganizerItem(1, "GET / HTTP/1.1", "HTTP/1.1 200 OK", "Old note")
-        ))
-        val handlersWithOrganizer = McpToolHandlers(manager, fakeOrganizer)
-
-        val result = handlersWithOrganizer.setOrganizerNotes(1, "New note")
-
-        assertEquals("success", result["status"])
-        assertEquals("New note", fakeOrganizer.getNotes(1))
-    }
-
-    @Test
-    fun `setOrganizerNotes returns error for non-existent item`() {
-        val fakeOrganizer = FakeOrganizerProvider(emptyList())
-        val handlersWithOrganizer = McpToolHandlers(manager, fakeOrganizer)
-
-        val result = handlersWithOrganizer.setOrganizerNotes(999, "Note")
-
-        assertEquals("not_found", result["error"])
-    }
-
-    @Test
     fun `startRun blocks until completion and returns results`() {
         val result = handlers.startRun(
             script = "def queueRequests(target, wordlists):\n    pass\ndef completed(results):\n    pass",
@@ -74,7 +51,7 @@ def completed(results):
         assertEquals("running", result["status"])
         assertNotNull(result["run_id"])
         assertNotNull(result["message"])
-        assertTrue((result["message"] as String).contains("turbo://runs/"))
+        assertTrue((result["message"] as String).contains("turbo_run_status"))
         assertFalse(result.containsKey("running"), "Should not contain 'running' boolean")
         assertFalse(result.containsKey("finished"), "Should not contain 'finished' boolean")
         assertNotNull(result["status_message"])
@@ -129,7 +106,7 @@ def completed(results):
 
     @Test
     fun `saveToOrganizer saves requests with notes and script`() {
-        val fakeOrganizer = FakeOrganizerProvider(emptyList())
+        val fakeOrganizer = FakeOrganizerProvider()
         val handlersWithOrganizer = McpToolHandlers(manager, fakeOrganizer)
 
         // Create a run with some requests
@@ -163,7 +140,7 @@ def completed(results):
 
     @Test
     fun `saveToOrganizer returns error for non-existent request`() {
-        val fakeOrganizer = FakeOrganizerProvider(emptyList())
+        val fakeOrganizer = FakeOrganizerProvider()
         val handlersWithOrganizer = McpToolHandlers(manager, fakeOrganizer)
 
         val run = manager.startRun()
@@ -182,6 +159,27 @@ def completed(results):
         assertEquals(listOf(1), saved)
         assertEquals(1, errors.size)
         assertEquals(999, errors[0]["request_id"])
+    }
+
+    @Test
+    fun `saveToOrganizer reports malformed items and still saves the valid ones`() {
+        val fakeOrganizer = FakeOrganizerProvider()
+        val handlersWithOrganizer = McpToolHandlers(manager, fakeOrganizer)
+
+        val run = manager.startRun()
+        val req1 = io.bitbytelab.raijin.turbo.Request("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        req1.id = 1
+        req1.response = "HTTP/1.1 200 OK\r\n\r\n"
+        run.store.add(req1)
+
+        val result = handlersWithOrganizer.saveToOrganizer(
+            runId = run.id,
+            items = """["not an object", {"request_id": "abc"}, {"request_id": "1", "notes": "string id"}]"""
+        )
+
+        assertEquals(listOf(1), result["saved"])
+        assertEquals(2, (result["errors"] as List<*>).size)
+        assertTrue(fakeOrganizer.sentItems.single().second.startsWith("string id"))
     }
 
     @Test
@@ -421,7 +419,7 @@ def completed(results):
 
     @Test
     fun `saveToOrganizer uses specified run`() {
-        val fakeOrganizer = FakeOrganizerProvider(emptyList())
+        val fakeOrganizer = FakeOrganizerProvider()
         val handlersWithOrganizer = McpToolHandlers(manager, fakeOrganizer)
 
         // Create two runs
@@ -557,47 +555,12 @@ def handleResponse(req, interesting):
 }
 
 // Test helpers
-data class FakeOrganizerItem(
-    val id: Int,
-    val request: String,
-    val response: String,
-    var notes: String = "",
-    val host: String = "example.com",
-    val port: Int = 443,
-    val secure: Boolean = true,
-    val timeRequestSent: java.time.ZonedDateTime? = null
-)
-
-class FakeOrganizerProvider(items: List<FakeOrganizerItem>) : OrganizerProvider {
-    private val items = items.toMutableList()
+class FakeOrganizerProvider : OrganizerProvider {
     val sentItems = mutableListOf<Pair<io.bitbytelab.raijin.turbo.Request, String>>()
-
-    override fun getItems(): List<OrganizerItemData> {
-        return items.map { OrganizerItemData(it.id, it.request, it.response, it.notes, it.host, it.port, it.secure, it.timeRequestSent) }
-    }
-
-    override fun getItemsByIds(ids: Set<Int>): List<OrganizerItemData> {
-        return items.filter { it.id in ids }.map { OrganizerItemData(it.id, it.request, it.response, it.notes, it.host, it.port, it.secure, it.timeRequestSent) }
-    }
-
-    override fun setNotes(id: Int, notes: String): Boolean {
-        val item = items.find { it.id == id } ?: return false
-        item.notes = notes
-        return true
-    }
 
     override fun sendToOrganizer(request: io.bitbytelab.raijin.turbo.Request, notes: String) {
         sentItems.add(Pair(request, notes))
     }
-
-    fun getNotes(id: Int): String? = items.find { it.id == id }?.notes
-}
-
-class ThrowingOrganizerProvider : OrganizerProvider {
-    override fun getItems(): List<OrganizerItemData> = throw RuntimeException("Test exception from getItems")
-    override fun getItemsByIds(ids: Set<Int>): List<OrganizerItemData> = throw RuntimeException("Test exception from getItemsByIds")
-    override fun setNotes(id: Int, notes: String): Boolean = throw RuntimeException("Test exception from setNotes")
-    override fun sendToOrganizer(request: io.bitbytelab.raijin.turbo.Request, notes: String) = throw RuntimeException("Test exception from sendToOrganizer")
 }
 
 // Collaborator test helpers
@@ -796,7 +759,7 @@ class CollaboratorToolHandlersTest {
 
     @Test
     fun `getCollaboratorInteractions sends HTTP interactions to Organizer`() {
-        val fakeOrganizer = FakeOrganizerProvider(emptyList())
+        val fakeOrganizer = FakeOrganizerProvider()
         val fakeCollaborator = FakeCollaboratorProvider(organizerProvider = fakeOrganizer)
         handlers = McpToolHandlers(manager, organizerProvider = fakeOrganizer, collaboratorProvider = fakeCollaborator)
 
@@ -816,7 +779,7 @@ class CollaboratorToolHandlersTest {
 
     @Test
     fun `getCollaboratorInteractions does not send DNS interactions to Organizer`() {
-        val fakeOrganizer = FakeOrganizerProvider(emptyList())
+        val fakeOrganizer = FakeOrganizerProvider()
         val fakeCollaborator = FakeCollaboratorProvider(organizerProvider = fakeOrganizer)
         handlers = McpToolHandlers(manager, organizerProvider = fakeOrganizer, collaboratorProvider = fakeCollaborator)
 

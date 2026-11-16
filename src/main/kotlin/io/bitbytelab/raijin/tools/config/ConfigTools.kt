@@ -1,6 +1,5 @@
 package io.bitbytelab.raijin.tools.config
 
-import io.bitbytelab.raijin.bridge.BurpSuiteBridge
 import io.bitbytelab.raijin.bridge.ConfigBridge
 import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.core.asBooleanSafe
@@ -15,10 +14,6 @@ import kotlinx.serialization.json.*
  * Configuration shortcut tools that wrap the ConfigBridge for common
  * Burp Suite configuration operations (proxy listeners, match/replace
  * rules, upstream proxy).
- *
- * The ConfigBridge is created on-the-fly from the BurpSuiteBridge's
- * underlying MontoyaApi, keeping the tool registration consistent
- * with the ToolRegistry call signature.
  */
 object ConfigTools {
 
@@ -29,13 +24,10 @@ object ConfigTools {
     )
     private val UPSTREAM_PROXY_TYPES = listOf("HTTP", "SOCKS4", "SOCKS5")
 
-    fun register(server: Server, burpSuiteBridge: BurpSuiteBridge) {
+    /** A string argument, or null when absent, JSON null, or not a primitive. */
+    private fun Map<String, JsonElement>.str(name: String): String? = (this[name] as? JsonPrimitive)?.contentOrNull
 
-        // Extract the MontoyaApi from BurpSuiteBridge via reflection
-        val apiField = burpSuiteBridge.javaClass.getDeclaredField("api")
-        apiField.isAccessible = true
-        val api = apiField.get(burpSuiteBridge) as burp.api.montoya.MontoyaApi
-        val bridge = ConfigBridge(api)
+    fun register(server: Server, bridge: ConfigBridge) {
 
         // 1. config_proxy_listeners_list
         server.addTool(
@@ -80,13 +72,13 @@ object ConfigTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val listenerInterface = args["interface"]?.jsonPrimitive?.contentOrNull
+                val listenerInterface = args.str("interface")
                     ?: return@addTool toolError("Missing required parameter: interface")
                 val tls = args["tls"].asBooleanSafe() ?: false
-                val redirectHost = args["redirect_host"]?.jsonPrimitive?.contentOrNull
+                val redirectHost = args.str("redirect_host")
                 val redirectPort = args["redirect_port"].asBoundedInt("redirect_port", 1, 65535)
                     .getOrElse { return@addTool toolError(it.message ?: "Invalid redirect_port") }
-                val certificate = args["certificate"]?.jsonPrimitive?.contentOrNull
+                val certificate = args.str("certificate")
 
                 toolJsonResult(bridge.addProxyListener(listenerInterface, tls, redirectHost, redirectPort, certificate))
             } catch (e: Exception) {
@@ -109,7 +101,7 @@ object ConfigTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val listenerInterface = args["interface"]?.jsonPrimitive?.contentOrNull
+                val listenerInterface = args.str("interface")
                     ?: return@addTool toolError("Missing required parameter: interface")
                 toolJsonResult(bridge.removeProxyListener(listenerInterface))
             } catch (e: Exception) {
@@ -143,14 +135,14 @@ object ConfigTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val type = args["type"]?.jsonPrimitive?.contentOrNull
+                val type = args.str("type")
                     ?: return@addTool toolError("Missing required parameter: type")
                 EnumValidation.error(type, MATCH_REPLACE_TYPES.toSet(), "type")?.let { return@addTool toolJsonResult(it) }
-                val match = args["match"]?.jsonPrimitive?.contentOrNull
+                val match = args.str("match")
                     ?: return@addTool toolError("Missing required parameter: match")
-                val replace = args["replace"]?.jsonPrimitive?.contentOrNull
+                val replace = args.str("replace")
                     ?: return@addTool toolError("Missing required parameter: replace")
-                val comment = args["comment"]?.jsonPrimitive?.contentOrNull
+                val comment = args.str("comment")
                 val enabled = args["enabled"].asBooleanSafe() ?: true
 
                 toolJsonResult(bridge.addMatchReplaceRule(type.trim().lowercase(), match, replace, comment, enabled))
@@ -236,16 +228,16 @@ object ConfigTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val host = args["host"]?.jsonPrimitive?.contentOrNull
+                val host = args.str("host")
                     ?: return@addTool toolError("Missing required parameter: host")
                 val port = args["port"].asBoundedInt("port", 1, 65535)
                     .getOrElse { return@addTool toolError(it.message ?: "Invalid port") }
                     ?: return@addTool toolError("Missing required parameter: port")
-                val proxyType = args["type"]?.jsonPrimitive?.contentOrNull ?: "HTTP"
+                val proxyType = args.str("type") ?: "HTTP"
                 EnumValidation.error(proxyType, UPSTREAM_PROXY_TYPES.toSet(), "type")?.let { return@addTool toolJsonResult(it) }
-                val authUser = args["auth_user"]?.jsonPrimitive?.contentOrNull
-                val authPass = args["auth_pass"]?.jsonPrimitive?.contentOrNull
-                val destinationHost = args["destination_host"]?.jsonPrimitive?.contentOrNull
+                val authUser = args.str("auth_user")
+                val authPass = args.str("auth_pass")
+                val destinationHost = args.str("destination_host")
 
                 toolJsonResult(bridge.setUpstreamProxy(host, port, proxyType, authUser, authPass, destinationHost))
             } catch (e: Exception) {

@@ -1,13 +1,13 @@
 package io.bitbytelab.raijin.turbo.mcp
 
+import io.bitbytelab.raijin.core.asBodyString
+import io.bitbytelab.raijin.core.asIntSafe
 import io.bitbytelab.raijin.turbo.Utils
 import io.bitbytelab.raijin.turbo.evalJython
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.int
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import kotlin.concurrent.thread
 
 class McpToolHandlers(
@@ -15,15 +15,6 @@ class McpToolHandlers(
     private val organizerProvider: OrganizerProvider = BurpOrganizerProvider(),
     private val collaboratorProvider: CollaboratorProvider? = null
 ) {
-
-    fun setOrganizerNotes(id: Int, notes: String): Map<String, String> {
-        val success = organizerProvider.setNotes(id, notes)
-        return if (success) {
-            mapOf("status" to "success")
-        } else {
-            mapOf("error" to "not_found")
-        }
-    }
 
     fun generateCollaboratorPayload(metadata: String): Map<String, Any?> {
         val provider = collaboratorProvider
@@ -74,11 +65,11 @@ class McpToolHandlers(
         } else ""
 
         for (item in itemList) {
-            val obj = item.jsonObject
-            val requestId = obj["request_id"]?.jsonPrimitive?.int
-            val notes = obj["notes"]?.jsonPrimitive?.content ?: ""
+            val obj = item as? JsonObject
+            val requestId = obj?.get("request_id").asIntSafe()
+            val notes = obj?.get("notes").asBodyString() ?: ""
             if (requestId == null) {
-                errors.add(mapOf("error" to "item is missing request_id"))
+                errors.add(mapOf("error" to "item must be an object with an integer request_id: $item"))
                 continue
             }
             val request = run.store.getRequest(requestId)
@@ -111,7 +102,7 @@ class McpToolHandlers(
             if (System.currentTimeMillis() - startTime > timeoutMs) {
                 val result = mutableMapOf<String, Any?>(
                     "status" to "running",
-                    "message" to "The run is still executing. Read turbo://runs/${run.id}?wait=true to long-poll until completion.",
+                    "message" to "The run is still executing. Call turbo_run_status with wait=true to long-poll until completion.",
                     "run_id" to run.id,
                     "status_message" to run.handler.statusString(),
                     "result_count" to run.store.count(),

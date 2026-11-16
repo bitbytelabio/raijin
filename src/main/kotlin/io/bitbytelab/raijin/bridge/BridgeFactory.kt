@@ -47,7 +47,8 @@ class BridgeFactory {
         val accessControl: AccessControlBridge,
         val injection: InjectionBridge,
         val idorHunt: IdorHuntBridge,
-        val autorize: AutorizeBridge
+        val autorize: AutorizeBridge,
+        val config: ConfigBridge
     ) {
         /**
          * Releases thread pools and extension registrations held by bridges on unload. One bridge
@@ -117,7 +118,8 @@ class BridgeFactory {
                 accessControl = AccessControlBridge(api),
                 injection = InjectionBridge(api),
                 idorHunt = IdorHuntBridge(api),
-                autorize = AutorizeBridge(stateManager)
+                autorize = AutorizeBridge(stateManager),
+                config = ConfigBridge(api)
             )
         }
     }
