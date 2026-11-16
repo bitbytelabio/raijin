@@ -115,9 +115,9 @@ class RaijinExtension : BurpExtension {
             val restoredFindings = FindingsStore.load(projectName)
             if (restoredFindings.isNotEmpty()) stateManager.restoreFindings(restoredFindings)
             stateManager.findingsListeners.add { f -> FindingsStore.append(f, projectName) }
-            // The snapshot is taken under the store's lock, so a finding added concurrently is not lost.
-            stateManager.findingsRemoveListeners.add { _ ->
-                FindingsStore.replaceProject(projectName) { stateManager.findings.toList() }
+            // Remove by id on disk: an in-flight listener must never snapshot state cleared by unload.
+            stateManager.findingsRemoveListeners.add { id ->
+                FindingsStore.remove(projectName, id)
             }
             api.logging().logToOutput(
                 "Raijin: restored ${restoredFindings.size} agent finding(s) (project: ${projectName.ifEmpty { "default" }}); store → ${FindingsStore.path()}"

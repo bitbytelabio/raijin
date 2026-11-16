@@ -54,6 +54,21 @@ class FindingsFileStore(private val file: File) {
         }
     }
 
+    /** Deletes only the named finding, without consulting live state that unload may clear. */
+    fun remove(project: String, id: String) {
+        lock.withLock {
+            try {
+                val lines = FindingsStore.dedupe(readParsed())
+                    .filterNot { (finding, owner) -> owner == project && finding.id == id }
+                    .map { (finding, owner) -> FindingsStore.buildEntry(finding, owner) }
+                if (lines.isEmpty()) Files.deleteIfExists(file.toPath()) else JsonlStoreSupport.atomicWriteLines(file, lines)
+                succeeded()
+            } catch (ex: Exception) {
+                failed("remove", ex)
+            }
+        }
+    }
+
     fun replaceProject(project: String, findings: List<StoredFinding>) = replaceProject(project) { findings }
 
     /**
@@ -170,4 +185,7 @@ object FindingsStore {
 
     /** Like [replaceProject], but [snapshot] is taken under the file lock: safe from any thread. */
     fun replaceProject(project: String, snapshot: () -> List<StoredFinding>) = defaultStore.replaceProject(project, snapshot)
+
+    /** Deletes one persisted finding even if its in-memory project state was already unloaded. */
+    fun remove(project: String, id: String) = defaultStore.remove(project, id)
 }
