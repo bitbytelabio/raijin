@@ -19,7 +19,7 @@ class TestRequestEngine : RequestEngine() {
     }
 
     override fun start(timeout: Int) {
-        runState.set(1) // live
+        goLive()
     }
 
     override fun buildRequest(template: String, payloads: List<String?>, learnBoring: Int?, label: String): Request {

@@ -197,6 +197,17 @@ class HTTP2RequestEngineTest {
         assertTrue(req.ttfb in 140_000L..req.ttlb, "ttfb ${req.ttfb} should be microseconds")
     }
 
+    @Test
+    fun `starting a stopped run leaves it stopped`() {
+        val engine = engine(server())
+        engine.cancel()
+
+        // start() used to set the run live outright, undoing the stop.
+        engine.start(5)
+
+        assertEquals(3, engine.runState.get())
+    }
+
     private fun elapsedMillis(startedNanos: Long) = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos)
 
     private fun liveThreads(prefix: String) = Thread.getAllStackTraces().keys.count { it.isAlive && it.name.startsWith(prefix) }

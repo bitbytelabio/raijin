@@ -5,6 +5,8 @@ import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.assertDoesNotThrow
+import org.junit.jupiter.api.assertTimeoutPreemptively
+import java.time.Duration
 
 class RequestEngineTest {
 
@@ -123,5 +125,60 @@ class RequestEngineTest {
         engine.finish(4)
 
         assertEquals(3, engine.runState.get())
+    }
+
+    @Test
+    fun `a stop before the run goes live stands, and the run takes no more requests`() {
+        val unstarted = TestRequestEngine()
+        unstarted.cancel()
+
+        // start() used to set the run live outright, undoing a stop that landed while it waited.
+        unstarted.start()
+
+        assertEquals(3, unstarted.runState.get())
+        assertThrows<IllegalStateException> { unstarted.queue(get("/late")) }
+    }
+
+    @Test
+    fun `a run put back to live is cancelled again`() {
+        engine.cancel()
+        engine.setRunState(1)
+
+        // The first cancel used to claim a one-shot flag, which made this one a no-op.
+        engine.cancel()
+
+        assertEquals(3, engine.runState.get())
+    }
+
+    @Test
+    fun `once started, requests queued while the pre-start backlog waits join it without blocking`() {
+        val unstarted = TestRequestEngine()
+        val queue = unstarted.requestQueue
+        repeat(101) { unstarted.queue(get("/$it")) } // the queue holds 100: one waits in the backlog
+        unstarted.start()
+
+        // Nothing takes from the queue here, as when every worker is in a callback queueing
+        // follow-ups. Those callbacks used to wait for the backlog to fit, and so for good.
+        assertTimeoutPreemptively(Duration.ofSeconds(5)) {
+            repeat(3) { unstarted.queue(get("/follow-$it")) }
+        }
+        assertEquals((0 until 100).map { "/$it" }, List(100) { path(queue.poll()) })
+
+        unstarted.queue(get("/after"))
+
+        val paths = generateSequence { queue.poll() }.map(::path).toList()
+        assertEquals(listOf("/100", "/follow-0", "/follow-1", "/follow-2", "/after"), paths)
+    }
+
+    @Test
+    fun `complete's timeout also bounds draining the pre-start backlog`() {
+        val unstarted = TestRequestEngine()
+        // The queue holds 100, so one request waits in the backlog, and nothing here ever takes
+        // from the queue to make room for it.
+        repeat(101) { unstarted.queue(get("/$it")) }
+
+        assertTimeoutPreemptively(Duration.ofSeconds(10)) { unstarted.showStats(1) }
+
+        assertEquals(3, unstarted.runState.get(), "the run should have been aborted at its timeout")
     }
 }

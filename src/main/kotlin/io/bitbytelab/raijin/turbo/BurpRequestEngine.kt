@@ -36,6 +36,9 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
 
         /** How long a gate nothing can open any more is left before its requests are failed. */
         private const val UNOPENABLE_GATE_GRACE_NANOS = 1_000_000_000L
+
+        /** [Request.order] of a gated request that got no response, so took no place in the race. */
+        private const val UNRANKED = -1
     }
 
     private val threadPool = Collections.synchronizedList(ArrayList<Thread>())
@@ -99,9 +102,7 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
     }
 
     override fun start(timeout: Int) {
-        // Stamped before the run goes live, so no worker can time an arrival from the old value.
-        start = System.nanoTime()
-        runState.set(1)
+        goLive()
     }
 
     override val autoProtocol = AutoProtocol.HTTP2
@@ -374,7 +375,8 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
 
             var n = 0
 
-            val reqs: ArrayList<Request> = ArrayList()
+            val answered = ArrayList<Request>(requestGroup.size)
+            val unanswered = ArrayList<Request>()
             for (resp in responses) {
                 val req = requestGroup.get(n++)
                 val response = resp.response()
@@ -384,9 +386,11 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
                     if (adaptive) recordTransportFailure(IllegalStateException("Montoya returned no response"))
                     req.response = "The server closed the connection without issuing a response."
                     permaFails.incrementAndGet()
+                    unanswered.add(req)
                 } else {
                     successfulRequests.getAndIncrement()
                     req.response = response.toString()
+                    answered.add(req)
                 }
 
                 recordTiming(req, resp)
@@ -404,16 +408,17 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
                 } else {
                     processResponse(req, response.toByteArray().bytes)
                 }
-                reqs.add(req)
             }
 
-            reqs.sortBy { it.ttfb }
-
-            var i = 0
-            for (req in reqs) {
-                req.order = i++
-                invokeCallback(req, req.interesting)
-            }
+            // req.order ranks the responses by arrival, 0 being the one the server answered first:
+            // the race's winner. A request with no response took no part in that race. Montoya has
+            // no timing for it, so its ttfb stayed 0 and ranked it ahead of every answered request;
+            // it is left unranked instead, and called back after the ranked ones.
+            answered.sortBy { it.ttfb }
+            answered.forEachIndexed { rank, req -> req.order = rank }
+            unanswered.forEach { it.order = UNRANKED }
+            for (req in answered) invokeCallback(req, req.interesting)
+            for (req in unanswered) invokeCallback(req, req.interesting)
         } finally {
             if (adaptive) activeRequests.addAndGet(-requestGroup.size)
             requestGroup.firstOrNull()?.gate?.let { finishGateLifecycle(it.name) }

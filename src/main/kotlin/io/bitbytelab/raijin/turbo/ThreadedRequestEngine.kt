@@ -196,9 +196,12 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
 
     override fun start(timeout: Int) {
         connectedLatch.await(timeout.toLong(), TimeUnit.SECONDS)
-        // Stamped before the run goes live, so no worker can time an arrival from the old value.
-        start = System.nanoTime()
-        runState.set(1)
+        goLive()
+    }
+
+    // A run that ends while start() still waits for its connections has none left to wait for.
+    override fun onTerminalStateEntering(state: Int) {
+        while (connectedLatch.count > 0) connectedLatch.countDown()
     }
 
     override val autoProtocol = AutoProtocol.HTTP1

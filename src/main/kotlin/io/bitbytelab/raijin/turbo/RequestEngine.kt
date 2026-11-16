@@ -32,6 +32,12 @@ abstract class RequestEngine(
 
         /** How long queue() waits for room before it gives up on the run. */
         const val QUEUE_TIMEOUT_SECONDS = 1800L
+
+        /** How long one wait for room in the queue lasts before the run's state is checked again. */
+        const val QUEUE_OFFER_SLICE_NANOS = 1_000_000_000L
+
+        /** How often openGate() moves the pre-start backlog on while the gate's requests are staged. */
+        const val GATE_BACKLOG_POLL_MILLIS = 1L
     }
 
 
@@ -74,10 +80,24 @@ abstract class RequestEngine(
     // HTTP/2 workers re-read it on every poll.
     @Volatile lateinit var requestQueue: LinkedBlockingQueue<Request>
     /**
-     * Requests queued before start() that did not fit in [requestQueue]. Nothing consumes the queue
-     * before then, so they wait here, in order, until the run is going.
+     * Requests held back from [requestQueue]: those queued before start() once it was full, and
+     * after start() whatever is queued while earlier ones still wait here, so that none overtakes
+     * another. They move into the queue, oldest first, as it has room: on each queue(), while
+     * openGate() waits for a gate's requests, and all of them in complete().
      */
     private val prestartBacklog = ConcurrentLinkedDeque<Request>()
+    /** Orders every move into and out of [prestartBacklog]; guards [backlogHead]. */
+    private val backlogLock = Any()
+    /** Held through a whole [drainPrestartBacklog], so that one drain at a time places requests. */
+    private val backlogDrainLock = Any()
+    /**
+     * Whether [prestartBacklog] holds requests or a drain is placing one; written under
+     * [backlogLock]. While it is false queue() skips that lock, and once the run is going and the
+     * backlog has emptied, it stays false.
+     */
+    @Volatile private var backlogInUse = false
+    /** The request a drain took off [prestartBacklog] and is still placing: nothing may overtake it. */
+    private var backlogHead: Request? = null
     abstract val callback: (Request, Boolean) -> Boolean?
     abstract var readCallback: ((String) -> Boolean)?
     abstract val maxRetriesPerRequest: Int
@@ -101,7 +121,6 @@ abstract class RequestEngine(
     var fixContentLength: Boolean = true
     @Volatile var lastError: String? = null
     private val idleCancelStarted = AtomicBoolean(false)
-    private val cancelClaimed = AtomicBoolean(false)
 
     // Written by applySetting() on the script thread, read by workers on every batch.
     val internalSettings = ConcurrentHashMap<String, Any>()
@@ -189,6 +208,19 @@ abstract class RequestEngine(
     }
 
     abstract fun start(timeout: Int = 10)
+
+    /**
+     * Puts a connecting run live, for start(): [start] is stamped first, so no worker can time an
+     * arrival from the old value. False, changing nothing, once the run is past connecting. A stop
+     * that lands while start() waits for connections stands, where setting the state outright put
+     * the stopped run back to live. Under the lock [finish] ends a run under, so the stamp never
+     * comes after the moment a stop froze.
+     */
+    protected fun goLive(): Boolean = synchronized(adaptiveControllerLock) {
+        if (runState.get() != 0) return false
+        start = System.nanoTime()
+        runState.compareAndSet(0, 1)
+    }
 
     abstract fun buildRequest(template: String, payloads: List<String?>, learnBoring: Int?, label: String): Request
 
@@ -341,49 +373,102 @@ abstract class RequestEngine(
             }
         }
 
-        if (state == 0) {
-            // Nothing consumes the queue before start(), so a script that queues more than it holds
-            // first (autoStart=False) must not block: the overflow waits in order until the run is
-            // going. Swapping in a bigger queue instead dropped this request, and left engines that
-            // had already captured the old queue polling it.
-            if (prestartBacklog.isEmpty() && requestQueue.offer(request)) return
-            prestartBacklog.addLast(request)
-            return
+        if (!deferToPrestartBacklog(request)) {
+            enqueue(request)
         }
-
-        drainPrestartBacklog()
-        enqueue(request)
     }
 
-    /** Offers [request], waiting while the queue is full until the run ends or the queue timeout passes. */
-    private fun enqueue(request: Request): Boolean {
+    /**
+     * Holds [request] back in [prestartBacklog] instead of queueing it now, and never blocks doing
+     * so. Before start() that is once the queue is full: nothing consumes the queue before then,
+     * so a script that queues more than it holds must not wait. After start() it is for as long as
+     * earlier requests still wait there, which [request] must not overtake. Waiting for those to
+     * fit instead blocked any callback queueing follow-ups, and once every worker was in one,
+     * nothing took from the queue again. The script thread moves the backlog on instead, as it
+     * opens gates and completes the run. False when [request] is for the queue itself.
+     */
+    private fun deferToPrestartBacklog(request: Request): Boolean {
+        if (!backlogInUse) {
+            if (runState.get() != 0) return false
+            if (requestQueue.offer(request)) return true
+        }
+        synchronized(backlogLock) {
+            if (runState.get() != 0) {
+                moveBacklogThatFits()
+                if (!backlogInUse) return false
+            }
+            backlogInUse = true
+            prestartBacklog.addLast(request)
+            return true
+        }
+    }
+
+    /**
+     * Offers [request], waiting while the queue is full until it fits, the run ends, the queue
+     * timeout passes - which gives up on the run - or [deadlineNanos] does, which the caller acts on.
+     */
+    private fun enqueue(request: Request, deadlineNanos: Long? = null): Boolean {
         // Untimed offer first. Every queued request comes through here, and where the queue has
-        // room — which is the whole of a non-streaming run, whose queue is unbounded — the timed
-        // form only adds deadline bookkeeping to a call that was never going to block.
-        var queued = requestQueue.offer(request)
-        var attempt = 0L
-        while (!queued && runState.get() <= 2 && attempt < QUEUE_TIMEOUT_SECONDS) {
-            queued = requestQueue.offer(request, 1, TimeUnit.SECONDS)
-            attempt += 1
+        // room the timed form only adds deadline bookkeeping to a call that was never going to block.
+        if (requestQueue.offer(request)) return true
+        val giveUpAt = System.nanoTime() + TimeUnit.SECONDS.toNanos(QUEUE_TIMEOUT_SECONDS)
+        val stopAt = if (deadlineNanos != null && deadlineNanos - giveUpAt < 0) deadlineNanos else giveUpAt
+        var queued = false
+        while (!queued && runState.get() <= 2) {
+            val left = stopAt - System.nanoTime()
+            if (left <= 0) break
+            queued = requestQueue.offer(request, minOf(left, QUEUE_OFFER_SLICE_NANOS), TimeUnit.NANOSECONDS)
         }
 
         if (!queued) {
             finishGatedRequest(request)
-            if (attempt >= QUEUE_TIMEOUT_SECONDS) {
+            if (runState.get() <= 2 && System.nanoTime() - giveUpAt >= 0) {
                 Utils.out("Timeout queuing request. Aborting.")
                 this.cancel()
             }
-            // otherwise the run has been cancelled so we don't need to do anything
+            // otherwise the run has ended, or the caller's deadline passed
         }
         return queued
     }
 
-    /** Moves requests queued before start() into the queue, oldest first. */
-    private fun drainPrestartBacklog() {
-        while (true) {
-            val pending = prestartBacklog.pollFirst() ?: return
-            if (!enqueue(pending)) return
+    /**
+     * Moves [prestartBacklog] into the queue, oldest first, waiting for room as the workers take
+     * requests. On the script thread's way to completing the run, which must not get ahead of what
+     * it queued; never in queue() (see [deferToPrestartBacklog]). False when the run ended, or
+     * [deadlineNanos] passed, first.
+     */
+    private fun drainPrestartBacklog(deadlineNanos: Long? = null): Boolean {
+        if (!backlogInUse) return true
+        return synchronized(backlogDrainLock) {
+            var queued = true
+            while (queued) {
+                val head = synchronized(backlogLock) {
+                    moveBacklogThatFits()
+                    prestartBacklog.pollFirst()?.also { backlogHead = it }
+                } ?: break
+                queued = try {
+                    enqueue(head, deadlineNanos)
+                } finally {
+                    synchronized(backlogLock) { backlogHead = null }
+                }
+            }
+            queued
         }
+    }
+
+    /**
+     * Moves what fits of [prestartBacklog] into the queue without waiting, oldest first, and puts
+     * the backlog out of use once it is empty. Holds off while a drain is still placing
+     * [backlogHead], which nothing may overtake. Called holding [backlogLock].
+     */
+    private fun moveBacklogThatFits() {
+        if (backlogHead != null) return
+        while (true) {
+            val next = prestartBacklog.peekFirst() ?: break
+            if (!requestQueue.offer(next)) return
+            prestartBacklog.pollFirst()
+        }
+        backlogInUse = false
     }
 
     open fun openGate(gateName: String) {
@@ -393,11 +478,33 @@ abstract class RequestEngine(
     /** Returns false when another invocation already opened this floodgate. */
     protected fun openGateOnce(gateName: String): Boolean {
         // Utils.out("Requested gate open: $gateName")
+        val gate = floodgates[gateName] ?: throw Exception("Unrecognised gate name in openGate() invocation")
+        if (runState.get() != 0 && backlogInUse) {
+            // Marked as opening first, under the monitor queue() checks that against, so that no
+            // request joins the gate while its share of the backlog moves.
+            synchronized(floodgates) { gate.fullyQueued.set(true) }
+            moveBacklogUntilStaged(gate)
+        }
         return synchronized(floodgates) {
-            if (!floodgates.containsKey(gateName)) {
-                throw Exception("Unrecognised gate name in openGate() invocation")
+            gate.open()
+        }
+    }
+
+    /**
+     * Keeps [prestartBacklog] moving into the queue until every request of [gate] is staged: the
+     * gate opens only then, the ones that overflowed the queue before start() reach the workers
+     * only through it, and nothing else moves it while the script waits here. Without waiting for
+     * room, which workers parked on this very gate - ThreadedRequestEngine holds one per gated
+     * request - may never make.
+     */
+    private fun moveBacklogUntilStaged(gate: Floodgate) {
+        while (gate.remaining.get() > 0 && runState.get() <= 2) {
+            val inUse = synchronized(backlogLock) {
+                moveBacklogThatFits()
+                backlogInUse
             }
-            floodgates[gateName]!!.open()
+            if (!inUse) return
+            Thread.sleep(GATE_BACKLOG_POLL_MILLIS)
         }
     }
 
@@ -459,24 +566,26 @@ abstract class RequestEngine(
             return
         }
 
-        if (prestartBacklog.isNotEmpty()) {
+        // complete(timeout) bounds the whole wait, draining the pre-start backlog included.
+        val deadline = if (timeout > 0) System.nanoTime() + TimeUnit.SECONDS.toNanos(timeout.toLong()) else null
+        if (backlogInUse) {
             // complete() before start(): the requests that overflowed the queue can only drain into
             // workers that are running.
             runState.compareAndSet(0, 1)
-            drainPrestartBacklog()
         }
+        var success = drainPrestartBacklog(deadline)
         if (!markFullyQueued()) {
             return
         }
 
-        var success = true
-        if (timeout > 0) {
-            success = awaitCompletion(timeout.toLong(), TimeUnit.SECONDS)
-        }
-        else {
-            while (!Utils.unloaded && runState.get() < 3) {
-                success = awaitCompletion(10, TimeUnit.SECONDS)
-                if (success) break
+        if (success) {
+            if (deadline != null) {
+                success = awaitCompletion(maxOf(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)
+            } else {
+                while (!Utils.unloaded && runState.get() < 3) {
+                    success = awaitCompletion(10, TimeUnit.SECONDS)
+                    if (success) break
+                }
             }
         }
 
@@ -517,10 +626,11 @@ abstract class RequestEngine(
     private fun cancelInternal() {
         Utils.unregisterEngine(this)
 
-        // A finished run stays finished (a completed run used to flip to cancelled and be ranked
-        // again), and of concurrent cancels only the first does the work.
-        if (runState.get() < 3 && cancelClaimed.compareAndSet(false, true)) {
-            finish(3)
+        // Only the cancel that ends the run does the work, and a finished run stays finished (a
+        // completed run used to flip to cancelled and be ranked again). Decided by the state
+        // itself rather than a flag of its own: once a stopped run had been put back to live,
+        // such a flag turned every later cancel into a no-op.
+        if (endRun(3)) {
             // A worker parked on a gate that will now never open has to see that at once.
             floodgates.values.forEach(Floodgate::wakeWaiters)
             sealCompletion()
@@ -582,23 +692,29 @@ abstract class RequestEngine(
      * later read of the status line reports the rate the run actually achieved.
      */
     fun finish(state: Int) {
-        var controller: AdaptiveController? = null
         if (state >= 3) {
-            synchronized(adaptiveControllerLock) {
-                // The first terminal state stands: a cancel racing the completion must not relabel it.
-                if (runState.get() >= 3) return
-                onTerminalStateEntering(state)
-                adaptiveControllerTerminal = true
-                controller = adaptiveController
-                adaptiveController = null
-                finished.compareAndSet(0, System.nanoTime())
-                runState.set(state)
-            }
+            endRun(state)
         } else {
             finished.compareAndSet(0, System.nanoTime())
             runState.set(state)
         }
+    }
+
+    /**
+     * Moves the run to terminal [state] unless it has ended already: the first terminal state
+     * stands, so a cancel racing the completion cannot relabel it. True when this call ended it.
+     */
+    private fun endRun(state: Int): Boolean {
+        val controller = synchronized(adaptiveControllerLock) {
+            if (runState.get() >= 3) return false
+            onTerminalStateEntering(state)
+            adaptiveControllerTerminal = true
+            finished.compareAndSet(0, System.nanoTime())
+            runState.set(state)
+            adaptiveController.also { adaptiveController = null }
+        }
         controller?.stop()
+        return true
     }
 
     /** How long the run has taken, and once it is over, how long it took. */
@@ -872,7 +988,10 @@ abstract class RequestEngine(
             latestAdaptiveSnapshot = Long.MIN_VALUE
         }
         requestQueue.clear()
-        prestartBacklog.clear()
+        synchronized(backlogLock) {
+            prestartBacklog.clear()
+            backlogInUse = false
+        }
         userState.clear()
     }
 

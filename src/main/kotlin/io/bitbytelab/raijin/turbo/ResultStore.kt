@@ -118,7 +118,9 @@ class ResultStore @JvmOverloads constructor(
 
     /**
      * Same signature as [RequestTable.setSortOrder], so a script's `table.setSortOrder(column,
-     * descending)` also works without the GUI. Results read without an explicit order follow it.
+     * descending)` also works without the GUI. Results read without an explicit order follow it,
+     * and so does the GUI results table, which polls it. Every call records a new [ResultSortOrder]:
+     * the table tells calls apart by identity (see [scriptSortOrderToApply]).
      */
     fun setSortOrder(column: Int, descending: Boolean) {
         requestedSortOrder = ResultSortOrder(column, descending)

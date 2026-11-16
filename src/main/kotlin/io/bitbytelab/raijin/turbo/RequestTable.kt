@@ -57,6 +57,15 @@ interface OutputHandler {
     abstract fun getAllRquests(): List<Request>
 }
 
+/**
+ * The order a script set with `table.setSortOrder()` that the results table has yet to apply, or
+ * null. Scripts are handed the [ResultStore] as `table`, so their order lands in the store and the
+ * table follows it. Told apart by identity: every call records a new [ResultSortOrder], so calling
+ * it again sorts again, same column and direction included, after the user has sorted by hand.
+ */
+internal fun scriptSortOrderToApply(requested: ResultSortOrder?, applied: ResultSortOrder?): ResultSortOrder? =
+    requested?.takeIf { it !== applied }
+
 class RequestTable(val store: ResultStore, val service: TurboService, val handler: RunHandler): JPanel() {
     val model = RequestTableModel()
     val issueTable = JTable(model)
@@ -224,6 +233,7 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
         // Poll ResultStore for new results
         var lastKnownSize = 0
         var finishedAt: Long? = null
+        var appliedScriptSort: ResultSortOrder? = null
         storePoller = javax.swing.Timer(100) {
             // Stop polling 10 seconds after run completes
             if (handler.status() != "running") {
@@ -246,6 +256,10 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
                     }
                 }
                 lastKnownSize = currentSize
+            }
+            scriptSortOrderToApply(store.sortOrder(), appliedScriptSort)?.let { order ->
+                appliedScriptSort = order
+                setSortOrder(order.column, order.descending)
             }
         }
         storePoller.start()

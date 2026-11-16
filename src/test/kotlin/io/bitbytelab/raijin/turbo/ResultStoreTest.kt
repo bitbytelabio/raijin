@@ -348,6 +348,24 @@ class ResultStoreTest {
     }
 
     @Test
+    fun `the GUI table applies each order a script sets, once`() {
+        assertNull(scriptSortOrderToApply(store.sortOrder(), null), "no order set, nothing to apply")
+
+        store.setSortOrder(2, false)
+        val first = store.sortOrder()
+        assertNotNull(first)
+        assertSame(first, scriptSortOrderToApply(first, null))
+        // Applied once, so a sort the user then picks by hand stays.
+        assertNull(scriptSortOrderToApply(store.sortOrder(), first))
+
+        // The same call again sorts again.
+        store.setSortOrder(2, false)
+        val repeated = store.sortOrder()
+        assertNotNull(repeated)
+        assertSame(repeated, scriptSortOrderToApply(repeated, first))
+    }
+
+    @Test
     fun `sorts by label and queue id`() {
         val b = Request("GET / HTTP/1.1", emptyList(), 0, "b").apply { id = 1 }
         val a = Request("GET / HTTP/1.1", emptyList(), 0, "a").apply { id = 2 }

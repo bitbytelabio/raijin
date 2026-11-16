@@ -174,11 +174,7 @@ open class HTTP2RequestEngine internal constructor(
         live.forEach { it.awaitExit(deadline) }
     }
 
-    /**
-     * The next request for a connection's writer: one handed back first, then new work. Read from
-     * [requestQueue] each time rather than a reference taken at startup, because queue() replaces
-     * that queue when a non-streaming run outgrows it.
-     */
+    /** The next request for a connection's writer: one handed back first, then new work. */
     internal fun nextRequest(pollMillis: Long): Request? =
         orphans.poll() ?: requestQueue.poll(pollMillis, TimeUnit.MILLISECONDS)
 
@@ -190,8 +186,7 @@ open class HTTP2RequestEngine internal constructor(
     }
 
     override fun start(timeout: Int) {
-        runState.set(1)
-        start = System.nanoTime()
+        if (!goLive()) return
         updateLastLife()
         startIdleTimeoutWatchdog()
     }
