@@ -1123,7 +1123,9 @@ class RaijinTab(
         // is only listed once.
         val seenInteractions = java.util.Collections.synchronizedSet(HashSet<String>())
         fun addInteraction(obj: JsonObject) {
-            val id = obj["id"]?.jsonPrimitive?.contentOrNull ?: ""
+            // `id` is the payload's interaction id, shared by every hit of that payload;
+            // `seq` is unique per interaction.
+            val id = (obj["seq"] ?: obj["id"])?.jsonPrimitive?.contentOrNull ?: ""
             if (id.isNotEmpty() && !seenInteractions.add(id)) return
             val row = interactionRow(obj)
             SwingUtilities.invokeLater { interTableModel.addRow(row) }

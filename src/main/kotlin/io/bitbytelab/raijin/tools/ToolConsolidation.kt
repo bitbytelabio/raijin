@@ -83,7 +83,7 @@ object ToolConsolidation {
                 "collaborator_", "collaborator_create_client", "collaborator_restore_client",
                 "collaborator_get_secret", "collaborator_generate_payload",
                 "collaborator_default_payload", "collaborator_poll", "collaborator_server_info",
-                "collaborator_remove_client",
+                "collaborator_remove_client", "collaborator_list_clients",
             ),
         ),
         Group(
