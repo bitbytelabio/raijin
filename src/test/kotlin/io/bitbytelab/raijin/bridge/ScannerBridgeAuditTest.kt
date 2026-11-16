@@ -6,6 +6,7 @@ import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.internal.MontoyaObjectFactory
 import burp.api.montoya.internal.ObjectFactoryLocator
 import burp.api.montoya.scanner.AuditConfiguration
+import burp.api.montoya.scanner.ReportFormat
 import burp.api.montoya.scanner.Scanner
 import burp.api.montoya.scanner.audit.Audit
 import burp.api.montoya.scanner.audit.issues.AuditIssue
@@ -337,5 +338,14 @@ class ScannerBridgeAuditTest {
         assertTrue(bridge.generateReport("pdf", null, null, "r").text("error")!!.contains("format"))
         assertTrue(bridge.generateReport("html", null, listOf("high", "severe"), "r").text("error")!!.contains("severity_filter[1]"))
         assertTrue(bridge.createCustomIssue("n", null, null, "urgent", "firm", "https://t/", null, null).text("error")!!.contains("severity"))
+    }
+
+    @Test
+    fun `a blank report format means the default, HTML`() {
+        // A blank format passes the format check: the error comes from the severity filter checked next.
+        assertTrue(bridge.generateReport(" ", null, listOf("severe"), "r").text("error")!!.contains("severity_filter[0]"))
+        assertEquals(ReportFormat.HTML, ScannerIssues.reportFormat(""))
+        assertEquals(ReportFormat.HTML, ScannerIssues.reportFormat("html"))
+        assertEquals(ReportFormat.XML, ScannerIssues.reportFormat(" XML "))
     }
 }
