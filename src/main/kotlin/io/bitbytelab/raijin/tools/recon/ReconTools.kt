@@ -4,9 +4,11 @@ import io.bitbytelab.raijin.bridge.ReconBridge
 import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.core.ParamMinerWordlists
 import io.bitbytelab.raijin.core.asBodyString
+import io.bitbytelab.raijin.core.asClampedInt
 import io.bitbytelab.raijin.core.asLongSafe
 import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.core.asStringMapResult
+import io.bitbytelab.raijin.core.withClampReport
 import io.bitbytelab.raijin.recon.ParamLocation
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
@@ -34,7 +36,7 @@ object ReconTools {
                 "fetch_source_maps=true (in scope only). Browse the target first, then run this.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    intProp("max_items", "Max recent history items to scan (default 500)", HISTORY_ITEMS)
+                    intProp("max_items", "Max recent history items to scan (default 500); a larger value is clamped to ${ReconBridge.MAX_HISTORY_ITEMS} and reported as max_items_clamped_to", HISTORY_ITEMS)
                     putJsonObject("host_filter") { put("type", "string"); put("description", "Optional host regex filter") }
                     putJsonObject("fetch_source_maps") {
                         put("type", "boolean")
@@ -46,12 +48,13 @@ object ReconTools {
         ) { request ->
             try {
                 val a = request.params.arguments ?: emptyMap()
+                val maxItems = a["max_items"].asClampedInt("max_items", HISTORY_ITEMS.first, HISTORY_ITEMS.last).getOrThrow()
                 toolJsonResult(
                     bridge.jsEndpoints(
-                        a.int("max_items", HISTORY_ITEMS) ?: 500,
+                        maxItems?.value ?: 500,
                         a.string("host_filter"),
                         a.bool("fetch_source_maps") ?: false,
-                    )
+                    ).withClampReport("max_items", maxItems)
                 )
             } catch (e: Exception) { toolError(e.message ?: "Unknown error") }
         }
@@ -104,12 +107,12 @@ object ReconTools {
                     enumProp("inject_in", ParamLocation.IDS, "query (default) | body | json_body | cookie | header")
                     putJsonObject("method") { put("type", "string"); put("description", "HTTP method; defaults to GET, or POST when inject_in is body/json_body") }
                     enumProp("wordlist", ParamMinerWordlists.names().sorted(), "Bundled wordlist when candidates is omitted (default: param-miner-params, or param-miner-headers for inject_in=header)")
-                    intProp("offset", "Index of the first candidate to test (default 0); pass next_offset from the previous result to continue", OFFSETS)
+                    intProp("offset", "Index of the first candidate to test (default 0); pass next_offset from the previous result to continue. An offset past the end tests nothing and is reported as offset_clamped_to", OFFSETS)
                     intProp("limit", "How many candidates to test from offset (default: all the rest)", LIMITS)
                     putJsonObject("headers") { put("type", "object"); put("description", "Request headers sent with every probe, e.g. {\"Authorization\": \"Bearer ...\"}") }
                     putJsonObject("cookies") { put("type", "object"); put("description", "Cookies sent with every probe, as {name: value} (or a 'a=1; b=2' string)") }
                     putJsonObject("body") { put("type", "string"); put("description", "Request body the candidates are added to (inject_in=body: form fields; json_body: a JSON object)") }
-                    putJsonObject("cache_buster") { put("type", "boolean"); put("description", "Add a query parameter with a new value to every request, so no response comes from a cache and nothing a probe causes is cached for others (default true)") }
+                    putJsonObject("cache_buster") { put("type", "boolean"); put("description", "Add a query parameter with a new value to every request, so no response comes from a cache and nothing a probe causes is cached for others (default true). Left off, and reported as cache_buster_dropped, when the target rejects unknown query parameters") }
                     intProp("bucket_size", "Names per request (default: query 64, body/json_body 128, cookie 32, header 20); halved automatically while the target rejects the size", BUCKET_SIZES)
                     intProp("max_requests", "Request budget for the run (default ${ReconBridge.DEFAULT_MAX_REQUESTS}); when reached the result says where to continue", REQUEST_BUDGETS)
                 },

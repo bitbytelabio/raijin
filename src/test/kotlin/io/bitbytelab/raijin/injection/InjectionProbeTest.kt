@@ -1,5 +1,9 @@
 package io.bitbytelab.raijin.injection
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.double
 import kotlinx.serialization.json.int
@@ -303,21 +307,92 @@ class InjectionProbeTest {
         assertEquals("mongodb", finding.evidence.getValue("probe").jsonObject.getValue("query_error").jsonPrimitive.content)
     }
 
+    private val users = listOf("admin", "carlos", "wiener")
+
+    /**
+     * The users a MongoDB `find({user: ...})` selects for the `user` query parameter, read the
+     * way Express `qs` reads it: `user=x` is the value, `user[$op]=x` an operator. An operator
+     * MongoDB would refuse selects nothing.
+     */
+    private fun mongoUsers(raw: String): List<String> {
+        val values = ArrayList<String>()
+        val operators = ArrayList<Pair<String, String>>()
+        for (pair in raw.substringBefore(" HTTP/1.1").substringAfter('?', "").split('&')) {
+            val name = URLDecoder.decode(pair.substringBefore('='), "UTF-8")
+            val value = URLDecoder.decode(pair.substringAfter('=', ""), "UTF-8")
+            if (name == "user") values += value
+            if (name.startsWith("user[") && name.endsWith("]")) operators += name.removePrefix("user[").removeSuffix("]") to value
+        }
+        if (values.isEmpty() && operators.isEmpty()) return emptyList()
+        return users.filter { user ->
+            values.all { it == user } && operators.all { (operator, operand) ->
+                when (operator) {
+                    "\$eq" -> user == operand
+                    "\$ne" -> user != operand
+                    "\$gt" -> user > operand
+                    "\$lt" -> user < operand
+                    "\$regex" -> Regex(operand).containsMatchIn(user)
+                    else -> false
+                }
+            }
+        }
+    }
+
+    private fun userList(found: List<String>): String =
+        html(if (found.isEmpty()) "<p>No users found</p>" else found.joinToString("", "<ul>", "</ul>") { "<li>$it</li>" })
+
     @Test
-    fun `operators that widen and narrow the query are found`() {
+    fun `operators that narrow the query to the base value are found`() {
         val request = "GET /users?user=FUZZ HTTP/1.1\r\nHost: target.test\r\n\r\n"
-        val run = probe(InjectionClass.NOSQLI, request = request) { raw ->
-            val target = URLDecoder.decode(raw.substringBefore(" HTTP/1.1"), "UTF-8")
-            val above = Regex("user\\[\\\$gt]=([^&]*)").find(target)?.groupValues?.get(1)
-            val below = Regex("user\\[\\\$lt]=([^&]*)").find(target)?.groupValues?.get(1)
-            val everyone = above != null && below != null && above < "admin" && "admin" < below
-            ok(html(if (everyone) "<ul><li>admin</li><li>carlos</li></ul>" else "<p>No users found</p>"))
+        val run = probe(InjectionClass.NOSQLI, request = request, settings = { copy(baseValue = "carlos") }) { raw -> ok(userList(mongoUsers(raw))) }
+        val finding = run.findings.single()
+        assertEquals("operator injection", finding.technique)
+        assertEquals("false_diverges", finding.evidence.getValue("polarity").jsonPrimitive.content)
+        assertTrue("user%5B\$eq%5D=carlos&user%5B\$ne%5D=49173 " in finding.evidence.getValue("request").jsonPrimitive.content)
+        assertTrue("user%5B\$eq%5D=49173&user%5B\$ne%5D=carlos " in finding.evidence.getValue("false_request").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `no NoSQL probe selects a document the baseline request leaves alone`() {
+        // The probes may land in deleteMany: whatever the base value, they reach its documents or none.
+        val request = "GET /users?user=FUZZ HTTP/1.1\r\nHost: target.test\r\n\r\n"
+        for (base in listOf("carlos", "1")) {
+            val selected = ArrayList<List<String>>()
+            val run = probe(InjectionClass.NOSQLI, request = request, settings = { copy(baseValue = base) }) { raw ->
+                ok(userList(mongoUsers(raw).also { selected += it }))
+            }
+            val reachable = users.filter { it == base }
+            assertTrue(run.requests.any { "user%5B\$eq%5D=" in it }, "the operator probes ran")
+            assertEquals(null, selected.firstOrNull { !reachable.containsAll(it) }, "base '$base': a probe selected documents the baseline does not")
+        }
+    }
+
+    @Test
+    fun `number operators are found in a JSON body that carries a number`() {
+        val request = "POST /api/orders HTTP/1.1\r\nHost: target.test\r\nContent-Type: application/json\r\nContent-Length: 8\r\n\r\n{\"id\":FUZZ}"
+        val orders = listOf("1", "2", "3")
+        val run = probe(InjectionClass.NOSQLI, request = request, settings = { copy(baseValue = "2") }) { raw ->
+            // MongoDB matches a number only against a number: {"id":"2"} finds nothing.
+            val condition = Json.parseToJsonElement(raw.substringAfter("\r\n\r\n")).jsonObject["id"]
+            fun same(id: String, operand: JsonElement?) = operand is JsonPrimitive && !operand.isString && operand.content == id
+            val found = orders.filter { id ->
+                when (condition) {
+                    is JsonObject -> condition.all { (operator, operand) ->
+                        when (operator) {
+                            "\$eq" -> same(id, operand)
+                            "\$ne" -> !same(id, operand)
+                            else -> false
+                        }
+                    }
+                    else -> same(id, condition)
+                }
+            }
+            ok("{\"orders\":[" + found.joinToString(",") { "{\"id\":$it,\"item\":\"widget\"}" } + "]}")
         }
         val finding = run.findings.single()
         assertEquals("operator injection", finding.technique)
-        assertEquals("true_diverges", finding.evidence.getValue("polarity").jsonPrimitive.content)
-        assertTrue("user%5B\$gt%5D=&user%5B\$lt%5D=~~~~ " in finding.evidence.getValue("request").jsonPrimitive.content)
-        assertTrue("user%5B\$gt%5D=~~~~&user%5B\$lt%5D= " in finding.evidence.getValue("false_request").jsonPrimitive.content)
+        assertEquals("numeric equality: {\"\$eq\":2,\"\$ne\":49173}", finding.payload)
+        assertTrue("{\"id\":{\"\$eq\":2,\"\$ne\":49173}}" in finding.evidence.getValue("request").jsonPrimitive.content)
     }
 
     @Test

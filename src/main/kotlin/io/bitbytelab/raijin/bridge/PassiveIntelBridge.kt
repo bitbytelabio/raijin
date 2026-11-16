@@ -6,10 +6,14 @@ import io.bitbytelab.raijin.core.BodyText
 import io.bitbytelab.raijin.recon.SecretPatterns
 import io.bitbytelab.raijin.safety.SafeRegex
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.add
+import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 import kotlin.math.min
 
 /** Scans traffic already in proxy history for secrets and other telling strings ([SecretPatterns]). */
@@ -20,8 +24,11 @@ class PassiveIntelBridge(private val api: MontoyaApi) {
         const val MAX_BODY_CHARS = 200_000
         private const val MAX_HEAD_CHARS = 64_000
 
-        /** Findings kept per category; the rest are counted in `omitted`. */
+        /** Distinct values kept per category; the rest are counted in `omitted`. */
         const val MAX_PER_CATEGORY = 100
+
+        /** Places listed per value: where it was first seen and the next few (`also_seen`). */
+        const val MAX_PLACES_PER_VALUE = 5
 
         /** Time all patterns together may spend on one history item, and the whole scan in total. */
         private const val ITEM_BUDGET_MS = 2_000L
@@ -54,7 +61,7 @@ class PassiveIntelBridge(private val api: MontoyaApi) {
      * @param inScopeOnly Only scan in-scope items
      * @param categories Optional list of pattern categories to check (default: all but the opt-in ones)
      * @param hostFilter Optional hostname filter
-     * @return JSON with all findings grouped by category, one per (match, url, location)
+     * @return JSON with the findings grouped by category, one per distinct value ([IntelFindings])
      */
     fun extractIntel(
         maxItems: Int,
@@ -90,9 +97,7 @@ class PassiveIntelBridge(private val api: MontoyaApi) {
             items = items.takeLast(maxItems.coerceAtLeast(0))
 
             val deadline = System.nanoTime() + SCAN_BUDGET_MS * 1_000_000
-            val findings = LinkedHashMap<String, MutableList<JsonObject>>()
-            val seen = HashSet<List<String>>()
-            val omitted = LinkedHashMap<String, Int>()
+            val findings = IntelFindings()
             val timedOut = LinkedHashSet<String>()
             var itemsScanned = 0
             var binarySkipped = 0
@@ -126,46 +131,13 @@ class PassiveIntelBridge(private val api: MontoyaApi) {
                     if (part.truncated) truncated++
                     val result = SecretPatterns.scan(part.text, selection.patterns, itemDeadline)
                     timedOut.addAll(result.timedOut)
-                    for ((pattern, value) in result.matches) {
-                        if (!seen.add(listOf(pattern, value, url, location))) continue
-                        val list = findings.getOrPut(pattern) { mutableListOf() }
-                        if (list.size >= MAX_PER_CATEGORY) {
-                            omitted[pattern] = (omitted[pattern] ?: 0) + 1
-                            continue
-                        }
-                        list.add(buildJsonObject {
-                            put("pattern", pattern)
-                            put("match", value)
-                            put("location", location)
-                            put("url", url)
-                            put("host", host)
-                        })
-                    }
+                    for ((pattern, value) in result.matches) findings.add(pattern, value, url, location, host)
                 }
             }
 
             buildJsonObject {
                 put("items_scanned", itemsScanned)
-                put("total_findings", findings.values.sumOf { it.size })
-                put("categories_with_findings", findings.size)
-
-                // Summary by category
-                put("summary", buildJsonObject {
-                    findings.forEach { (cat, matches) ->
-                        put(cat, matches.size)
-                    }
-                })
-
-                // Detailed findings
-                put("findings", buildJsonObject {
-                    findings.forEach { (cat, matches) ->
-                        put(cat, buildJsonArray { matches.forEach { add(it) } })
-                    }
-                })
-
-                if (omitted.isNotEmpty()) {
-                    put("omitted", buildJsonObject { omitted.forEach { (cat, count) -> put(cat, count) } })
-                }
+                findings.writeTo(this)
                 if (binarySkipped > 0) put("binary_bodies_skipped", binarySkipped)
                 if (truncated > 0) put("bodies_truncated", truncated)
                 if (timedOut.isNotEmpty()) put("patterns_timed_out", buildJsonArray { timedOut.forEach { add(it) } })
@@ -182,5 +154,75 @@ class PassiveIntelBridge(private val api: MontoyaApi) {
         } catch (e: Exception) {
             buildJsonObject { put("error", "Passive intel extraction failed: ${e.message}") }
         }
+    }
+}
+
+/**
+ * What one scan found, by category and then by distinct value: where a value was first seen, how
+ * many places (a URL's request or response) carry it, and a few more of them. The cap per
+ * category counts distinct values, so a session token sent on every page takes one slot and a
+ * different token found once still gets its own.
+ */
+internal class IntelFindings(
+    private val maxPerCategory: Int = PassiveIntelBridge.MAX_PER_CATEGORY,
+    private val maxPlaces: Int = PassiveIntelBridge.MAX_PLACES_PER_VALUE,
+) {
+    private class Place(val url: String, val location: String, val host: String)
+
+    private class Sighting(val first: Place) {
+        val places = HashSet<Pair<String, String>>()
+        val more = ArrayList<Place>()
+    }
+
+    private val categories = LinkedHashMap<String, LinkedHashMap<String, Sighting>>()
+    private val omitted = LinkedHashMap<String, MutableSet<String>>()
+
+    /** Records [value] of [pattern] in the [location] (request or response) of [url]. */
+    fun add(pattern: String, value: String, url: String, location: String, host: String) {
+        val values = categories.getOrPut(pattern) { LinkedHashMap() }
+        val sighting = values[value] ?: run {
+            if (values.size >= maxPerCategory) {
+                omitted.getOrPut(pattern) { HashSet() }.add(value)
+                return
+            }
+            Sighting(Place(url, location, host)).also { values[value] = it }
+        }
+        if (sighting.places.add(url to location) && sighting.places.size > 1 && sighting.more.size < maxPlaces - 1) {
+            sighting.more.add(Place(url, location, host))
+        }
+    }
+
+    /** Puts `total_findings`, `categories_with_findings`, `summary`, `findings` and, when a cap was hit, `omitted`. */
+    fun writeTo(out: JsonObjectBuilder) {
+        out.put("total_findings", categories.values.sumOf { it.size })
+        out.put("categories_with_findings", categories.size)
+        out.putJsonObject("summary") { categories.forEach { (category, values) -> put(category, values.size) } }
+        out.putJsonObject("findings") {
+            categories.forEach { (category, values) ->
+                putJsonArray(category) {
+                    values.forEach { (value, sighting) ->
+                        addJsonObject {
+                            put("pattern", category)
+                            put("match", value)
+                            put("location", sighting.first.location)
+                            put("url", sighting.first.url)
+                            put("host", sighting.first.host)
+                            put("occurrences", sighting.places.size)
+                            if (sighting.more.isNotEmpty()) {
+                                putJsonArray("also_seen") {
+                                    sighting.more.forEach { place ->
+                                        addJsonObject {
+                                            put("url", place.url)
+                                            put("location", place.location)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (omitted.isNotEmpty()) out.putJsonObject("omitted") { omitted.forEach { (category, values) -> put(category, values.size) } }
     }
 }

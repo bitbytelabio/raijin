@@ -17,7 +17,10 @@ import kotlin.random.Random
  * parameter with a value used for nothing else, so whatever gets stored is stored under a key no
  * other visitor asks for; the same key is then requested without the input to see whether the
  * changed response comes back. No input is sent at all once the cache is seen to ignore that
- * parameter.
+ * parameter, and none that works by changing the status, the redirect or the path until a new
+ * value of it is seen to get its own cache entry. A changed status counts only while a visitor
+ * without the input still gets the normal answer, since a rate limit or a WAF changes it for
+ * everyone; a run of 429/503 answers that a visitor gets too stops the run.
  *
  * Deception: a URL the origin treats as the target page but the cache treats as a static file
  * (`/account/x.css`, `/account;x.css`) gets a logged-in user's page stored for anyone. Each
@@ -42,7 +45,14 @@ class CacheProbe(
      * target host and `%p` a random port; an input without `%s` or `%p` shows only through the
      * status or redirect it causes.
      */
-    data class Input(val kind: String, val name: String, val template: String = "%s")
+    data class Input(val kind: String, val name: String, val template: String = "%s") {
+        /**
+         * True when the input works by changing the status or the redirect (it carries no value
+         * that could come back) or by rewriting the path the origin serves (a 404 or 403 then).
+         */
+        val changesStatus: Boolean
+            get() = ("%s" !in template && "%p" !in template) || (kind == HEADER && name.lowercase() in PATH_OVERRIDES)
+    }
 
     /**
      * @param host target host, for `%h`.
@@ -61,7 +71,10 @@ class CacheProbe(
 
     /**
      * @param verdict [CONFIRMED] when a request without the input got the changed response back
-     *   from the cache, else [UNCONFIRMED]: the input changes the response, which was not seen cached.
+     *   from the cache; [UNCONFIRMED] when the input changes the response, which was not seen
+     *   cached; [INCONCLUSIVE] when it changes the status or redirect but whether that is stored
+     *   could not be judged without risking other visitors, or a visitor without the input then
+     *   got that status too.
      * @param cacheKey the cache-buster pair the attempt was isolated under.
      */
     data class PoisonFinding(
@@ -90,7 +103,9 @@ class CacheProbe(
      * @param cached the target's response is served from a cache.
      * @param busterEffective true when a new cache-buster value was seen to get its own cache
      *   entry, false when it was served an existing one, null when nothing was seen cached.
+     * @param poisoningSkipped why poisoning was not run, or which inputs were held back.
      * @param sessionDependent the target answers differently without a session, or null when deception was not probed.
+     * @param stopped why the run ended early: [STOP_BUDGET], [STOP_RATE_LIMITED], [STOP_BASELINE_CHANGED] or [STOP_BUSTER_IGNORED].
      */
     class Report(
         val error: String?,
@@ -121,6 +136,13 @@ class CacheProbe(
     private var requests = 0
     private var stopped: String? = null
 
+    // What a new cache-buster value was seen to get: a cache entry of its own (true), one shared
+    // with other values (false), or nothing seen either way (null).
+    private var busterEffective: Boolean? = null
+
+    // Rate-limit and overload answers in a row.
+    private var throttled = 0
+
     fun run(): Report {
         // Is there a cache, does it store this response, and does it key on the cache-buster?
         val firstKey = buster()
@@ -137,29 +159,52 @@ class CacheProbe(
             freshHit = send(asUser(busted(base, buster())))?.let { CacheSignals.classify(it.headers).state } == CacheSignals.State.HIT
         }
         val cached = repeatHit || freshHit
-        val effective = if (freshHit) false else if (repeatHit) true else null
+        busterEffective = if (freshHit) false else if (repeatHit) true else null
 
         // What a visitor without a session gets: the yardstick for "served to someone else".
         val visitorKey = buster()
         val visitorResult = send(busted(base, visitorKey), anonymous = true)
         val visitor = if (visitorResult != null) Sample(visitorResult, visitorKey) else clean
 
+        // A rate limit or an overloaded server already answering: there is no normal answer to compare with.
+        val throttledStatus = listOfNotNull(firstResult, visitorResult).firstOrNull { it.status in THROTTLED }?.status
+        val unhealthy = when {
+            throttledStatus != null ->
+                "the target answered $throttledStatus before any input was sent (a rate limit or an overloaded server), so its normal " +
+                    "answer is unknown; nothing was sent"
+            stopped == STOP_RATE_LIMITED -> "the target answered 429 or 503 to every request before any input was sent; nothing was sent"
+            else -> null
+        }
+        if (unhealthy != null && stopped == null) stopped = STOP_RATE_LIMITED
+
         val poisoning = ArrayList<PoisonFinding>()
         var poisoningTested = 0
         var poisoningSkipped: String? = null
         if (!config.poisoning) {
             poisoningSkipped = "not requested"
-        } else if (effective == false) {
+        } else if (unhealthy != null) {
+            poisoningSkipped = unhealthy
+        } else if (busterEffective == false) {
             poisoningSkipped = "the cache serves a stored response for a cache-buster value it has never seen, so it does not key on the " +
                 "query string: an attempt could not be kept away from other visitors, and none was sent"
         } else {
             // Cookies the target hands out are inputs too; the session's own cookies are left alone.
             val own = cookieNames(identity.filter { it.first.equals("Cookie", ignoreCase = true) }.joinToString(";") { it.second }, ';')
             val issued = cookieNames(firstResult.header("set-cookie").orEmpty(), '\n').filterNot { it in own }
-            for (input in inputs(issued, config.extraHeaders, config.extraCookies)) {
+            // Until a new cache-buster value is seen to get its own entry, the error or redirect an
+            // input causes could be stored under the page's real key, for every visitor.
+            val isolated = busterEffective == true
+            val (sendable, withheld) = inputs(issued, config.extraHeaders, config.extraCookies).partition { isolated || !it.changesStatus }
+            for (input in sendable) {
                 if (stopped != null) break
                 poisoningTested++
                 poison(input, clean, visitor, cached)?.let(poisoning::add)
+            }
+            if (withheld.isNotEmpty()) {
+                poisoningSkipped = "${withheld.size} input(s) that work by changing the status, the redirect or the path were not sent " +
+                    "(${withheld.joinToString(", ") { it.name }}): no new cache-buster value was seen to get a cache entry of its own, so " +
+                    "the response they cause could have been stored for every visitor. Their result is inconclusive; test them on a URL " +
+                    "whose repeated request is a cache hit, or by hand."
             }
         }
 
@@ -169,6 +214,8 @@ class CacheProbe(
         var sessionDependent: Boolean? = null
         if (!config.deception) {
             deceptionSkipped = "not requested"
+        } else if (unhealthy != null) {
+            deceptionSkipped = unhealthy
         } else if (cached) {
             deceptionSkipped = "the target's own response is already served from the cache"
         } else if (firstResult.status !in 200..299) {
@@ -184,7 +231,7 @@ class CacheProbe(
         }
 
         return Report(
-            error = null, busterParam = busterParam, first = first, repeat = repeat, cached = cached, busterEffective = effective,
+            error = null, busterParam = busterParam, first = first, repeat = repeat, cached = cached, busterEffective = busterEffective,
             poisoning = poisoning, poisoningTested = poisoningTested, poisoningSkipped = poisoningSkipped,
             deception = deception, deceptionTested = deceptionTested, deceptionSkipped = deceptionSkipped,
             sessionDependent = sessionDependent, requests = requests, stopped = stopped,
@@ -209,7 +256,47 @@ class CacheProbe(
         val sample = Sample(response, key)
         val effects = effects(sample, clean, marker)
         if (effects.isEmpty()) return null
-        if (effects.none { it.startsWith(REFLECTED) }) {
+        val reflected = effects.any { it.startsWith(REFLECTED) }
+
+        val vary = response.header("vary").orEmpty().split(',', '\n').map { it.trim().lowercase() }
+        val keyedByVary = "*" in vary || (if (input.kind == COOKIE) "cookie" else input.name.lowercase()) in vary
+        val changed = "Sent with ${input.kind} ${input.name}: $value, the response changed (${effects.joinToString("; ")})"
+        fun finding(verdict: String, severity: String, detail: String) =
+            PoisonFinding(input, value, effects, verdict, severity, detail, "$busterParam=$key", keyedByVary)
+
+        if (busterEffective != true && !effects.all { it.startsWith(REFLECTED) }) {
+            // Nothing showed that the cache keys on the cache-buster, so this error or redirect is
+            // not planted again to see whether it sticks. A visitor's request under a new
+            // cache-buster shows whether it already reaches everyone.
+            val now = freshVisit()
+            if (stopped == STOP_RATE_LIMITED) return null
+            if (now != null && !sameAnswer(now, visitor)) {
+                if (marker != null && holds(now, marker)) {
+                    busterEffective = false
+                    stopped = STOP_BUSTER_IGNORED
+                    return finding(
+                        CONFIRMED, "high",
+                        "$changed, and a request without it, without a session and under a new cache-buster got that response back: the " +
+                            "cache ignores the cache-buster and now serves this response to every visitor. The run was stopped; have the " +
+                            "cached page purged.",
+                    )
+                }
+                stopped = STOP_BASELINE_CHANGED
+                return finding(
+                    INCONCLUSIVE, "info",
+                    "$changed, and a request without any input under a new cache-buster then got HTTP ${now.result.status} where a " +
+                        "visitor first got ${visitor.result.status}: either the cache ignores the cache-buster and now serves this " +
+                        "response to every visitor, or the target changed its answer for everyone. The run was stopped; check the page by hand.",
+                )
+            }
+            return finding(
+                INCONCLUSIVE, "info",
+                "$changed. No new cache-buster value was seen to get a cache entry of its own, so a changed status or redirect is not " +
+                    "sent again to see whether it is stored: a cache that ignores the cache-buster would serve it to every visitor. Test " +
+                    "it on a URL whose repeated request is a cache hit, or by hand.",
+            )
+        }
+        if (!reflected) {
             // A status or redirect can change on its own: it counts once it repeats under another key.
             val again = buster()
             val repeated = send(withInput(asUser(busted(base, again)), input, value)) ?: return null
@@ -225,26 +312,45 @@ class CacheProbe(
             send(poisoned)
             confirmed = send(visit, anonymous = true)?.let { shows(Sample(it, key), sample, visitor, marker) } == true
         }
+        // The target began rate limiting: whatever this input seemed to change says nothing.
+        if (stopped == STOP_RATE_LIMITED) return null
 
-        val vary = response.header("vary").orEmpty().split(',', '\n').map { it.trim().lowercase() }
-        val keyedByVary = "*" in vary || (if (input.kind == COOKIE) "cookie" else input.name.lowercase()) in vary
-        val what = "${input.kind} ${input.name}: $value"
-        val reflected = effects.any { it.startsWith(REFLECTED) }
+        if (confirmed && !reflected) {
+            // A rate limit, a WAF or an outage gives this URL another status for everyone too: the
+            // change is the input's only while a visitor without it still gets the normal answer.
+            val now = freshVisit()
+            if (now == null) {
+                if (stopped == STOP_RATE_LIMITED) return null
+                return finding(
+                    UNCONFIRMED, if (cached && !keyedByVary) "low" else "info",
+                    "$changed, and the same URL requested without it and without a session got that response back, but no request was " +
+                        "left to show that a visitor still gets the normal answer under another cache-buster, so it is not confirmed.",
+                )
+            }
+            if (!sameAnswer(now, visitor)) {
+                stopped = STOP_BASELINE_CHANGED
+                return finding(
+                    INCONCLUSIVE, "info",
+                    "$changed, and the same URL requested without it got that response back, but so did a request without any input " +
+                        "under a new cache-buster (HTTP ${now.result.status}, where a visitor first got ${visitor.result.status}). The " +
+                        "target now answers everyone this way (a rate limit, a WAF, an outage) or its cache serves this response whatever " +
+                        "the cache-buster, so the change is not put down to the input; the run was stopped. Check the page by hand.",
+                )
+            }
+        }
+
         return if (confirmed) {
-            PoisonFinding(
-                input, value, effects, CONFIRMED, if (reflected || effects.any { it.startsWith(REDIRECT) }) "high" else "medium",
-                "Sent with $what, the response changed (${effects.joinToString("; ")}), and the same URL requested without it and " +
-                    "without a session got that changed response back: the cache stores it under a key that leaves this input out, so " +
-                    "one request plants it for every visitor.",
-                "$busterParam=$key", keyedByVary,
+            finding(
+                CONFIRMED, if (reflected || effects.any { it.startsWith(REDIRECT) }) "high" else "medium",
+                "$changed, and the same URL requested without it and without a session got that changed response back: the cache " +
+                    "stores it under a key that leaves this input out, so one request plants it for every visitor.",
             )
         } else {
-            PoisonFinding(
-                input, value, effects, UNCONFIRMED, if (cached && !keyedByVary) "low" else "info",
-                "Sent with $what, the response changed (${effects.joinToString("; ")}), but a request without it did not get the changed " +
-                    "response back" + (if (keyedByVary) " (Vary lists this input, so the cache keys on it)" else "") +
+            finding(
+                UNCONFIRMED, if (cached && !keyedByVary) "low" else "info",
+                "$changed, but a request without it did not get the changed response back" +
+                    (if (keyedByVary) " (Vary lists this input, so the cache keys on it)" else "") +
                     ". Worth another look on URLs of this site that are cached.",
-                "$busterParam=$key", keyedByVary,
             )
         }
     }
@@ -283,6 +389,16 @@ class CacheProbe(
 
     private fun holds(sample: Sample, marker: String): Boolean =
         sample.result.body.contains(marker, ignoreCase = true) || sample.result.headers.values.any { it.contains(marker, ignoreCase = true) }
+
+    /** A visitor's request (no input, no session) under a new cache-buster; null when it got no answer. */
+    private fun freshVisit(): Sample? {
+        val key = buster()
+        return send(busted(base, key), anonymous = true)?.let { Sample(it, key) }
+    }
+
+    /** Whether [now] is the answer [visitor] got: the same status and redirect target. */
+    private fun sameAnswer(now: Sample, visitor: Sample): Boolean =
+        now.result.status == visitor.result.status && location(now) == location(visitor)
 
     /** The redirect target without the cache-buster value, which differs per request by design. */
     private fun location(sample: Sample): String? = sample.result.header("location")?.replace(sample.buster, "")
@@ -360,7 +476,21 @@ class CacheProbe(
         }
         requests++
         val result = try { transport.send(request, anonymous) } catch (_: Exception) { null }
-        return result?.takeIf { it.status > 0 }
+        if (result == null || result.status <= 0) return null
+        if (result.status !in THROTTLED) {
+            throttled = 0
+            return result
+        }
+        if (++throttled < THROTTLED_RUN) return result
+        // Several in a row: what the inputs did, or a rate limit or an overloaded target answering
+        // everyone this way? A visitor's request under a new cache-buster tells them apart.
+        throttled = 0
+        val check = freshVisit()
+        if (check == null || check.result.status in THROTTLED) {
+            if (stopped == null) stopped = STOP_RATE_LIMITED
+            return null
+        }
+        return result
     }
 
     private fun report(error: String): Report = Report(
@@ -376,9 +506,22 @@ class CacheProbe(
 
         const val CONFIRMED = "confirmed"
         const val UNCONFIRMED = "unconfirmed"
+        const val INCONCLUSIVE = "inconclusive"
         const val LIKELY = "likely"
         const val POTENTIAL = "potential"
         const val STOP_BUDGET = "request_budget"
+        const val STOP_RATE_LIMITED = "rate_limited"
+        const val STOP_BASELINE_CHANGED = "baseline_changed"
+
+        /** A response an input caused came back under a new cache-buster: the cache ignores it, and the run stops. */
+        const val STOP_BUSTER_IGNORED = "cache_buster_ignored"
+
+        /** Statuses of a rate limit or an overloaded server, and how many in a row make the run check for one. */
+        private val THROTTLED = setOf(429, 503)
+        private const val THROTTLED_RUN = 3
+
+        /** Headers that make the origin serve another path than the one requested. */
+        private val PATH_OVERRIDES = setOf("x-original-url", "x-rewrite-url")
 
         private const val REFLECTED = "reflected in"
         private const val STATUS = "status"

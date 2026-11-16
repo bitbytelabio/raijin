@@ -16,7 +16,7 @@ object PassiveIntelTools {
     fun register(server: Server, bridge: PassiveIntelBridge) {
         server.addTool(
             name = "passive_intel",
-            description = """Scan proxy history for sensitive data: cloud and API keys (AWS, Google, GitHub including fine-grained github_pat_, GitLab glpat-, OpenAI sk-proj-, Anthropic sk-ant-, Slack, Stripe), JWTs, private keys, internal IPs and URLs, S3/Azure/GCS buckets, source-map URLs, stack traces, SQL errors, server versions and sensitive paths. Zero-effort intelligence gathering from traffic already captured: no request is sent. Binary bodies are skipped and each body is scanned up to ${PassiveIntelBridge.MAX_BODY_CHARS} characters; a finding is reported once per (match, url, location), at most ${PassiveIntelBridge.MAX_PER_CATEGORY} per category (the rest are counted in "omitted").
+            description = """Scan proxy history for sensitive data: cloud and API keys (AWS, Google, GitHub including fine-grained github_pat_, GitLab glpat-, OpenAI sk-proj-, Anthropic sk-ant-, Slack, Stripe), JWTs, private keys, internal IPs and URLs, S3/Azure/GCS buckets, source-map URLs, stack traces, SQL errors, server versions and sensitive paths. Zero-effort intelligence gathering from traffic already captured: no request is sent. Binary bodies are skipped and each body is scanned up to ${PassiveIntelBridge.MAX_BODY_CHARS} characters. A finding is one distinct value of a category: where it was first seen (url, request or response), how many such places carry it ("occurrences") and up to ${PassiveIntelBridge.MAX_PLACES_PER_VALUE - 1} more of them ("also_seen"). At most ${PassiveIntelBridge.MAX_PER_CATEGORY} distinct values per category, so a token sent on every page takes one slot; further values are counted in "omitted".
 
 Parameters: max_items (int, default 1000), in_scope_only (bool, default false), categories (optional array of pattern names; a partial name such as "aws" selects every pattern containing it), host_filter (optional regex).
 
@@ -32,11 +32,8 @@ Available categories: ${SecretPatterns.ALL.keys.joinToString(", ")}. ${SecretPat
                     putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Only scan in-scope items, default false") }
                     putJsonObject("categories") {
                         put("type", "array")
-                        put("description", "Optional array of pattern names to check")
-                        putJsonObject("items") {
-                            put("type", "string")
-                            putJsonArray("enum") { SecretPatterns.ALL.keys.forEach { add(it) } }
-                        }
+                        put("description", "Optional array of pattern names to check; a partial name selects every pattern containing it (\"aws\" selects aws_access_key and aws_secret_key). The available names are listed in the tool description.")
+                        putJsonObject("items") { put("type", "string") }
                     }
                     putJsonObject("host_filter") { put("type", "string"); put("description", "Optional regex to filter by host") }
                 },

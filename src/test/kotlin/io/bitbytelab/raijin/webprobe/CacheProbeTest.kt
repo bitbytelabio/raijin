@@ -18,24 +18,28 @@ class CacheProbeTest {
 
     /**
      * A cache: stores what [stores] allows under [keyOf], says MISS when it stores and HIT when
-     * it serves, and passes everything else through untouched.
+     * it serves (unless it does not [announce] either), and passes everything else through untouched.
      */
     private class FakeCache(
         private val origin: (ProbeRequest) -> ProbeResult,
         private val keyOf: (ProbeRequest) -> String = { it.target },
         private val stores: (ProbeRequest, ProbeResult) -> Boolean = { _, response -> response.status == 200 },
+        private val announce: Boolean = true,
     ) {
         val log = ArrayList<Pair<ProbeRequest, Boolean>>()
         private val store = HashMap<String, ProbeResult>()
 
+        /** What the cache holds, by key. */
+        val stored: Map<String, ProbeResult> get() = store
+
         fun send(request: ProbeRequest, anonymous: Boolean): ProbeResult {
             log.add(request to anonymous)
             val key = keyOf(request)
-            store[key]?.let { return it.copy(headers = it.headers + ("x-cache" to "HIT")) }
+            store[key]?.let { return if (announce) it.copy(headers = it.headers + ("x-cache" to "HIT")) else it }
             val response = origin(request)
             if (!stores(request, response)) return response
             store[key] = response
-            return response.copy(headers = response.headers + ("x-cache" to "MISS"))
+            return if (announce) response.copy(headers = response.headers + ("x-cache" to "MISS")) else response
         }
     }
 
@@ -162,12 +166,19 @@ class CacheProbeTest {
             },
             stores = { _, _ -> true },
         )
-        val finding = probe(cache, deception = false).poisoning.single()
+        val report = probe(cache, deception = false)
+        val finding = report.poisoning.single()
 
         assertEquals("X-HTTP-Method-Override", finding.input.name)
         assertEquals(CacheProbe.CONFIRMED, finding.verdict)
         assertEquals(listOf("status 200 -> 405"), finding.effects)
         assertEquals("medium", finding.severity)
+        // Before confirming, a visitor's request under a new cache-buster showed the page is still served to everyone.
+        val attempt = finding.cacheKey.substringAfter('=')
+        val visit = cache.log.indexOfFirst { (request, anonymous) -> anonymous && busterOf(request, report.busterParam) == attempt }
+        val (control, anonymous) = cache.log[visit + 1]
+        assertTrue(anonymous && inputsOf(control).isEmpty(), control.render())
+        assertTrue(busterOf(control, report.busterParam) != attempt, control.render())
     }
 
     @Test
@@ -197,6 +208,106 @@ class CacheProbeTest {
         assertEquals(CacheProbe.CONFIRMED, finding.verdict)
         assertEquals(CacheProbe.STOP_BUDGET, report.stopped)
         assertEquals(12, report.requests)
+    }
+
+    // --- rate limits, WAFs and caches that may be shared ------------------------------------
+
+    /** An origin that serves the page [healthy] times, then answers [status] to everything (a rate limit, a WAF ban). */
+    private fun turningOrigin(healthy: Int, status: Int): (ProbeRequest) -> ProbeResult {
+        var calls = 0
+        return { _ -> if (++calls > healthy) ProbeResult(status, "Request blocked") else ProbeResult(200, "<html>$filler</html>") }
+    }
+
+    @Test
+    fun `a rate limit that starts mid-run is no poisoning and stops the run`() {
+        val report = probe(FakeCache(turningOrigin(healthy = 8, status = 429)), deception = false)
+
+        assertTrue(report.poisoning.isEmpty(), report.poisoning.map { it.input.name to it.verdict }.toString())
+        assertEquals(CacheProbe.STOP_RATE_LIMITED, report.stopped)
+        assertTrue(report.requests < 20, "kept sending into the rate limit: ${report.requests} requests")
+    }
+
+    @Test
+    fun `a WAF that starts refusing everyone is not taken for a status the cache keeps`() {
+        val report = probe(FakeCache(turningOrigin(healthy = 8, status = 403)), deception = false)
+
+        val finding = report.poisoning.single()
+        assertEquals(CacheProbe.INCONCLUSIVE, finding.verdict)
+        assertEquals("info", finding.severity)
+        assertEquals(CacheProbe.STOP_BASELINE_CHANGED, report.stopped)
+    }
+
+    @Test
+    fun `a target already answering 429 gets no input at all`() {
+        val cache = FakeCache({ ProbeResult(429, "Too Many Requests") })
+        val report = probe(cache)
+
+        assertEquals(CacheProbe.STOP_RATE_LIMITED, report.stopped)
+        assertTrue(report.poisoning.isEmpty() && report.deception.isEmpty())
+        assertTrue("429" in report.poisoningSkipped.orEmpty(), report.poisoningSkipped)
+        assertTrue("429" in report.deceptionSkipped.orEmpty(), report.deceptionSkipped)
+        assertTrue(cache.log.none { inputsOf(it.first).isNotEmpty() }, "an input went to a target that is rate limiting")
+    }
+
+    /** An origin that honours a scheme hint, a method override and a path override, as frameworks behind a proxy do. */
+    private val statusOrigin: (ProbeRequest) -> ProbeResult = { request ->
+        when {
+            request.header("X-Forwarded-Scheme") == "http" -> ProbeResult(301, "", mapOf("location" to "https://t.example/home"))
+            request.header("X-HTTP-Method-Override") != null -> ProbeResult(405, "Method Not Allowed")
+            request.header("X-Original-URL") != null -> ProbeResult(404, "not found")
+            else -> ProbeResult(200, "<html>$filler</html>")
+        }
+    }
+
+    @Test
+    fun `no input that changes the status goes out before the cache-buster is seen to isolate it`() {
+        // A cache that names no hit or miss, keys on the path alone and keeps redirects and errors.
+        val cache = FakeCache(statusOrigin, keyOf = { it.path }, stores = { _, response -> response.status != 200 }, announce = false)
+        val report = probe(cache, deception = false)
+
+        assertNull(report.busterEffective)
+        val held = CacheProbe.DEFAULT_HEADERS.filter { it.changesStatus }.map { it.name.lowercase() }.toSet()
+        assertTrue(held.containsAll(listOf("x-forwarded-scheme", "x-http-method-override", "x-original-url")), held.toString())
+        val sent = cache.log.flatMap { inputsOf(it.first) }.map { it.first.lowercase() }.toSet()
+        assertTrue(sent.intersect(held).isEmpty(), "sent to a cache that may be shared: ${sent.intersect(held)}")
+        assertTrue(cache.stored.isEmpty(), "stored for every visitor: ${cache.stored.keys}")
+        val skipped = report.poisoningSkipped.orEmpty()
+        assertTrue("inconclusive" in skipped && "X-Forwarded-Scheme" in skipped, skipped)
+        assertTrue(report.poisoning.isEmpty(), report.poisoning.toString())
+        assertTrue(report.poisoningTested > 0, "the inputs that only show by reflection still ran")
+    }
+
+    /** An origin that redirects to the host X-Forwarded-Host names. */
+    private val redirectingOrigin: (ProbeRequest) -> ProbeResult = { request ->
+        request.header("X-Forwarded-Host")?.let { ProbeResult(302, "", mapOf("location" to "https://$it/home")) } ?: ProbeResult(200, "<html>$filler</html>")
+    }
+
+    @Test
+    fun `a status change where isolation is unknown is sent once and reported as inconclusive`() {
+        // Nothing in front of the origin keeps anything, and nothing says so.
+        val cache = FakeCache(redirectingOrigin, stores = { _, _ -> false }, announce = false)
+        val report = probe(cache, deception = false)
+
+        val finding = report.poisoning.single()
+        assertEquals("X-Forwarded-Host", finding.input.name)
+        assertEquals(CacheProbe.INCONCLUSIVE, finding.verdict)
+        assertEquals(1, cache.log.count { it.first.header("X-Forwarded-Host") != null }, "the redirect was planted more than once")
+        assertNull(report.stopped)
+        assertTrue(report.poisoningTested > 1, "the run went on with the other inputs")
+    }
+
+    @Test
+    fun `a changed response that comes back under a new cache-buster reaches everyone, and the run stops there`() {
+        // A cache that names no hit or miss, keys on the path alone and keeps redirects.
+        val cache = FakeCache(redirectingOrigin, keyOf = { it.path }, stores = { _, response -> response.status == 302 }, announce = false)
+        val report = probe(cache, deception = false)
+
+        val finding = report.poisoning.single()
+        assertEquals("X-Forwarded-Host", finding.input.name)
+        assertEquals(CacheProbe.CONFIRMED, finding.verdict)
+        assertEquals(CacheProbe.STOP_BUSTER_IGNORED, report.stopped)
+        assertEquals(false, report.busterEffective)
+        assertEquals(1, cache.log.count { inputsOf(it.first).isNotEmpty() }, "inputs went on after the cache was seen to be shared")
     }
 
     // --- deception --------------------------------------------------------------------------

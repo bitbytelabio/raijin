@@ -122,8 +122,36 @@ class ReconToolsTest {
         assertRejected("recon_param_mine", mine("bucket_size", json("999")), "'bucket_size'", "got 999")
         assertRejected("recon_param_mine", mine("max_requests", json("5")), "'max_requests'", "between 20 and 5000")
         assertRejected("recon_param_mine", mine("max_requests", json("\"many\"")), "'max_requests'", "integer")
-        assertRejected("recon_js_endpoints", buildJsonObject { put("max_items", 0) }, "'max_items'", "between 1 and")
-        assertRejected("recon_js_endpoints", buildJsonObject { put("max_items", 100000) }, "'max_items'")
+        assertRejected("recon_js_endpoints", buildJsonObject { put("max_items", "lots") }, "'max_items'", "integer")
+    }
+
+    @Test
+    fun `a max_items outside the cap is clamped and reported, not refused`() {
+        for ((asked, used) in listOf(5000 to ReconBridge.MAX_HISTORY_ITEMS, 0 to 1)) {
+            val result = call("recon_js_endpoints", buildJsonObject { put("max_items", asked) })
+            val body = Json.parseToJsonElement((result.content.first() as TextContent).text).jsonObject
+            // The stand-in fails every Burp call: reaching it means the argument was accepted.
+            assertTrue("unexpected Burp call" in body.getValue("error").jsonPrimitive.content, body.toString())
+            assertEquals(used, body.getValue("max_items_clamped_to").jsonPrimitive.int, body.toString())
+        }
+    }
+
+    @Test
+    fun `an offset past the end of the candidates tests nothing and says so`() {
+        val args = buildJsonObject {
+            put("url", "https://t.example/")
+            putJsonArray("candidates") { add("a"); add("b") }
+            put("offset", 5)
+        }
+        val result = call("recon_param_mine", args)
+        val text = (result.content.first() as TextContent).text
+        assertTrue(result.isError != true, text)
+        val body = Json.parseToJsonElement(text).jsonObject
+        assertEquals(2, body.getValue("total_candidates").jsonPrimitive.int)
+        assertEquals(2, body.getValue("offset_clamped_to").jsonPrimitive.int)
+        assertEquals(0, body.getValue("tested").jsonPrimitive.int)
+        assertEquals(0, body.getValue("requests_sent").jsonPrimitive.int)
+        assertTrue("next_offset" !in body)
     }
 
     @Test

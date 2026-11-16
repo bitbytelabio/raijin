@@ -88,10 +88,12 @@ class ReconBridge(private val api: MontoyaApi) {
     /**
      * Optional settings of [paramMine].
      *
-     * @param offset index of the first candidate to test, [limit] how many from there (null: all).
+     * @param offset index of the first candidate to test, [limit] how many from there (null: all);
+     *   an offset at or past the end of the list tests nothing and says so.
      * @param headers request headers sent with every probe; [cookies] are added to its Cookie header.
      * @param body request body the body / JSON candidates are added to.
-     * @param cacheBuster add a query parameter with a new value to every request.
+     * @param cacheBuster add a query parameter with a new value to every request, unless the target
+     *   rejects it ([ParamMiner] leaves it off then and the result says so).
      * @param bucketSize candidates per request (null: the default of the location).
      */
     class ParamMineOptions(
@@ -409,8 +411,24 @@ class ReconBridge(private val api: MontoyaApi) {
                 is ParamMinerWordlists.Resolved.Ok -> resolved.entries
             }
             if (all.isEmpty()) return error("No candidates to test")
-            if (options.offset < 0 || options.offset >= all.size) {
-                return error("offset ${options.offset} is outside the candidate list (${all.size} candidates)")
+            if (options.offset < 0) return error("offset ${options.offset} is negative")
+            if (options.offset >= all.size) {
+                // Paging on with next_offset past the last page leaves nothing to test: a result, not an error.
+                return buildJsonObject {
+                    put("url", url)
+                    check.warning?.let { put("scope_warning", it) }
+                    put("mode", modeId)
+                    put("inject_in", location.id)
+                    put("wordlist_used", if (candidates == null) wordlistName else null)
+                    put("total_candidates", all.size)
+                    put("offset", options.offset)
+                    put("offset_clamped_to", all.size)
+                    put("tested", 0)
+                    put("requests_sent", 0)
+                    put("interesting_count", 0)
+                    put("interesting_params", buildJsonArray {})
+                    put("note", "offset ${options.offset} is at or past the end of the candidate list (${all.size} candidates): nothing is left to test, and no request was sent.")
+                }
             }
             val end = if (options.limit == null) all.size else min(all.size.toLong(), options.offset.toLong() + options.limit).toInt()
             val slice = all.subList(options.offset, end.coerceAtLeast(options.offset))
@@ -450,11 +468,12 @@ class ReconBridge(private val api: MontoyaApi) {
                 bucketSize = options.bucketSize ?: location.bucketSize,
                 maxRequests = options.maxRequests,
                 ignoreNameCase = location.ignoresNameCase,
+                cacheBuster = options.cacheBuster,
             )
-            val outcome = ParamMiner(mined, config) { params ->
+            val outcome = ParamMiner(mined, config) { params, cacheBuster ->
                 // A new value per request: no response comes from a cache, and nothing a probe
                 // makes the target store is served to anyone else.
-                val buster = if (options.cacheBuster) ProbeText.token(Random.Default, 12) else null
+                val buster = if (cacheBuster) ProbeText.token(Random.Default, 12) else null
                 val request = ParamInjection.inject(if (buster == null) base else base.withQuery("$busterName=$buster"), location, params)
                 val result = transport.send(seed.service, request)
                 if (result == null || buster == null) result
@@ -482,6 +501,15 @@ class ReconBridge(private val api: MontoyaApi) {
                 if (nextOffset < all.size) put("next_offset", nextOffset)
                 put("bucket_size", outcome.bucketSize)
                 put("requests_sent", outcome.requests)
+                outcome.busterRejectedStatus?.let { status ->
+                    put("cache_buster_dropped", true)
+                    put(
+                        "cache_buster_note",
+                        "The plain request got HTTP $status once it carried the cache-buster query parameter and a normal answer " +
+                            "without it: the target rejects unknown query parameters, which would have hidden every candidate. The " +
+                            "run went without the buster, so a response may come from a cache and a change a probe causes may be cached for others."
+                    )
+                }
                 outcome.baseline?.let { baseline ->
                     put("baseline", buildJsonObject {
                         put("status", baseline.status)

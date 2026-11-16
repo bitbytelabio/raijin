@@ -44,11 +44,34 @@ class ParamMinerTest {
             random = Random(7),
             sleep = { sleeps.add(it) },
         )
-        val outcome = ParamMiner(candidates, config) { params ->
+        val outcome = ParamMiner(candidates, config) { params, busted ->
+            check(!busted) { "a cache-buster was asked for by a run that has none" }
             requests.add(params)
             server(params)
         }.run()
         return Run(outcome, requests, sleeps)
+    }
+
+    private class BustedRun(val outcome: ParamMiner.Outcome, val requests: List<Pair<List<Pair<String, String>>, Boolean>>)
+
+    /** A run whose transport adds a cache-buster query parameter on request; [server] sees whether one was added. */
+    private fun mineBusted(candidates: List<Entry>, server: (List<Pair<String, String>>, Boolean) -> ProbeResult?): BustedRun {
+        val requests = ArrayList<Pair<List<Pair<String, String>>, Boolean>>()
+        val config = ParamMiner.Config(
+            host = "t.example",
+            reflection = true,
+            diff = true,
+            bucketSize = 64,
+            maxRequests = 2000,
+            cacheBuster = true,
+            random = Random(7),
+            sleep = { },
+        )
+        val outcome = ParamMiner(candidates, config) { params, busted ->
+            requests.add(params to busted)
+            server(params, busted)
+        }.run()
+        return BustedRun(outcome, requests)
     }
 
     private fun List<Pair<String, String>>.value(name: String): String? = firstOrNull { it.first == name }?.second
@@ -219,6 +242,51 @@ class ParamMinerTest {
         assertEquals(listOf("limit"), run.outcome.hits.map { it.candidate.name })
         assertTrue(run.outcome.hits.single().diff.any { it.startsWith("status 400 -> 200") })
         assertTrue(run.requests.all { it.size <= 1 })
+    }
+
+    @Test
+    fun `a cache-buster the target rejects is left off, so its strict mode still finds names`() {
+        val candidates = names(40).toMutableList()
+        candidates[17] = Entry("limit")
+        val run = mineBusted(candidates) { params, busted ->
+            // An API that refuses every query parameter it does not know, the cache-buster included.
+            if (busted || params.any { it.first != "limit" }) ProbeResult(400, "{\"error\":\"unknown field\"}") else ProbeResult(200, "{\"items\":[]}")
+        }
+
+        assertEquals(400, run.outcome.busterRejectedStatus)
+        assertTrue(run.outcome.rejectsUnknownNames)
+        assertEquals(listOf("limit"), run.outcome.hits.map { it.candidate.name })
+        // The plain request with and without the buster, both once more; then never with it again.
+        assertEquals(listOf(true, false, true, false), run.requests.take(4).map { it.second })
+        assertTrue(run.requests.drop(4).none { it.second })
+    }
+
+    @Test
+    fun `a cache-buster the target takes stays on every request at no extra cost`() {
+        val server = { params: List<Pair<String, String>> -> ProbeResult(200, page + (params.value("p0123") ?: "")) }
+        val run = mineBusted(names(300)) { params, _ -> server(params) }
+
+        assertNull(run.outcome.busterRejectedStatus)
+        assertTrue(run.requests.all { it.second })
+        assertEquals(listOf("p0123"), run.outcome.hits.map { it.candidate.name })
+        assertEquals(mine(names(300), reflection = true, diff = true, server = server).requests.size, run.requests.size)
+    }
+
+    @Test
+    fun `an error that does not repeat does not cost the run its cache-buster`() {
+        var hiccup = true
+        val run = mineBusted(names(100)) { params, busted ->
+            if (busted && hiccup) {
+                hiccup = false
+                ProbeResult(502, "bad gateway")
+            } else {
+                ProbeResult(200, page + (params.value("p0042") ?: ""))
+            }
+        }
+
+        assertNull(run.outcome.busterRejectedStatus)
+        assertEquals(1, run.requests.count { !it.second }, "only the one plain request without the buster")
+        assertEquals(listOf("p0042"), run.outcome.hits.map { it.candidate.name })
     }
 
     @Test

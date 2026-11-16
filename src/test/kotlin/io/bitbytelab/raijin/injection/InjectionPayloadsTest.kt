@@ -4,6 +4,8 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class InjectionPayloadsTest {
@@ -110,9 +112,9 @@ class InjectionPayloadsTest {
 
     @Test
     fun `operator probes use the same operators with swapped operands`() {
-        for (probe in InjectionPayloads.nosqlOperators) for (round in rounds) {
-            val whenTrue = probe.bounds(round, true)
-            val whenFalse = probe.bounds(round, false)
+        for (probe in InjectionPayloads.nosqlOperators) for (round in rounds) for (base in listOf("1", "carlos", "a.b+c")) {
+            val whenTrue = probe.conditions(base, round, true) ?: continue
+            val whenFalse = assertNotNull(probe.conditions(base, round, false), probe.label)
             assertNotEquals(whenTrue, whenFalse, probe.label)
             assertEquals(whenTrue.map { it.first }, whenFalse.map { it.first }, probe.label)
             assertEquals(
@@ -120,7 +122,52 @@ class InjectionPayloadsTest {
                 whenFalse.joinToString("") { it.second }.toList().sorted(),
                 "${probe.label}: operands carry the same characters",
             )
-            if (probe.numeric) (whenTrue + whenFalse).forEach { assertTrue(it.second.toLongOrNull() != null, it.second) }
+            if (probe.numeric) (whenTrue + whenFalse).forEach { assertTrue(it.second.toBigDecimalOrNull() != null, it.second) }
+        }
+        val numeric = InjectionPayloads.nosqlOperators.single { it.numeric }
+        assertNull(numeric.conditions("carlos", 0, true), "number operands for a value that is not a number")
+    }
+
+    /** The documents of [values] a MongoDB filter of [conditions] on one field selects. */
+    private fun select(values: List<String>, conditions: List<Pair<String, String>>, numeric: Boolean): List<String> =
+        values.filter { value ->
+            conditions.all { (operator, operand) ->
+                val same = if (numeric) value.toBigDecimal().compareTo(operand.toBigDecimal()) == 0 else value == operand
+                when (operator) {
+                    "\$eq" -> same
+                    "\$ne" -> !same
+                    "\$regex" -> !numeric && Regex(operand).containsMatchIn(value)
+                    else -> error("unexpected operator $operator")
+                }
+            }
+        }
+
+    @Test
+    fun `operator probes select the base value's documents or none, never the whole collection`() {
+        val collections = listOf(
+            false to listOf("admin", "carlos", "wiener", "", "1", "49173", "a.b+c", "aXb+c"),
+            true to listOf("1", "2", "3", "49173", "58231"),
+        )
+        for ((numeric, values) in collections) {
+            for (probe in InjectionPayloads.nosqlOperators.filter { it.numeric == numeric }) {
+                for (base in values) for (round in rounds) {
+                    val whenTrue = probe.conditions(base, round, true) ?: continue
+                    val whenFalse = assertNotNull(probe.conditions(base, round, false))
+                    val label = "${probe.label} with base '$base', round $round"
+                    assertEquals(listOf(base), select(values, whenTrue, numeric), "$label: TRUE")
+                    assertTrue(base !in select(values, whenFalse, numeric), "$label: FALSE")
+                    assertTrue(select(values, whenFalse, numeric).size <= 1, "$label: FALSE matches one decoy at most")
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `no default SQL boolean pair widens the query`() {
+        for (pair in InjectionPayloads.sqlBoolean) {
+            assertFalse(Regex("(?i)\\bOR\\b").containsMatchIn(pair.text), "an OR pair matches rows the base value does not: ${pair.text}")
+            // MySQL reads `+` as arithmetic: 'x'+...+'' becomes 0, which equals every value not starting with a digit.
+            if ("'+" in pair.text) assertTrue("IIF(" in pair.text, "a + concatenation MySQL would evaluate: ${pair.text}")
         }
     }
 

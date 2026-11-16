@@ -565,7 +565,7 @@ class InjectionProbe(
             break
         }
         booleanBased(InjectionClass.NOSQLI, "boolean-based (server-side JavaScript)", InjectionPayloads.nosqlBoolean.map { textCondition(it) })
-        if (template.renderKeyOperators(listOf("\$gt" to "")) == null && template.renderJsonValue("1") == null) {
+        if (template.renderKeyOperators(listOf("\$eq" to "")) == null && template.renderJsonValue("1") == null) {
             notes += "nosqli operator injection needs FUZZ to be the value of a query/form parameter or a JSON value; skipped for this injection point"
         } else {
             booleanBased(InjectionClass.NOSQLI, "operator injection", InjectionPayloads.nosqlOperators.map { operatorCondition(it) })
@@ -574,14 +574,16 @@ class InjectionProbe(
     }
 
     private fun operatorCondition(candidate: InjectionPayloads.OperatorProbe): (Int, Boolean) -> Condition? = { round, truth ->
-        val operators = candidate.bounds(round, truth)
-        val json = buildJsonObject {
-            for ((op, operand) in operators) {
-                if (candidate.numeric) put(op, operand.toLong()) else put(op, operand)
-            }
-        }.toString()
-        val request = template.renderKeyOperators(operators) ?: template.renderJsonValue(json)
-        request?.let { Condition(it, "${candidate.label}: $json", structural = true) }
+        candidate.conditions(settings.baseValue, round, truth)?.let { operators ->
+            val json = buildJsonObject {
+                for ((op, operand) in operators) {
+                    if (candidate.numeric) put(op, operand.toLongOrNull() ?: operand.toBigDecimal()) else put(op, operand)
+                }
+            }.toString()
+            // A query or form value always arrives as a string: number operands need a JSON body.
+            val keyed = if (candidate.numeric) null else template.renderKeyOperators(operators)
+            (keyed ?: template.renderJsonValue(json))?.let { Condition(it, "${candidate.label}: $json", structural = true) }
+        }
     }
 
     private fun cmdi() {

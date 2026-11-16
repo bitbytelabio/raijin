@@ -55,6 +55,12 @@ object InjectionPayloads {
     /** Appended to the base value to unbalance the query and raise a database error. */
     val sqlBreakers: List<String> = listOf("'", "\"", "')", "'\"", "\\")
 
+    /**
+     * Every pair narrows the query the value sits in (AND, or an unchanged value), so neither side
+     * reaches a row the baseline request leaves alone: `FUZZ` may sit in a DELETE or an UPDATE.
+     * There is no OR pair to widen the WHERE clause when the base value matches nothing; pass a
+     * base value that matches a row instead.
+     */
     val sqlBoolean: List<Enclosed> = listOf(
         Enclosed("{base}' AND '{x}'<'{y}", "'", "'"),
         Enclosed("{base} AND {x}<{y}"),
@@ -63,9 +69,9 @@ object InjectionPayloads {
         Enclosed("{base}) AND ({x}<{y}", "(", ")"),
         // The value concatenated between two string literals: keep it unchanged when TRUE.
         Enclosed("{base}'||(CASE WHEN {x}<{y} THEN '' ELSE 'zq' END)||'", "'", "'"),
-        Enclosed("{base}'+(CASE WHEN {x}<{y} THEN '' ELSE 'zq' END)+'", "'", "'"),
-        // Last: OR widens the WHERE clause, which matters when the base value matches nothing.
-        Enclosed("{base}' OR '{x}'<'{y}", "'", "'"),
+        // SQL Server's `+` concatenates; IIF fails on MySQL, whose `+` is arithmetic and would turn
+        // `col='x'+...+''` into `col=0`, a match for every value that does not start with a digit.
+        Enclosed("{base}'+IIF({x}<{y},'','zq')+'", "'", "'"),
     )
 
     /**
@@ -110,24 +116,62 @@ object InjectionPayloads {
     )
 
     /**
-     * Query operators that replace the value itself (`user[$gt]=`, `{"user":{"$gt":""}}`).
-     * [bounds] gives each round's operator/operand pairs for a TRUE or FALSE condition; FALSE is
-     * the same operators with the operands swapped. [numeric] operands are JSON numbers.
+     * Query operators that replace the value itself (`user[$eq]=1`, `{"user":{"$eq":"1"}}`). Each
+     * pair narrows the query to one value: TRUE asks for the base value and not a decoy, so it
+     * matches what the baseline matches; FALSE asks for the decoy and not the base value, which
+     * matches nothing the baseline does. Neither side reaches a document the baseline request
+     * leaves alone (a probe may land in `deleteMany`), so the operators are only told apart when
+     * the base value matches something. FALSE is TRUE with the operands swapped, and each round
+     * takes a new decoy.
+     *
+     * [conditions] gives the operator/operand pairs for a base value, round and truth, or null when
+     * the probe does not apply to that base value. [numeric] operands are JSON numbers, which only
+     * a JSON body can carry.
      */
-    class OperatorProbe(val label: String, val numeric: Boolean, val bounds: (round: Int, truth: Boolean) -> List<Pair<String, String>>)
+    class OperatorProbe(
+        val label: String,
+        val numeric: Boolean,
+        val conditions: (base: String, round: Int, truth: Boolean) -> List<Pair<String, String>>?,
+    )
 
-    private fun range(low: String, high: String, truth: Boolean): List<Pair<String, String>> =
-        if (truth) listOf("\$gt" to low, "\$lt" to high) else listOf("\$gt" to high, "\$lt" to low)
+    /** A round's decoy: a literal of [booleanRounds] that differs from [base], as text and as a number. */
+    private fun decoy(base: String, round: Int): String {
+        val literals = booleanRounds[round % booleanRounds.size]
+        val number = base.toBigDecimalOrNull()
+        val clashes = literals.lo == base || (number != null && number.compareTo(literals.lo.toBigDecimal()) == 0)
+        return if (clashes) literals.hi else literals.lo
+    }
+
+    private fun equality(base: String, decoy: String, truth: Boolean): List<Pair<String, String>> =
+        if (truth) listOf("\$eq" to base, "\$ne" to decoy) else listOf("\$eq" to decoy, "\$ne" to base)
+
+    /** [text] as a regular expression that matches it literally. */
+    private fun regexLiteral(text: String): String = buildString(text.length + 8) {
+        for (ch in text) {
+            if (ch in REGEX_SPECIAL) append('\\')
+            append(ch)
+        }
+    }
+
+    private const val REGEX_SPECIAL = "\\^\$.|?*+()[]{}"
 
     val nosqlOperators: List<OperatorProbe> = listOf(
-        OperatorProbe("string range", numeric = false) { round, truth -> range("", "~".repeat(4 + round), truth) },
-        OperatorProbe("regex", numeric = false) { round, truth ->
-            val inner = listOf(".*", ".{0,}", "(.*)")[round % 3]
-            listOf("\$regex" to if (truth) "^$inner$" else "$${inner}^")
+        OperatorProbe("equality", numeric = false) { base, round, truth -> equality(base, decoy(base, round), truth) },
+        // `^$` followed by more text never matches, so each side is the anchored equality of its
+        // first branch; an empty base value would leave FALSE's second branch a bare `^$`. Each
+        // operand sits in its own group, so an encoded `^` (%5E) never runs into its first
+        // character and an echo of either side holds the same words.
+        OperatorProbe("regex", numeric = false) { base, round, truth ->
+            if (base.isEmpty()) {
+                null
+            } else {
+                val other = decoy(base, round)
+                val (wanted, never) = if (truth) base to other else other to base
+                listOf("\$regex" to "^(" + regexLiteral(wanted) + ")\$|^\$(" + regexLiteral(never) + ")")
+            }
         },
-        OperatorProbe("numeric range", numeric = true) { round, truth ->
-            val bound = listOf("99999999999", "88888888888", "77777777777")[round % 3]
-            range("-$bound", bound, truth)
+        OperatorProbe("numeric equality", numeric = true) { base, round, truth ->
+            if (base.toBigDecimalOrNull() == null) null else equality(base, decoy(base, round), truth)
         },
     )
 

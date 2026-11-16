@@ -120,9 +120,12 @@ class ParamMiner(
     private val config: Config,
     private val transport: Transport,
 ) {
-    /** Sends one request carrying exactly these `name to value` inputs; null when the target gave no response. */
+    /**
+     * Sends one request carrying exactly these `name to value` inputs, and the transport's
+     * cache-buster query parameter when [cacheBuster] is set; null when the target gave no response.
+     */
     fun interface Transport {
-        fun send(params: List<Pair<String, String>>): ProbeResult?
+        fun send(params: List<Pair<String, String>>, cacheBuster: Boolean): ProbeResult?
     }
 
     /**
@@ -132,6 +135,8 @@ class ParamMiner(
      * @param bucketSize candidates per request to start from; halved while the target rejects it.
      * @param maxRequests hard cap on requests; the run stops there and says how far it got.
      * @param ignoreNameCase names differing only in case are the same input (headers).
+     * @param cacheBuster the transport can add a cache-buster to every request; the run leaves it
+     *   off when the target rejects it.
      */
     class Config(
         val host: String,
@@ -140,6 +145,7 @@ class ParamMiner(
         val bucketSize: Int,
         val maxRequests: Int,
         val ignoreNameCase: Boolean = false,
+        val cacheBuster: Boolean = false,
         val baselineSamples: Int = 3,
         val random: Random = Random.Default,
         val sleep: (Long) -> Unit = { Thread.sleep(it) },
@@ -156,6 +162,9 @@ class ParamMiner(
      * @param rejectsUnknownNames any unknown name changes the status, so candidates went one per request.
      * @param stopped why the run ended before the list did, or null.
      * @param unanswered candidates whose request got no response, so nothing is known about them.
+     * @param busterRejectedStatus the status the plain request got with the cache-buster when the
+     *   buster alone changed it (and the plain request without it got another); the run then went
+     *   without the buster. Null when it kept the buster or never had one.
      */
     class Outcome(
         val error: String?,
@@ -171,6 +180,7 @@ class ParamMiner(
         val stopped: String?,
         val unanswered: List<Entry>,
         val canaryPrefix: String,
+        val busterRejectedStatus: Int? = null,
     )
 
     /** One input of a request: a candidate ([index] into the list) or a made-up name ([DECOY]). */
@@ -198,6 +208,8 @@ class ParamMiner(
     private var stopped: String? = null
     private var bucketSize = 0
     private var strict = false
+    private var busted = config.cacheBuster
+    private var busterRejectedStatus: Int? = null
     private var mirrors = false
     private var profile: BehavioralDiff.Baseline? = null
 
@@ -214,9 +226,13 @@ class ParamMiner(
     fun run(): Outcome {
         if (candidates.isEmpty()) return outcome(null, 0)
 
+        // The cache-buster is one more query parameter the target does not know. A target that
+        // rejects unknown parameters rejects every request carrying it, so the run leaves it off.
+        var plain = send(emptyList())
+        if (busted && plain != null) plain = withoutRejectedBuster(plain)
+
         // One unknown name against none: a target that answers the two differently (an API that
         // rejects unknown fields) can only be mined one name per request.
-        val plain = send(emptyList())
         val reference = listOfNotNull(send(decoys(1)), send(decoys(1)))
         if (reference.isEmpty()) return outcome(baselineError(), 0)
         val referenceStatus = reference.map { it.raw.status }.distinct().singleOrNull()
@@ -246,6 +262,26 @@ class ParamMiner(
             if (stopped == null) tested += bucket.indices.size
         }
         return outcome(null, tested)
+    }
+
+    /**
+     * The plain request as the run goes on sending it: [withBuster] itself, or the plain request
+     * without the cache-buster when the buster alone turns a page the target serves (2xx, or a
+     * redirect) into a rejection or a redirect. After that no request carries the buster. Both
+     * statuses have to repeat, so a passing error does not cost the run its cache isolation, and
+     * a stale error served from a cache for the plain URL never replaces a fresh page.
+     */
+    private fun withoutRejectedBuster(withBuster: Observation): Observation {
+        if (withBuster.raw.status in 200..299) return withBuster
+        val bare = send(emptyList(), cacheBuster = false) ?: return withBuster
+        if (bare.raw.status >= 400 || bare.raw.status == withBuster.raw.status) return withBuster
+        val bustedAgain = send(emptyList(), cacheBuster = true) ?: return withBuster
+        if (bustedAgain.raw.status != withBuster.raw.status) return bustedAgain
+        val bareAgain = send(emptyList(), cacheBuster = false) ?: return bustedAgain
+        if (bareAgain.raw.status != bare.raw.status) return bustedAgain
+        busted = false
+        busterRejectedStatus = withBuster.raw.status
+        return bareAgain
     }
 
     /** Whether the plain request and a one-decoy request get [plainStatus] and [decoyStatus] a second time. */
@@ -511,14 +547,14 @@ class ParamMiner(
 
     // --- requests -------------------------------------------------------------------------
 
-    private fun send(slots: List<Slot>): Observation? {
+    private fun send(slots: List<Slot>, cacheBuster: Boolean = busted): Observation? {
         if (stopped != null) return null
         if (requests >= config.maxRequests) {
             stopped = STOP_BUDGET
             return null
         }
         requests++
-        val raw = try { transport.send(slots.map { it.name to it.value }) } catch (_: Exception) { null }
+        val raw = try { transport.send(slots.map { it.name to it.value }, cacheBuster) } catch (_: Exception) { null }
         if (raw == null || raw.status <= 0) {
             if (++failures >= MAX_FAILURES) stopped = STOP_NO_RESPONSE
             return null
@@ -617,6 +653,7 @@ class ParamMiner(
         stopped = stopped,
         unanswered = unanswered.map { candidates[it] },
         canaryPrefix = canaries.prefix,
+        busterRejectedStatus = busterRejectedStatus,
     )
 
     companion object {

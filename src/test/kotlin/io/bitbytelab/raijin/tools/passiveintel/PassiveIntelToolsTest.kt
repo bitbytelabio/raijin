@@ -62,13 +62,24 @@ class PassiveIntelToolsTest {
     }
 
     @Test
-    fun `the schema lists the categories that exist and bounds max_items`() {
+    fun `the schema takes any category name, the description lists them, and max_items is bounded`() {
         val properties = tool.tool.inputSchema.properties!!
-        val categories = properties.getValue("categories").jsonObject.getValue("items").jsonObject.getValue("enum").jsonArray.map { it.jsonPrimitive.content }
-        assertEquals(SecretPatterns.ALL.keys.toList(), categories)
-        assertTrue("debug_info" !in categories && "heroku_api_key" !in categories)
+        val items = properties.getValue("categories").jsonObject.getValue("items").jsonObject
+        // A partial name ("aws") is a valid category: an enum would make clients refuse it.
+        assertTrue("enum" !in items, items.toString())
+        val description = tool.tool.description.orEmpty()
+        for (name in SecretPatterns.ALL.keys) assertTrue(name in description, name)
         assertEquals(1, properties.getValue("max_items").jsonObject.getValue("minimum").jsonPrimitive.int)
         assertTrue("action" !in properties)
+    }
+
+    @Test
+    fun `a partial category name gets past the arguments to the scan`() {
+        val result = call(buildJsonObject { putJsonArray("categories") { add("aws") } })
+        val message = Json.parseToJsonElement((result.content.first() as TextContent).text).jsonObject.getValue("error").jsonPrimitive.content
+        // The stand-in fails every Burp call: reaching it means "aws" was accepted.
+        assertTrue("unexpected Burp call" in message, message)
+        assertTrue("Unknown categories" !in message, message)
     }
 
     @Test
