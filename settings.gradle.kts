@@ -1,6 +1,4 @@
-// Build-JDK is pinned to a JDK 17 toolchain via gradle/gradle-daemon-jvm.properties
-// (a script-level guard is impossible — Kotlin 2.1.20 can't even COMPILE these
-// .kts scripts under Java 22+, crashing with a cryptic "25.0.3"). The daemon
-// criteria make `./gradlew` relaunch the build under JDK 17 even when launched
-// with Burp's bundled Java 25. See GitHub issue #2.
+// Gradle's daemon runs on JDK 21 via gradle/gradle-daemon-jvm.properties, even
+// when ./gradlew is launched with a newer JVM such as Burp's bundled Java.
+// Keep this aligned with the bytecode/toolchain target in build.gradle.kts.
 rootProject.name = "raijin"
