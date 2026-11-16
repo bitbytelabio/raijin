@@ -139,7 +139,9 @@ class RaijinTab(
         tabbedPane.addTab("Autorize", autorizePanel)
         tabbedPane.addTab("Collaborator", buildCollaboratorTab())
         tabbedPane.addTab("Rules", buildRulesTab())
-        tabbedPane.addTab("JWT", JwtPanel(bridges.jwt))
+        val jwtPanel = JwtPanel(bridges.jwt)
+        disposer.add("JWT panel") { jwtPanel.dispose() }
+        tabbedPane.addTab("JWT", jwtPanel)
         val runsPanel = TurboRunsPanel()
         disposer.add("Turbo runs panel") { runsPanel.dispose() }
         tabbedPane.addTab("Turbo", runsPanel)
