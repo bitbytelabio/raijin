@@ -42,6 +42,8 @@ class EventBus(private val maxBufferSize: Int = 10000) {
     private val buffer = ConcurrentLinkedDeque<BurpEvent>()
     private val bufferSize = AtomicInteger(0)
     private val idCounter = AtomicLong(0)
+    /** Separate from [idCounter] so subscribing never leaves gaps in event ids. */
+    private val subscriptionCounter = AtomicLong(0)
     private val subscribers = CopyOnWriteArrayList<EventSubscriber>()
 
     /**
@@ -126,7 +128,7 @@ class EventBus(private val maxBufferSize: Int = 10000) {
      * @return A subscription id that can be passed to [unsubscribe].
      */
     fun subscribe(types: List<String>, callback: (BurpEvent) -> Unit): String {
-        val id = "sub-${idCounter.incrementAndGet()}"
+        val id = "sub-${subscriptionCounter.incrementAndGet()}"
         subscribers.add(EventSubscriber(id, types, callback, internal = false))
         return id
     }
@@ -136,7 +138,7 @@ class EventBus(private val maxBufferSize: Int = 10000) {
      * that is preserved across [clear] calls and only removed on [unsubscribe] or [clearAll].
      */
     fun subscribeInternal(types: List<String>, callback: (BurpEvent) -> Unit): String {
-        val id = "sub-int-${idCounter.incrementAndGet()}"
+        val id = "sub-int-${subscriptionCounter.incrementAndGet()}"
         subscribers.add(EventSubscriber(id, types, callback, internal = true))
         return id
     }

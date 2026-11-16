@@ -1715,7 +1715,7 @@ class HttpBridge(
                     val bodyStr = resp.bodyToString()
                     val rendered = io.bitbytelab.raijin.core.BodyText.render(bodyStr, maxBodyLength, resp.mimeType().name)
                     put("response_body", rendered.text)
-                    if (rendered.isBinary) put("response_body_encoding", "base64")
+                    if (rendered.binary) put("response_body_binary", true)
                     if (rendered.truncated) put("response_body_truncated", true)
 
                     // Cookies

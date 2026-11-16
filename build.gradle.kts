@@ -64,6 +64,9 @@ dependencies {
     // what InQL (the reference extension this ports from) uses.
     implementation("com.graphql-java:graphql-java:21.5")
 
+    // YAML OpenAPI/Swagger documents (api_import_openapi). Parsed with SafeConstructor only.
+    implementation("org.yaml:snakeyaml:2.4")
+
     // --- Tests ---
     testImplementation(kotlin("test-junit5"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")

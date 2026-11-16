@@ -254,7 +254,7 @@ class HttpPipelineBridge(api: MontoyaApi) {
         })
         val renderedBody = BodyText.render(r.body, maxResponseLength)
         put("body", renderedBody.text)
-        if (renderedBody.isBinary) put("body_encoding", "base64")
+        if (renderedBody.binary) put("body_binary", true)
         if (renderedBody.truncated) put("body_truncated", true)
         if (r.warnings.isNotEmpty()) put("warnings", buildJsonArray { r.warnings.forEach { add(it) } })
     }
