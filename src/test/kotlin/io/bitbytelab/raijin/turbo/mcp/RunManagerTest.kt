@@ -1,8 +1,12 @@
 package io.bitbytelab.raijin.turbo.mcp
 
+import io.bitbytelab.raijin.turbo.Request
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Assertions.*
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 class RunManagerTest {
 
@@ -308,5 +312,119 @@ class RunManagerTest {
         assertNull(manager.getRun(runs.first().id))
         assertNotNull(manager.getRun(runs.last().id))
         assertNotNull(manager.getRun(triggerRun.id))
+    }
+
+    private fun finishedRunWithBody(manager: RunManager): Pair<ActiveRun, Request> {
+        val run = manager.startRun()
+        run.handler.markScriptCompleted()
+        val req = Request("GET / HTTP/1.1").apply { response = "HTTP/1.1 200 OK\r\n\r\nBody"; id = 1 }
+        run.store.add(req)
+        return run to req
+    }
+
+    @Test
+    fun `low memory is judged against the size of the heap`() {
+        val oneGb = 1L shl 30
+        // A 1 GB heap with 300 MB free is fine; the old flat 1 GB rule called every 1 GB heap low.
+        assertFalse(RunManager.isLowOnMemory(oneGb, oneGb - 300_000_000))
+        assertTrue(RunManager.isLowOnMemory(oneGb, oneGb - 100_000_000))
+        // A large heap keeps the 1 GB headroom.
+        val bigHeap = 32L shl 30
+        assertTrue(RunManager.isLowOnMemory(bigHeap, bigHeap - 900_000_000))
+        assertFalse(RunManager.isLowOnMemory(bigHeap, bigHeap - 2_000_000_000))
+        // An unbounded heap never is.
+        assertFalse(RunManager.isLowOnMemory(Long.MAX_VALUE, 50L shl 30))
+    }
+
+    @Test
+    fun `low memory with no finished run to free costs no collection`() {
+        val manager = RunManager()
+        var collections = 0
+        assertFalse(manager.relieveMemoryPressure(1000, { 999 }, { collections++ }, 0))
+
+        val running = manager.startRun()
+        assertFalse(manager.relieveMemoryPressure(1000, { 999 }, { collections++ }, 5_000_000_000))
+
+        assertEquals(0, collections)
+        assertNotNull(manager.getRun(running.id))
+    }
+
+    @Test
+    fun `pressure that one collection clears keeps every body and is rechecked at most once a minute`() {
+        val manager = RunManager()
+        val (run, req) = finishedRunWithBody(manager)
+        var used = 990L
+        var collections = 0
+        val collect = {
+            collections++
+            used = 500L
+        }
+
+        assertFalse(manager.relieveMemoryPressure(1000, { used }, collect, 0))
+        assertEquals(1, collections)
+        assertNotNull(req.response)
+        assertFalse(run.responsesStripped)
+
+        used = 990L
+        assertFalse(manager.relieveMemoryPressure(1000, { used }, collect, 5_000_000_000))
+        assertEquals(1, collections, "collected again within the minute")
+
+        used = 990L
+        manager.relieveMemoryPressure(1000, { used }, collect, 61_000_000_000)
+        assertEquals(2, collections)
+    }
+
+    @Test
+    fun `pressure a collection does not clear strips finished runs, then evicts the oldest`() {
+        val manager = RunManager()
+        val (older, olderReq) = finishedRunWithBody(manager)
+        val (newer, _) = finishedRunWithBody(manager)
+        var collections = 0
+
+        assertTrue(manager.relieveMemoryPressure(1000, { 990 }, { collections++ }, 0))
+        assertEquals(2, collections)
+        assertTrue(older.responsesStripped)
+        assertTrue(newer.responsesStripped)
+        assertNull(olderReq.response)
+        assertEquals(200, olderReq.code)
+
+        assertTrue(manager.relieveMemoryPressure(1000, { 990 }, { collections++ }, 5_000_000_000))
+        assertTrue(manager.isEvicted(older.id))
+        assertNotNull(manager.getRun(newer.id))
+    }
+
+    @Test
+    fun `finished runs past the cap are evicted without waiting for a new run`() {
+        val manager = RunManager(maxCompletedRuns = 1)
+        val first = manager.startRun().also { it.handler.markScriptCompleted() }
+        val second = manager.startRun().also { it.handler.markScriptCompleted() }
+
+        manager.relieveMemoryPressure(maxHeap = 1000, usedHeap = { 0 }, collectGarbage = {}, nowNanos = 0)
+
+        assertTrue(manager.isEvicted(first.id))
+        assertNotNull(manager.getRun(second.id))
+    }
+
+    @Test
+    fun `stopRun stops a script that has not built its engine yet`() {
+        val run = manager.startRun()
+        val attached = CountDownLatch(1)
+        val interrupted = CountDownLatch(1)
+        val script = thread {
+            run.handler.attachScriptThread()
+            attached.countDown()
+            try {
+                Thread.sleep(10_000)
+            } catch (e: InterruptedException) {
+                interrupted.countDown()
+            }
+        }
+        assertTrue(attached.await(2, TimeUnit.SECONDS))
+
+        assertEquals("stopped", manager.stopRun(run.id))
+
+        assertTrue(interrupted.await(2, TimeUnit.SECONDS), "the script was not interrupted")
+        assertEquals("exited-early", run.handler.status())
+        script.join(1000)
     }
 }

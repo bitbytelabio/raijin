@@ -1,16 +1,22 @@
 package io.bitbytelab.raijin.turbo
 
 
+/**
+ * Control and status of one run. The script thread writes it while the GUI timer and MCP threads
+ * read it, so every field is volatile.
+ */
 class RunHandler (){
-    private var running = false
-    private var engine: RequestEngine? = null
-    private var statusOverride: String? = null
-    private var errorFlag: Boolean = false
+    private val lock = Any()
+    @Volatile private var engine: RequestEngine? = null
+    @Volatile private var scriptThread: Thread? = null
+    @Volatile private var stopRequested = false
+    @Volatile private var statusOverride: String? = null
+    @Volatile private var errorFlag: Boolean = false
     @Volatile private var scriptCompleted = false
-    var msg: String = ""
-    var code: String = ""
-    var baseRequest: String = ""
-    var rawRequest: ByteArray = "".toByteArray()
+    @Volatile var msg: String = ""
+    @Volatile var code: String = ""
+    @Volatile var baseRequest: String = ""
+    @Volatile var rawRequest: ByteArray = "".toByteArray()
 
     fun hasError(): Boolean = errorFlag
 
@@ -25,12 +31,14 @@ class RunHandler (){
         if (errorFlag) return "failed"
         val eng = engine
         if (eng != null) {
+            val state = eng.runState.get()
             return when {
-                eng.runState.get() >= 4 -> "completed"
-                eng.runState.get() >= 3 -> "exited-early"
+                state >= 4 -> "completed"
+                state >= 3 -> "exited-early"
                 else -> "running"
             }
         }
+        if (stopRequested) return "exited-early"
         return if (scriptCompleted) "completed" else "running"
     }
 
@@ -40,43 +48,75 @@ class RunHandler (){
 
     fun markScriptCompleted() {
         scriptCompleted = true
+        scriptThread = null
+    }
+
+    /**
+     * Binds the thread running the user's script, so [abort] can stop a script that has not built
+     * its engine yet. A stop requested before the binding interrupts the thread straight away.
+     */
+    @JvmOverloads
+    fun attachScriptThread(thread: Thread = Thread.currentThread()) {
+        val interrupt = synchronized(lock) {
+            scriptThread = thread
+            stopRequested && engine == null
+        }
+        if (interrupt) thread.interrupt()
     }
 
     fun setRequestEngine(engine: RequestEngine) {
-        running = true
-        this.engine = engine
+        val cancel = synchronized(lock) {
+            this.engine = engine
+            stopRequested
+        }
+        // The stop landed while the script was still building this engine: it applies here too.
+        if (cancel) engine.cancel()
     }
 
     fun statusString(): String {
-        if (statusOverride != null){
-            return statusOverride!!
-        }
+        statusOverride?.let { return it }
 
-        if (engine != null) {
-            val engineStatus = engine!!.statusString()
-            if (msg.isBlank()) return engineStatus
+        val eng = engine
+        if (eng != null) {
+            val engineStatus = eng.statusString()
+            val message = msg
+            if (message.isBlank()) return engineStatus
             val terminal = listOf(" | Completed", " | Cancelled").firstOrNull(engineStatus::endsWith)
             return if (terminal == null) {
-                "$engineStatus | $msg"
+                "$engineStatus | $message"
             } else {
-                engineStatus.removeSuffix(terminal) + " | " + msg + terminal
+                engineStatus.removeSuffix(terminal) + " | " + message + terminal
             }
         }
 
+        if (stopRequested) return "Stopped before the request engine started"
         return "Engine warming up..."
     }
 
+    /**
+     * Replaces the status line. After a stop, an error does not mark the run failed: the stop
+     * interrupts the script, and the exception that surfaces is the stop working.
+     */
     fun overrideStatus(msg: String, isError: Boolean = true) {
         statusOverride = msg
-        errorFlag = isError
+        errorFlag = isError && !stopRequested
     }
 
     fun setMessage(msg: String) {
         this.msg = msg
     }
 
+    /**
+     * Stops the run: cancels its engine, or, while the script has not built one yet, interrupts
+     * the script thread so the stop does not wait for the script to get that far.
+     */
     fun abort() {
-        running = false
-        this.engine?.cancel()
+        var interrupt: Thread? = null
+        val eng = synchronized(lock) {
+            stopRequested = true
+            engine.also { if (it == null) interrupt = scriptThread }
+        }
+        interrupt?.takeIf { it !== Thread.currentThread() }?.interrupt()
+        eng?.cancel()
     }
 }

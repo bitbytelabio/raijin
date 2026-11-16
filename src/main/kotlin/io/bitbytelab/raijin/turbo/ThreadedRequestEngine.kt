@@ -6,12 +6,12 @@ import java.io.*
 import java.net.*
 import java.security.cert.X509Certificate
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.GZIPInputStream
-import javax.net.SocketFactory
 import javax.net.ssl.*
 import kotlin.IllegalStateException
 import kotlin.concurrent.thread
@@ -32,7 +32,8 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
     val requestsPerConnection: Int
         get() = requestLimit.get()
 
-    var domains = HashSet<String>()
+    // Filled from certificates during handshakes on every worker thread.
+    val domains: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     init {
         try {
@@ -47,7 +48,7 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
 
             internalSettings.put("ignoreLength", false)
 
-            idleTimeout *= 1000
+            // idleTimeout is in milliseconds, as on every other engine and in the docs.
             lastLife = System.currentTimeMillis()
 
             require(!adaptive || threads > 0) { "Adaptive worker count must be positive" }
@@ -122,32 +123,40 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
             return Math.pow(2.0, exponent.toDouble()).toLong() * 200L
         }
 
-        fun uncompressIfNecessary(headers: String, body: String): String {
-            if (headers.lowercase().indexOf("content-encoding: ") == -1) {
-                return body
+        /**
+         * The response body as a string of bytes (ISO-8859-1), decompressed when [headers] name a
+         * content coding. The bytes go to the decompressor exactly as received: passing them through
+         * a String first corrupted every byte from 0x80 to 0xFF.
+         */
+        fun uncompressIfNecessary(headers: String, body: ByteArray): String {
+            val lowered = headers.lowercase()
+            if (lowered.indexOf("content-encoding: ") == -1) {
+                return Utils.bytesToString(body)
             }
-            val compressionType: CompressionType
-            if (headers.lowercase().indexOf("content-encoding: gzip") != -1) {
-                compressionType = CompressionType.GZIP
-            } else if (headers.lowercase().indexOf("content-encoding: deflate") != -1) {
-                compressionType = CompressionType.DEFLATE
-            } else if (headers.lowercase().indexOf("content-encoding: br") != -1) {
-                compressionType = CompressionType.BROTLI
-            } else {
-                return body
+            val compressionType = when {
+                lowered.indexOf("content-encoding: gzip") != -1 -> CompressionType.GZIP
+                lowered.indexOf("content-encoding: deflate") != -1 -> CompressionType.DEFLATE
+                lowered.indexOf("content-encoding: br") != -1 -> CompressionType.BROTLI
+                else -> return Utils.bytesToString(body)
             }
 
-            if (Utils.montoyaApi == null) {
+            val api = Utils.montoyaApi
+            if (api == null) {
                 if (compressionType == CompressionType.GZIP) {
-                    return ungzip(body.toByteArray(Charsets.ISO_8859_1))
+                    return ungzip(body)
                 }
                 Utils.out("Can't decompress response")
-                return body;
+                return Utils.bytesToString(body)
             }
 
-
-            val decompressed = Utils.montoyaApi!!.utilities().compressionUtils().decompress(burp.api.montoya.core.ByteArray.byteArray(body), compressionType)
-            return Utils.montoyaApi!!.utilities().byteUtils().convertToString(decompressed.bytes)
+            return try {
+                val decompressed = api.utilities().compressionUtils()
+                    .decompress(burp.api.montoya.core.ByteArray.byteArray(*body), compressionType)
+                Utils.bytesToString(decompressed.bytes)
+            } catch (e: RuntimeException) {
+                Utils.err("Decompression failed - possible partial response. Using undecompressed bytes instead.")
+                Utils.bytesToString(body)
+            }
         }
 
         fun ungzip(compressed: ByteArray): String {
@@ -169,10 +178,10 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                 }
             } catch (e: IOException) {
                 Utils.err("GZIP decompression failed - possible partial response. Using undecompressed bytes instead.")
-                return String(compressed)
+                return Utils.bytesToString(compressed)
             }
 
-            return String(out.toByteArray())
+            return Utils.bytesToString(out.toByteArray())
         }
 
 
@@ -187,8 +196,9 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
 
     override fun start(timeout: Int) {
         connectedLatch.await(timeout.toLong(), TimeUnit.SECONDS)
-        runState.set(1)
+        // Stamped before the run goes live, so no worker can time an arrival from the old value.
         start = System.nanoTime()
+        runState.set(1)
     }
 
     override val autoProtocol = AutoProtocol.HTTP1
@@ -282,15 +292,36 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
         return Request(prepared, payloads, learnBoring?: 0, label)
     }
 
+    /**
+     * Connects within the run's timeout and, for HTTPS, layers TLS over the connected socket under
+     * the target's host name. That sends SNI, which a TLS socket opened straight to the resolved
+     * address never did, so name-based virtual hosts and CDNs answered as their default site.
+     */
+    private fun openConnection(reuseSSL: Boolean): Socket {
+        val plain = Socket()
+        try {
+            plain.connect(InetSocketAddress(ipAddress, port), (timeout * 1000).coerceAtLeast(0))
+            if (target.protocol != "https") {
+                return plain
+            }
+            val factory = if (reuseSSL) trustingSslSocketFactory else createSSLSocketFactory()
+            // An IPv6 literal keeps its brackets in URL.host; without them it is recognised as an
+            // address, for which no SNI is sent.
+            val serverName = target.host.removePrefix("[").removeSuffix("]")
+            return factory.createSocket(plain, serverName, port, true)
+        } catch (failure: Throwable) {
+            runCatching { plain.close() }
+            throw failure
+        }
+    }
+
     private fun sendRequests(handle: DynamicWorkerRegistry.Handle?, baseReadFreq: Int) {
         val readFreq = baseReadFreq
         val inflight = ArrayDeque<Request>()
         var connected = false
         var reqWithResponse: Request? = null
         var answeredRequests = 0
-        val badWords = HashSet<String>()
         var consecutiveFailedConnections = 0
-        var startTime: Long = 0
         var reuseSSL = resumeSSL
         var requestReservedForSetup: Request? = null
 
@@ -310,17 +341,8 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                 }
                 try {
 
-                val socket: Socket?
-                try {
-                    socket = if (target.protocol == "https") {
-                        if (reuseSSL) {
-                            trustingSslSocketFactory.createSocket(ipAddress, port)
-                        } else {
-                            createSSLSocketFactory().createSocket(ipAddress, port)
-                        }
-                    } else {
-                        SocketFactory.getDefault().createSocket(ipAddress, port)
-                    }
+                val socket = try {
+                    openConnection(reuseSSL)
                 }
                 catch (ex: Exception) {
                     recordTransportFailure(ex)
@@ -347,12 +369,13 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                 val connectionIdAuto = connections.incrementAndGet().toString()
                 try {
                 //(socket as SSLSocket).session.peerCertificates
-                socket!!.soTimeout = timeout * 1000
+                socket.soTimeout = timeout * 1000
                 socket.tcpNoDelay = true
                 socket.receiveBufferSize = readSize
                 socket.keepAlive = true
                 // socket.setOption(ExtendedSocketOptions.TCP_KEEPIDLE, 30)
                 // todo tweak other TCP options for max performance
+                val reader = Http1ResponseReader(SocketHttp1Source(socket), readSize, ::triggerReadCallback, ::shouldAbandonRun)
 
                 if(!connected) {
                     connected = true
@@ -368,13 +391,11 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                 answeredRequests = 0
                 while (requestsSent < requestLimit.get() && !shouldAbandonRun()) {
                     if (shouldRetire(handle)) return
-                    val ignoreLength = internalSettings.get("ignoreLength") as Boolean
-                    var ditchConnection = false;
+                    val ignoreLength = internalSettings["ignoreLength"] == true
+                    var ditchConnection = false
                     var readCount = 0
-                    startTime = 0
-                    var endTime: Long = 0
-                    var bodyEndTime: Long = 0
-                    var buffer = ""
+                    // Every batch starts on a clean buffer: bytes left over from the last are dropped.
+                    reader.discard()
 
                     for (j in 1..readFreq) {
                         if (requestsSent >= requestLimit.get() || shouldRetire(handle)) {
@@ -411,11 +432,14 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                         if (!wasReservedForSetup) activeRequests.incrementAndGet()
                         val byteReq = req.getRequestAsBytes()
                         val outputstream = socket.getOutputStream()
+                        // Each request carries its own send time, so every response in a pipelined
+                        // batch is timed from its own request, not from the last one written.
+                        req.sent = 0L
                         if (req.gate != null) {
                             val withHold = 1
                             outputstream.write(byteReq, 0, byteReq.size-withHold)
                             req.gate!!.waitForGo()
-                            startTime = System.nanoTime()
+                            req.sent = System.nanoTime()
                             outputstream.write(byteReq, byteReq.size-withHold, withHold)
                         }
                         else if (req.pauseBefore != 0) {
@@ -428,16 +452,16 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                             val part1 = byteReq.sliceArray(0 until end)
                             //Utils.out("'"+Utilities.helpers.bytesToString(part1)+"'")
                             outputstream.write(part1)
-                            startTime = System.nanoTime()
+                            req.sent = System.nanoTime()
 
-                            buffer = waitForData(socket, req.pauseTime)
+                            waitForData(reader, req.pauseTime)
 
                             val part2 = byteReq.sliceArray(end until byteReq.size)
                             outputstream.write(part2)
                             //Utils.out("'"+Utilities.helpers.bytesToString(part2)+"'")
                         } else if (!req.pauseMarkers.isEmpty()) {
                             var i = 0
-                            startTime = System.nanoTime()
+                            req.sent = System.nanoTime()
                             // pauses *after* sending the pauseMarker
                             while (i < byteReq.size && !shouldAbandonRun()) {
                                 var pausePoint = -1
@@ -447,7 +471,7 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                                     pausePoint = Utils.indexOf(byteReq, pauseBytes, i, byteReq.size)
                                     if (pausePoint != -1) {
                                         outputstream.write(byteReq.sliceArray(i until (pausePoint+pauseBytes.size)))
-                                        buffer = waitForData(socket, req.pauseTime)
+                                        waitForData(reader, req.pauseTime)
                                         i = pausePoint + pauseBytes.size
                                         break
                                     }
@@ -462,7 +486,7 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                         }
                         else {
                             outputstream.write(byteReq)
-                            startTime = System.nanoTime()
+                            req.sent = System.nanoTime()
                         }
 
                         readCount++
@@ -470,180 +494,17 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
 
                     }
 
-                    val readBuffer = ByteArray(readSize)
-
                     for (k in 1..readCount) {
-
-                        var bodyStart = buffer.indexOf("\r\n\r\n")
-                        if (bodyStart != -1) {
-                            endTime = System.nanoTime()
+                        val response = reader.readResponse(ignoreLength) ?: break
+                        if (response.closeConnection) {
+                            ditchConnection = true
                         }
 
-                        var consumeFirstBlock = buffer.startsWith("HTTP/1.1 100")
-                        var ateContinue = false
-                        var continueBlock = ""
-
-
-                        while (bodyStart == -1 && !shouldAbandonRun()) {
-                            val len = socket.getInputStream().read(readBuffer)
-                            if(len == -1) {
-                                break
-                            }
-                            endTime = System.nanoTime()
-
-                            val read = Utils.bytesToString(readBuffer.copyOfRange(0, len))
-                            triggerReadCallback(read)
-                            buffer += read
-                            bodyStart = buffer.indexOf("\r\n\r\n")
-                        }
-
-                        while ((bodyStart == -1 || (consumeFirstBlock && !ateContinue)) && !shouldAbandonRun()) {
-                            try {
-                                val len = socket.getInputStream().read(readBuffer)
-                                if(len == -1) {
-                                    break
-                                }
-                                endTime = System.nanoTime()
-
-                                val read = Utils.bytesToString(readBuffer.copyOfRange(0, len))
-                                triggerReadCallback(read)
-                                buffer += read
-                                consumeFirstBlock = buffer.startsWith("HTTP/1.1 100")
-                                bodyStart = buffer.indexOf("\r\n\r\n")
-                                if (consumeFirstBlock && bodyStart != -1 && !ateContinue && !ignoreLength) {
-                                    consumeFirstBlock = false
-                                    ateContinue = true
-                                    continueBlock = buffer.substring(0, bodyStart+4)
-                                    buffer = buffer.substring(bodyStart+4)
-                                    bodyStart = buffer.indexOf("\r\n\r\n")
-                                }
-                            } catch (ex: SocketTimeoutException) {
-                                break
-                            }
-                        }
-
-                        if (buffer.isEmpty() && ateContinue) {
-                            buffer = continueBlock
-                            continueBlock = ""
-                            bodyStart = buffer.length
-                            // todo handle missing body
-                        }
-
-                        val contentLength = getContentLength(buffer)
-
-                        if (buffer.isEmpty()) {
-                            throw ConnectException("No response")
-                        } else if (bodyStart == -1) {
-                            throw ConnectException("Unterminated response: '"+buffer+"'")
-                        }
-
-                        if (contentLength > 10000000) {
-                            throw ConnectException("Response too large - 10mb max")
-                        }
-
-                        if (bodyStart+4 > buffer.length) {
-                            bodyStart = buffer.length - 4
-                        }
-
-                        val headers = buffer.substring(0, bodyStart+4)
-                        var body = ""
-
-                        if (contentLength != -1 && !ignoreLength) {
-                            val responseLength = bodyStart + contentLength + 4
-
-                            while (buffer.length < responseLength && !shouldAbandonRun()) {
-                                val len = socket.getInputStream().read(readBuffer)
-                                if (len == -1) {
-                                    ditchConnection = true
-                                    body = buffer.substring(bodyStart + 4)
-                                    buffer = ""
-                                    break
-                                    //throw RuntimeException("CL response finished unexpectedly")
-                                }
-                                val read =  Utils.bytesToString(readBuffer.copyOfRange(0, len))
-                                triggerReadCallback(read)
-                                buffer += read
-                            }
-
-                            if (!ditchConnection && !shouldAbandonRun()) {
-                                body = buffer.substring(bodyStart + 4, responseLength)
-                                buffer = buffer.substring(responseLength)
-                            }
-                        }
-                        else if (headers.lowercase().contains("transfer-encoding: chunked") || headers.contains("^transfer-encoding:[ ]*chunked".toRegex(setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE)))  && !ignoreLength) {
-
-                            buffer = buffer.substring(bodyStart + 4)
-
-                            while (!shouldAbandonRun()) {
-                                var chunk = getNextChunkLength(buffer)
-                                while (chunk.length == -1 || buffer.length < (chunk.length+2)) {
-                                    val len = socket.getInputStream().read(readBuffer)
-                                    if (len == -1) {
-                                        throw RuntimeException("Chunked response finished unexpectedly")
-                                    }
-                                    val read = Utils.bytesToString(readBuffer.copyOfRange(0, len))
-                                    triggerReadCallback(read)
-                                    buffer += read
-                                    chunk = getNextChunkLength(buffer)
-                                }
-
-                                body += buffer.substring(chunk.skip, chunk.length)
-                                buffer = buffer.substring(chunk.length + 2)
-
-                                if (chunk.length == chunk.skip) {
-                                    break
-                                }
-                            }
-                        }
-                        else {
-
-                            if (ignoreLength) {
-                                socket.soTimeout = 5000
-                            } else if (ateContinue) {
-                                socket.soTimeout = 100
-                            } else {
-                                Utils.err("Response has no content-length - doing a one-second socket read instead. This is slow!")
-                                socket.soTimeout = 1000
-                                ditchConnection = true
-                            }
-
-                            try {
-                                body += buffer.substring(bodyStart + 4)
-                                while (!shouldAbandonRun()) {
-                                    val len = socket.getInputStream().read(readBuffer)
-
-                                    if (len == -1) {
-                                        break
-                                    }
-
-                                    buffer = Utils.bytesToString(readBuffer.copyOfRange(0, len))
-                                    body += buffer
-                                }
-                            } catch (ex: SocketTimeoutException) {
-
-                            } catch (ex: SSLProtocolException) {
-
-                            } catch (ex: java.lang.Exception) {
-                                Utils.err("Exception during timed read: "+ex)
-                            }
-                        }
-
-                        bodyEndTime = System.nanoTime()
-
-                        if (shouldAbandonRun()) {
-                            break
-                        }
-
-                        if (!headers.startsWith("HTTP")) {
+                        if (!response.head.startsWith("HTTP")) {
                             throw Exception("no http")
                         }
 
-                        var msg = headers
-                        if (continueBlock.isNotEmpty()) {
-                            msg = continueBlock + msg
-                        }
-
-                        msg += uncompressIfNecessary(headers, body)
+                        val msg = response.interim + response.head + uncompressIfNecessary(response.head, response.body)
 
                         reqWithResponse = inflight.removeFirst()
                         try {
@@ -652,10 +513,11 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                             if (reqWithResponse.connectionId == null) {
                                 reqWithResponse.connectionId = connectionIdAuto
                             }
-                            reqWithResponse.ttfb = (endTime - startTime) / 1000 // convert ns to microseconds
-                            reqWithResponse.ttlb = (bodyEndTime - startTime) / 1000
+                            val sentAt = reqWithResponse.sent
+                            reqWithResponse.ttfb = (response.headCompletedAt - sentAt) / 1000 // convert ns to microseconds
+                            reqWithResponse.ttlb = (response.lastByteAt - sentAt) / 1000
                             reqWithResponse.time = reqWithResponse.ttfb
-                            reqWithResponse.arrival = (endTime - start) / 1000
+                            reqWithResponse.arrival = (response.headCompletedAt - start) / 1000
 
                             answeredRequests += 1
                             val interesting = try {
@@ -674,7 +536,6 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                         }
 
                     }
-                    badWords.clear()
 
                     if (ditchConnection) {
                         break
@@ -714,8 +575,8 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                             } else {
                                 badReq.response = "null"
                             }
-                            if (startTime != 0L) {
-                                val elapsed = (System.nanoTime() - startTime) / 1000
+                            if (badReq.sent != 0L) {
+                                val elapsed = (System.nanoTime() - badReq.sent) / 1000
                                 badReq.ttfb = elapsed
                                 badReq.ttlb = elapsed
                                 badReq.time = elapsed
@@ -784,62 +645,15 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
         return !shouldAbandonRun() && !shouldRetire(handle)
     }
 
-    private fun waitForData(socket: Socket, pauseTime: Int): String {
-
-        val oldTimeout = socket.soTimeout
-        socket.soTimeout = pauseTime
-        var len = -1
-        val readBuffer = ByteArray(readSize)
-        try {
-            len = socket.getInputStream().read(readBuffer)
-        } catch (e: Exception) {
-
-        }
-        socket.soTimeout = oldTimeout
-        if (explodeOnEarlyRead && len != -1) {
+    /**
+     * Holds a part-sent request for up to [pauseTime] ms, ending early if the server answers. What
+     * arrives joins the reader's buffer: it is the start of a response, and replacing it at each
+     * pause lost an early response when a later pause heard nothing.
+     */
+    private fun waitForData(reader: Http1ResponseReader, pauseTime: Int) {
+        val received = reader.readWithin(pauseTime)
+        if (explodeOnEarlyRead && received > 0) {
             throw IllegalStateException()
-        }
-        var read = ""
-        if (len != -1) {
-            read = Utils.bytesToString(readBuffer.copyOfRange(0, len))
-        }
-
-        return read
-    }
-
-    fun getContentLength(buf: String): Int {
-        val cstart = buf.indexOf("Content-Length: ")+16
-        if (cstart == 15) {
-            return -1
-        }
-
-        val cend = buf.indexOf("\r", cstart)
-        try {
-            return buf.substring(cstart, cend).trim().toInt()
-        } catch (e: NumberFormatException) {
-            throw RuntimeException("Can't parse content length in $buf")
-        }
-    }
-
-    data class Result(val skip: Int, val length: Int)
-
-    fun getNextChunkLength(buf: String): Result {
-        if (buf.isEmpty()) {
-            return Result(-1, -1)
-        }
-
-        val chunkLengthStart = 0
-        val chunkLengthEnd = buf.indexOf("\r\n")
-        if(chunkLengthEnd == -1) {
-            return Result(-1, -1)
-            //throw RuntimeException("Couldn't find the chunk length. Response size may be unspecified - try Burp request engine instead?")
-        }
-
-        try {
-            val skip = 2+chunkLengthEnd-chunkLengthStart
-            return Result(skip, Integer.parseInt(buf.substring(chunkLengthStart, chunkLengthEnd).trim(), 16)+skip)
-        } catch (e: NumberFormatException) {
-            throw RuntimeException("Can't parse followup chunk length '${buf.substring(chunkLengthStart, chunkLengthEnd)}' in $buf")
         }
     }
 

@@ -1,13 +1,20 @@
 import string, random, time, math, re
+from threading import Lock as _Lock
 
 # `turbo` is injected by Raijin: the engine classes this script environment drives. (The Java
 # package name starts with "io", which Jython would resolve to Python's stdlib io module.)
 
+# Binds the thread running this script to its run, so a stop requested before the script has
+# built its engine can interrupt it.
+if 'handler' in globals():
+    handler.attachScriptThread()
+
+# search(), not match(): a pattern can occur anywhere in the response, not only at its start.
 def MatchRegex(regex):
     m = re.compile(unicode(regex), re.UNICODE|re.DOTALL|re.MULTILINE|re.IGNORECASE)
     def decorator(func):
         def handleResponse(req, interesting):
-            if m.match(req.response):
+            if m.search(req.response):
                 func(req, interesting)
         return handleResponse
     return decorator
@@ -92,7 +99,7 @@ def FilterRegex(regex):
     m = re.compile(unicode(regex), re.UNICODE|re.DOTALL|re.MULTILINE|re.IGNORECASE)
     def decorator(func):
         def handleResponse(req, interesting):
-            if not m.match(req.response):
+            if not m.search(req.response):
                 func(req, interesting)
         return handleResponse
     return decorator
@@ -144,92 +151,45 @@ def FilterLineCountRange(min, max):
         return handleResponse
     return decorator
 
+# Callbacks run on every worker thread at once, so the Unique* counters are read and bumped under
+# one lock. They are kept per engine: a new engine starts from nothing.
+_uniqueLock = _Lock()
+_uniqueCounts = {}
+
+def _admitUnique(kind, req, key, instances):
+    with _uniqueLock:
+        counts = _uniqueCounts.setdefault((kind, req.engine), {})
+        seen = counts.get(key, 0)
+        if seen >= instances:
+            return False
+        counts[key] = seen + 1
+        return True
+
 def UniqueWordCount(instances=1):
     def decorator(func):
         def handleResponse(req, interesting):
-            global CodeWords
-            try:
-                CodeWords
-            except:
-                CodeWords = {}
-
-            if "lastreq" in CodeWords:
-                currreqs = req.engine.engine.successfulRequests.intValue()
-                lastreqs = CodeWords["lastreq"]
-                if currreqs < lastreqs:
-                    CodeWords = {}
-                    CodeWords["lastreq"] = currreqs
-            CodeWords["lastreq"] = req.engine.engine.successfulRequests.intValue()
-
             codeword = str(req.status) + str(req.wordcount)
-            if codeword in CodeWords:
-                if CodeWords[codeword] >= instances:
-                    return
-                else:
-                    CodeWords[codeword] += 1
-            else:
-                CodeWords[codeword] = 1
-            func(req, interesting)
+            if _admitUnique('wordcount', req, codeword, instances):
+                func(req, interesting)
         return handleResponse
     return decorator
 
 def UniqueLineCount(instances=1):
     def decorator(func):
         def handleResponse(req, interesting):
-            global CodeLines
-            try:
-                CodeLines
-            except:
-                CodeLines = {}
-
-            if "lastreq" in CodeLines:
-                currreqs = req.engine.engine.successfulRequests.intValue()
-                lastreqs = CodeLines["lastreq"]
-                if currreqs < lastreqs:
-                    CodeLines = {}
-                    CodeLines["lastreq"] = currreqs
-            CodeLines["lastreq"] = req.engine.engine.successfulRequests.intValue()
-
             linecount = len(req.response.split('\n'))
             codeline = str(req.status) + str(linecount)
-            if codeline in CodeLines:
-                if CodeLines[codeline] >= instances:
-                    return
-                else:
-                    CodeLines[codeline] += 1
-            else:
-                CodeLines[codeline] = 1
-            func(req, interesting)
+            if _admitUnique('linecount', req, codeline, instances):
+                func(req, interesting)
         return handleResponse
     return decorator
 
 def UniqueSize(instances=1):
     def decorator(func):
         def handleResponse(req, interesting):
-            global CodeLength
-            try:
-                CodeLength
-            except:
-                CodeLength = {}
-
-            if "lastreq" in CodeLength:
-                currreqs = req.engine.engine.successfulRequests.intValue()
-                lastreqs = CodeLength["lastreq"]
-                if currreqs < lastreqs:
-                    CodeLength = {}
-                    CodeLength["lastreq"] = currreqs
-
-            CodeLength["lastreq"] = req.engine.engine.successfulRequests.intValue()
-
             codelen = str(req.status) + str(req.length)
-            if codelen in CodeLength:
-                if CodeLength[codelen] >= instances:
-                    return
-                else:
-                    CodeLength[codelen] += 1
-            else:
-                CodeLength[codelen] = 1
-            func(req, interesting)
+            if _admitUnique('size', req, codelen, instances):
+                func(req, interesting)
         return handleResponse
     return decorator
 

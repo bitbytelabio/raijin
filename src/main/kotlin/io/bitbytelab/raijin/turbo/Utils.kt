@@ -162,7 +162,23 @@ object Utils {
     fun normalizeLineEndings(request: String): String =
         if (!request.contains("\r\n")) request.replace("\n", "\r\n") else request
 
-    @JvmStatic fun getBodyStart(response: ByteArray): Int = indexOf(response, "\r\n\r\n".toByteArray()) + 4
+    /** Where the body starts, or the end of [response] when nothing ends its headers. */
+    @JvmStatic fun getBodyStart(response: ByteArray): Int = findBodyStart(response).let { if (it < 0) response.size else it }
+
+    /**
+     * The index just past the blank line that ends the headers (`\r\n\r\n`, else `\n\n`), or -1 when
+     * [message] has none. Without the -1 a missing blank line read as a body starting at byte 3.
+     */
+    @JvmStatic
+    fun findBodyStart(message: ByteArray): Int {
+        val crlf = indexOf(message, CRLF_CRLF)
+        if (crlf >= 0) return crlf + CRLF_CRLF.size
+        val lf = indexOf(message, LF_LF)
+        return if (lf >= 0) lf + LF_LF.size else -1
+    }
+
+    private val CRLF_CRLF = "\r\n\r\n".toByteArray(StandardCharsets.ISO_8859_1)
+    private val LF_LF = "\n\n".toByteArray(StandardCharsets.ISO_8859_1)
 
     @JvmStatic
     fun indexOf(outer: ByteArray, inner: ByteArray): Int = indexOf(outer, inner, 0, outer.size)

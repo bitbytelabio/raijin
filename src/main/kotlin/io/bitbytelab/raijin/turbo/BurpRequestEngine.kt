@@ -6,6 +6,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
 import burp.api.montoya.http.HttpMode
@@ -32,6 +33,9 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
             AdaptiveWorkerStarterConstructionContext.withStarter(adaptiveWorkerStarter) {
                 BurpRequestEngine(url, threads, maxQueueSize, maxRetriesPerRequest, idleTimeout, callback, readCallback, useHTTP1, adaptive, requestSender, batchRequestSender, Unit)
             }
+
+        /** How long a gate nothing can open any more is left before its requests are failed. */
+        private const val UNOPENABLE_GATE_GRACE_NANOS = 1_000_000_000L
     }
 
     private val threadPool = Collections.synchronizedList(ArrayList<Thread>())
@@ -42,7 +46,12 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
     // while the sending side iterates and removes, and a plain HashMap + LinkedList loses or
     // duplicates parked requests under that race.
     private val gatedRequests = ConcurrentHashMap<String, MutableList<Request>>()
-    private val connectionLocks = ConcurrentHashMap<String, ReentrantLock>()
+    /** One per connectionId in use, removed when its last user lets go, so dynamic ids (0cl) do not pile up. */
+    private val connectionLocks = ConcurrentHashMap<String, ConnectionLock>()
+    /** Workers holding a request or a gated batch; a response callback in one of them could still open a gate. */
+    private val busyWorkers = AtomicInteger(0)
+    private val unopenableGateLock = Any()
+    private var unopenableSince: Long? = null // guarded by unopenableGateLock
     private val hasInjectedRequestSender = requestSender != null
     private val montoyaRequestBuilder = BurpMontoyaRequestBuilder()
     private val requestSender = requestSender ?: BurpRequestSender(::sendMontoyaRequest)
@@ -90,8 +99,9 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
     }
 
     override fun start(timeout: Int) {
-        runState.set(1)
+        // Stamped before the run goes live, so no worker can time an arrival from the old value.
         start = System.nanoTime()
+        runState.set(1)
     }
 
     override val autoProtocol = AutoProtocol.HTTP2
@@ -170,24 +180,22 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
             )
             req.response = montoyaResp.response()?.toString()
             req.montoyaReq = montoyaResp
-            req.ttfb = montoyaResp.timingData().get().timeBetweenRequestSentAndStartOfResponse().toNanos() / 1000
-            req.ttlb = montoyaResp.timingData().get().timeBetweenRequestSentAndEndOfResponse().toNanos() / 1000
-            req.time = req.ttfb
+            recordTiming(req, montoyaResp)
             return
         }
 
         // Lock on connectionId to ensure sequential requests for connection reuse
-        val lock = req.connectionId?.let { connectionLocks.computeIfAbsent(it) { ReentrantLock() } }
-        lock?.lock()
+        val connectionId = req.connectionId
+        val lock = connectionId?.let(::lockConnection)
         try {
             val montoyaService = service.toMontoya()
             val protocolVersion = if (useHTTP1) HttpMode.HTTP_1 else HttpMode.HTTP_2
 
-            val montoyaResp = if (req.connectionId != null) {
+            val montoyaResp = if (connectionId != null) {
                 Utils.montoyaApi!!.http().sendRequest(
                     montoyaRequestBuilder.build(montoyaService, req.getRequest(), req.kettled, useHTTP1),
                     protocolVersion,
-                    req.connectionId
+                    connectionId
                 )
             } else {
                 Utils.montoyaApi!!.http().sendRequest(
@@ -196,9 +204,7 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
                 )
             }
 
-            req.ttfb = montoyaResp.timingData().get().timeBetweenRequestSentAndStartOfResponse().toNanos() / 1000
-            req.ttlb = montoyaResp.timingData().get().timeBetweenRequestSentAndEndOfResponse().toNanos() / 1000
-            req.time = req.ttfb
+            recordTiming(req, montoyaResp)
             if (montoyaResp.response() != null) {
                 req.response = montoyaResp.response().toString()
             }
@@ -206,8 +212,39 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
                 req.connectionId = connections.incrementAndGet().toString()
             }
         } finally {
-            lock?.unlock()
+            if (connectionId != null && lock != null) unlockConnection(connectionId, lock)
         }
+    }
+
+    private class ConnectionLock {
+        val lock = ReentrantLock()
+        var users = 0 // changed only inside connectionLocks' compute for this id
+    }
+
+    private fun lockConnection(connectionId: String): ConnectionLock {
+        val entry = connectionLocks.compute(connectionId) { _, existing ->
+            (existing ?: ConnectionLock()).also { it.users++ }
+        }!!
+        entry.lock.lock()
+        return entry
+    }
+
+    private fun unlockConnection(connectionId: String, entry: ConnectionLock) {
+        entry.lock.unlock()
+        connectionLocks.computeIfPresent(connectionId) { _, existing ->
+            if (--existing.users == 0) null else existing
+        }
+    }
+
+    /**
+     * ttfb/ttlb/time in microseconds from Montoya's timing data, which is absent when no response
+     * came back; reading it unconditionally threw for every unanswered request in a gated batch.
+     */
+    private fun recordTiming(req: Request, exchange: HttpRequestResponse) {
+        val timing = exchange.timingData().orElse(null) ?: return
+        req.ttfb = timing.timeBetweenRequestSentAndStartOfResponse().toNanos() / 1000
+        req.ttlb = timing.timeBetweenRequestSentAndEndOfResponse().toNanos() / 1000
+        req.time = req.ttfb
     }
 
     private fun buildService(target: URL, port: Int): TurboService =
@@ -257,85 +294,23 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
 
     private fun sendRequests(service: TurboService, handle: DynamicWorkerRegistry.Handle?) {
         try {
-            while(runState.get()<1) {
+            while (runState.get() < 1 && !shouldAbandonRun()) {
                 Thread.sleep(10)
             }
 
-
-            while(runState.get() < 3 && !Utils.unloaded) {
+            // shouldAbandonRun() also applies idleTimeout, which this engine used to ignore.
+            while (!shouldAbandonRun()) {
 
                 if (shouldRetire(handle)) return
 
                 try {
                 val requestGroup = getGatedRequests()
                 if (requestGroup != null) {
-                    if (adaptive) activeRequests.addAndGet(requestGroup.size)
+                    busyWorkers.incrementAndGet()
                     try {
-                    val protocolVersion: HttpMode
-                    var sharedConnectionId: String? = null
-                    if (useHTTP1) {
-                        connections.addAndGet(requestGroup.size)
-                        protocolVersion = HttpMode.HTTP_1
-                    } else {
-                        protocolVersion = HttpMode.HTTP_2
-                        sharedConnectionId = connections.incrementAndGet().toString()
-                    }
-
-                    val timer = System.nanoTime()
-                    val responses = try {
-                        batchRequestSender.send(service, requestGroup, protocolVersion)
-                    } catch (failure: Exception) {
-                        if (adaptive) repeat(requestGroup.size) { recordTransportFailure(failure) }
-                        throw failure
-                    }
-
-                    var n = 0
-
-                    val reqs: ArrayList<Request> = ArrayList()
-                    for (resp in responses) {
-                        val req = requestGroup.get(n++)
-                        val response = resp.response()
-
-                        // we don't need to support retries for batches requests
-                        if (response == null) {
-                            if (adaptive) recordTransportFailure(IllegalStateException("Montoya returned no response"))
-                            req.response = "The server closed the connection without issuing a response."
-                            permaFails.incrementAndGet()
-                        } else {
-                            successfulRequests.getAndIncrement()
-                            req.response = response.toString()
-                        }
-
-                        req.ttfb = resp.timingData().get().timeBetweenRequestSentAndStartOfResponse().toNanos() / 1000
-                        req.ttlb = resp.timingData().get().timeBetweenRequestSentAndEndOfResponse().toNanos() / 1000
-                        req.time = req.ttfb
-                        req.arrival = (timer - start) / 1000 + req.ttfb
-
-                        if (req.connectionId == null) {
-                            req.connectionId = if (useHTTP1) {
-                                connections.incrementAndGet().toString()
-                            } else {
-                                sharedConnectionId
-                            }
-                        }
-                        req.interesting = if (response == null) {
-                            true
-                        } else {
-                            processResponse(req, response.toByteArray().bytes)
-                        }
-                        reqs.add(req)
-                    }
-
-                    reqs.sortBy { it.ttfb }
-
-                    var i = 0
-                    for (req in reqs) {
-                        req.order = i++
-                        invokeCallback(req, req.interesting)
-                    }
+                        sendGatedBatch(service, requestGroup)
                     } finally {
-                        if (adaptive) activeRequests.addAndGet(-requestGroup.size)
-                        requestGroup.firstOrNull()?.gate?.let { finishGateLifecycle(it.name) }
+                        busyWorkers.decrementAndGet()
                     }
                     continue
                 }
@@ -344,7 +319,8 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
 
                 if (req == null) {
                     if (gatedRequests.isNotEmpty()) {
-                        continue;
+                        failUnopenableGates()
+                        continue
                     }
 
                     if (runState.get() == 2) {
@@ -354,63 +330,12 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
                     }
                 }
 
-                if (req.gate != null) {
-                    gatedRequests.computeIfAbsent(req.gate!!.name) {
-                        Collections.synchronizedList(LinkedList<Request>())
-                    }.add(req)
-                    req.gate!!.remaining.decrementAndGet() // todo is this right?
-                    continue
+                busyWorkers.incrementAndGet()
+                try {
+                    sendQueuedRequest(service, req)
+                } finally {
+                    busyWorkers.decrementAndGet()
                 }
-
-
-                if (req.endpointOverride != null) {
-                    val overrideTarget = URL(req.endpointOverride)
-                    val tempService = buildService(overrideTarget, getEffectivePort(overrideTarget))
-
-                    connections.incrementAndGet()
-                    if (adaptive) activeRequests.incrementAndGet()
-                    try {
-                        try {
-                            requestSender.send(tempService, req)
-                        } catch (failure: Exception) {
-                            if (adaptive) recordTransportFailure(failure)
-                            throw failure
-                        }
-                        if (req.response == null) {
-                            val failure = IllegalStateException("Montoya returned no response")
-                            if (adaptive) recordTransportFailure(failure)
-                            throw failure
-                        }
-                        req.interesting = processResponse(req, req.getResponseAsBytes()!!)
-                        successfulRequests.getAndIncrement()
-                        invokeCallback(req, req.interesting)
-                    } finally {
-                        if (adaptive) activeRequests.decrementAndGet()
-                    }
-                    continue
-                }
-
-                if (adaptive) {
-                    activeRequests.incrementAndGet()
-                    try {
-                        sendAdaptiveRequest(service, req)
-                        finishRequest(req)
-                    } finally {
-                        activeRequests.decrementAndGet()
-                    }
-                    continue
-                }
-
-                requestSender.send(service, req)
-                connections.incrementAndGet()
-                while (req.response == null && shouldRetry(req)) {
-                    Utils.out("Retrying ${req.words}")
-                    requestSender.send(service, req)
-                    connections.incrementAndGet()
-                    Utils.out("Retried ${req.words}")
-                }
-
-                finishRequest(req)
 
             } catch (ex: Exception) {
                 ex.printStackTrace()
@@ -423,6 +348,169 @@ open class BurpRequestEngine private constructor(url: String, threads: Int, maxQ
             }
         } finally {
             if (handle == null) completedLatch.countDown() else handle.close()
+        }
+    }
+
+    private fun sendGatedBatch(service: TurboService, requestGroup: List<Request>) {
+        if (adaptive) activeRequests.addAndGet(requestGroup.size)
+        try {
+            val protocolVersion: HttpMode
+            var sharedConnectionId: String? = null
+            if (useHTTP1) {
+                connections.addAndGet(requestGroup.size)
+                protocolVersion = HttpMode.HTTP_1
+            } else {
+                protocolVersion = HttpMode.HTTP_2
+                sharedConnectionId = connections.incrementAndGet().toString()
+            }
+
+            val timer = System.nanoTime()
+            val responses = try {
+                batchRequestSender.send(service, requestGroup, protocolVersion)
+            } catch (failure: Exception) {
+                if (adaptive) repeat(requestGroup.size) { recordTransportFailure(failure) }
+                throw failure
+            }
+
+            var n = 0
+
+            val reqs: ArrayList<Request> = ArrayList()
+            for (resp in responses) {
+                val req = requestGroup.get(n++)
+                val response = resp.response()
+
+                // we don't need to support retries for batches requests
+                if (response == null) {
+                    if (adaptive) recordTransportFailure(IllegalStateException("Montoya returned no response"))
+                    req.response = "The server closed the connection without issuing a response."
+                    permaFails.incrementAndGet()
+                } else {
+                    successfulRequests.getAndIncrement()
+                    req.response = response.toString()
+                }
+
+                recordTiming(req, resp)
+                req.arrival = (timer - start) / 1000 + req.ttfb
+
+                if (req.connectionId == null) {
+                    req.connectionId = if (useHTTP1) {
+                        connections.incrementAndGet().toString()
+                    } else {
+                        sharedConnectionId
+                    }
+                }
+                req.interesting = if (response == null) {
+                    true
+                } else {
+                    processResponse(req, response.toByteArray().bytes)
+                }
+                reqs.add(req)
+            }
+
+            reqs.sortBy { it.ttfb }
+
+            var i = 0
+            for (req in reqs) {
+                req.order = i++
+                invokeCallback(req, req.interesting)
+            }
+        } finally {
+            if (adaptive) activeRequests.addAndGet(-requestGroup.size)
+            requestGroup.firstOrNull()?.gate?.let { finishGateLifecycle(it.name) }
+        }
+    }
+
+    private fun sendQueuedRequest(service: TurboService, req: Request) {
+        if (req.gate != null) {
+            gatedRequests.computeIfAbsent(req.gate!!.name) {
+                Collections.synchronizedList(LinkedList<Request>())
+            }.add(req)
+            // Parked until the gate opens; this also wakes an openGate() waiting for it.
+            req.gate!!.reportReadyWithoutWaiting()
+            return
+        }
+
+
+        if (req.endpointOverride != null) {
+            val overrideTarget = URL(req.endpointOverride)
+            val tempService = buildService(overrideTarget, getEffectivePort(overrideTarget))
+
+            connections.incrementAndGet()
+            if (adaptive) activeRequests.incrementAndGet()
+            try {
+                try {
+                    requestSender.send(tempService, req)
+                } catch (failure: Exception) {
+                    if (adaptive) recordTransportFailure(failure)
+                    throw failure
+                }
+                if (req.response == null) {
+                    val failure = IllegalStateException("Montoya returned no response")
+                    if (adaptive) recordTransportFailure(failure)
+                    throw failure
+                }
+                req.interesting = processResponse(req, req.getResponseAsBytes()!!)
+                successfulRequests.getAndIncrement()
+                invokeCallback(req, req.interesting)
+            } finally {
+                if (adaptive) activeRequests.decrementAndGet()
+            }
+            return
+        }
+
+        if (adaptive) {
+            activeRequests.incrementAndGet()
+            try {
+                sendAdaptiveRequest(service, req)
+                finishRequest(req)
+            } finally {
+                activeRequests.decrementAndGet()
+            }
+            return
+        }
+
+        requestSender.send(service, req)
+        connections.incrementAndGet()
+        while (req.response == null && shouldRetry(req)) {
+            Utils.out("Retrying ${req.words}")
+            requestSender.send(service, req)
+            connections.incrementAndGet()
+            Utils.out("Retried ${req.words}")
+        }
+
+        finishRequest(req)
+    }
+
+    /**
+     * Fails parked gated requests whose gate can no longer open. Once the script has finished
+     * queueing (runState 2) only a response callback could still call openGate(), so when the
+     * queue stays empty with nothing in flight for a whole grace period, nothing will, and the
+     * workers used to wait on such a gate forever.
+     */
+    private fun failUnopenableGates() {
+        synchronized(unopenableGateLock) {
+            val stalled = runState.get() == 2 &&
+                requestQueue.isEmpty() &&
+                busyWorkers.get() == 0 &&
+                gatedRequests.keys.none { floodgates[it]?.hasStartedOpening() == true }
+            if (!stalled) {
+                unopenableSince = null
+                return
+            }
+            val now = System.nanoTime()
+            val since = unopenableSince ?: now.also { unopenableSince = it }
+            if (now - since < UNOPENABLE_GATE_GRACE_NANOS) return
+            unopenableSince = null
+
+            for (gateName in gatedRequests.keys.toList()) {
+                val parked = gatedRequests.remove(gateName) ?: continue
+                val message = "Gate '$gateName' was never opened, so its ${parked.size} requests were not sent. " +
+                    "Call engine.openGate('$gateName') before engine.complete()"
+                Utils.err(message)
+                lastError = message
+                permaFails.addAndGet(parked.size)
+                finishGateLifecycle(gateName)
+            }
         }
     }
 

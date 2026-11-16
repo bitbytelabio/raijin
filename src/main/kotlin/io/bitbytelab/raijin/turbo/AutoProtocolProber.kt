@@ -112,6 +112,10 @@ class AutoProtocolProber(
             verifyCertificates: Boolean,
             timeout: Duration,
         ): AutoProbeResult = timed(AutoProtocol.HTTP3) {
+            // Kwik builds and connects in one call, so there is no transport to track while the
+            // handshake runs. A cancel still ends it: cancel() interrupts this thread, and Kwik
+            // aborts an interrupted handshake (abortHandshake, then terminate). A transport that
+            // connects after the cancel is closed by track() the moment it exists.
             val transport = ControlledKwikQuicTransport.connect(
                 endpoint.host,
                 endpoint.portOrDefault(),
@@ -183,6 +187,18 @@ class AutoProtocolProber(
         endpoint: URL,
         verifyCertificates: Boolean,
         eligible: Set<AutoProtocol>,
+    ): List<AutoProbeResult> = probe(endpoint, verifyCertificates, eligible) {}
+
+    /**
+     * As [probe], also handing each protocol's result to [onResult] once, as soon as it is known:
+     * from the probe's own thread when it finishes in time, else as the timeout at the deadline.
+     * The returned list still waits for every protocol.
+     */
+    internal fun probe(
+        endpoint: URL,
+        verifyCertificates: Boolean,
+        eligible: Set<AutoProtocol>,
+        onResult: (AutoProbeResult) -> Unit,
     ): List<AutoProbeResult> {
         val protocols = admittedProtocols(endpoint, eligible)
         val deadlineNanos = System.nanoTime() + timeout.toNanos()
@@ -210,11 +226,15 @@ class AutoProtocolProber(
                             currentExecution.remove()
                         }
                     }
-                    execution.complete(result, deadlineNanos, handshakeProbe)
+                    if (execution.complete(result, deadlineNanos, handshakeProbe)) {
+                        execution.report(result, onResult)
+                    }
                 }
             }
             protocols.map { protocol ->
-                completedResult(protocol, probes[protocol], executions.getValue(protocol), deadlineNanos)
+                val execution = executions.getValue(protocol)
+                completedResult(protocol, probes[protocol], execution, deadlineNanos)
+                    .also { execution.report(it, onResult) }
             }
         } finally {
             executor.shutdownNow()
@@ -281,6 +301,7 @@ class AutoProtocolProber(
         private val worker = AtomicReference<Thread?>()
         private val completion = AtomicReference<Completion?>()
         private val completionReady = CompletableFuture<Completion>()
+        private val reported = AtomicBoolean(false)
 
         fun start(): Boolean {
             worker.set(Thread.currentThread())
@@ -305,20 +326,27 @@ class AutoProtocolProber(
             resources.forEach(::scheduleClose)
         }
 
+        /** Records the probe's result; true when it finished in time and nothing cancelled it. */
         fun complete(
             result: AutoProbeResult,
             deadlineNanos: Long,
             handshakeProbe: AutoHandshakeProbe?,
-        ) {
+        ): Boolean {
             val completed = Completion(result, System.nanoTime())
             completion.compareAndSet(null, completed)
             completionReady.complete(completed)
             worker.set(null)
             if (cancelled.get() || completed.completedAtNanos > deadlineNanos) {
                 cancel(handshakeProbe)
-            } else {
-                resources.clear()
+                return false
             }
+            resources.clear()
+            return true
+        }
+
+        /** Hands [result] to [onResult] unless this protocol's result was already handed over. */
+        fun report(result: AutoProbeResult, onResult: (AutoProbeResult) -> Unit) {
+            if (reported.compareAndSet(false, true)) onResult(result)
         }
 
         fun resultCompletedBy(deadlineNanos: Long): AutoProbeResult? {
@@ -327,7 +355,14 @@ class AutoProtocolProber(
             }
             val remainingNanos = deadlineNanos - System.nanoTime()
             if (remainingNanos > 0) {
-                runCatching { completionReady.get(remainingNanos, TimeUnit.NANOSECONDS) }
+                try {
+                    completionReady.get(remainingNanos, TimeUnit.NANOSECONDS)
+                } catch (_: InterruptedException) {
+                    // The caller is being stopped: report what is known and keep the interrupt for it.
+                    Thread.currentThread().interrupt()
+                } catch (_: Exception) {
+                    // Timed out or failed; judged below.
+                }
             }
             val completed = completion.get() ?: return null
             return completed.result.takeIf { completed.completedAtNanos <= deadlineNanos }
@@ -418,12 +453,18 @@ internal class AutoProtocolProbeCache(
 
         if (claimed.isNotEmpty()) {
             try {
-                val fresh = prober.probe(endpoint, verifyCertificates, claimed.keys)
-                    .associateBy { it.protocol }
+                // Each protocol is published the moment its own handshake settles, so a caller
+                // that needs only HTTP/1 is not held until an HTTP/3 probe times out.
+                val fresh = prober.probe(endpoint, verifyCertificates, claimed.keys) { result ->
+                    claimed[result.protocol]?.let { (key, entry) ->
+                        publish(key, entry, result, deadlineAfter(nanoTime(), ttlNanos))
+                    }
+                }.associateBy { it.protocol }
                 val expiresAt = deadlineAfter(nanoTime(), ttlNanos)
                 claimed.forEach { (protocol, keyedEntry) ->
                     val result = fresh[protocol]
                         ?: AutoProbeResult.failure(protocol, "probe returned no result")
+                    // A no-op for every protocol already published as it finished.
                     publish(keyedEntry.first, keyedEntry.second, result, expiresAt)
                 }
             } catch (failure: Throwable) {

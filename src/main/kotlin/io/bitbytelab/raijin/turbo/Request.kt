@@ -9,7 +9,7 @@ import java.io.IOException
 import java.lang.Exception
 import java.net.URL
 import java.util.*
-import kotlin.collections.HashMap
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Returns the effective port for a URL, using the default port for the protocol
@@ -22,7 +22,9 @@ fun getEffectivePort(url: URL): Int {
 
 open class Request(val template: String, val words: List<String?>, val learnBoring: Int, var label: String = "") {
 
-    var response: String? = null
+    // Written by the worker that received it, read by the GUI and MCP threads, and cleared when the
+    // body is dropped to save memory.
+    @Volatile var response: String? = null
     var interesting: Boolean = false
     var targetUrl: URL? = null
     var engine: Any? = null
@@ -47,7 +49,8 @@ open class Request(val template: String, val words: List<String?>, val learnBori
     var kettled: Boolean = false
     var anomalyRank: Int? = null
 
-    private val attributes: HashMap<String, Any> = HashMap()
+    // Computed lazily by whichever thread reads first (worker, GUI, MCP), so a concurrent map.
+    private val attributes = ConcurrentHashMap<String, Any>()
 
     val code: Int get() = getAttribute("code") as Int
     val status: Int get() = code
@@ -67,7 +70,7 @@ open class Request(val template: String, val words: List<String?>, val learnBori
         return attributes.getOrPut(name) {
             when(name) {
                 "length" -> response?.length ?: 0
-                "wordcount" -> (response ?: "").split(Regex("[^a-zA-Z0-9]")).size
+                "wordcount" -> countWords(response ?: "")
                 "code" -> calculateCode()
                 else -> "Unknown attribute"
             }
@@ -80,25 +83,28 @@ open class Request(val template: String, val words: List<String?>, val learnBori
         getAttribute("wordcount")
     }
 
-    fun stripResponseBody() {
+    /** Drops the body (and the Montoya copy of it), keeping what was computed from it. */
+    internal fun dropResponseBody() {
         materializeAttributes()
         response = null
         montoyaReq = null
+    }
+
+    fun stripResponseBody() {
+        dropResponseBody()
         engine = null
         callback = null
         gate = null
     }
 
     fun calculateCode(): Int {
-        if (response == null) {
-            return 0
-        }
+        val current = response ?: return 0
         try {
-            if(response!!.startsWith(":status")) {
-                return Integer.parseInt(response!!.split(" ", "\r", "\n", limit=3).get(1))
+            if(current.startsWith(":status")) {
+                return Integer.parseInt(current.split(" ", "\r", "\n", limit=3).get(1))
             }
 
-            return Integer.parseInt(response?.split(" ", ignoreCase = false, limit = 3)?.get(1))
+            return Integer.parseInt(current.split(" ", ignoreCase = false, limit = 3).get(1))
         } catch (e: Exception) {
             return 0
         }
@@ -162,7 +168,8 @@ open class Request(val template: String, val words: List<String?>, val learnBori
 
     // todo fix performance
     fun fixContentLength(request: String): String {
-        return String(fixContentLength(request.toByteArray(Charsets.ISO_8859_1)))
+        // ISO-8859-1 both ways: each char is one byte. The default charset turned 0x80-0xFF into U+FFFD.
+        return Utils.bytesToString(fixContentLength(Utils.stringToBytes(request)))
     }
 
     fun fixContentLength(request: ByteArray): ByteArray {
@@ -170,17 +177,16 @@ open class Request(val template: String, val words: List<String?>, val learnBori
             return request
         }
 
-        if (Utils.getHeaders(String(request)).contains("Content-Length: ")) {
-            val start = Utils.getBodyStart(request)
-            val contentLength = request.size - start
-            try {
-                return setHeader(request, "Content-Length", Integer.toString(contentLength))
-            } catch (e: RuntimeException) {
-                return request
-            }
-
-        } else {
+        // No blank line after the headers means no body to measure; such a request is usually
+        // deliberately unfinished, so it goes out as written.
+        val bodyStart = Utils.findBodyStart(request)
+        if (bodyStart < 0 || Utils.indexOf(request, CONTENT_LENGTH_FIELD, 0, bodyStart) == -1) {
             return request
+        }
+        return try {
+            setHeader(request, "Content-Length", (request.size - bodyStart).toString())
+        } catch (e: RuntimeException) {
+            request
         }
     }
 
@@ -201,37 +207,65 @@ open class Request(val template: String, val words: List<String?>, val learnBori
 
     }
 
+    /**
+     * Offsets of [header] in the headers of [request]: where its line starts, where its value
+     * starts, and where the value ends (before the line ending). The name must start the line and
+     * match exactly, case included: a deliberately odd header (` Content-Length`, `content-length`)
+     * is left alone. The value follows `name:` and at most one space.
+     */
     fun getHeaderOffsets(request: ByteArray, header: String): IntArray {
-        var i = 0
-        val end = request.size
-        while (i < end) {
-            val line_start = i
-
-            // Make ' foo: bar' get interpreted as 'foo: bar'
-            if (request[i] == ' '.code.toByte()) {
-                i++
+        val name = Utils.stringToBytes(header)
+        val headersEnd = Utils.findBodyStart(request).let { if (it < 0) request.size else it }
+        // The first line is the request line.
+        var lineStart = indexOfByte(request, LF, 0, headersEnd) + 1
+        while (lineStart in 1 until headersEnd) {
+            val lineEnd = indexOfByte(request, LF, lineStart, headersEnd).let { if (it < 0) headersEnd else it }
+            val valueEnd = if (lineEnd > lineStart && request[lineEnd - 1] == CR) lineEnd - 1 else lineEnd
+            val colon = lineStart + name.size
+            if (colon < valueEnd && request[colon] == COLON && startsWithAt(request, lineStart, name)) {
+                val valueStart = if (colon + 1 < valueEnd && request[colon + 1] == SPACE) colon + 2 else colon + 1
+                return intArrayOf(lineStart, valueStart, valueEnd)
             }
-
-            while (i < end && request[i++] != ' '.code.toByte()) {
-            }
-            val header_name = request.copyOfRange(line_start, i - 2)
-            val headerValueStart = i
-            while (i < end && request[i++] != '\n'.code.toByte()) {
-            }
-            if (i == end) {
-                break
-            }
-
-            val header_str = String(header_name) // todo check this actually works
-
-            if (header == header_str) {
-                return intArrayOf(line_start, headerValueStart, i - 2)
-            }
-
-            if (i + 2 < end && request[i] == '\r'.code.toByte() && request[i + 1] == '\n'.code.toByte()) {
-                break
-            }
+            lineStart = lineEnd + 1
         }
         throw RuntimeException("Couldn't find header: '$header'")
+    }
+
+    private companion object {
+        val CONTENT_LENGTH_FIELD = Utils.stringToBytes("Content-Length: ")
+        const val LF = '\n'.code.toByte()
+        const val CR = '\r'.code.toByte()
+        const val COLON = ':'.code.toByte()
+        const val SPACE = ' '.code.toByte()
+
+        fun indexOfByte(bytes: ByteArray, value: Byte, from: Int, to: Int): Int {
+            for (i in from until to) {
+                if (bytes[i] == value) return i
+            }
+            return -1
+        }
+
+        fun startsWithAt(bytes: ByteArray, at: Int, prefix: ByteArray): Boolean {
+            if (at + prefix.size > bytes.size) return false
+            for (i in prefix.indices) {
+                if (bytes[at + i] != prefix[i]) return false
+            }
+            return true
+        }
+
+        /** Same count as `split(Regex("[^a-zA-Z0-9]")).size`, without building the pieces. */
+        fun countWords(text: String): Int {
+            var count = 1
+            var i = 0
+            while (i < text.length) {
+                val codePoint = text.codePointAt(i)
+                val alphanumeric = codePoint in 'a'.code..'z'.code ||
+                    codePoint in 'A'.code..'Z'.code ||
+                    codePoint in '0'.code..'9'.code
+                if (!alphanumeric) count++
+                i += Character.charCount(codePoint)
+            }
+            return count
+        }
     }
 }

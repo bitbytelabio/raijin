@@ -7,14 +7,17 @@ import java.io.*
 import java.net.URL
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import java.util.zip.GZIPInputStream
-import kotlin.collections.HashMap
+import kotlin.concurrent.thread
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
@@ -26,10 +29,14 @@ abstract class RequestEngine(
     private companion object {
         /** Marker replaced with a fresh random value on every queued request that carries it. */
         const val RANDOM_MARKER = "\$randomplz"
+
+        /** How long queue() waits for room before it gives up on the run. */
+        const val QUEUE_TIMEOUT_SECONDS = 1800L
     }
 
 
-    var start: Long = System.nanoTime()
+    // Set by start() on the script thread and read by every worker for arrival times.
+    @Volatile var start: Long = System.nanoTime()
 
     /**
      * When the run stopped, or 0 while it is still going. The status line is read after the fact -
@@ -40,12 +47,17 @@ abstract class RequestEngine(
     private val finished = AtomicLong(0)
     val failedWords = ConcurrentHashMap<Int, AtomicInteger>()
     var successfulRequests = AtomicInteger(0)
-    val userState = HashMap<String, Any>()
+    /**
+     * Script state shared by the script thread and every callback. A synchronised HashMap rather
+     * than a ConcurrentHashMap, which would reject the None (null) values scripts store.
+     */
+    val userState: MutableMap<String, Any> = Collections.synchronizedMap(HashMap())
     val lastRequestID = AtomicInteger(0)
     var connections = AtomicInteger(0)
     val runState = AtomicInteger(0) // 0 = connecting, 1 = live, 2 = fully queued, 3 = cancelled, 4 = completed
     lateinit var completedLatch: CountDownLatch
-    private val baselines = LinkedList<SafeResponseVariations>()
+    // Iterated by every worker on every response, added to rarely: copy-on-write.
+    private val baselines = CopyOnWriteArrayList<SafeResponseVariations>()
     val retries = AtomicInteger(0)
     val permaFails = AtomicInteger(0)
     val transportFailures = AtomicInteger(0)
@@ -58,7 +70,14 @@ abstract class RequestEngine(
     lateinit var outputHandler: OutputHandler
     @set:JvmName("setRequestTableInternal")
     var requestTable: RequestTable? = null
-    lateinit var requestQueue: LinkedBlockingQueue<Request>
+    // Assigned once by each engine's constructor and never replaced (see queue()); volatile because
+    // HTTP/2 workers re-read it on every poll.
+    @Volatile lateinit var requestQueue: LinkedBlockingQueue<Request>
+    /**
+     * Requests queued before start() that did not fit in [requestQueue]. Nothing consumes the queue
+     * before then, so they wait here, in order, until the run is going.
+     */
+    private val prestartBacklog = ConcurrentLinkedDeque<Request>()
     abstract val callback: (Request, Boolean) -> Boolean?
     abstract var readCallback: ((String) -> Boolean)?
     abstract val maxRetriesPerRequest: Int
@@ -77,12 +96,15 @@ abstract class RequestEngine(
     private var latestAdaptiveSnapshotEpoch = Long.MIN_VALUE
     private val activeGateLifecycles = ConcurrentHashMap.newKeySet<String>()
     private val gateOutstandingRequests = ConcurrentHashMap<String, AtomicInteger>()
-    var lastLife: Long = System.currentTimeMillis()
+    @Volatile var lastLife: Long = System.currentTimeMillis()
     abstract var idleTimeout: Long
     var fixContentLength: Boolean = true
-    var lastError: String? = null
+    @Volatile var lastError: String? = null
+    private val idleCancelStarted = AtomicBoolean(false)
+    private val cancelClaimed = AtomicBoolean(false)
 
-    val internalSettings: HashMap<String, Any> = HashMap()
+    // Written by applySetting() on the script thread, read by workers on every batch.
+    val internalSettings = ConcurrentHashMap<String, Any>()
 
     init {
         if (requiresBurpProfessional) {
@@ -320,33 +342,48 @@ abstract class RequestEngine(
             }
         }
 
-        var timeout = 1800L
         if (state == 0) {
-            timeout = 1
+            // Nothing consumes the queue before start(), so a script that queues more than it holds
+            // first (autoStart=False) must not block: the overflow waits in order until the run is
+            // going. Swapping in a bigger queue instead dropped this request, and left engines that
+            // had already captured the old queue polling it.
+            if (prestartBacklog.isEmpty() && requestQueue.offer(request)) return
+            prestartBacklog.addLast(request)
+            return
         }
 
+        drainPrestartBacklog()
+        enqueue(request)
+    }
+
+    /** Offers [request], waiting while the queue is full until the run ends or the queue timeout passes. */
+    private fun enqueue(request: Request): Boolean {
         // Untimed offer first. Every queued request comes through here, and where the queue has
         // room — which is the whole of a non-streaming run, whose queue is unbounded — the timed
         // form only adds deadline bookkeeping to a call that was never going to block.
         var queued = requestQueue.offer(request)
         var attempt = 0L
-        while (!queued && runState.get() <= 2 && attempt < timeout) {
+        while (!queued && runState.get() <= 2 && attempt < QUEUE_TIMEOUT_SECONDS) {
             queued = requestQueue.offer(request, 1, TimeUnit.SECONDS)
             attempt += 1
         }
 
         if (!queued) {
             finishGatedRequest(request)
-            if (state == 0 && requestQueue.size == 100) {
-                Utils.out("Looks like a non-streaming run, unlimiting the queue")
-                requestQueue = LinkedBlockingQueue(requestQueue)
-            }
-            else if (attempt == timeout) {
+            if (attempt >= QUEUE_TIMEOUT_SECONDS) {
                 Utils.out("Timeout queuing request. Aborting.")
                 this.cancel()
-            } else {
-                // the run has been cancelled so we don't need to do anything
             }
+            // otherwise the run has been cancelled so we don't need to do anything
+        }
+        return queued
+    }
+
+    /** Moves requests queued before start() into the queue, oldest first. */
+    private fun drainPrestartBacklog() {
+        while (true) {
+            val pending = prestartBacklog.pollFirst() ?: return
+            if (!enqueue(pending)) return
         }
     }
 
@@ -391,8 +428,12 @@ abstract class RequestEngine(
             return true
         }
         if (idleTimeout > 0 && System.currentTimeMillis() > lastLife + idleTimeout) {
-            Utils.out("Cancelling run due to total timeout exceeded: "+ idleTimeout)
-            cancel()
+            if (idleCancelStarted.compareAndSet(false, true)) {
+                Utils.out("Cancelling run due to idle timeout exceeded: ${idleTimeout}ms")
+                // Off this thread: cancel() waits for the workers to finish, and the caller is
+                // usually one of them.
+                thread(isDaemon = true, name = "turbo-idle-timeout") { cancel() }
+            }
             return true
         }
         return false
@@ -415,12 +456,21 @@ abstract class RequestEngine(
     }
 
     private fun showStatsInternal(timeout: Int) {
-        if (runState.get() == 3) {
+        if (runState.get() >= 3) {
+            return
+        }
+
+        if (prestartBacklog.isNotEmpty()) {
+            // complete() before start(): the requests that overflowed the queue can only drain into
+            // workers that are running.
+            runState.compareAndSet(0, 1)
+            drainPrestartBacklog()
+        }
+        if (!markFullyQueued()) {
             return
         }
 
         var success = true
-        runState.set(2)
         if (timeout > 0) {
             success = awaitCompletion(timeout.toLong(), TimeUnit.SECONDS)
         }
@@ -456,11 +506,24 @@ abstract class RequestEngine(
         }
     }
 
+    /** Moves the run to 2 (fully queued); false when it has already ended. */
+    private fun markFullyQueued(): Boolean {
+        while (true) {
+            val state = runState.get()
+            if (state >= 3) return false
+            if (runState.compareAndSet(state, 2)) return true
+        }
+    }
+
     private fun cancelInternal() {
         Utils.unregisterEngine(this)
 
-        if (runState.get() != 3) {
+        // A finished run stays finished (a completed run used to flip to cancelled and be ranked
+        // again), and of concurrent cancels only the first does the work.
+        if (runState.get() < 3 && cancelClaimed.compareAndSet(false, true)) {
             finish(3)
+            // A worker parked on a gate that will now never open has to see that at once.
+            floodgates.values.forEach(Floodgate::wakeWaiters)
             sealCompletion()
             Utils.out("Cancelled run")
 
@@ -523,6 +586,8 @@ abstract class RequestEngine(
         var controller: AdaptiveController? = null
         if (state >= 3) {
             synchronized(adaptiveControllerLock) {
+                // The first terminal state stands: a cancel racing the completion must not relabel it.
+                if (runState.get() >= 3) return
                 onTerminalStateEntering(state)
                 adaptiveControllerTerminal = true
                 controller = adaptiveController
@@ -682,7 +747,8 @@ abstract class RequestEngine(
         val seconds = elapsedNanos.toDouble() / 1_000_000_000
         val rps = if (seconds > 0) requests / seconds else 0.0
         val nextWord = requestQueue.peek()?.words?.joinToString(separator="/")
-        val statusString = String.format("Reqs: %d | Queued: %d | Duration: %d | RPS: %.0f | Connections: %d | Retries: %d | Fails: %d | Next: %s", requests.toInt(), requestQueue.count(), duration, rps, connections.get(), retries.get(), permaFails.get(), nextWord)
+        val queued = requestQueue.size + prestartBacklog.size
+        val statusString = String.format("Reqs: %d | Queued: %d | Duration: %d | RPS: %.0f | Connections: %d | Retries: %d | Fails: %d | Next: %s", requests.toInt(), queued, duration, rps, connections.get(), retries.get(), permaFails.get(), nextWord)
         val withAdaptiveStatus = adaptiveStatus.snapshot()?.let { status ->
             val protocol = when (status.protocol) {
                 AutoProtocol.HTTP1 -> "THREADED"
@@ -736,18 +802,18 @@ abstract class RequestEngine(
         }
 
         if (req.learnBoring != 0) {
-            var base = baselines.getOrNull(req.learnBoring-1)
-            if (base == null) {
-                base = SafeResponseVariations()
-                baselines.add(base)
-            }
-            base.updateWith(response)
+            baselineFor(req.learnBoring).updateWith(response)
 
             //reinvokeCallbacks()
             return false
         }
 
         return true
+    }
+
+    /** The baseline a `learn=` value names, created on first use; atomic, so concurrent learners share it. */
+    private fun baselineFor(learnBoring: Int): SafeResponseVariations = synchronized(baselines) {
+        baselines.getOrNull(learnBoring - 1) ?: SafeResponseVariations().also { baselines.add(it) }
     }
 
     fun shouldRetry(req: Request): Boolean {
@@ -807,6 +873,7 @@ abstract class RequestEngine(
             latestAdaptiveSnapshot = Long.MIN_VALUE
         }
         requestQueue.clear()
+        prestartBacklog.clear()
         userState.clear()
     }
 

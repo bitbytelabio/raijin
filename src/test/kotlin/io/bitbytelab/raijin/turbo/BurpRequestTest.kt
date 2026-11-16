@@ -129,4 +129,64 @@ class BurpRequestTest {
         req.connectionId = "my-connection"
         assertEquals("my-connection", req.connectionId)
     }
+
+    @Test
+    fun `fixContentLength keeps bytes 0x80 to 0xFF intact`() {
+        val body = "caf\u00e9 \u00ff"
+        val req = Request("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\n$body")
+
+        assertEquals("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: ${body.length}\r\n\r\n$body", req.getRequest())
+    }
+
+    @Test
+    fun `fixContentLength finds the header after one written without a space`() {
+        val req = Request("POST / HTTP/1.1\r\nX-A:b\r\nContent-Length: 99\r\n\r\nhello")
+
+        assertEquals("POST / HTTP/1.1\r\nX-A:b\r\nContent-Length: 5\r\n\r\nhello", req.getRequest())
+    }
+
+    @Test
+    fun `deliberately odd Content-Length headers go out as written`() {
+        val leadingSpace = "POST / HTTP/1.1\r\nHost: x\r\n Content-Length: 99\r\n\r\nhello"
+        val lowerCase = "POST / HTTP/1.1\r\nHost: x\r\ncontent-length: 99\r\n\r\nhello"
+
+        assertEquals(leadingSpace, Request(leadingSpace).getRequest())
+        assertEquals(lowerCase, Request(lowerCase).getRequest())
+    }
+
+    @Test
+    fun `a request with no blank line after its headers goes out as written`() {
+        val unfinished = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n"
+
+        assertEquals(unfinished, Request(unfinished).getRequest())
+    }
+
+    @Test
+    fun `getHeaderOffsets finds the value with or without a space after the colon`() {
+        val bytes = "GET / HTTP/1.1\r\nA:1\r\nB: 22\r\n\r\n".toByteArray(Charsets.ISO_8859_1)
+        val req = Request("GET / HTTP/1.1")
+
+        assertArrayEquals(intArrayOf(16, 18, 19), req.getHeaderOffsets(bytes, "A"))
+        assertArrayEquals(intArrayOf(21, 24, 26), req.getHeaderOffsets(bytes, "B"))
+        assertThrows(RuntimeException::class.java) { req.getHeaderOffsets(bytes, "C") }
+    }
+
+    @Test
+    fun `wordcount counts as splitting on non-alphanumerics does`() {
+        val samples = listOf("", "abc", "a b", "a  b", "\u00e9", "x\uD83D\uDE00y", "HTTP/1.1 200 OK\r\n\r\n<p>hi</p>")
+        for (text in samples) {
+            val req = Request("GET / HTTP/1.1").apply { response = text }
+            assertEquals(text.split(Regex("[^a-zA-Z0-9]")).size, req.wordcount, text)
+        }
+    }
+
+    @Test
+    fun `the body starts at the end of a message whose headers never end`() {
+        val unterminated = "GET / HTTP/1.1\r\nHost: x\r\n".toByteArray(Charsets.ISO_8859_1)
+
+        assertEquals(-1, Utils.findBodyStart(unterminated))
+        assertEquals(unterminated.size, Utils.getBodyStart(unterminated))
+        assertEquals(5, Utils.getBodyStart("A\r\n\r\nbody".toByteArray(Charsets.ISO_8859_1)))
+        assertEquals(3, Utils.getBodyStart("A\n\nbody".toByteArray(Charsets.ISO_8859_1)))
+    }
 }

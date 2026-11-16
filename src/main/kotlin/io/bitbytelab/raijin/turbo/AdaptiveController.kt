@@ -231,6 +231,11 @@ class AdaptiveController @JvmOverloads constructor(
         } ?: 0
         if (windowBaseline != null && failures > 0) {
             val elapsedNanos = (now - baselineNanos).coerceAtLeast(0L)
+            // Failures are judged once per window, as everywhere else. Judged at every 250ms
+            // sample, each failure that one backoff caused while the pool converged drove another
+            // backoff before the first had settled, and a resize rejected while a gate was in
+            // progress was retried against the same failures four times a second.
+            if (elapsedNanos < WINDOW_NANOS) return
             val failureOnlyWindow = AdaptiveWindow(
                 limits = current.limits,
                 successfulRps = 0.0,
@@ -240,6 +245,13 @@ class AdaptiveController @JvmOverloads constructor(
                 elapsedNanos = elapsedNanos,
             )
             observeWindow(failureOnlyWindow, current, now, 0.0)
+            if (baseline === windowBaseline) {
+                // Rejected: the failures stay counted from this baseline so the resize is retried,
+                // and the window starts over so that happens once a window.
+                baselineNanos = now
+                previousSampleNanos = now
+                saturatedNanos = 0L
+            }
             return
         }
 

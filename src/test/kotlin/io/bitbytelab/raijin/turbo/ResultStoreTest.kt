@@ -294,4 +294,95 @@ class ResultStoreTest {
         assertEquals(200, req1.code)
         assertEquals(404, req2.code)
     }
+
+    private fun response(status: Int, body: String = "") = "HTTP/1.1 $status X\r\n\r\n$body"
+
+    @Test
+    fun `ID order is the order results arrived in`() {
+        val requests = (1..5).map { i -> Request("GET /$i HTTP/1.1").apply { id = 10 - i } }
+        requests.forEach(store::add)
+
+        assertEquals(requests, store.getResults(SortField.ID, descending = false, limit = 10))
+        assertEquals(requests.reversed(), store.getResults(SortField.ID, descending = true, limit = 10))
+        assertEquals(requests.reversed().drop(1).take(2), store.getResults(SortField.ID, true, limit = 2, offset = 1))
+    }
+
+    @Test
+    fun `ties keep arrival order in either direction`() {
+        val requests = (1..4).map { i -> Request("GET /$i HTTP/1.1").apply { response = response(200) } }
+        requests.forEach(store::add)
+
+        assertEquals(requests, store.getResults(SortField.STATUS, descending = false))
+        assertEquals(requests, store.getResults(SortField.STATUS, descending = true))
+    }
+
+    @Test
+    fun `setSortOrder takes the GUI table's column numbers and orders results read without an explicit sort`() {
+        val ok = Request("GET /a HTTP/1.1").apply { response = response(200) }
+        val missing = Request("GET /b HTTP/1.1").apply { response = response(404) }
+        val broken = Request("GET /c HTTP/1.1").apply { response = response(500) }
+        listOf(missing, broken, ok).forEach(store::add)
+
+        store.setSortOrder(2, false) // Status, ascending
+
+        assertEquals(ResultSortOrder(2, false), store.sortOrder())
+        assertEquals(SortField.STATUS, store.sortOrder()!!.field)
+        assertEquals(listOf(ok, missing, broken), store.getResults())
+        assertEquals(listOf(broken, missing, ok), store.getResults(descending = true))
+        // An explicit sort still wins.
+        assertEquals(listOf(ok, broken, missing), store.getResults(SortField.ID, descending = true))
+    }
+
+    @Test
+    fun `every GUI column has a sort field and other column numbers are rejected`() {
+        val expected = listOf(
+            SortField.ID, SortField.PAYLOAD, SortField.STATUS, SortField.ANOMALY_RANK, SortField.WORDCOUNT,
+            SortField.LENGTH, SortField.TTFB, SortField.TTLB, SortField.ARRIVAL, SortField.LABEL,
+            SortField.QUEUE_ID, SortField.CONNECTION_ID,
+        )
+        expected.forEachIndexed { column, field -> assertEquals(field, ResultSortOrder(column, true).field) }
+
+        assertThrows(IllegalArgumentException::class.java) { store.setSortOrder(12, true) }
+        assertThrows(IllegalArgumentException::class.java) { store.setSortOrder(-1, true) }
+        assertNull(store.sortOrder())
+    }
+
+    @Test
+    fun `sorts by label and queue id`() {
+        val b = Request("GET / HTTP/1.1", emptyList(), 0, "b").apply { id = 1 }
+        val a = Request("GET / HTTP/1.1", emptyList(), 0, "a").apply { id = 2 }
+        store.add(b)
+        store.add(a)
+
+        assertEquals(listOf(a, b), store.getResults(SortField.LABEL, descending = false))
+        assertEquals(listOf(b, a), store.getResults(SortField.QUEUE_ID, descending = false))
+    }
+
+    @Test
+    fun `past its budget a store drops the oldest bodies and keeps their metadata`() {
+        val budgeted = ResultStore(responseBodyBudget = 1_000)
+        val body = "x".repeat(100)
+        val requests = (1..300).map { Request("GET / HTTP/1.1").apply { response = response(201, body) } }
+        requests.forEach(budgeted::add)
+
+        // The newest 256 always keep their bodies, so only the 44 before them can give theirs up.
+        assertEquals(44, budgeted.droppedBodyCount())
+        requests.take(44).forEach { dropped ->
+            assertNull(dropped.response)
+            assertEquals(201, dropped.code)
+            assertEquals(response(201, body).length, dropped.length)
+        }
+        requests.drop(44).forEach { assertNotNull(it.response) }
+        assertEquals(300, budgeted.count())
+    }
+
+    @Test
+    fun `a store within its budget keeps every body`() {
+        val budgeted = ResultStore(responseBodyBudget = 1_000_000)
+        val requests = (1..300).map { Request("GET / HTTP/1.1").apply { response = response(200, "body") } }
+        requests.forEach(budgeted::add)
+
+        assertEquals(0, budgeted.droppedBodyCount())
+        requests.forEach { assertNotNull(it.response) }
+    }
 }
