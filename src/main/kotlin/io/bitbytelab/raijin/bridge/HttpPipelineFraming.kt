@@ -6,9 +6,9 @@ import java.net.SocketException
 import java.net.SocketTimeoutException
 
 /**
- * Dependency-free HTTP/1.1 response framing reader for [HttpPipelineBridge]. Reads exactly one
- * response per [readOne] call off a shared socket, so [HttpPipelineBridge] can pipeline several
- * raw requests over one connection and read the responses back in order.
+ * Dependency-free HTTP/1.1 response framing reader. A [Reader] reads the responses on one socket
+ * one [Reader.next] call at a time, so [HttpPipelineBridge] can pipeline several raw requests over
+ * one connection and read the responses back in order; [readOne] reads a single response.
  *
  * Uses the same byte<->ISO-8859-1-String bijection Turbo's
  * [io.bitbytelab.raijin.turbo.ThreadedRequestEngine] uses for its own HTTP/1.1 parsing, so no byte
@@ -17,6 +17,9 @@ import java.net.SocketTimeoutException
  * Framing is strict, because a framing disagreement with the target is the finding this tool exists
  * to surface: anything it cannot frame unambiguously (bad or conflicting Content-Length, bad chunk
  * size, chunk data without its CRLF) ends in [Outcome.Malformed] instead of a guess or an exception.
+ *
+ * Every outcome also says what arrived on the wire for its response ([Received]): the bytes exactly
+ * as read and when the first and the last of them were read off the socket.
  */
 internal object HttpPipelineFraming {
 
@@ -46,16 +49,61 @@ internal object HttpPipelineFraming {
                     headers.any { it.first.equals("Connection", ignoreCase = true) && it.second.contains("keep-alive", ignoreCase = true) })
     }
 
-    sealed class Outcome(val bytesReadFromSocket: Int) {
-        class Ok(val response: Response, bytesReadFromSocket: Int) : Outcome(bytesReadFromSocket)
-        class Eof(val partial: String, bytesReadFromSocket: Int) : Outcome(bytesReadFromSocket)
-        class TimedOut(val partial: String, val kind: String, bytesReadFromSocket: Int) : Outcome(bytesReadFromSocket)
-        class Reset(val partial: String, val message: String, bytesReadFromSocket: Int) : Outcome(bytesReadFromSocket)
-        class Malformed(val reason: String, val partial: String, bytesReadFromSocket: Int) : Outcome(bytesReadFromSocket)
+    /**
+     * What arrived on the wire for one response: everything from its first byte (that of any 1xx
+     * absorbed before it) through its last (chunk framing and trailers included), or, when reading
+     * failed, through the last byte that arrived.
+     *
+     * @param bytes the first of those bytes as ISO-8859-1 chars, up to the reader's capture cap
+     *   (empty when capture is off).
+     * @param length how many bytes arrived for the response.
+     * @param firstByteAtNanos [System.nanoTime] after the read that delivered the first byte (for
+     *   bytes carried over from an earlier read, that read). Meaningless when [length] is 0.
+     * @param lastByteAtNanos the same for the last byte.
+     */
+    class Received(val bytes: String, val length: Int, val firstByteAtNanos: Long, val lastByteAtNanos: Long) {
+        /** [bytes] holds fewer bytes than arrived. */
+        val truncated: Boolean get() = bytes.length < length
+
+        companion object {
+            val NONE = Received("", 0, 0L, 0L)
+        }
+    }
+
+    sealed class Outcome(val bytesReadFromSocket: Int, val received: Received) {
+        class Ok(val response: Response, bytesReadFromSocket: Int, received: Received = Received.NONE) :
+            Outcome(bytesReadFromSocket, received) {
+            /** [System.nanoTime] when the response's first byte (of a 1xx before it, if any) was read off the socket. */
+            val firstByteAtNanos: Long get() = received.firstByteAtNanos
+
+            /** [System.nanoTime] when the response's last byte was read off the socket. */
+            val lastByteAtNanos: Long get() = received.lastByteAtNanos
+        }
+        class Eof(val partial: String, bytesReadFromSocket: Int, received: Received = Received.NONE) :
+            Outcome(bytesReadFromSocket, received)
+        class TimedOut(val partial: String, val kind: String, bytesReadFromSocket: Int, received: Received = Received.NONE) :
+            Outcome(bytesReadFromSocket, received)
+        class Reset(val partial: String, val message: String, bytesReadFromSocket: Int, received: Received = Received.NONE) :
+            Outcome(bytesReadFromSocket, received)
+        class Malformed(val reason: String, val partial: String, bytesReadFromSocket: Int, received: Received = Received.NONE) :
+            Outcome(bytesReadFromSocket, received)
+    }
+
+    /** The code writing requests on the socket a [Reader] reads, while it reads. */
+    interface Activity {
+        /** Called on the reading thread right after a read returned data. */
+        fun dataArrived()
+
+        /**
+         * [System.currentTimeMillis] from which the idle timeout may count (it counts from the
+         * latest data when that is later), or null while it must not run at all because requests
+         * are still being written.
+         */
+        fun quietSinceMs(): Long?
     }
 
     private sealed class ReadResult {
-        class Data(val len: Int) : ReadResult()
+        object Data : ReadResult()
         object Eof : ReadResult()
         object TimedOut : ReadResult()
         class Errored(val message: String) : ReadResult()
@@ -77,6 +125,9 @@ internal object HttpPipelineFraming {
      * the *next* [readOne] call rather than lost or re-read. [carry] is only appended to on the
      * [Outcome.Ok] path — any other outcome means the caller stops reading from this socket, so
      * there is no "next call" to hand leftover bytes to.
+     *
+     * @param carryReadAtNanos when the bytes in [carry] were read: the [Outcome.Ok.lastByteAtNanos]
+     *   of the call that left them there. Null dates them at the start of this call.
      */
     fun readOne(
         socket: Socket,
@@ -85,11 +136,15 @@ internal object HttpPipelineFraming {
         totalDeadlineAtMs: Long,
         maxResponseBytes: Int = DEFAULT_MAX_RESPONSE_BYTES,
         expectNoBody: Boolean = false,
+        carryReadAtNanos: Long? = null,
     ): Outcome {
-        val wire = Wire(socket, StringBuilder(carry), idleTimeoutMs, totalDeadlineAtMs, maxResponseBytes)
+        val reader = Reader(
+            socket, idleTimeoutMs, totalDeadlineAtMs, maxResponseBytes,
+            carry = carry, carryReadAtNanos = carryReadAtNanos ?: System.nanoTime(),
+        )
         carry.setLength(0)
-        val outcome = wire.readResponse(expectNoBody)
-        if (outcome is Outcome.Ok) carry.append(wire.buf, wire.pos, wire.buf.length)
+        val outcome = reader.next(expectNoBody)
+        if (outcome is Outcome.Ok) carry.append(reader.leftover())
         return outcome
     }
 
@@ -112,85 +167,161 @@ internal object HttpPipelineFraming {
     }
 
     /**
-     * One response's read off [socket]. [buf] holds the bytes read so far as ISO-8859-1 chars and
-     * [pos] is the first one not consumed yet. Consumed data is dropped in bulk ([compact]) instead
-     * of being shifted out after every chunk, and every search resumes where the previous one
-     * stopped, so a large or finely chunked response costs linear time.
+     * Reads the responses on [socket], one per [next] call. Not thread-safe: one thread reads.
+     *
+     * [buf] holds the bytes read so far as ISO-8859-1 chars and [pos] is the first one not consumed
+     * yet. Consumed data is dropped in bulk ([compact]) instead of being shifted out after every
+     * chunk, and every search resumes where the previous one stopped, so a large or finely chunked
+     * response costs linear time. A response's bytes are copied to its capture as they are dropped,
+     * so the capture survives compaction, and each byte is copied at most once.
+     *
+     * Bytes are only read while the current response is incomplete, so the read that completes a
+     * response delivered its last byte and everything after it: [lastDataAtNanos] dates both the
+     * end of one response and the bytes of the next that came with it.
+     *
+     * @param totalDeadlineAtMs [System.currentTimeMillis] at which reading stops for good.
+     * @param captureBytes how many bytes of each response to keep in [Received.bytes] (0: none).
+     * @param activity the code writing to [socket] meanwhile, if any: it holds off the idle timeout
+     *   while it writes and hears about every read that returned data.
+     * @param carry bytes already read off [socket], at [carryReadAtNanos], that start the first response.
      */
-    private class Wire(
+    class Reader(
         private val socket: Socket,
-        val buf: StringBuilder,
         private val idleTimeoutMs: Long,
         private val totalDeadlineAtMs: Long,
-        private val maxBytes: Int,
+        private val maxBytes: Int = DEFAULT_MAX_RESPONSE_BYTES,
+        private val captureBytes: Int = 0,
+        private val activity: Activity? = null,
+        carry: CharSequence = "",
+        carryReadAtNanos: Long = System.nanoTime(),
     ) {
         private val input = socket.getInputStream()
         private val readBuf = ByteArray(65536)
-        var pos = 0
+        private val buf = StringBuilder(carry)
+        private var pos = 0
+        private var lastDataAtMs = System.currentTimeMillis()
+
+        /** [System.nanoTime] after the latest read that returned data (of the carry before any). */
+        var lastDataAtNanos: Long = carryReadAtNanos
+            private set
+
+        /** Bytes this reader has read off the socket. */
+        var totalBytesRead: Long = 0
+            private set
+
+        // The response being read: bytes read for it, when its first byte arrived, and its capture
+        // (bytes before buf index [capFrom] are in [capture] or past the cap, [capLength] in all).
         private var bytesRead = 0
+        private var hasFirstByte = false
+        private var firstByteAtNanos = 0L
+        private val capture = StringBuilder()
+        private var capFrom = 0
+        private var capLength = 0
 
         private val available: Int get() = buf.length - pos
+
+        /** The next response; after any outcome but [Outcome.Ok], reading this socket is over. */
+        fun next(expectNoBody: Boolean = false): Outcome {
+            bytesRead = 0
+            hasFirstByte = available > 0
+            firstByteAtNanos = lastDataAtNanos
+            capture.setLength(0)
+            capFrom = pos
+            capLength = 0
+            compact()
+            return readResponse(expectNoBody)
+        }
+
+        /** Bytes read past the end of the last response [next] returned. */
+        fun leftover(): String = rest()
 
         private fun rest(): String = buf.substring(pos)
 
         private fun totalExceeded() = System.currentTimeMillis() >= totalDeadlineAtMs
 
+        /**
+         * Waits for more bytes and appends them to [buf]. Idle time counts from the latest data,
+         * and not at all while [activity] is still writing: a request being written or held in a
+         * pause is not an idle connection. A timeout in between re-checks both deadlines.
+         */
         private fun read(): ReadResult {
-            if (totalExceeded()) return ReadResult.TimedOut
-            return try {
-                socket.soTimeout = minOf(idleTimeoutMs, totalDeadlineAtMs - System.currentTimeMillis())
-                    .coerceIn(1, Int.MAX_VALUE.toLong()).toInt()
-                val len = input.read(readBuf)
-                if (len == -1) {
-                    ReadResult.Eof
-                } else {
+            while (true) {
+                val now = System.currentTimeMillis()
+                if (now >= totalDeadlineAtMs) return ReadResult.TimedOut
+                val quietSince = if (activity == null) lastDataAtMs else activity.quietSinceMs()?.let { maxOf(it, lastDataAtMs) } ?: now
+                val idleDeadline = quietSince + idleTimeoutMs
+                if (now >= idleDeadline) return ReadResult.TimedOut
+                try {
+                    socket.soTimeout = (minOf(idleDeadline, totalDeadlineAtMs) - now).coerceIn(1, Int.MAX_VALUE.toLong()).toInt()
+                    val len = input.read(readBuf)
+                    if (len == -1) return ReadResult.Eof
+                    lastDataAtNanos = System.nanoTime()
+                    lastDataAtMs = System.currentTimeMillis()
+                    if (!hasFirstByte) {
+                        hasFirstByte = true
+                        firstByteAtNanos = lastDataAtNanos
+                    }
+                    buf.append(String(readBuf, 0, len, Charsets.ISO_8859_1))
                     bytesRead += len
-                    ReadResult.Data(len)
+                    totalBytesRead += len
+                    activity?.dataArrived()
+                    return ReadResult.Data
+                } catch (_: SocketTimeoutException) {
+                    // Both deadlines are re-checked above.
+                } catch (e: SocketException) {
+                    return ReadResult.Errored(e.message ?: "connection reset")
+                } catch (e: IOException) {
+                    return ReadResult.Errored(e.message ?: "io error")
                 }
-            } catch (_: SocketTimeoutException) {
-                ReadResult.TimedOut
-            } catch (e: SocketException) {
-                ReadResult.Errored(e.message ?: "connection reset")
-            } catch (e: IOException) {
-                ReadResult.Errored(e.message ?: "io error")
             }
         }
 
-        private fun append(len: Int) {
-            buf.append(String(readBuf, 0, len, Charsets.ISO_8859_1))
+        /** Moves the current response's bytes up to buf index [end] into its capture. */
+        private fun captureTo(end: Int) {
+            if (end <= capFrom) return
+            val room = captureBytes - capture.length
+            if (room > 0) capture.append(buf, capFrom, capFrom + minOf(room, end - capFrom))
+            capLength += end - capFrom
+            capFrom = end
+        }
+
+        /** What arrived for the current response, through buf index [end]. */
+        private fun receivedThrough(end: Int): Received {
+            captureTo(end)
+            return if (capLength == 0) Received.NONE else Received(capture.toString(), capLength, firstByteAtNanos, lastDataAtNanos)
         }
 
         /** The [Outcome] for a read that ended the response: timeout, reset, or (otherwise) EOF. */
         private fun fail(r: ReadResult, partial: String): Outcome = when (r) {
-            ReadResult.TimedOut -> Outcome.TimedOut(partial, if (totalExceeded()) "total" else "idle", bytesRead)
-            is ReadResult.Errored -> Outcome.Reset(partial, r.message, bytesRead)
-            else -> Outcome.Eof(partial, bytesRead)
+            ReadResult.TimedOut -> Outcome.TimedOut(partial, if (totalExceeded()) "total" else "idle", bytesRead, receivedThrough(buf.length))
+            is ReadResult.Errored -> Outcome.Reset(partial, r.message, bytesRead, receivedThrough(buf.length))
+            else -> Outcome.Eof(partial, bytesRead, receivedThrough(buf.length))
         }
 
-        private fun malformed(reason: String, partial: String) = Outcome.Malformed(reason, partial, bytesRead)
+        private fun malformed(reason: String, partial: String) =
+            Outcome.Malformed(reason, partial, bytesRead, receivedThrough(buf.length))
 
         private fun compact() {
             if (pos >= COMPACT_AFTER && pos > buf.length / 2) {
+                captureTo(pos)
                 buf.delete(0, pos)
                 pos = 0
+                capFrom = 0
             }
         }
 
-        fun readResponse(expectNoBody: Boolean): Outcome {
+        private fun readResponse(expectNoBody: Boolean): Outcome {
             while (true) {
                 var scanFrom = pos
                 var headerEnd = buf.indexOf("\r\n\r\n", scanFrom)
                 while (headerEnd == -1) {
                     scanFrom = maxOf(pos, buf.length - 3)
                     when (val r = read()) {
-                        is ReadResult.Data -> {
-                            if (available.toLong() + r.len > maxBytes) {
-                                return malformed("response headers exceeded $maxBytes byte cap", rest())
-                            }
-                            append(r.len)
+                        ReadResult.Data -> if (available > maxBytes) {
+                            return malformed("response headers exceeded $maxBytes byte cap", rest())
                         }
                         ReadResult.Eof -> return if (available == 0) {
-                            Outcome.Eof("", bytesRead)
+                            Outcome.Eof("", bytesRead, receivedThrough(buf.length))
                         } else {
                             malformed("connection closed before headers completed", rest())
                         }
@@ -226,6 +357,7 @@ internal object HttpPipelineFraming {
             fun ok(body: Body.Read, framing: String, closes: Boolean = connectionClose) = Outcome.Ok(
                 Response(statusLine, statusCode, headers, body.text, framing, closes, warnings, body.trailers),
                 bytesRead,
+                receivedThrough(pos),
             )
 
             if (statusCode == 101) return ok(Body.Read(""), "switching-protocols")
@@ -278,10 +410,8 @@ internal object HttpPipelineFraming {
 
         private fun readFixed(length: Int): Body {
             while (available < length) {
-                when (val r = read()) {
-                    is ReadResult.Data -> append(r.len)
-                    else -> return Body.Failed(fail(r, rest()))
-                }
+                val r = read()
+                if (r != ReadResult.Data) return Body.Failed(fail(r, rest()))
             }
             val text = buf.substring(pos, pos + length)
             pos += length
@@ -291,11 +421,8 @@ internal object HttpPipelineFraming {
         private fun readToClose(): Body {
             while (true) {
                 when (val r = read()) {
-                    is ReadResult.Data -> {
-                        if (available.toLong() + r.len > maxBytes) {
-                            return Body.Failed(malformed("response exceeded $maxBytes byte cap", rest()))
-                        }
-                        append(r.len)
+                    ReadResult.Data -> if (available > maxBytes) {
+                        return Body.Failed(malformed("response exceeded $maxBytes byte cap", rest()))
                     }
                     ReadResult.Eof -> {
                         val text = rest()
@@ -315,11 +442,8 @@ internal object HttpPipelineFraming {
                 while (lineEnd == -1) {
                     scanFrom = maxOf(pos, buf.length - 1)
                     when (val r = read()) {
-                        is ReadResult.Data -> {
-                            if (body.length.toLong() + available + r.len > maxBytes) {
-                                return Body.Failed(malformed("response exceeded $maxBytes byte cap", body.toString()))
-                            }
-                            append(r.len)
+                        ReadResult.Data -> if (body.length.toLong() + available > maxBytes) {
+                            return Body.Failed(malformed("response exceeded $maxBytes byte cap", body.toString()))
                         }
                         else -> return Body.Failed(fail(r, body.toString()))
                     }
@@ -336,10 +460,8 @@ internal object HttpPipelineFraming {
                     return Body.Failed(malformed("response exceeded $maxBytes byte cap", body.toString()))
                 }
                 while (available.toLong() < size.toLong() + 2) {
-                    when (val r = read()) {
-                        is ReadResult.Data -> append(r.len)
-                        else -> return Body.Failed(fail(r, body.toString()))
-                    }
+                    val r = read()
+                    if (r != ReadResult.Data) return Body.Failed(fail(r, body.toString()))
                 }
                 body.append(buf, pos, pos + size)
                 if (buf[pos + size] != '\r' || buf[pos + size + 1] != '\n') {
@@ -368,11 +490,8 @@ internal object HttpPipelineFraming {
                     scanFrom = maxOf(pos, buf.length - 3)
                 }
                 when (val r = read()) {
-                    is ReadResult.Data -> {
-                        if (body.length.toLong() + available + r.len > maxBytes) {
-                            return Body.Failed(malformed("chunk trailers exceeded $maxBytes byte cap", body.toString()))
-                        }
-                        append(r.len)
+                    ReadResult.Data -> if (body.length.toLong() + available > maxBytes) {
+                        return Body.Failed(malformed("chunk trailers exceeded $maxBytes byte cap", body.toString()))
                     }
                     else -> return Body.Failed(fail(r, body.toString()))
                 }

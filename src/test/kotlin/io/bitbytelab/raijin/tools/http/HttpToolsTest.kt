@@ -32,9 +32,9 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
- * The HTTP tool layer: bad arguments come back as `isError` results naming the problem, before
- * anything is sent. The bridge runs on a Montoya stand-in that fails any call, so a test that
- * reached Burp would show that error instead of the expected one.
+ * The HTTP tool layer: malformed arguments come back as `isError` results naming the problem, before
+ * anything is sent, while out-of-range numbers are clamped with a note. The bridge runs on a Montoya
+ * stand-in that fails any call, so a call that got past argument checking ends in a send error.
  */
 class HttpToolsTest {
 
@@ -72,48 +72,109 @@ class HttpToolsTest {
         fragments.forEach { assertTrue(it in message, "$tool: '$it' not in: $message") }
     }
 
+    private fun notes(result: CallToolResult): List<String> =
+        json(result)["notes"]?.jsonArray?.map { it.jsonPrimitive.content }.orEmpty()
+
+    private fun JsonObject.with(key: String, json: String) = JsonObject(this + (key to Json.parseToJsonElement(json)))
+
+    private val pipeline = buildJsonObject {
+        put("host", "127.0.0.1")
+        put("port", 1)
+        putJsonArray("requests") { add(buildJsonObject { put("raw_request", "GET / HTTP/1.1\r\n\r\n") }) }
+    }
+
     @Test
-    fun `out-of-range numbers and unknown enum values are rejected`() {
+    fun `malformed values and unknown enum values are rejected`() {
         val fuzz = buildJsonObject { put("request", "GET /?q=FUZZ HTTP/1.1\r\n\r\n"); put("host", "h"); putJsonArray("payloads") { add("x") } }
-        assertRejected("http_fuzz", JsonObject(fuzz + ("port" to Json.parseToJsonElement("70000"))), "'port'", "1 and 65535")
-        assertRejected("http_race", buildJsonObject { put("request", "GET / HTTP/1.1\r\n\r\n"); put("host", "h"); put("count", 0) }, "'count'")
+        assertRejected("http_fuzz", fuzz.with("port", "70000"), "'port'", "1 and 65535")
+        assertRejected("http_fuzz", fuzz.with("attack_mode", "\"intruder\""), "'attack_mode'", "cluster_bomb")
+        assertRejected("http_race", buildJsonObject { put("request", "GET / HTTP/1.1\r\n\r\n"); put("host", "h"); put("count", "many") }, "'count'", "integer")
         assertRejected("http_send_request", buildJsonObject { put("url", "https://h/"); put("http_mode", "HTTP_3") }, "'http_mode'", "HTTP_2_IGNORE_ALPN")
-        assertRejected("http_send_request", buildJsonObject { put("url", "https://h/"); put("timeout_ms", 0) }, "'timeout_ms'")
-        val pipeline = buildJsonObject {
-            put("host", "h")
-            putJsonArray("requests") { add(buildJsonObject { put("raw_request", "GET / HTTP/1.1\r\n\r\n") }) }
+        assertRejected("http_send_request", buildJsonObject { put("url", "https://h/"); put("follow_redirects", "sometimes") }, "'follow_redirects'", "same_host")
+        assertRejected("http_send_pipeline", pipeline.with("write_mode", "\"burst\""), "'write_mode'", "concat, single_write")
+        assertRejected("http_send_pipeline", pipeline.with("http_mode", "\"HTTP_2\""), "'http_mode'")
+    }
+
+    @Test
+    fun `out-of-range numbers are clamped with a note instead of rejected`() {
+        val race = call("http_race", buildJsonObject { put("request", "GET / HTTP/1.1\r\n\r\n"); put("host", "h"); put("count", 0) })
+        assertTrue(notes(race).any { "'count' = 0" in it && "1 was used" in it }, json(race).toString())
+        assertFalse("'count'" in json(race)["error"]?.jsonPrimitive?.content.orEmpty())
+
+        val pipelined = call("http_send_pipeline", pipeline.with("max_responses", "0"))
+        assertTrue(notes(pipelined).any { "'max_responses' = 0" in it }, json(pipelined).toString())
+
+        val fuzz = buildJsonObject {
+            put("request", "GET /?q=FUZZ HTTP/1.1\r\n\r\n"); put("host", "h"); putJsonArray("payloads") { add("x") }
+            put("concurrency", 500); put("max_requests", 0)
         }
-        assertRejected("http_send_pipeline", JsonObject(pipeline + ("write_mode" to Json.parseToJsonElement("\"burst\""))), "'write_mode'", "concat, single_write")
-        assertRejected("http_send_pipeline", JsonObject(pipeline + ("max_responses" to Json.parseToJsonElement("0"))), "'max_responses'")
-        assertRejected("http_send_pipeline", JsonObject(pipeline + ("http_mode" to Json.parseToJsonElement("\"HTTP_2\""))), "'http_mode'")
+        val fuzzed = notes(call("http_fuzz", fuzz))
+        assertTrue(fuzzed.any { "'concurrency' = 500" in it } && fuzzed.any { "'max_requests' = 0" in it }, fuzzed.toString())
     }
 
     @Test
-    fun `fuzz rejects malformed positions, stop conditions and payload libraries`() {
-        fun fuzz(extra: JsonObject.() -> JsonObject) = buildJsonObject {
-            put("request", "GET /?q=§a§ HTTP/1.1\r\n\r\n"); put("host", "h"); putJsonArray("payloads") { add("x") }
-        }.extra()
-        assertRejected("http_fuzz", fuzz { JsonObject(this + ("positions" to Json.parseToJsonElement("[[1]]"))) }, "positions[0]")
-        assertRejected("http_fuzz", fuzz { JsonObject(this + ("stop_on_match" to Json.parseToJsonElement("""{"status_codes":["x"]}"""))) }, "status_codes")
-        assertRejected("http_fuzz", fuzz { JsonObject(this + ("stop_on_match" to Json.parseToJsonElement("""{"body_regex":"("}"""))) }, "body_regex")
-        assertRejected("http_fuzz", fuzz { JsonObject(this + ("payload_library" to Json.parseToJsonElement("\"nope\""))) }, "'payload_library'", "sqli")
+    fun `timeout_ms 0 means no hard timeout again`() {
+        val result = call("http_send_request", buildJsonObject { put("url", "https://h/"); put("timeout_ms", 0) })
+        assertFalse("timeout_ms" in errorOf(result), json(result).toString())
+        assertTrue(notes(result).isEmpty(), notes(result).toString())
     }
 
     @Test
-    fun `traffic rules validate patterns and headers and keep a tool filter`() {
+    fun `http2 headers, fuzz payload sets and race options are checked before sending`() {
+        assertRejected("http_send_request", buildJsonObject { put("url", "https://h/") }.with("http2_headers", """[{"name":":path"}]"""), "http2_headers[0]", "'value'")
+        assertRejected("http_send_request", buildJsonObject { put("url", "https://h/") }.with("http2_headers", """"x""""), "http2_headers")
+
+        val fuzz = buildJsonObject { put("request", "GET /?a=§1§&b=§2§ HTTP/1.1\r\n\r\n"); put("host", "h") }
+        assertRejected("http_fuzz", fuzz.with("payload_sets", """[["a"]]""").with("payloads", """["b"]"""), "not both")
+        assertRejected("http_fuzz", fuzz.with("payload_sets", """[["a"], []]"""), "payload_sets[1]", "empty")
+        assertRejected("http_fuzz", fuzz.with("payload_sets", """["nope"]"""), "unknown payload library")
+        assertRejected("http_fuzz", fuzz.with("payloads", """["a"]""").with("encoders", """["rot13"]"""), "rot13")
+        assertRejected("http_fuzz", fuzz.with("payloads", """["a"]""").with("grep_regex", "\"(\""), "'grep_regex'")
+        assertRejected("http_fuzz", fuzz.with("payloads", """["a"]""").with("filter_length", """["big"]"""), "filter_length")
+        assertRejected("http_fuzz", fuzz, "payload_sets")
+
+        val race = buildJsonObject { put("request", "GET / HTTP/1.1\r\n\r\n"); put("host", "h") }
+        assertRejected("http_race", race.with("sync", "\"single_packet\"").with("http_mode", "\"HTTP_1\""), "last_byte")
+        assertRejected("http_race", race.with("sync", "\"last_byte\"").with("http_mode", "\"HTTP_2\""), "HTTP_1")
+        assertRejected("http_race", race.with("sni", "\"x\""), "last_byte")
+        val legacy = call("http_race", race.with("gate_delay", "100"))
+        assertTrue(notes(legacy).any { "gate_delay is no longer used" in it }, json(legacy).toString())
+    }
+
+    @Test
+    fun `fuzz rejects malformed positions and stop conditions`() {
+        val fuzz = buildJsonObject { put("request", "GET /?q=§a§ HTTP/1.1\r\n\r\n"); put("host", "h"); putJsonArray("payloads") { add("x") } }
+        assertRejected("http_fuzz", fuzz.with("positions", "[[1]]"), "positions[0]")
+        assertRejected("http_fuzz", fuzz.with("stop_on_match", """{"status_codes":["x"]}"""), "status_codes")
+        assertRejected("http_fuzz", fuzz.with("stop_on_match", """{"body_regex":"("}"""), "body_regex")
+        assertRejected("http_fuzz", fuzz.with("payload_library", "\"nope\""), "'payload_library'", "sqli")
+    }
+
+    @Test
+    fun `traffic rules keep header lines exactly as given and validate patterns`() {
         fun rule(extra: JsonObject) = JsonObject(buildJsonObject { put("direction", "request") } + extra)
         assertRejected("http_set_traffic_rule", rule(buildJsonObject { put("match_url", "[") }), "'match_url'", "regex")
-        assertRejected("http_set_traffic_rule", rule(buildJsonObject { put("modify_add_header", "no colon") }), "'modify_add_header'")
-        assertRejected("http_set_traffic_rule", rule(buildJsonObject { putJsonObject("modify_replace_header") { put("X-A", "a\r\nInjected: 1") } }), "modify_replace_header")
         assertRejected("http_set_traffic_rule", rule(buildJsonObject { putJsonArray("tool_filter") { add("NOPE") } }), "unknown tool", "EXTENSIONS")
         assertRejected("http_set_traffic_rule", rule(buildJsonObject { put("action", "drop"); put("direction", "response") }), "direction=request")
+
+        val raw = call("http_set_traffic_rule", rule(buildJsonObject {
+            put("rule_id", "raw")
+            put("modify_add_header", "Transfer-Encoding : chunked\r\nX-Smuggled: 1")
+            putJsonObject("modify_replace_header") { put("X-A", "a\r\nInjected: 1") }
+        }))
+        assertEquals(null, raw.isError?.takeIf { it }, (raw.content.first() as TextContent).text)
+        val stored = state.trafficRules.single { it.ruleId == "raw" }
+        assertEquals("Transfer-Encoding : chunked\r\nX-Smuggled: 1", stored.modifyAddHeader)
+        assertEquals(mapOf("X-A" to "a\r\nInjected: 1"), stored.modifyReplaceHeader)
+        val noColon = call("http_set_traffic_rule", rule(buildJsonObject { put("modify_add_header", "no colon") }))
+        assertEquals(null, noColon.isError?.takeIf { it }, (noColon.content.first() as TextContent).text)
 
         val set = call("http_set_traffic_rule", rule(buildJsonObject {
             put("rule_id", "probe-tag")
             put("modify_add_header", "X-Probe: 1")
             putJsonArray("tool_filter") { add("extensions") }
         }))
-        assertFalse(set.isError == true, (set.content.first() as TextContent).text)
+        assertEquals(null, set.isError?.takeIf { it }, (set.content.first() as TextContent).text)
         assertEquals(setOf("EXTENSIONS"), state.trafficRules.single { it.ruleId == "probe-tag" }.toolFilter)
 
         val listed = json(call("http_list_traffic_rules", buildJsonObject {})).getValue("rules").jsonArray
@@ -153,10 +214,15 @@ class HttpToolsTest {
         fun enumOf(tool: String, param: String) = server.tools.getValue(tool).tool.inputSchema.properties!!
             .getValue(param).jsonObject.getValue("enum").jsonArray.map { it.jsonPrimitive.content }
         assertEquals(listOf("AUTO", "HTTP_1", "HTTP_2", "HTTP_2_IGNORE_ALPN"), enumOf("http_send_request", "http_mode"))
+        assertEquals(listOf("never", "always", "same_host", "in_scope"), enumOf("http_send_request", "follow_redirects"))
         assertEquals(listOf("concat", "single_write"), enumOf("http_send_pipeline", "write_mode"))
         assertEquals(listOf("modify", "drop", "spoof_response"), enumOf("http_set_traffic_rule", "action"))
+        assertEquals(listOf("sniper", "battering_ram", "pitchfork", "cluster_bomb"), enumOf("http_fuzz", "attack_mode"))
+        assertEquals(listOf("all", "clusters", "summary"), enumOf("http_fuzz", "report"))
+        assertEquals(listOf("single_packet", "last_byte"), enumOf("http_race", "sync"))
         val toolFilterItems = server.tools.getValue("http_set_traffic_rule").tool.inputSchema.properties!!
             .getValue("tool_filter").jsonObject.getValue("items").jsonObject.getValue("enum").jsonArray.map { it.jsonPrimitive.content }
         assertTrue("EXTENSIONS" in toolFilterItems && "SCANNER" in toolFilterItems, toolFilterItems.toString())
+        assertFalse(server.tools.getValue("http_race").tool.inputSchema.properties!!.containsKey("gate_delay"))
     }
 }

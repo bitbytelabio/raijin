@@ -1,49 +1,30 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
-import burp.api.montoya.core.ToolType
 import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpService
-import burp.api.montoya.http.message.params.HttpParameter
-import io.bitbytelab.raijin.safety.BoundedHttp
-import io.bitbytelab.raijin.safety.HeaderSafety
-import io.bitbytelab.raijin.safety.RequestHygiene
-import io.bitbytelab.raijin.safety.SafeRegex
-import io.bitbytelab.raijin.safety.ScopeGate
 import burp.api.montoya.http.handler.HttpHandler
-import burp.api.montoya.http.handler.HttpRequestToBeSent
-import burp.api.montoya.http.handler.HttpResponseReceived
-import burp.api.montoya.http.handler.RequestToBeSentAction
-import burp.api.montoya.http.handler.ResponseReceivedAction
-import burp.api.montoya.http.message.HttpHeader
 import burp.api.montoya.http.message.HttpRequestResponse
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.http.message.responses.analysis.ResponseVariationsAnalyzer
-import burp.api.montoya.core.ByteArray as BurpByteArray
 import io.bitbytelab.raijin.events.EventBus
-import io.bitbytelab.raijin.state.SessionRule
+import io.bitbytelab.raijin.safety.RequestHygiene
+import io.bitbytelab.raijin.safety.SafeRegex
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.state.TrafficRule
 import io.bitbytelab.raijin.transport.ToolCallTracker
-import io.bitbytelab.raijin.core.BodyText
-import io.bitbytelab.raijin.core.asBodyString
-import io.bitbytelab.raijin.core.asStringMap
 import kotlinx.serialization.json.*
-import java.net.URI
-import java.time.Instant
 import java.time.ZonedDateTime
-import java.util.concurrent.Callable
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
+import burp.api.montoya.core.ByteArray as BurpByteArray
 
 /**
- * Bridge wrapping the Montoya HTTP API.
- *
- * Provides MCP-friendly methods for sending HTTP requests, managing cookies,
- * analyzing responses, and managing global traffic rules. Also creates the
- * [HttpHandler] registered during extension initialization.
+ * Bridge wrapping the Montoya HTTP API for the `http_*` tools: sending requests (one, in parallel,
+ * chained, raw bytes, native HTTP/2), the cookie jar, response analysis, fuzzing and race testing,
+ * plus the global [HttpHandler] registered during extension initialization. The work itself lives
+ * in focused helpers: [HttpRequestBuilder], [HttpRequestChain], [HttpExchangeJson],
+ * [HttpGlobalHandler], [HttpFuzzRunner], [HttpRace], [HttpPipelineBridge].
  */
 class HttpBridge(
     private val api: MontoyaApi,
@@ -51,40 +32,34 @@ class HttpBridge(
     private val stateManager: StateManager
 ) {
 
-    /**
-     * Adds an HttpRequestResponse to Burp's sitemap and annotates it as MCP-originated.
-     * Called after every request sent via MCP tools so it's visible in Burp UI.
-     */
-    private fun addToSitemap(result: HttpRequestResponse, note: String = "[MCP] Raijin") {
-        try {
-            api.siteMap().add(result)
-        } catch (_: Exception) {}
-        try {
-            result.annotations().setNotes(note)
-        } catch (_: Exception) {}
-    }
+    /** Shared, centralized scope gate used by EVERY outbound path in this bridge. */
+    private val scopeGate = ScopeGate(api)
+
+    private val timeouts = HttpTimeouts()
+
+    internal val chain = HttpRequestChain(api, scopeGate, timeouts)
+
+    /** Session login macros (`session_macro_*` tools), run by the global handler when a session expires. */
+    internal val sessionMacros = SessionMacroEngine(api, eventBus, stateManager, chain)
+
+    private val race = HttpRace(api, scopeGate, timeouts)
 
     // ---------------------------------------------------------------
     // Send request
     // ---------------------------------------------------------------
 
     /**
-     * Sends a single HTTP request and returns the serialized response.
+     * Sends a single HTTP request and returns the serialized exchange.
      *
-     * The request can be built from either a raw HTTP string or from
-     * structured parameters (URL, method, headers, body).
+     * The request is built from raw text, from a URL with structured headers and body
+     * ([HttpRequestBuilder.build]), or, when [http2Fields] is given, as a native HTTP/2 request whose
+     * header list (pseudo-headers included) is sent as given ([HttpRequestBuilder.http2]).
      *
-     * @param url Target URL (used when rawRequest is null).
-     * @param method HTTP method (defaults to "GET").
-     * @param headers Map of header name to value.
-     * @param body Optional request body string.
-     * @param rawRequest Optional raw HTTP request string (takes priority).
-     * @param host Optional target host override.
-     * @param port Optional target port override.
-     * @param useTls Optional TLS flag override.
-     * @param httpMode HTTP mode: "AUTO", "HTTP_1", "HTTP_2", "HTTP_2_IGNORE_ALPN".
-     * @param connectionId Optional connection ID for request multiplexing.
-     * @return JSON object with request/response details and timing.
+     * @param httpMode "AUTO", "HTTP_1", "HTTP_2" or "HTTP_2_IGNORE_ALPN"; a native HTTP/2 request
+     *   is sent with HTTP_2 unless HTTP_2_IGNORE_ALPN is asked for.
+     * @param connectionId pins/reuses one Montoya connection.
+     * @param timeoutMs hard timeout; null or 0 waits for Burp.
+     * @param options Burp request options (redirects, SNI, response timeout, TLS verification).
      */
     fun sendRequest(
         url: String?,
@@ -100,37 +75,48 @@ class HttpBridge(
         maxBodyLength: Int? = null,
         timeoutMs: Long? = null,
         preserveHeaders: Boolean = true,
-        autoFixContentLength: Boolean = true
+        autoFixContentLength: Boolean = true,
+        http2Fields: List<Pair<String, String>>? = null,
+        options: HttpSendOptions = HttpSendOptions(),
     ): JsonObject {
         return try {
             val fixReport = mutableMapOf<String, JsonElement>()
-            val httpRequest = buildRequest(
-                url, method, headers, body, rawRequest, host, port, useTls,
-                preserveHeaders = preserveHeaders,
-                autoFixContentLength = autoFixContentLength,
-                fixReport = fixReport
-            )
-            val mode = resolveHttpMode(httpMode)
+            var mode = HttpModes.resolve(httpMode)
+            val httpRequest = if (http2Fields != null) {
+                require(rawRequest == null && headers.isNullOrEmpty()) {
+                    "http2_headers is the whole HTTP/2 header list: send it without raw_request or headers"
+                }
+                require(mode != HttpMode.HTTP_1) { "http2_headers builds an HTTP/2 request: http_mode HTTP_1 cannot send it" }
+                if (mode == HttpMode.AUTO) mode = HttpMode.HTTP_2
+                HttpRequestBuilder.http2(url, method, http2Fields, body, host, port, useTls)
+            } else {
+                HttpRequestBuilder.build(
+                    url, method, headers, body, rawRequest, host, port, useTls,
+                    preserveHeaders = preserveHeaders,
+                    autoFixContentLength = autoFixContentLength,
+                    fixReport = fixReport
+                )
+            }
 
             val targetUrl = try { httpRequest.url() } catch (_: Exception) { url ?: "" }
             val scope = scopeGate.check(targetUrl)
             scope.deny?.let { return it }
 
             val startTime = System.nanoTime()
-            val result: HttpRequestResponse = executeWithTimeout(timeoutMs) {
-                if (connectionId != null) {
-                    api.http().sendRequest(httpRequest, mode, connectionId)
-                } else {
-                    api.http().sendRequest(httpRequest, mode)
+            val result: HttpRequestResponse = timeouts.run(timeoutMs) {
+                when {
+                    !options.isDefault -> sendWithOptions(httpRequest, options, mode, connectionId)
+                    connectionId != null -> api.http().sendRequest(httpRequest, mode, connectionId)
+                    else -> api.http().sendRequest(httpRequest, mode)
                 }
             }
             val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
 
-            addToSitemap(result, "[MCP] http_send_request via Raijin")
+            api.recordInSiteMap(result, "[MCP] http_send_request via Raijin")
             ToolCallTracker.recordSentResult(result)
 
-            val hygiene = RequestHygiene.scan(method, url, headers)
-            withFixReport(withScopeWarning(withRequestWarnings(serializeRequestResponse(result, elapsedMs, maxBodyLength), hygiene), scope.warning), fixReport)
+            val hygiene = if (http2Fields != null) emptyList() else RequestHygiene.scan(method, url, headers)
+            withFixReport(withScopeWarning(withRequestWarnings(HttpExchangeJson.serialize(result, elapsedMs, maxBodyLength), hygiene), scope.warning), fixReport)
         } catch (e: Exception) {
             buildJsonObject {
                 put("error", "Failed to send request: ${e.message}")
@@ -140,10 +126,20 @@ class HttpBridge(
         }
     }
 
+    /** Sends through Montoya's `RequestOptions`, which an older Burp does not have. */
+    private fun sendWithOptions(request: HttpRequest, options: HttpSendOptions, mode: HttpMode, connectionId: String?): HttpRequestResponse =
+        try {
+            api.http().sendRequest(request, options.toRequestOptions(mode, connectionId))
+        } catch (e: LinkageError) {
+            throw IllegalStateException(
+                "This Burp does not support request options (follow_redirects, sni, response_timeout_ms, verify_tls): ${e.message}"
+            )
+        }
+
     /**
      * Sends multiple HTTP requests in parallel.
      *
-     * @param requests List of request descriptors (each a map of URL/method/headers/body/raw_request/host/port/use_tls).
+     * @param requests Request objects (url/method/headers/body/raw_request/host/port/use_tls).
      * @param httpMode HTTP mode for all requests.
      * @return JSON object with results array.
      */
@@ -154,22 +150,13 @@ class HttpBridge(
         timeoutMs: Long? = null
     ): JsonObject {
         return try {
-            val mode = resolveHttpMode(httpMode)
+            val mode = HttpModes.resolve(httpMode)
 
             // Build all requests, recording original index and any per-request build errors.
             data class Built(val originalIndex: Int, val request: HttpRequest?, val error: String?)
             val built = requests.mapIndexed { idx, reqObj ->
                 try {
-                    val rawReq = reqObj["raw_request"]?.jsonPrimitive?.contentOrNull
-                    val reqUrl = reqObj["url"]?.jsonPrimitive?.contentOrNull
-                    val reqMethod = reqObj["method"]?.jsonPrimitive?.contentOrNull
-                    val reqBody = reqObj["body"].asBodyString()
-                    val reqHost = reqObj["host"]?.jsonPrimitive?.contentOrNull
-                    val reqPort = reqObj["port"]?.jsonPrimitive?.intOrNull
-                    val reqTls = reqObj["use_tls"]?.jsonPrimitive?.booleanOrNull
-                    val reqHeaders = reqObj["headers"].asStringMap()
-                    val httpReq = buildRequest(reqUrl, reqMethod, reqHeaders, reqBody, rawReq, reqHost, reqPort, reqTls)
-                    Built(idx, httpReq, null)
+                    Built(idx, HttpRequestBuilder.fromObject(reqObj), null)
                 } catch (e: Exception) {
                     Built(idx, null, e.message ?: "Failed to build request")
                 }
@@ -186,9 +173,8 @@ class HttpBridge(
                 }
             }
 
-            // Group successfully-built requests by HttpService (host+port+tls). Burp's
-            // sendRequests() rejects mixed services with "HTTP service on each request must
-            // be the same"; this fix groups by service and dispatches each group separately.
+            // Burp's sendRequests() rejects mixed services ("HTTP service on each request must be
+            // the same"), so requests are grouped by service and each group dispatched separately.
             val grouped = built.filter { it.request != null }.groupBy { b ->
                 val svc = b.request!!.httpService()
                 Triple(svc.host(), svc.port(), svc.secure())
@@ -199,32 +185,25 @@ class HttpBridge(
             val perGroupTimings = mutableMapOf<String, Long>()
 
             val totalStart = System.nanoTime()
-            executeWithTimeout(timeoutMs) {
+            timeouts.run(timeoutMs) {
                 grouped.forEach { (svc, group) ->
                     val groupKey = "${svc.first}:${svc.second}:${if (svc.third) "tls" else "plain"}"
-                    val groupRequests = group.map { it.request!! }
                     val groupStart = System.nanoTime()
                     val groupResults = try {
-                        api.http().sendRequests(groupRequests, mode)
-                    } catch (e: Exception) {
+                        api.http().sendRequests(group.map { it.request!! }, mode)
+                    } catch (_: Exception) {
                         // If a single group fails, leave its slots null; carry on with others.
                         emptyList()
                     }
                     perGroupTimings[groupKey] = (System.nanoTime() - groupStart) / 1_000_000
                     group.forEachIndexed { gIdx, b ->
-                        if (gIdx < groupResults.size) {
-                            resultsArray[b.originalIndex] = groupResults[gIdx]
-                        }
+                        if (gIdx < groupResults.size) resultsArray[b.originalIndex] = groupResults[gIdx]
                     }
                 }
-                Unit
             }
             val totalElapsedMs = (System.nanoTime() - totalStart) / 1_000_000
 
-            // Add successful results to sitemap.
-            resultsArray.filterNotNull().forEach { result ->
-                addToSitemap(result, "[MCP] Parallel request via Raijin")
-            }
+            resultsArray.filterNotNull().forEach { api.recordInSiteMap(it, "[MCP] Parallel request via Raijin") }
 
             buildJsonObject {
                 put("total_requests", requests.size)
@@ -244,9 +223,7 @@ class HttpBridge(
                                     put("error", b.error)
                                     put("phase", "build")
                                 }
-                                result != null -> {
-                                    serializeRequestResponse(result, null, maxBodyLength).forEach { (k, v) -> put(k, v) }
-                                }
+                                result != null -> HttpExchangeJson.serialize(result, null, maxBodyLength).forEach { (k, v) -> put(k, v) }
                                 else -> {
                                     put("error", "Send failed (group dispatch error or no response)")
                                     put("phase", "send")
@@ -266,19 +243,11 @@ class HttpBridge(
     }
 
     /**
-     * Executes a chain of HTTP requests sequentially, extracting variables
-     * from each response and substituting them into subsequent requests.
+     * Executes a chain of HTTP requests sequentially ([HttpRequestChain]), extracting values from
+     * each response (regex, JSONPath or XPath) into `{{variable}}` placeholders of later steps.
      *
-     * Each step can define:
-     * - A request (url/method/headers/body/raw_request)
-     * - Extract rules: list of {name, pattern (regex with capture group), from ("body" or "header")}
-     *
-     * Placeholders `{{variable_name}}` in subsequent steps are replaced with
-     * the extracted values.
-     *
-     * @param steps List of step descriptors.
-     * @param httpMode HTTP mode for all requests.
      * @param stopOnError Whether to stop the chain if a step fails.
+     * @param timeoutMs hard timeout of each step; null or 0 waits for Burp.
      * @return JSON object with step results and extracted variables.
      */
     fun sendRequestChain(
@@ -288,142 +257,35 @@ class HttpBridge(
         connectionId: String? = null,
         timeoutMs: Long? = null
     ): JsonObject {
-        val mode = resolveHttpMode(httpMode)
-        val variables = mutableMapOf<String, String>()
-        val stepResults = mutableListOf<JsonObject>()
-
-        for ((index, step) in steps.withIndex()) {
-            try {
-                // Substitute variables in the step's fields
-                val substitutedStep = substituteVariables(step, variables)
-                // Checked before sending, so a malformed extract rule fails the step without a request.
-                val extractions = parseExtractRules(substitutedStep["extract"])
-
-                val rawReq = substitutedStep["raw_request"]?.jsonPrimitive?.contentOrNull
-                val reqUrl = substitutedStep["url"]?.jsonPrimitive?.contentOrNull
-                val reqMethod = substitutedStep["method"]?.jsonPrimitive?.contentOrNull
-                val reqBody = substitutedStep["body"].asBodyString()
-                val reqHost = substitutedStep["host"]?.jsonPrimitive?.contentOrNull
-                val reqPort = substitutedStep["port"]?.jsonPrimitive?.intOrNull
-                val reqTls = substitutedStep["use_tls"]?.jsonPrimitive?.booleanOrNull
-                val reqHeaders = substitutedStep["headers"].asStringMap()
-
-                val fixReport = mutableMapOf<String, JsonElement>()
-                val httpRequest = buildRequest(reqUrl, reqMethod, reqHeaders, reqBody, rawReq, reqHost, reqPort, reqTls, fixReport = fixReport)
-
-                val scopeDeny = scopeGate.deny(httpRequest.url())
-                if (scopeDeny != null) {
-                    stepResults.add(buildJsonObject {
-                        put("step", index)
-                        put("success", false)
-                        put("out_of_scope", true)
-                        put("error", "Blocked by scope policy: step target is not in Burp's scope (mcp_scope_mode=enforce).")
-                    })
-                    if (stopOnError) break else continue
-                }
-
-                val startTime = System.nanoTime()
-                val result = executeWithTimeout(timeoutMs) {
-                    if (connectionId != null) {
-                        api.http().sendRequest(httpRequest, mode, connectionId)
-                    } else {
-                        api.http().sendRequest(httpRequest, mode)
-                    }
-                }
-                val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
-
-                addToSitemap(result, "[MCP] Chain step $index via Raijin")
-
-                val extractedInStep = mutableMapOf<String, String>()
-                for (rule in extractions) {
-                    val searchText = if (rule.fromHeader) {
-                        result.response()?.headers()?.joinToString("\r\n") {
-                            "${it.name()}: ${it.value()}"
-                        } ?: ""
-                    } else {
-                        result.response()?.bodyToString() ?: ""
-                    }
-
-                    val match = SafeRegex.find(rule.pattern, searchText)
-                    if (match != null) {
-                        val extractedValue = if (match.groupValues.size > 1) {
-                            match.groupValues[1]
-                        } else {
-                            match.value
-                        }
-                        variables[rule.name] = extractedValue
-                        extractedInStep[rule.name] = extractedValue
-                    }
-                }
-
-                val serializedResult = serializeRequestResponse(result, elapsedMs)
-                stepResults.add(buildJsonObject {
-                    put("step", index)
-                    put("success", true)
-                    serializedResult.forEach { (k, v) -> put(k, v) }
-                    fixReport.forEach { (k, v) -> put(k, v) }
-                    if (connectionId != null) {
-                        put("connection_id", connectionId)
-                        put("connection_reused", index > 0)
-                    }
-                    if (extractedInStep.isNotEmpty()) {
-                        put("extracted", buildJsonObject {
-                            extractedInStep.forEach { (k, v) -> put(k, v) }
-                        })
-                    }
-                })
-            } catch (e: Exception) {
-                stepResults.add(buildJsonObject {
-                    put("step", index)
-                    put("success", false)
-                    put("error", e.message ?: "Unknown error")
-                    if (e is HttpRequestTimeoutException) put("is_timeout", true)
-                })
-
-                if (stopOnError) break
-            }
-        }
-
+        val result = chain.run(steps, HttpModes.resolve(httpMode), stopOnError, connectionId, timeoutMs)
         return buildJsonObject {
             put("total_steps", steps.size)
-            put("completed_steps", stepResults.size)
-            put("variables", buildJsonObject {
-                variables.forEach { (k, v) -> put(k, v) }
+            put("completed_steps", result.steps.size)
+            put("variables", buildJsonObject { result.variables.forEach { (k, v) -> put(k, v) } })
+            put("steps", buildJsonArray {
+                result.steps.forEach { step ->
+                    add(buildJsonObject {
+                        put("step", step.index)
+                        put("success", step.success)
+                        val exchange = step.exchange
+                        if (exchange != null) {
+                            HttpExchangeJson.serialize(exchange, step.elapsedMs).forEach { (k, v) -> put(k, v) }
+                            step.fixReport.forEach { (k, v) -> put(k, v) }
+                            if (connectionId != null) {
+                                put("connection_id", connectionId)
+                                put("connection_reused", step.index > 0)
+                            }
+                            if (step.extracted.isNotEmpty()) {
+                                put("extracted", buildJsonObject { step.extracted.forEach { (k, v) -> put(k, v) } })
+                            }
+                        } else {
+                            if (step.outOfScope) put("out_of_scope", true)
+                            put("error", step.error ?: "Unknown error")
+                            if (step.timeout) put("is_timeout", true)
+                        }
+                    })
+                }
             })
-            put("steps", buildJsonArray { stepResults.forEach { add(it) } })
-        }
-    }
-
-    private class ExtractRule(val name: String, val pattern: String, val fromHeader: Boolean)
-
-    /**
-     * Parses a chain step's `extract` list. It MUST be a JSON array of {name, pattern, from}
-     * objects; a raw `.jsonArray` accessor would throw a cryptic kotlinx exception when a client
-     * passes a single object, so the shape and every pattern are checked with actionable messages.
-     */
-    private fun parseExtractRules(element: JsonElement?): List<ExtractRule> {
-        val items = when (element) {
-            null, JsonNull -> return emptyList()
-            is JsonArray -> element
-            else -> throw IllegalArgumentException(
-                "'extract' must be a JSON ARRAY of {name,pattern,from} objects, e.g. " +
-                    "extract:[{\"name\":\"csrf\",\"pattern\":\"...\",\"from\":\"body\"}]. " +
-                    "Got ${element::class.simpleName}."
-            )
-        }
-        return items.mapIndexed { i, item ->
-            val obj = item as? JsonObject ?: throw IllegalArgumentException(
-                "Each 'extract' item must be a JSON OBJECT with {name,pattern,from}. Got ${item::class.simpleName}."
-            )
-            val name = obj["name"]?.jsonPrimitive?.contentOrNull
-            val pattern = obj["pattern"]?.jsonPrimitive?.contentOrNull
-            require(!name.isNullOrEmpty() && pattern != null) { "extract[$i] needs both 'name' and 'pattern'." }
-            SafeRegex.validate(pattern)?.let { throw IllegalArgumentException("extract[$i].pattern is not a valid regex: $it") }
-            val from = obj["from"]?.jsonPrimitive?.contentOrNull ?: "body"
-            require(from.equals("body", ignoreCase = true) || from.equals("header", ignoreCase = true)) {
-                "extract[$i].from must be 'body' or 'header' (got '$from')."
-            }
-            ExtractRule(name, pattern, from.equals("header", ignoreCase = true))
         }
     }
 
@@ -677,597 +539,26 @@ class HttpBridge(
     // ---------------------------------------------------------------
 
     /**
-     * Creates an [HttpHandler] that applies [TrafficRule]s and [SessionRule]s from the
-     * [StateManager] to all outgoing requests and incoming responses.
-     *
-     * Raijin's own internal probes (auth_diff, autorize, idor_hunt, access-control sweep: sent by
-     * [BoundedHttp.sendInternal], so tool EXTENSIONS plus [BoundedHttp.INTERNAL_BYPASS_HEADER])
-     * skip every session rule and every traffic rule whose tool filter does not name EXTENSIONS,
-     * on the request and on the response path. An unauthenticated probe therefore never leaves
-     * with a re-injected Cookie/Authorization, and its response never overwrites an extracted
-     * session value. The marker header itself never reaches the wire.
-     *
-     * This handler is registered once during extension initialization in
-     * [RaijinExtension.registerBurpHandlers].
+     * The [HttpHandler] applying traffic rules, session rules and session login macros to all HTTP
+     * traffic ([HttpGlobalHandler]). Registered once in [io.bitbytelab.raijin.core.RaijinExtension].
      */
-    fun createGlobalHttpHandler(): HttpHandler {
-        // Internal probes still waiting for their response; bounded because a dropped probe never gets one.
-        val internalProbeMessageIds = java.util.Collections.synchronizedMap(
-            object : java.util.LinkedHashMap<Int, Boolean>(256, 0.75f, false) {
-                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, Boolean>): Boolean = size > 4096
-            }
-        )
-        return object : HttpHandler {
-            override fun handleHttpRequestToBeSent(requestToBeSent: HttpRequestToBeSent): RequestToBeSentAction {
-                val toolName = try { requestToBeSent.toolSource().toolType().name } catch (_: Exception) { null }
-                val marked = try { requestToBeSent.hasHeader(BoundedHttp.INTERNAL_BYPASS_HEADER) } catch (_: Exception) { false }
-                val internalProbe = marked && toolName == ToolType.EXTENSIONS.name
-                if (internalProbe) {
-                    try { internalProbeMessageIds[requestToBeSent.messageId()] = true } catch (_: Exception) {}
-                }
-                val outgoing: HttpRequest =
-                    if (marked) requestToBeSent.withRemovedHeader(BoundedHttp.INTERNAL_BYPASS_HEADER) else requestToBeSent
-                var currentRequest = outgoing
-                val currentAnnotations = requestToBeSent.annotations()
+    fun createGlobalHttpHandler(): HttpHandler = HttpGlobalHandler(api, eventBus, stateManager, sessionMacros)
 
-                val matchingRules = stateManager.trafficRules.filter { rule ->
-                    rule.enabled && rule.direction.equals("request", ignoreCase = true) &&
-                        trafficRuleAppliesTo(rule, toolName, internalProbe) &&
-                        matchesTrafficRuleRequest(rule, outgoing)
-                }
-
-                // A matching drop/spoof_response rule short-circuits before any header
-                // modification — the request is never sent, so modifying it first is pointless.
-                // First match wins. Falls through to the ordinary modify pipeline below when the
-                // running Burp predates Montoya 2026.7 (no drop()/spoof() on this Burp) or the
-                // stored spoof_response text fails to parse as an HTTP response.
-                val terminating = matchingRules.firstOrNull {
-                    it.action.equals("drop", true) || it.action.equals("spoof_response", true)
-                }
-                if (terminating != null) {
-                    val terminated = applyTerminatingRule(terminating, requestToBeSent, currentAnnotations)
-                    if (terminated != null) return terminated
-                }
-
-                val modifyRules = matchingRules.filter { it.action.equals("modify", true) }
-                for (rule in modifyRules) {
-                    currentRequest = applyTrafficRuleToRequest(rule, currentRequest)
-
-                    eventBus.emit("http.traffic_rule.applied", buildJsonObject {
-                        put("rule_id", rule.ruleId)
-                        put("direction", "request")
-                        put("action", "modify")
-                        put("url", requestToBeSent.url())
-                        put("timestamp", Instant.now().toString())
-                    })
-                }
-
-                var sessionChanged = false
-
-                // Session-handling rules: inject previously-extracted values into the request.
-                if (!internalProbe) {
-                    val reqUrl = requestToBeSent.url()
-                    val reqSuiteInScope = if (stateManager.sessionRules.any { it.enabled && it.lastExtractedValue != null })
-                        (try { api.scope().isInScope(reqUrl) } catch (_: Exception) { false }) else false
-                    for (rule in stateManager.sessionRules) {
-                        if (!rule.enabled) continue
-                        val value = rule.lastExtractedValue ?: continue
-                        if (!SessionRuleEngine.inScope(rule, reqUrl, reqSuiteInScope)) continue
-                        val before = currentRequest
-                        currentRequest = applySessionInjection(rule, currentRequest, value)
-                        if (currentRequest !== before) {
-                            sessionChanged = true
-                            eventBus.emit("session.rule.injected", buildJsonObject {
-                                put("rule", rule.ruleName)
-                                put("url", reqUrl)
-                                put("inject_into", rule.injectInto)
-                                put("timestamp", Instant.now().toString())
-                            })
-                        }
-                    }
-                }
-
-                return if (!marked && modifyRules.isEmpty() && !sessionChanged) {
-                    RequestToBeSentAction.continueWith(requestToBeSent)
-                } else {
-                    RequestToBeSentAction.continueWith(currentRequest, currentAnnotations)
-                }
-            }
-
-            override fun handleHttpResponseReceived(responseReceived: HttpResponseReceived): ResponseReceivedAction {
-                val internalProbe = try { internalProbeMessageIds.remove(responseReceived.messageId()) != null } catch (_: Exception) { false }
-                val toolName = try { responseReceived.toolSource().toolType().name } catch (_: Exception) { null }
-
-                var currentResponse: HttpResponse = responseReceived
-                val currentAnnotations = responseReceived.annotations()
-
-                val matchingRules = stateManager.trafficRules.filter { rule ->
-                    rule.enabled && rule.direction.equals("response", ignoreCase = true) &&
-                        trafficRuleAppliesTo(rule, toolName, internalProbe) &&
-                        matchesTrafficRuleResponse(rule, responseReceived)
-                }
-
-                for (rule in matchingRules) {
-                    currentResponse = applyTrafficRuleToResponse(rule, currentResponse)
-
-                    eventBus.emit("http.traffic_rule.applied", buildJsonObject {
-                        put("rule_id", rule.ruleId)
-                        put("direction", "response")
-                        try {
-                            put("url", responseReceived.initiatingRequest()?.url() ?: "")
-                        } catch (_: Exception) { }
-                        put("timestamp", Instant.now().toString())
-                    })
-                }
-
-                // Session-handling rules: extract token/CSRF values for later injection.
-                if (!internalProbe) {
-                    val respUrl = try { responseReceived.initiatingRequest()?.url() ?: "" } catch (_: Exception) { "" }
-                    val respSuiteInScope = if (stateManager.sessionRules.any { it.enabled })
-                        (try { api.scope().isInScope(respUrl) } catch (_: Exception) { false }) else false
-                    val lazyBody = lazy { try { currentResponse.bodyToString() } catch (_: Exception) { "" } }
-                    for (rule in stateManager.sessionRules) {
-                        if (!rule.enabled) continue
-                        if (!SessionRuleEngine.inScope(rule, respUrl, respSuiteInScope)) continue
-                        val headerValue = if (rule.extractFrom.equals("header", true) && rule.extractHeaderName != null)
-                            try { currentResponse.headerValue(rule.extractHeaderName) } catch (_: Exception) { null } else null
-                        val body = if (rule.extractFrom.equals("body", true)) lazyBody.value else ""
-                        val extracted = SessionRuleEngine.extract(rule, headerValue, body)
-                        if (extracted != null && extracted != rule.lastExtractedValue) {
-                            rule.lastExtractedValue = extracted
-                            eventBus.emit("session.rule.extracted", buildJsonObject {
-                                put("rule", rule.ruleName)
-                                put("url", respUrl)
-                                put("timestamp", Instant.now().toString())
-                            })
-                        }
-                    }
-                }
-
-                return if (matchingRules.isEmpty()) {
-                    ResponseReceivedAction.continueWith(responseReceived)
-                } else {
-                    ResponseReceivedAction.continueWith(currentResponse, currentAnnotations)
-                }
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------
-    // Session-handling rule application
-    // ---------------------------------------------------------------
-
-    /**
-     * Injects a rendered session value into [request] per the rule's
-     * `injectInto` target. Header injection is CRLF-validated; cookie/body use
-     * upsert semantics so repeated requests don't accumulate duplicates.
-     */
-    private fun applySessionInjection(rule: SessionRule, request: HttpRequest, value: String): HttpRequest {
-        val rendered = SessionRuleEngine.render(rule.injectValueTemplate, value)
-        return when (rule.injectInto.lowercase()) {
-            "header" ->
-                if (HeaderSafety.isValidHeaderName(rule.injectName) && HeaderSafety.isValidHeaderValue(rendered))
-                    request.withUpdatedHeader(rule.injectName, rendered)
-                else request
-            "cookie" ->
-                // Cookies serialize into a header — a CRLF in name/value is header injection.
-                if (!HeaderSafety.containsCrlf(rule.injectName) && !HeaderSafety.containsCrlf(rendered))
-                    upsertParam(request, HttpParameter.cookieParameter(rule.injectName, rendered))
-                else request
-            "body" ->
-                if (!HeaderSafety.containsCrlf(rule.injectName) && !HeaderSafety.containsCrlf(rendered))
-                    upsertParam(request, HttpParameter.bodyParameter(rule.injectName, rendered))
-                else request
-            else -> request
-        }
-    }
-
-    private fun upsertParam(request: HttpRequest, param: HttpParameter): HttpRequest =
-        if (request.hasParameter(param.name(), param.type())) request.withUpdatedParameters(param)
-        else request.withAddedParameters(param)
-
-    // ---------------------------------------------------------------
-    // Traffic rule matching helpers
-    // ---------------------------------------------------------------
-
-    private fun matchesTrafficRuleRequest(rule: TrafficRule, request: HttpRequest): Boolean {
-        if (rule.matchUrl != null) {
-            if (!SafeRegex.containsMatchIn(rule.matchUrl, request.url(), ignoreCase = true)) {
-                return false
-            }
-        }
-        if (rule.matchHost != null) {
-            if (!SafeRegex.matchesHostPattern(rule.matchHost, request.httpService().host())) {
-                return false
-            }
-        }
-        if (rule.matchHeader != null) {
-            val headerStr = request.headers().joinToString("\r\n") { "${it.name()}: ${it.value()}" }
-            if (!SafeRegex.containsMatchIn(rule.matchHeader, headerStr, ignoreCase = true)) {
-                return false
-            }
-        }
-        return true
-    }
-
-    private fun matchesTrafficRuleResponse(rule: TrafficRule, response: HttpResponseReceived): Boolean {
-        if (rule.matchUrl != null) {
-            val url = try { response.initiatingRequest()?.url() } catch (_: Exception) { null } ?: return false
-            if (!SafeRegex.containsMatchIn(rule.matchUrl, url, ignoreCase = true)) {
-                return false
-            }
-        }
-        if (rule.matchHost != null) {
-            val host = try { response.initiatingRequest()?.httpService()?.host() } catch (_: Exception) { null } ?: return false
-            if (!SafeRegex.matchesHostPattern(rule.matchHost, host)) {
-                return false
-            }
-        }
-        if (rule.matchHeader != null) {
-            val headerStr = response.headers().joinToString("\r\n") { "${it.name()}: ${it.value()}" }
-            if (!SafeRegex.containsMatchIn(rule.matchHeader, headerStr, ignoreCase = true)) {
-                return false
-            }
-        }
-        return true
-    }
-
-    // ---------------------------------------------------------------
-    // Traffic rule application helpers
-    // ---------------------------------------------------------------
-
-    /**
-     * Applies a matched "drop" or "spoof_response" [rule] via Montoya's
-     * `RequestToBeSentAction.drop()` / `.spoof()` (added in the Montoya API shipped with
-     * Burp 2026.7 — [RequestToBeSentAction] offered no way to suppress a request before
-     * that). Returns the terminating action, or `null` to fall through to the ordinary
-     * modify pipeline when the running Burp is older than 2026.7 ([NoSuchMethodError] —
-     * the interface this extension compiles against declares the method, but an older
-     * Burp's runtime implementation does not) or when a "spoof_response" rule's stored
-     * text fails to parse as an HTTP response.
-     */
-    private fun applyTerminatingRule(
-        rule: TrafficRule,
-        requestToBeSent: HttpRequestToBeSent,
-        annotations: burp.api.montoya.core.Annotations
-    ): RequestToBeSentAction? {
-        val degraded = { reason: String ->
-            eventBus.emit("http.traffic_rule.degraded", buildJsonObject {
-                put("rule_id", rule.ruleId)
-                put("action", rule.action.lowercase())
-                put("url", requestToBeSent.url())
-                put("reason", reason)
-                put("timestamp", Instant.now().toString())
-            })
-        }
-        val applied = { action: String ->
-            eventBus.emit("http.traffic_rule.applied", buildJsonObject {
-                put("rule_id", rule.ruleId)
-                put("direction", "request")
-                put("action", action)
-                put("url", requestToBeSent.url())
-                put("timestamp", Instant.now().toString())
-            })
-        }
-
-        if (rule.action.equals("drop", true)) {
-            return try {
-                RequestToBeSentAction.drop(annotations).also { applied("drop") }
-            } catch (_: NoSuchMethodError) {
-                degraded("drop() needs Burp's Montoya API 2026.7 or later; this Burp is older, so the request was sent instead.")
-                null
-            }
-        }
-
-        // action == "spoof_response"
-        val spoofText = rule.spoofResponse
-        if (spoofText == null) {
-            degraded("spoof_response action has no stored response text; the request was sent instead.")
-            return null
-        }
-        val spoofed = try {
-            HttpResponse.httpResponse(RequestHygiene.normalizeCrlf(spoofText))
-        } catch (e: Exception) {
-            degraded("spoof_response text could not be parsed as an HTTP response (${e.message}); the request was sent instead.")
-            return null
-        }
-        return try {
-            RequestToBeSentAction.spoof(spoofed, annotations).also { applied("spoof_response") }
-        } catch (_: NoSuchMethodError) {
-            degraded("spoof() needs Burp's Montoya API 2026.7 or later; this Burp is older, so the request was sent instead.")
-            null
-        }
-    }
-
-    private fun applyTrafficRuleToRequest(rule: TrafficRule, request: HttpRequest): HttpRequest {
-        var modified = request
-
-        if (rule.modifyAddHeader != null) {
-            HeaderSafety.parseHeaderLine(rule.modifyAddHeader)?.let { (name, value) ->
-                modified = modified.withAddedHeader(name, value)
-            }
-        }
-        if (rule.modifyRemoveHeader != null) {
-            modified = modified.withRemovedHeader(rule.modifyRemoveHeader)
-        }
-        rule.modifyReplaceHeader?.forEach { (headerName, headerValue) ->
-            if (HeaderSafety.isValidHeaderName(headerName) && HeaderSafety.isValidHeaderValue(headerValue)) {
-                modified = modified.withUpdatedHeader(headerName, headerValue)
-            }
-        }
-
-        return modified
-    }
-
-    private fun applyTrafficRuleToResponse(rule: TrafficRule, response: HttpResponse): HttpResponse {
-        var modified = response
-
-        if (rule.modifyAddHeader != null) {
-            HeaderSafety.parseHeaderLine(rule.modifyAddHeader)?.let { (name, value) ->
-                modified = modified.withAddedHeader(name, value)
-            }
-        }
-        if (rule.modifyRemoveHeader != null) {
-            modified = modified.withRemovedHeader(rule.modifyRemoveHeader)
-        }
-        rule.modifyReplaceHeader?.forEach { (headerName, headerValue) ->
-            if (HeaderSafety.isValidHeaderName(headerName) && HeaderSafety.isValidHeaderValue(headerValue)) {
-                modified = modified.withUpdatedHeader(headerName, headerValue)
-            }
-        }
-
-        return modified
-    }
-
-    // ---------------------------------------------------------------
-    // Request building helpers
-    // ---------------------------------------------------------------
-
-    /**
-     * Builds an [HttpRequest] from either a raw string or structured parameters.
-     *
-     * Behaviour notes (fixes for known agent-reported issues):
-     * - When [rawRequest] lacks port info, defaults to TLS:443 (modern web default)
-     *   instead of plain:80. Honour explicit [port]/[useTls] overrides.
-     * - When [url] + [headers] are both supplied AND [preserveHeaders] is true (default),
-     *   constructs a complete raw HTTP request preserving the caller's headers byte-exact,
-     *   bypassing Burp's default User-Agent/Accept/etc. injection.
-     * - Auto-recomputes Content-Length on raw_request if it is wrong (silent CL bugs
-     *   are responsible for ghost status_code:0 responses).
-     */
-    private fun buildRequest(
-        url: String?,
-        method: String?,
-        headers: Map<String, String>?,
-        body: String?,
-        rawRequest: String?,
-        host: String?,
-        port: Int?,
-        useTls: Boolean?,
-        preserveHeaders: Boolean = true,
-        autoFixContentLength: Boolean = true,
-        fixReport: MutableMap<String, JsonElement>? = null
-    ): HttpRequest {
-        // Issue #7 (reopened): strip raw CR/LF (and other C0 control chars) from the STRUCTURED
-        // inputs so a stray newline — commonly emitted by an LLM — can't reach the HTTP/2 :path or
-        // split a header and get the request "kettled" / RST_STREAM'd (PROTOCOL_ERROR) by the server.
-        // The url-only path (buildFromUrlMontoya → httpRequestFromUrl) previously passed the raw url
-        // straight through. raw_request gets its header block's LF→CRLF normalization
-        // (buildFromRawRequest) so bare-LF agent output parses, with the body left as typed; only
-        // http_send_raw_bytes stays byte-verbatim for intentional request-smuggling research.
-        // RequestHygiene.scan still surfaces a warning.
-        val cUrl = url?.let { RequestHygiene.stripControl(it) }
-        val cMethod = method?.let { RequestHygiene.stripControl(it) }
-        val cHeaders = headers?.entries?.associate {
-            RequestHygiene.stripControl(it.key) to RequestHygiene.stripControl(it.value)
-        }
-
-        var request: HttpRequest = if (rawRequest != null) {
-            buildFromRawRequest(rawRequest, host, port, useTls, autoFixContentLength, fixReport)
-        } else if (cUrl != null) {
-            if (preserveHeaders) {
-                buildFromUrlPreservingHeaders(cUrl, cMethod, cHeaders.orEmpty(), body, host, port, useTls)
-            } else {
-                buildFromUrlMontoya(cUrl, cMethod, cHeaders, body, host, port, useTls)
-            }
-        } else {
-            throw IllegalArgumentException("Either 'url' or 'raw_request' must be provided")
-        }
-
-        // For raw_request: allow extra (sanitized) header overrides via the headers map.
-        if (rawRequest != null) {
-            cHeaders?.forEach { (name, value) ->
-                request = request.withHeader(name, value)
-            }
-        }
-
-        return request
-    }
-
-    /**
-     * Builds a request from raw HTTP text, defaulting to TLS:443 when port info is absent.
-     * Auto-fixes Content-Length on the raw request if [autoFixContentLength] is true.
-     */
-    private fun buildFromRawRequest(
-        rawRequest: String,
-        host: String?,
-        port: Int?,
-        useTls: Boolean?,
-        autoFixContentLength: Boolean,
-        fixReport: MutableMap<String, JsonElement>? = null
-    ): HttpRequest {
-        // Issue #7 (request-line variant): LLMs commonly emit raw requests with bare-LF line
-        // endings. Montoya cannot delimit the request line then, so the whole message folds
-        // into the HTTP/2 :path and the request gets kettled / RST_STREAM'd. Normalizing
-        // LF→CRLF is lossless for deliberate CRLF (smuggling research keeps its \r\n, and
-        // byte-level work belongs to http_send_raw_bytes, which stays verbatim). It must run
-        // BEFORE fixContentLength — that helper keys on "\r\n\r\n" and silently no-ops on
-        // bare-LF input.
-        val normalized = RequestHygiene.normalizeCrlf(rawRequest)
-        // One charset for the Content-Length count and the bytes on the wire (RequestHygiene.wireCharset).
-        val charset = RequestHygiene.wireCharset(normalized)
-        val cleaned = if (autoFixContentLength) {
-            val fix = RequestHygiene.fixContentLength(normalized, utf8Body = charset == Charsets.UTF_8)
-            if (fix.rewrittenFrom != null && fixReport != null) {
-                fixReport["content_length_rewritten"] = buildJsonObject {
-                    put("from", fix.rewrittenFrom)
-                    put("to", fix.rewrittenTo)
-                }
-            }
-            fix.request
-        } else {
-            normalized
-        }
-        val bytes = BurpByteArray.byteArray(*cleaned.toByteArray(charset))
-
-        val hostMatch = parseHostHeader(cleaned)
-        val resolvedHost = host ?: hostMatch?.first
-
-        if (resolvedHost == null) {
-            return HttpRequest.httpRequest(bytes)
-        }
-
-        val hostHeaderPort = if (host == null) hostMatch?.second else null
-
-        // Modern web default: TLS:443 unless caller explicitly says otherwise
-        val effectivePort = port ?: hostHeaderPort ?: 443
-        val effectiveTls = useTls ?: (effectivePort != 80)
-
-        return HttpRequest.httpRequest(HttpService.httpService(resolvedHost, effectivePort, effectiveTls), bytes)
-    }
-
-    /**
-     * Builds a request from URL + headers as a complete raw HTTP request, preserving the
-     * caller's headers exactly. Bypasses Burp's default header injection (User-Agent,
-     * Accept, Accept-Language, etc.) which silently overrides caller-supplied values.
-     */
-    private fun buildFromUrlPreservingHeaders(
-        url: String,
-        method: String?,
-        headers: Map<String, String>,
-        body: String?,
-        hostOverride: String?,
-        portOverride: Int?,
-        tlsOverride: Boolean?
-    ): HttpRequest {
-        val (svcHost, svcPort, svcTls) = resolveService(url, hostOverride, portOverride, tlsOverride)
-        val rawHttp = constructRawHttpRequest(url, method ?: "GET", headers, body, svcHost, svcPort, svcTls)
-        val bytes = BurpByteArray.byteArray(*rawHttp.toByteArray(RequestHygiene.wireCharset(rawHttp)))
-        return HttpRequest.httpRequest(HttpService.httpService(svcHost, svcPort, svcTls), bytes)
-    }
-
-    /**
-     * Legacy/Burp-managed path: uses Montoya's [HttpRequest.httpRequestFromUrl] which adds
-     * Burp's default headers, then layers user headers on top via withHeader (replaces if
-     * present). Use this when [preserveHeaders] is false.
-     */
-    private fun buildFromUrlMontoya(
-        url: String,
-        method: String?,
-        headers: Map<String, String>?,
-        body: String?,
-        hostOverride: String?,
-        portOverride: Int?,
-        tlsOverride: Boolean?
-    ): HttpRequest {
-        var req = HttpRequest.httpRequestFromUrl(url)
-        if (method != null) req = req.withMethod(method)
-        if (body != null) req = req.withBody(body)
-        headers?.forEach { (n, v) -> req = req.withHeader(n, v) }
-        if (hostOverride != null || portOverride != null || tlsOverride != null) {
-            // Same resolution as the preserve-headers path, so an override means the same on both;
-            // Montoya's own URL parse supplies the host when java.net.URI cannot.
-            val montoyaHost = try { req.httpService()?.host() } catch (_: Exception) { null }
-            val (svcHost, svcPort, svcTls) = resolveService(url, hostOverride, portOverride, tlsOverride, montoyaHost)
-            req = req.withService(HttpService.httpService(svcHost, svcPort, svcTls))
-        }
-        return req
-    }
-
-    /**
-     * Resolves (host, port, tls) from a URL + optional overrides. Without a port override or an
-     * explicit port in the URL, the port is the default for the resolved TLS setting.
-     */
-    private fun resolveService(
-        url: String,
-        hostOverride: String?,
-        portOverride: Int?,
-        tlsOverride: Boolean?,
-        fallbackHost: String? = null
-    ): Triple<String, Int, Boolean> {
-        val uri = try { URI(url) } catch (_: Exception) { null }
-        val tls = tlsOverride ?: (uri?.scheme?.equals("https", ignoreCase = true) ?: url.startsWith("https"))
-        val host = hostOverride ?: uri?.host ?: fallbackHost
-            ?: throw IllegalArgumentException("Cannot extract host from URL: $url")
-        val port = portOverride ?: when {
-            uri != null && uri.port > 0 -> uri.port
-            tls -> 443
-            else -> 80
-        }
-        return Triple(host, port, tls)
-    }
-
-    // ---------------------------------------------------------------
-    // Timeout-bounded execution
-    // ---------------------------------------------------------------
-
-    private val httpExecutor = Executors.newCachedThreadPool { r ->
-        Thread(r, "raijin-http-${System.nanoTime()}").apply { isDaemon = true }
-    }
-
-    /** Shuts down internal HTTP timeout pool on extension unload. */
+    /** Shuts down the timeout pool on extension unload. */
     fun shutdown() {
-        httpExecutor.shutdownNow()
-    }
-
-    /** Thrown by [executeWithTimeout] on expiry, so callers can detect a timeout structurally
-     * instead of string-matching the exception message. */
-    private class HttpRequestTimeoutException(message: String) : RuntimeException(message)
-
-    /**
-     * Runs [action] on a daemon thread with a hard timeout. On timeout, cancels the
-     * future (Burp request continues in background but caller is unblocked) and throws.
-     * If [timeoutMs] is null or non-positive, runs synchronously without overhead.
-     */
-    private fun <T> executeWithTimeout(timeoutMs: Long?, action: () -> T): T {
-        if (timeoutMs == null || timeoutMs <= 0) return action()
-        val future = httpExecutor.submit(Callable { action() })
-        return try {
-            future.get(timeoutMs, TimeUnit.MILLISECONDS)
-        } catch (e: TimeoutException) {
-            future.cancel(true)
-            throw HttpRequestTimeoutException("Request timed out after ${timeoutMs}ms")
-        }
+        timeouts.shutdown()
     }
 
     // ---------------------------------------------------------------
     // Raw bytes request (byte-level control for smuggling)
     // ---------------------------------------------------------------
 
-    private val pipelineBridge = HttpPipelineBridge(api)
-
     /**
-     * Sends multiple raw requests over ONE socket and reads back multiple responses in order —
-     * see [HttpPipelineBridge] for why this cannot be done through Montoya's `api.http()`.
+     * Raijin's own raw-socket HTTP/1.1 pipelining (`http_send_pipeline`): several requests over one
+     * socket, several responses read back — see [HttpPipelineBridge] for why Montoya's `api.http()`
+     * cannot do this.
      */
-    fun sendPipeline(
-        host: String,
-        port: Int,
-        useTls: Boolean,
-        httpMode: String?,
-        requests: List<JsonObject>,
-        writeMode: String,
-        writePauseMs: Long,
-        maxResponses: Int?,
-        idleTimeoutMs: Long,
-        totalTimeoutMs: Long,
-        keepOpen: Boolean,
-        connectionId: String?,
-        maxResponseLength: Int?,
-    ): JsonObject = pipelineBridge.send(
-        host, port, useTls, httpMode, requests, writeMode, writePauseMs,
-        maxResponses, idleTimeoutMs, totalTimeoutMs, keepOpen, connectionId, maxResponseLength
-    )
+    val pipeline = HttpPipelineBridge(api)
 
     /**
      * Sends a raw byte-level HTTP request for HTTP request smuggling testing.
@@ -1276,12 +567,7 @@ class HttpBridge(
      * @param rawHex Hex-encoded raw bytes (e.g. "474554202f...").
      * @param rawString Request text; literal \r\n / \n escapes become real line breaks only when it
      *   has no real ones ([RequestHygiene.unescapeLineEndings]), sent in [RequestHygiene.wireCharset].
-     * @param host Target host.
-     * @param port Target port.
-     * @param useTls Whether to use TLS.
-     * @param httpMode HTTP mode string.
-     * @param maxBodyLength Optional response body truncation length.
-     * @return JSON object with serialized request/response.
+     * @param timeoutMs hard timeout; null or 0 waits for Burp.
      */
     fun sendRawBytes(
         rawHex: String?,
@@ -1304,20 +590,20 @@ class HttpBridge(
 
             val service = HttpService.httpService(host, port, useTls)
             val httpRequest = HttpRequest.httpRequest(service, BurpByteArray.byteArray(*bytes))
-            val mode = resolveHttpMode(httpMode)
+            val mode = HttpModes.resolve(httpMode)
 
             val targetUrl = try { httpRequest.url() } catch (_: Exception) { (if (useTls) "https" else "http") + "://$host:$port/" }
             val scope = scopeGate.check(targetUrl)
             scope.deny?.let { return it }
 
             val startTime = System.nanoTime()
-            val result = executeWithTimeout(timeoutMs) { api.http().sendRequest(httpRequest, mode) }
+            val result = timeouts.run(timeoutMs) { api.http().sendRequest(httpRequest, mode) }
             val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
 
-            addToSitemap(result, "[MCP] Raw bytes request via Raijin")
+            api.recordInSiteMap(result, "[MCP] Raw bytes request via Raijin")
             ToolCallTracker.recordSentResult(result)
 
-            withScopeWarning(serializeRequestResponse(result, elapsedMs, maxBodyLength), scope.warning)
+            withScopeWarning(HttpExchangeJson.serialize(result, elapsedMs, maxBodyLength), scope.warning)
         } catch (e: Exception) {
             buildJsonObject {
                 put("error", "Failed to send raw bytes: ${e.message}")
@@ -1327,18 +613,11 @@ class HttpBridge(
         }
     }
 
-    // ---------------------------------------------------------------
-    // Scope policy gate (operator-controlled; the agent cannot change it)
-    // ---------------------------------------------------------------
-
-    /** Shared, centralized scope gate used by EVERY outbound path in this bridge. */
-    private val scopeGate = ScopeGate(api)
-
     /** Returns [base] with a `scope_warning` field appended when [warning] is non-null. */
     private fun withScopeWarning(base: JsonObject, warning: String?): JsonObject =
         if (warning == null) base else JsonObject(base + ("scope_warning" to JsonPrimitive(warning)))
 
-    /** Merges in any out-of-band fields [buildRequest] recorded via its `fixReport` parameter
+    /** Merges in any out-of-band fields [HttpRequestBuilder.build] recorded via its `fixReport` parameter
      * (currently just `content_length_rewritten`), so a silent Content-Length rewrite is visible
      * to the caller instead of only being observable by diffing bytes on the wire. */
     private fun withFixReport(base: JsonObject, fixReport: Map<String, JsonElement>): JsonObject =
@@ -1353,102 +632,88 @@ class HttpBridge(
         else JsonObject(base + ("warnings" to JsonArray(warnings.map { JsonPrimitive(it) })))
 
     // ---------------------------------------------------------------
-    // Fuzzer (intruder-like payload injection)
+    // Fuzzer (Intruder-style payload injection)
     // ---------------------------------------------------------------
 
     /**
-     * Sends requests with payloads injected at marked positions (sniper mode: each payload at
-     * each position in turn), one at a time through Burp. Injection points, resolved by
-     * [HttpFuzzPlan.planRaw]:
-     * - `§` markers (or a custom [marker]) around values, like Burp Intruder. Example:
-     *   `GET /api?id=§1§ HTTP/1.1` with payloads `["1","2","3"]`. The markers of the inactive
-     *   positions are stripped.
-     * - The literal `FUZZ` keyword: every occurrence is replaced. No marker pairs needed.
-     * - Legacy [positions]: [start, end) offsets into [request] as given.
+     * Runs an Intruder-style attack ([HttpFuzzPlan.planAttack]) through Burp: sniper,
+     * battering_ram, pitchfork or cluster_bomb over the request's injection points (`§` marker
+     * pairs or a custom [marker], the `FUZZ` keyword, or [positions] offsets), payloads run through
+     * [encoders] before they are placed, every request with its Content-Length recomputed and sent
+     * as UTF-8. [HttpFuzzRunner] sends them (in order or several at a time, rate limited), applies
+     * the stop condition and response filter, and clusters every response.
      *
-     * Every request gets its Content-Length recomputed after substitution and is sent as UTF-8.
-     * [timeoutMs] bounds each request; one that times out or fails is reported in its own result
-     * entry and the run goes on.
+     * @param maxRequests cap on the requests the attack sends.
+     * @param timeoutMs hard timeout of each request; null or 0 waits for Burp. A request that fails
+     *   or times out is reported in its own entry and the run goes on.
      */
-    fun fuzz(
+    internal fun fuzz(
         request: String,
         host: String,
         port: Int,
         useTls: Boolean,
         positions: List<Pair<Int, Int>>?,
-        payloads: List<String>,
+        payloadSets: List<List<String>>,
+        marker: String?,
+        attackMode: HttpFuzzPlan.AttackMode,
+        encoders: List<String>,
+        maxRequests: Long,
         httpMode: String?,
         maxBodyLength: Int?,
-        marker: String?,
-        stopOnStatusCodes: List<Int>? = null,
-        stopOnBodyRegex: String? = null,
-        timeoutMs: Long? = null
+        timeoutMs: Long?,
+        runOptions: HttpFuzzRunner.Options,
     ): JsonObject {
-        if (stopOnBodyRegex != null) {
-            SafeRegex.validate(stopOnBodyRegex)?.let { return buildJsonObject { put("error", "Invalid stop_on_match.body_regex: $it") } }
+        runOptions.stopOnBodyRegex?.let { pattern ->
+            SafeRegex.validate(pattern)?.let { return buildJsonObject { put("error", "Invalid stop_on_match.body_regex: $it") } }
         }
         return try {
             val service = HttpService.httpService(host, port, useTls)
-            val mode = resolveHttpMode(httpMode)
+            val mode = HttpModes.resolve(httpMode)
             scopeGate.deny((if (useTls) "https" else "http") + "://$host:$port/")?.let { return it }
-            val results = mutableListOf<JsonObject>()
-
-            val plan = when (val p = HttpFuzzPlan.planRaw(request, positions, payloads, marker)) {
-                is HttpFuzzPlan.Result.Error -> return buildJsonObject { put("error", p.message) }
-                is HttpFuzzPlan.Result.Ok -> p
+            val encode = PayloadEncoders.chain(encoders)
+            val plan = when (val planned = HttpFuzzPlan.planAttack(request, positions, payloadSets, marker, attackMode, encode, maxRequests)) {
+                is HttpFuzzPlan.AttackResult.Error -> return buildJsonObject { put("error", planned.message) }
+                is HttpFuzzPlan.AttackResult.Ok -> planned.plan
             }
-
-            var stoppedEarly = false
-            var failed = 0
-            for (planned in plan.requests) {
-                val httpRequest = HttpRequest.httpRequest(service, BurpByteArray.byteArray(*planned.request.toByteArray(Charsets.UTF_8)))
-                val startTime = System.nanoTime()
-                val result = try {
-                    executeWithTimeout(timeoutMs) { api.http().sendRequest(httpRequest, mode) }
-                } catch (e: Exception) {
-                    failed++
-                    results.add(buildJsonObject {
-                        put("payload", planned.payload)
-                        put("position", planned.position)
-                        put("error", e.message ?: "send failed")
-                        put("is_timeout", e is HttpRequestTimeoutException)
-                    })
-                    continue
-                }
-                val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
-                addToSitemap(result, "[MCP] Fuzz ${plan.mode} pos=${planned.position} payload=${planned.payload}")
-
-                val serialized = serializeRequestResponse(result, elapsedMs, maxBodyLength)
-                results.add(buildJsonObject {
-                    put("payload", planned.payload)
-                    put("position", planned.position)
-                    serialized.forEach { (k, v) -> put(k, v) }
-                })
-
-                if (result.hasResponse()) {
-                    val statusCode = result.response().statusCode().toInt()
-                    val statusMatch = stopOnStatusCodes != null && statusCode in stopOnStatusCodes
-                    val bodyMatch = stopOnBodyRegex != null && SafeRegex.find(stopOnBodyRegex, result.response().bodyToString()) != null
-                    if (statusMatch || bodyMatch) {
-                        stoppedEarly = true
-                        break
-                    }
-                }
-            }
-
-            buildJsonObject {
-                put("total_requests", results.size)
-                put("payloads_count", payloads.size)
-                put("mode", plan.mode)
-                put("stopped_early", stoppedEarly)
-                if (failed > 0) put("failed_requests", failed)
-                put("results", buildJsonArray { results.forEach { add(it) } })
-            }
+            val runner = HttpFuzzRunner { attack -> sendFuzzRequest(attack, service, mode, plan.mode, maxBodyLength, timeoutMs) }
+            runner.run(plan, runOptions)
         } catch (e: Exception) {
-            buildJsonObject {
-                put("error", "Fuzz failed: ${e.message}")
-            }
+            buildJsonObject { put("error", "Fuzz failed: ${e.message}") }
         }
+    }
+
+    private fun sendFuzzRequest(
+        attack: HttpFuzzPlan.AttackRequest,
+        service: HttpService,
+        mode: HttpMode,
+        attackMode: HttpFuzzPlan.AttackMode,
+        maxBodyLength: Int?,
+        timeoutMs: Long?,
+    ): HttpFuzzRunner.Sent {
+        val httpRequest = HttpRequest.httpRequest(service, BurpByteArray.byteArray(*attack.request.toByteArray(Charsets.UTF_8)))
+        val start = System.nanoTime()
+        val result = try {
+            timeouts.run(timeoutMs) { api.http().sendRequest(httpRequest, mode) }
+        } catch (e: Exception) {
+            return HttpFuzzRunner.Sent.Failed(e.message ?: "send failed", e is HttpRequestTimeoutException)
+        }
+        val elapsedMs = (System.nanoTime() - start) / 1_000_000
+        api.recordInSiteMap(result, "[MCP] Fuzz ${attackMode.id} pos=${attack.position} payload=${attack.label}")
+        val response: HttpResponse? = if (result.hasResponse()) result.response() else null
+        val head = response?.let { r ->
+            buildString {
+                append(r.httpVersion()).append(' ').append(r.statusCode().toInt()).append(' ').append(r.reasonPhrase() ?: "")
+                r.headers().forEach { append("\r\n").append(it.name()).append(": ").append(it.value()) }
+            }
+        } ?: ""
+        return HttpFuzzRunner.Sent.Answered(
+            status = response?.statusCode()?.toInt() ?: 0,
+            bodyLength = response?.body()?.length() ?: 0,
+            head = head,
+            body = response?.bodyToString() ?: "",
+            elapsedMs = elapsedMs,
+            json = { HttpExchangeJson.serialize(result, elapsedMs, maxBodyLength) },
+        )
     }
 
     // ---------------------------------------------------------------
@@ -1456,364 +721,31 @@ class HttpBridge(
     // ---------------------------------------------------------------
 
     /**
-     * Race condition tester: dispatches N requests concurrently via Burp's parallel
-     * request engine ([burp.api.montoya.http.Http.sendRequests]) and analyzes the
-     * responses for variations (status codes, body lengths) that indicate the server
-     * handles concurrent requests inconsistently.
-     *
-     * NOTE: This is best-effort concurrency, NOT guaranteed single-packet / last-byte
-     * synchronization. Requests are built up front and handed to Burp's parallel sender
-     * in one batch; Burp dispatches them as concurrently as the engine and transport
-     * allow. There is no microsecond-level last-byte gate — use this to surface likely
-     * race conditions, not to guarantee a precise arrival window.
-     *
-     * @param request Base HTTP request string (use FUZZ for varied payloads)
-     * @param host Target host
-     * @param port Target port
-     * @param useTls Use TLS
-     * @param count Number of concurrent requests (default 10). IGNORED when [payloads]
-     *   is non-empty — in that case one request is built per payload and [payloads]
-     *   takes precedence.
-     * @param payloads Optional: if provided, each request gets a different payload
-     *   replacing the FUZZ keyword, and the request count equals payloads.size.
-     * @param httpMode HTTP mode
-     * @param maxBodyLength Response truncation
-     * @param gateDelay Milliseconds to sleep immediately before dispatching the batch
-     *   (a simple pre-dispatch gate). 0 or negative dispatches immediately (default 100).
-     * @param timeoutMs Hard timeout for the whole batch.
+     * Releases [count] copies of [request] (or one request per payload, `FUZZ` replaced) at once
+     * behind a real synchronisation barrier ([HttpRace]): an HTTP/2 single-packet attack through
+     * Burp, or HTTP/1.1 last-byte synchronisation on Raijin's own connections. Responses are
+     * clustered (status, length, body similarity) to show whether the race changed the outcome.
      */
-    fun raceCondition(
+    internal fun raceCondition(
         request: String,
         host: String,
         port: Int,
         useTls: Boolean,
         count: Int,
         payloads: List<String>?,
+        sync: HttpRace.Sync,
         httpMode: String?,
+        sni: String?,
         maxBodyLength: Int?,
-        gateDelay: Long,
-        timeoutMs: Long? = null
-    ): JsonObject {
-        return try {
-            val service = HttpService.httpService(host, port, useTls)
-            val mode = resolveHttpMode(httpMode)
-            scopeGate.deny((if (useTls) "https" else "http") + "://$host:$port/")?.let { return it }
-
-            // Content-Length is recomputed after FUZZ substitution; requests go out as UTF-8.
-            val requests = HttpFuzzPlan.raceRequests(request, count, payloads).map { text ->
-                HttpRequest.httpRequest(service, BurpByteArray.byteArray(*text.toByteArray(Charsets.UTF_8)))
-            }
-
-            // Optional pre-dispatch gate: sleep gateDelay ms before releasing the batch.
-            if (gateDelay > 0) {
-                try { Thread.sleep(gateDelay) } catch (_: InterruptedException) { Thread.currentThread().interrupt() }
-            }
-
-            // Send all requests in parallel using Burp's parallel sender (best-effort
-            // concurrency — see kdoc; this is NOT guaranteed single-packet sync).
-            val startTime = System.nanoTime()
-            val responses = executeWithTimeout(timeoutMs) { api.http().sendRequests(requests, mode) }
-            val totalElapsedMs = (System.nanoTime() - startTime) / 1_000_000
-
-            // Analyze results for race condition indicators
-            val statusCodes = mutableMapOf<Int, Int>()
-            val bodyLengths = mutableMapOf<Int, Int>()
-            val resultsList = mutableListOf<JsonObject>()
-
-            responses.forEachIndexed { index, result ->
-                addToSitemap(result, "[MCP] Race request #$index via Raijin")
-                val statusCode = try { result.response()?.statusCode()?.toInt() ?: 0 } catch (_: Throwable) { 0 }
-                val bodyLen = try { result.response()?.body()?.length() ?: 0 } catch (_: Throwable) { 0 }
-
-                statusCodes[statusCode] = (statusCodes[statusCode] ?: 0) + 1
-                bodyLengths[bodyLen] = (bodyLengths[bodyLen] ?: 0) + 1
-
-                val serialized = serializeRequestResponse(result, null, maxBodyLength)
-                resultsList.add(buildJsonObject {
-                    put("index", index)
-                    if (payloads != null && index < payloads.size) put("payload", payloads[index])
-                    serialized.forEach { (k, v) -> put(k, v) }
-                })
-            }
-
-            // Race condition analysis
-            val hasStatusVariation = statusCodes.size > 1
-            val hasLengthVariation = bodyLengths.size > 1
-            val raceDetected = hasStatusVariation || hasLengthVariation
-
-            buildJsonObject {
-                put("total_requests", requests.size)
-                put("total_elapsed_ms", totalElapsedMs)
-                put("avg_ms_per_request", if (requests.isNotEmpty()) totalElapsedMs / requests.size else 0)
-
-                put("analysis", buildJsonObject {
-                    put("race_condition_likely", raceDetected)
-                    put("status_code_distribution", buildJsonObject {
-                        statusCodes.forEach { (code, count) -> put(code.toString(), count) }
-                    })
-                    put("body_length_distribution", buildJsonObject {
-                        bodyLengths.forEach { (len, count) -> put(len.toString(), count) }
-                    })
-                    put("status_variation", hasStatusVariation)
-                    put("length_variation", hasLengthVariation)
-                    if (raceDetected) {
-                        put("note", "Response variations detected — possible race condition. Different status codes or body lengths across identical simultaneous requests suggest the server handles concurrent requests inconsistently.")
-                    }
-                })
-
-                put("results", buildJsonArray { resultsList.forEach { add(it) } })
-            }
-        } catch (e: Exception) {
-            buildJsonObject {
-                put("error", "Race condition test failed: ${e.message}")
-                put("is_timeout", e is HttpRequestTimeoutException)
-            }
-        }
-    }
-
-    /**
-     * Resolves an HTTP mode string to an [HttpMode] enum value.
-     */
-    private fun resolveHttpMode(mode: String?): HttpMode {
-        return when (mode?.uppercase()) {
-            "HTTP_1" -> HttpMode.HTTP_1
-            "HTTP_2" -> HttpMode.HTTP_2
-            "HTTP_2_IGNORE_ALPN" -> HttpMode.HTTP_2_IGNORE_ALPN
-            else -> HttpMode.AUTO
-        }
-    }
-
-    // ---------------------------------------------------------------
-    // Variable substitution for request chains
-    // ---------------------------------------------------------------
-
-    /**
-     * Recursively substitutes `{{variable}}` placeholders in all string values
-     * within a JSON object.
-     */
-    private fun substituteVariables(obj: JsonObject, variables: Map<String, String>): JsonObject {
-        return buildJsonObject {
-            obj.forEach { (key, value) ->
-                put(key, substituteInElement(value, variables))
-            }
-        }
-    }
-
-    private fun substituteInElement(element: JsonElement, variables: Map<String, String>): JsonElement {
-        return when (element) {
-            is JsonPrimitive -> {
-                if (element.isString) {
-                    var result = element.content
-                    variables.forEach { (varName, varValue) ->
-                        result = result.replace("{{$varName}}", varValue)
-                    }
-                    JsonPrimitive(result)
-                } else {
-                    element
-                }
-            }
-            is JsonObject -> buildJsonObject {
-                element.forEach { (key, value) ->
-                    put(key, substituteInElement(value, variables))
-                }
-            }
-            is JsonArray -> buildJsonArray {
-                element.forEach { add(substituteInElement(it, variables)) }
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------
-    // Response serialization
-    // ---------------------------------------------------------------
-
-    /**
-     * Serializes an [HttpRequestResponse] to a [JsonObject]. Bodies go through [BodyText.render]
-     * (binary placeholder, lone surrogates replaced, truncation on a safe boundary).
-     *
-     * @param result The request/response pair to serialize.
-     * @param elapsedMs Optional elapsed time in milliseconds.
-     * @param maxBodyLength Optional maximum response body length in characters; null or <= 0 uses
-     *                      [BodyText.DEFAULT_MAX_LENGTH]. The request body always uses that default.
-     */
-    fun serializeRequestResponse(result: HttpRequestResponse, elapsedMs: Long?, maxBodyLength: Int? = null): JsonObject {
-        return buildJsonObject {
-            put("has_response", result.hasResponse())
-            put("url", result.url() ?: "")
-
-            // Request info
-            try {
-                val req = result.request()
-                if (req != null) {
-                    put("request_method", req.method())
-                    put("request_url", req.url())
-                    put("request_host", req.httpService().host())
-                    put("request_port", req.httpService().port())
-                    put("request_secure", req.httpService().secure())
-                    put("request_headers", buildJsonArray {
-                        req.headers().forEach { h ->
-                            add(buildJsonObject {
-                                put("name", h.name())
-                                put("value", h.value())
-                            })
-                        }
-                    })
-                    val requestBody = BodyText.render(req.bodyToString())
-                    put("request_body", requestBody.text)
-                    if (requestBody.binary) put("request_body_binary", true)
-                    if (requestBody.truncated) put("request_body_truncated", true)
-                }
-            } catch (e: Exception) {
-                put("request_serialize_error", e.message ?: "failed to serialize request")
-            }
-
-            // Response info
-            if (result.hasResponse()) {
-                try {
-                    val resp = result.response()
-                    put("status_code", resp.statusCode().toInt())
-                    put("response_http_version", resp.httpVersion())
-                    put("response_reason", resp.reasonPhrase() ?: "")
-                    put("response_mime_type", resp.mimeType().name)
-                    put("response_body_length", resp.body().length())
-                    put("response_headers", buildJsonArray {
-                        resp.headers().forEach { h ->
-                            add(buildJsonObject {
-                                put("name", h.name())
-                                put("value", h.value())
-                            })
-                        }
-                    })
-                    val bodyStr = resp.bodyToString()
-                    val rendered = BodyText.render(bodyStr, maxBodyLength, resp.mimeType().name)
-                    put("response_body", rendered.text)
-                    if (rendered.binary) put("response_body_binary", true)
-                    if (rendered.truncated) put("response_body_truncated", true)
-
-                    // Cookies
-                    val cookies = resp.cookies()
-                    if (cookies.isNotEmpty()) {
-                        put("response_cookies", buildJsonArray {
-                            cookies.forEach { c ->
-                                add(buildJsonObject {
-                                    put("name", c.name())
-                                    put("value", c.value())
-                                    put("domain", c.domain())
-                                    put("path", c.path())
-                                })
-                            }
-                        })
-                    }
-                } catch (e: Exception) {
-                    put("response_serialize_error", e.message ?: "failed to serialize response")
-                }
-            }
-
-            // Timing
-            if (elapsedMs != null) {
-                put("elapsed_ms", elapsedMs)
-            }
-
-            try {
-                val timingOpt = result.timingData()
-                if (timingOpt.isPresent) {
-                    val td = timingOpt.get()
-                    put("timing", buildJsonObject {
-                        put("time_to_first_byte_ms", td.timeBetweenRequestSentAndStartOfResponse().toMillis())
-                        put("time_to_complete_ms", td.timeBetweenRequestSentAndEndOfResponse().toMillis())
-                        put("time_request_sent", td.timeRequestSent().toString())
-                    })
-                }
-            } catch (_: Exception) { }
-        }
-    }
+        timeoutMs: Long?,
+        similarity: Double,
+    ): JsonObject = race.run(
+        HttpFuzzPlan.raceRequests(request, count, payloads),
+        payloads?.takeIf { it.isNotEmpty() },
+        host, port, useTls, sync, HttpModes.resolve(httpMode), sni, maxBodyLength, timeoutMs, similarity,
+    )
 
     companion object {
-        private val HEADER_BLOCK_END = Regex("\\r?\\n\\r?\\n")
-
-        /**
-         * Constructs a complete raw HTTP/1.1 request from structured parameters.
-         * Exactly preserves caller headers; auto-adds Host and Content-Length only if missing.
-         */
-        internal fun constructRawHttpRequest(
-            url: String,
-            method: String,
-            headers: Map<String, String>,
-            body: String?,
-            host: String,
-            port: Int,
-            tls: Boolean
-        ): String {
-            val uri = try { URI(url) } catch (_: Exception) { null }
-            val pathPart = uri?.rawPath?.ifEmpty { "/" } ?: "/"
-            val queryPart = uri?.rawQuery?.let { "?$it" } ?: ""
-            val requestTarget = "$pathPart$queryPart"
-
-            val isDefaultPort = (tls && port == 443) || (!tls && port == 80)
-            // A bare IPv6 literal (host override "::1") gets its brackets back for the Host header.
-            val hostLiteral = if (host.contains(':') && !host.startsWith("[")) "[$host]" else host
-            val hostHeader = if (isDefaultPort) hostLiteral else "$hostLiteral:$port"
-
-            val sb = StringBuilder()
-            sb.append("$method $requestTarget HTTP/1.1\r\n")
-
-            val hasHost = headers.keys.any { it.equals("Host", ignoreCase = true) }
-            if (!hasHost) sb.append("Host: $hostHeader\r\n")
-
-            headers.forEach { (k, v) -> sb.append("$k: $v\r\n") }
-
-            val hasContentLength = headers.keys.any { it.equals("Content-Length", ignoreCase = true) }
-            val hasTransferEncoding = headers.keys.any { it.equals("Transfer-Encoding", ignoreCase = true) }
-            if (body != null && !hasContentLength && !hasTransferEncoding) {
-                // Counted in the charset the whole request is sent with: a wide char anywhere (even in
-                // a header) sends the body's Latin-1 chars as two UTF-8 bytes each.
-                val charset = if (RequestHygiene.wireCharset(sb) == Charsets.UTF_8) Charsets.UTF_8 else RequestHygiene.wireCharset(body)
-                sb.append("Content-Length: ${body.toByteArray(charset).size}\r\n")
-            }
-
-            sb.append("\r\n")
-            if (body != null) sb.append(body)
-
-            return sb.toString()
-        }
-
-        /**
-         * Host and port named by the first `Host` header of [raw]'s header block, never read past
-         * the blank line (a smuggled request's Host in the body is not the target) nor across a
-         * line break. Handles `example.com:8080`, `[::1]:8443` and a bare IPv6 literal; a
-         * missing or invalid port is null.
-         */
-        internal fun parseHostHeader(raw: String): Pair<String, Int?>? {
-            val headerEnd = HEADER_BLOCK_END.find(raw)?.range?.first ?: raw.length
-            for (rawLine in raw.substring(0, headerEnd).split('\n')) {
-                val line = rawLine.removeSuffix("\r")
-                val colon = line.indexOf(':')
-                if (colon <= 0 || !line.substring(0, colon).equals("Host", ignoreCase = true)) continue
-                return parseHostValue(line.substring(colon + 1).trim())
-            }
-            return null
-        }
-
-        private fun parseHostValue(value: String): Pair<String, Int?>? {
-            if (value.isEmpty() || value.any { it.isWhitespace() }) return null
-            if (value.startsWith("[")) {
-                val close = value.indexOf(']')
-                if (close <= 1) return null
-                val port = value.substring(close + 1).takeIf { it.startsWith(":") }?.let { parsePort(it.substring(1)) }
-                return value.substring(1, close) to port
-            }
-            val colon = value.indexOf(':')
-            return when {
-                colon < 0 -> value to null
-                value.indexOf(':', colon + 1) >= 0 -> value to null // bare IPv6 literal: every colon is the address's
-                colon == 0 -> null
-                else -> value.substring(0, colon) to parsePort(value.substring(colon + 1))
-            }
-        }
-
-        private fun parsePort(s: String): Int? =
-            s.takeIf { it.isNotEmpty() && it.all { c -> c in '0'..'9' } }?.toIntOrNull()?.takeIf { it in 1..65535 }
-
         /**
          * Whether [rule]'s tool filter admits traffic from [toolName]. An internal probe only takes
          * rules whose filter explicitly names its tool (EXTENSIONS): an unfiltered rule is meant for

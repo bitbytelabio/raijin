@@ -1,73 +1,310 @@
 package io.bitbytelab.raijin.bridge
 
 import io.bitbytelab.raijin.safety.RequestHygiene
+import kotlin.math.min
 
 /**
- * Pure, Montoya-free planning logic for [HttpBridge.fuzz].
+ * Pure, Montoya-free planning logic for [HttpBridge.fuzz] and [HttpBridge.raceCondition]: where a
+ * request's injection points are (FUZZ keyword, marker pairs, offset positions) and which requests
+ * a Burp Intruder attack type sends for the payload sets it is given.
  *
- * Extracted so the injection-point resolution (FUZZ keyword, marker pairs, legacy
- * offset positions) and its validation can be unit-tested without a live Burp API.
- *
- * Fixes three defects that lived in the inline fuzz body:
- *  1. Custom multi-character markers were detected with a first-character-only heuristic
- *     (`count { it == marker[0] }`), so a marker like `[[` or `MARK` could silently fail
- *     to register any injection points (no-op).
- *  2. Reversed / out-of-bounds offset pairs (`start > end`, negatives, past end-of-string)
- *     produced corrupted requests or threw StringIndexOutOfBoundsException. They are now
- *     validated up front and rejected with an actionable message.
- *  3. Astral / multi-byte payloads: planning stays at the String level and the caller
- *     (HttpBridge) encodes the final request with an explicit UTF-8 charset so surrogate
- *     pairs survive — the old path handed the String straight to Montoya's String overload.
- *     [planRaw] / [raceRequests] recompute Content-Length for those UTF-8 bytes after
- *     substitution, so a payload that changes the body length still gets a matching header.
+ * Planning stays at the String level and the caller sends each request as UTF-8, so astral and
+ * multi-byte payloads survive; every planned request gets its Content-Length recomputed for those
+ * bytes ([withContentLength]).
  */
 internal object HttpFuzzPlan {
 
-    /** A single request to send: the fully-substituted request text plus reporting metadata. */
-    data class PlannedRequest(val request: String, val payload: String, val position: Int)
+    private const val FUZZ_KEYWORD = "FUZZ"
 
-    /** Result of planning: either a list of requests to send (with the mode label) or an error. */
-    sealed class Result {
-        data class Ok(val mode: String, val requests: List<PlannedRequest>) : Result()
-        data class Error(val message: String) : Result()
+    const val KEYWORD_POSITIONS = "fuzz_keyword"
+    const val MARKER_POSITIONS = "marker_pairs"
+    const val OFFSET_POSITIONS = "offset"
+
+    /** Burp Intruder's attack types. */
+    enum class AttackMode(val id: String) {
+        /** One payload set; each position in turn takes every payload while the others keep their value. */
+        SNIPER("sniper"),
+
+        /** One payload set; every position takes the same payload. */
+        BATTERING_RAM("battering_ram"),
+
+        /** One payload set per position, walked in step: request n uses the n-th payload of each set. */
+        PITCHFORK("pitchfork"),
+
+        /** One payload set per position; every combination is sent. */
+        CLUSTER_BOMB("cluster_bomb");
+
+        companion object {
+            val ids: List<String> = entries.map { it.id }
+
+            fun of(id: String?): AttackMode? = entries.firstOrNull { it.id.equals(id?.trim(), ignoreCase = true) }
+        }
     }
 
     /**
-     * [plan] for a request exactly as the caller typed it, producing ready-to-send text: the
-     * header block's line endings are canonicalized ([RequestHygiene.normalizeCrlf]), legacy
-     * offset [positions] (which index the text as typed) are moved onto the normalized request,
-     * and every substituted request gets an unambiguous Content-Length recomputed ([withContentLength]).
+     * A request cut at its injection points: `literals[0] + value + literals[1] + ... + literals[n]`.
+     * Slot i is the i-th injection point in text order and `positionOf[i]` the caller's number for
+     * it (the two differ only for offset positions given out of order).
+     *
+     * @param positionMode how the injection points were given: [KEYWORD_POSITIONS], [MARKER_POSITIONS] or [OFFSET_POSITIONS].
+     * @param baseValues what each position holds while another one is fuzzed.
      */
-    fun planRaw(
+    class Template(
+        val positionMode: String,
+        private val literals: List<String>,
+        private val positionOf: List<Int>,
+        val baseValues: List<String>,
+    ) {
+        val positions: Int get() = baseValues.size
+
+        /** The request with `values[p]` at position p. */
+        fun render(values: List<String>): String = buildString {
+            for (slot in positionOf.indices) {
+                append(literals[slot])
+                append(values[positionOf[slot]])
+            }
+            append(literals.last())
+        }
+    }
+
+    /**
+     * One request to send.
+     *
+     * @param request the request text, payloads placed and Content-Length recomputed.
+     * @param payloads the payload placed at each position as the caller gave it (before encoding);
+     *   null where the position kept its own value.
+     * @param position the position being fuzzed in a sniper attack over markers or offsets; 0 for
+     *   the FUZZ keyword (every occurrence is replaced) and -1 when every position takes a payload.
+     */
+    class AttackRequest(val request: String, val payloads: List<String?>, val position: Int) {
+        /** The payloads of this request as one line, for reports. */
+        val label: String get() = payloads.filterNotNull().distinct().joinToString(" | ")
+    }
+
+    /**
+     * @param total requests the attack type defines for these payload sets.
+     * @param planned requests that will be produced: [total], capped.
+     * @param notes what was adjusted on the way (payload sets reused or ignored, the cap).
+     * @param requests the requests in the order Intruder sends them, produced on demand.
+     */
+    class AttackPlan(
+        val mode: AttackMode,
+        val positionMode: String,
+        val positions: Int,
+        val total: Long,
+        val planned: Long,
+        val notes: List<String>,
+        val requests: Sequence<AttackRequest>,
+    )
+
+    sealed class AttackResult {
+        class Ok(val plan: AttackPlan) : AttackResult()
+        class Error(val message: String) : AttackResult()
+    }
+
+    private sealed class Resolved {
+        class Ok(val template: Template) : Resolved()
+        class Error(val message: String) : Resolved()
+    }
+
+    /**
+     * Plans an attack on a request exactly as the caller typed it: the header block's line endings
+     * are canonicalized ([RequestHygiene.normalizeCrlf]) and legacy offset [positions] (which index
+     * the text as typed) are moved onto the normalized request.
+     *
+     * Injection points, in this order of precedence: every `FUZZ` keyword, `marker…marker` pairs
+     * (default marker `§`), then [positions] as [start, end) offsets. Payload set i belongs to
+     * position i; sniper and battering ram use the first set only, and with fewer sets than
+     * positions the last set is reused. A sniper attack over the FUZZ keyword replaces every
+     * occurrence at once, as this tool always did.
+     *
+     * @param encode applied to each payload before it is placed.
+     * @param maxRequests cap on the requests produced.
+     */
+    fun planAttack(
         rawRequest: String,
         positions: List<Pair<Int, Int>>?,
-        payloads: List<String>,
-        marker: String?
-    ): Result {
+        payloadSets: List<List<String>>,
+        marker: String?,
+        mode: AttackMode = AttackMode.SNIPER,
+        encode: (String) -> String = { it },
+        maxRequests: Long = Long.MAX_VALUE,
+    ): AttackResult {
+        if (payloadSets.isEmpty() || payloadSets.any { it.isEmpty() }) {
+            return AttackResult.Error("Every payload set needs at least one payload.")
+        }
         val normalized = RequestHygiene.normalizeCrlf(rawRequest)
         var mapped = positions
         if (!positions.isNullOrEmpty() && normalized != rawRequest) {
             // Offset mode validates against the text as typed, so errors quote the caller's numbers.
-            val offsetMode = !normalized.contains("FUZZ") && countOccurrences(normalized, effectiveMarker(marker)) == 0
-            if (offsetMode) validatePositions(positions, rawRequest.length)?.let { return Result.Error(it) }
+            val offsetMode = !normalized.contains(FUZZ_KEYWORD) && countOccurrences(normalized, effectiveMarker(marker)) == 0
+            if (offsetMode) validatePositions(positions, rawRequest.length)?.let { return AttackResult.Error(it) }
             mapped = positions.map { (start, end) ->
                 RequestHygiene.adjustedOffset(rawRequest, start) to RequestHygiene.adjustedOffset(rawRequest, end)
             }
         }
-        return when (val planned = plan(normalized, mapped, payloads, marker)) {
-            is Result.Error -> planned
-            is Result.Ok -> Result.Ok(planned.mode, planned.requests.map { it.copy(request = withContentLength(it.request)) })
+        val template = when (val resolved = resolve(normalized, mapped, marker)) {
+            is Resolved.Error -> return AttackResult.Error(resolved.message)
+            is Resolved.Ok -> resolved.template
+        }
+
+        val count = template.positions
+        val notes = ArrayList<String>()
+        val multiSet = mode == AttackMode.PITCHFORK || mode == AttackMode.CLUSTER_BOMB
+        if (!multiSet && payloadSets.size > 1) {
+            notes += "${mode.id} uses one payload set: the first of ${payloadSets.size} was used."
+        }
+        if (multiSet && payloadSets.size < count) {
+            notes += "${payloadSets.size} payload set(s) for $count positions: positions ${payloadSets.size + 1}-$count reuse set ${payloadSets.size}."
+        }
+        if (multiSet && payloadSets.size > count) {
+            notes += "${payloadSets.size} payload sets for $count position(s): sets ${count + 1}-${payloadSets.size} were not used."
+        }
+        val first = payloadSets[0]
+        val perPosition = List(count) { payloadSets[min(it, payloadSets.lastIndex)] }
+        fun everywhere(payload: String, position: Int): AttackRequest {
+            val encoded = encode(payload)
+            return AttackRequest(withContentLength(template.render(List(count) { encoded })), List(count) { payload }, position)
+        }
+        fun combination(raw: List<String>): AttackRequest =
+            AttackRequest(withContentLength(template.render(raw.map(encode))), raw, -1)
+
+        val total: Long
+        val requests: Sequence<AttackRequest>
+        when (mode) {
+            AttackMode.SNIPER -> if (template.positionMode == KEYWORD_POSITIONS) {
+                total = first.size.toLong()
+                requests = first.asSequence().map { everywhere(it, 0) }
+            } else {
+                total = count.toLong() * first.size
+                requests = sequence {
+                    for (position in 0 until count) {
+                        for (payload in first) {
+                            val values = template.baseValues.toMutableList()
+                            values[position] = encode(payload)
+                            val placed = MutableList<String?>(count) { null }
+                            placed[position] = payload
+                            yield(AttackRequest(withContentLength(template.render(values)), placed, position))
+                        }
+                    }
+                }
+            }
+            AttackMode.BATTERING_RAM -> {
+                total = first.size.toLong()
+                requests = first.asSequence().map { everywhere(it, -1) }
+            }
+            AttackMode.PITCHFORK -> {
+                val steps = perPosition.minOf { it.size }
+                total = steps.toLong()
+                requests = (0 until steps).asSequence().map { step -> combination(perPosition.map { it[step] }) }
+            }
+            AttackMode.CLUSTER_BOMB -> {
+                total = perPosition.fold(1L) { product, set -> saturatedProduct(product, set.size.toLong()) }
+                requests = sequence {
+                    // Position 0 turns fastest, the last position slowest, as in Intruder.
+                    val odometer = IntArray(count)
+                    while (true) {
+                        yield(combination(List(count) { perPosition[it][odometer[it]] }))
+                        var wheel = 0
+                        while (wheel < count) {
+                            odometer[wheel]++
+                            if (odometer[wheel] < perPosition[wheel].size) break
+                            odometer[wheel] = 0
+                            wheel++
+                        }
+                        if (wheel == count) break
+                    }
+                }
+            }
+        }
+
+        val planned = min(total, maxRequests.coerceAtLeast(1))
+        if (planned < total) notes += "The attack defines $total requests; only the first $planned are sent (max_requests)."
+        val capped = if (planned < total) requests.take(planned.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()) else requests
+        return AttackResult.Ok(AttackPlan(mode, template.positionMode, count, total, planned, notes, capped))
+    }
+
+    /** `a * b` without overflow: [Long.MAX_VALUE] once the product no longer fits. */
+    private fun saturatedProduct(a: Long, b: Long): Long =
+        if (a != 0L && b > Long.MAX_VALUE / a) Long.MAX_VALUE else a * b
+
+    /** Finds the injection points of [baseRequest] (already CRLF-normalized, offsets mapped onto it). */
+    private fun resolve(baseRequest: String, positions: List<Pair<Int, Int>>?, marker: String?): Resolved {
+        val effectiveMarker = effectiveMarker(marker)
+        val hasFuzzKeyword = baseRequest.contains(FUZZ_KEYWORD)
+        val markerCount = countOccurrences(baseRequest, effectiveMarker)
+        if (!hasFuzzKeyword && markerCount > 0 && markerCount % 2 != 0) {
+            return Resolved.Error(
+                "Odd number ($markerCount) of '$effectiveMarker' markers; every injection point needs a closing marker " +
+                    "(e.g. ${effectiveMarker}value${effectiveMarker})."
+            )
+        }
+        val hasMarkerPairs = markerCount >= 2
+
+        return when {
+            // Every occurrence of the FUZZ keyword is an injection point.
+            hasFuzzKeyword && !hasMarkerPairs -> {
+                val literals = baseRequest.split(FUZZ_KEYWORD)
+                val points = literals.size - 1
+                Resolved.Ok(Template(KEYWORD_POSITIONS, literals, List(points) { it }, List(points) { "" }))
+            }
+
+            // marker…marker pairs: the text between the markers is the position's own value.
+            hasMarkerPairs -> {
+                if (markerCount % 2 != 0) {
+                    return Resolved.Error(
+                        "Odd number ($markerCount) of '$effectiveMarker' markers; every injection point needs a closing marker."
+                    )
+                }
+                val pairs = findMarkerPairs(baseRequest, effectiveMarker)
+                if (pairs.isEmpty()) {
+                    return Resolved.Error(
+                        "Found marker '$effectiveMarker' but could not pair it into injection points. " +
+                            "Wrap each value with an opening and closing marker, e.g. ${effectiveMarker}value${effectiveMarker}."
+                    )
+                }
+                val literals = ArrayList<String>(pairs.size + 1)
+                val values = ArrayList<String>(pairs.size)
+                var cursor = 0
+                for ((start, end) in pairs) {
+                    literals += baseRequest.substring(cursor, start)
+                    values += baseRequest.substring(start + effectiveMarker.length, end - effectiveMarker.length)
+                    cursor = end
+                }
+                literals += baseRequest.substring(cursor)
+                Resolved.Ok(Template(MARKER_POSITIONS, literals, List(pairs.size) { it }, values))
+            }
+
+            // Legacy [start, end) offsets.
+            !positions.isNullOrEmpty() -> {
+                validatePositions(positions, baseRequest.length)?.let { return Resolved.Error(it) }
+                val inTextOrder = positions.withIndex().sortedBy { it.value.first }
+                val literals = ArrayList<String>(positions.size + 1)
+                val values = MutableList(positions.size) { "" }
+                var cursor = 0
+                for ((position, range) in inTextOrder) {
+                    literals += baseRequest.substring(cursor, range.first)
+                    values[position] = baseRequest.substring(range.first, range.second)
+                    cursor = range.second
+                }
+                literals += baseRequest.substring(cursor)
+                Resolved.Ok(Template(OFFSET_POSITIONS, literals, inTextOrder.map { it.index }, values))
+            }
+
+            else -> Resolved.Error(
+                "No injection points found. Use FUZZ keyword, ${effectiveMarker}marker${effectiveMarker} pairs, or a positions array."
+            )
         }
     }
 
     /**
      * Request texts for one `http_race` batch: one per payload with every `FUZZ` replaced when
      * [payloads] is non-empty (it wins over [count]), else [count] copies of the request. Line
-     * endings and Content-Length are handled as in [planRaw].
+     * endings and Content-Length are handled as in [planAttack].
      */
     fun raceRequests(rawRequest: String, count: Int, payloads: List<String>?): List<String> {
         val base = RequestHygiene.normalizeCrlf(rawRequest)
-        if (!payloads.isNullOrEmpty()) return payloads.map { withContentLength(base.replace("FUZZ", it)) }
+        if (!payloads.isNullOrEmpty()) return payloads.map { withContentLength(base.replace(FUZZ_KEYWORD, it)) }
         val fixed = withContentLength(base)
         return List(count) { fixed }
     }
@@ -81,97 +318,6 @@ internal object HttpFuzzPlan {
 
     /** A blank marker would match everywhere; it means "use the default `§`". */
     private fun effectiveMarker(marker: String?): String = marker?.takeIf { it.isNotEmpty() } ?: "§"
-
-    /**
-     * Builds the list of concrete requests to send for a fuzz run.
-     *
-     * @param baseRequest CRLF-normalized base request text.
-     * @param positions optional legacy [start,end) offset pairs (UTF-16 indices).
-     * @param payloads payload strings to inject (already merged with any library set).
-     * @param marker optional custom marker string; defaults to `§`.
-     */
-    fun plan(
-        baseRequest: String,
-        positions: List<Pair<Int, Int>>?,
-        payloads: List<String>,
-        marker: String?
-    ): Result {
-        val effectiveMarker = effectiveMarker(marker)
-        val hasFuzzKeyword = baseRequest.contains("FUZZ")
-        val markerCount = countOccurrences(baseRequest, effectiveMarker)
-        if (!hasFuzzKeyword && markerCount > 0 && markerCount % 2 != 0) {
-            return Result.Error(
-                "Odd number ($markerCount) of '$effectiveMarker' markers; every injection point needs a closing marker " +
-                    "(e.g. ${effectiveMarker}value${effectiveMarker})."
-            )
-        }
-        val hasMarkerPairs = markerCount >= 2
-
-        return when {
-            // Mode 1: FUZZ keyword — replace every occurrence of "FUZZ" with each payload.
-            hasFuzzKeyword && !hasMarkerPairs -> {
-                Result.Ok(
-                    "fuzz_keyword",
-                    payloads.map { payload ->
-                        PlannedRequest(baseRequest.replace("FUZZ", payload), payload, 0)
-                    }
-                )
-            }
-
-            // Mode 2: Marker pairs — find marker…marker pairs, replace active pair with payload and
-            // strip markers from inactive positions (True Sniper mode).
-            hasMarkerPairs -> {
-                if (markerCount % 2 != 0) {
-                    return Result.Error(
-                        "Odd number ($markerCount) of '$effectiveMarker' markers; every injection point needs a closing marker."
-                    )
-                }
-                val markerPositions = findMarkerPairs(baseRequest, effectiveMarker)
-                if (markerPositions.isEmpty()) {
-                    return Result.Error(
-                        "Found marker '$effectiveMarker' but could not pair it into injection points. " +
-                            "Wrap each value with an opening and closing marker, e.g. ${effectiveMarker}value${effectiveMarker}."
-                    )
-                }
-                val out = ArrayList<PlannedRequest>(payloads.size * markerPositions.size)
-                for (payload in payloads) {
-                    for (posIdx in markerPositions.indices) {
-                        out.add(
-                            PlannedRequest(
-                                substituteSniperMarker(baseRequest, markerPositions, effectiveMarker.length, posIdx, payload),
-                                payload,
-                                posIdx
-                            )
-                        )
-                    }
-                }
-                Result.Ok("marker_pairs", out)
-            }
-
-            // Mode 3: Legacy offset-based positions.
-            positions != null && positions.isNotEmpty() -> {
-                validatePositions(positions, baseRequest.length)?.let { return Result.Error(it) }
-                val out = ArrayList<PlannedRequest>(payloads.size * positions.size)
-                for (payload in payloads) {
-                    for ((posIdx, pos) in positions.withIndex()) {
-                        val (start, end) = pos
-                        out.add(
-                            PlannedRequest(
-                                baseRequest.substring(0, start) + payload + baseRequest.substring(end),
-                                payload,
-                                posIdx
-                            )
-                        )
-                    }
-                }
-                Result.Ok("offset", out)
-            }
-
-            else -> Result.Error(
-                "No injection points found. Use FUZZ keyword, ${effectiveMarker}marker${effectiveMarker} pairs, or a positions array."
-            )
-        }
-    }
 
     /** Counts non-overlapping occurrences of [needle] in [haystack]. Empty needle yields 0. */
     fun countOccurrences(haystack: String, needle: String): Int {
@@ -201,26 +347,6 @@ internal object HttpFuzzPlan {
             searchFrom = closeIdx + marker.length
         }
         return positions
-    }
-
-    private fun substituteSniperMarker(
-        baseRequest: String,
-        positions: List<Pair<Int, Int>>,
-        markerLen: Int,
-        activeIdx: Int,
-        payload: String
-    ): String = buildString(baseRequest.length + payload.length) {
-        var cursor = 0
-        positions.forEachIndexed { idx, (start, end) ->
-            append(baseRequest, cursor, start)
-            if (idx == activeIdx) {
-                append(payload)
-            } else {
-                append(baseRequest, start + markerLen, end - markerLen)
-            }
-            cursor = end
-        }
-        append(baseRequest, cursor, baseRequest.length)
     }
 
     /**

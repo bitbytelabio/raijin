@@ -2,16 +2,11 @@ package io.bitbytelab.raijin.tools.http
 
 import burp.api.montoya.core.ToolType
 import io.bitbytelab.raijin.bridge.HttpBridge
-import io.bitbytelab.raijin.core.EnumValidation
-import io.bitbytelab.raijin.core.PayloadLibraries
+import io.bitbytelab.raijin.bridge.HttpSendOptions
 import io.bitbytelab.raijin.core.asBodyString
-import io.bitbytelab.raijin.core.asJsonObjectList
-import io.bitbytelab.raijin.core.asJsonObjectSafe
-import io.bitbytelab.raijin.core.asLongSafe
 import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.core.asStringMap
 import io.bitbytelab.raijin.core.asStringMapResult
-import io.bitbytelab.raijin.safety.HeaderSafety
 import io.bitbytelab.raijin.safety.SafeRegex
 import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.state.TrafficRule
@@ -22,11 +17,14 @@ import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.serialization.json.*
 
 /**
- * Registers the HTTP MCP tools onto the given [Server].
+ * Registers the HTTP MCP tools onto the given [Server]: sending, the cookie jar, response
+ * analysis, traffic rules and raw bytes here; pipelining in [HttpPipelineTools]; fuzzing and race
+ * testing in [HttpAttackTools].
  *
- * Each tool checks its arguments (closed value sets, numeric bounds) before delegating to the
- * [HttpBridge], and answers through [toolJsonResult] / [toolError], so every failure is flagged
- * `isError` and an exception never escapes the handler.
+ * Each tool checks its arguments ([ToolArgs]: closed value sets, malformed values) before
+ * delegating to the [HttpBridge], clamps out-of-range numbers with a note, and answers through
+ * [toolJsonResult] / [toolError], so every failure is flagged `isError` and an exception never
+ * escapes the handler.
  */
 object HttpTools {
 
@@ -35,22 +33,17 @@ object HttpTools {
      * from hanging indefinitely on unresponsive targets or stuck SSE streams. Override
      * with the RAIJIN_DEFAULT_TIMEOUT_MS env var at extension load time.
      */
-    private val DEFAULT_TIMEOUT_MS: Long =
+    internal val DEFAULT_TIMEOUT_MS: Long =
         System.getenv("RAIJIN_DEFAULT_TIMEOUT_MS")?.toLongOrNull() ?: 25_000L
 
-    private val HTTP_MODES = listOf("AUTO", "HTTP_1", "HTTP_2", "HTTP_2_IGNORE_ALPN")
-    private val PIPELINE_HTTP_MODES = listOf("HTTP_1")
+    internal val HTTP_MODES = listOf("AUTO", "HTTP_1", "HTTP_2", "HTTP_2_IGNORE_ALPN")
     private val DIRECTIONS = listOf("request", "response")
     private val RULE_ACTIONS = listOf("modify", "drop", "spoof_response")
-    private val WRITE_MODES = listOf("concat", "single_write")
 
-    private val PORTS = 1L..65_535L
-    private val TIMEOUTS_MS = 1L..600_000L
-    private val LENGTHS = 0L..Int.MAX_VALUE.toLong()
-    private val RACE_COUNTS = 1L..1_000L
-    private val GATE_DELAYS_MS = 0L..60_000L
-    private val WRITE_PAUSES_MS = 0L..60_000L
-    private val MAX_RESPONSES = 1L..1_000L
+    internal val PORTS = 1..65_535
+    internal val LENGTHS = 0..Int.MAX_VALUE
+
+    private const val TIMEOUT_DESCRIPTION = "0 = no hard timeout, max 600000, default 25000"
 
     fun register(server: Server, bridge: HttpBridge, stateManager: StateManager) {
         val toolTypes = ToolType.entries.map { it.name }
@@ -60,7 +53,7 @@ object HttpTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "http_send_request",
-            description = """Send an HTTP request through Burp Suite. Build from URL + method + headers + body, or from a raw HTTP request string. Supports HTTP/1.1, HTTP/2, and connection reuse.
+            description = """Send an HTTP request through Burp Suite. Build from URL + method + headers + body, from a raw HTTP request string, or as a native HTTP/2 request with full control of its header list (pseudo-headers included). Supports HTTP/1.1, HTTP/2, connection reuse and Burp's request options.
 
 Parameters:
 - url (string): target URL (use this OR raw_request)
@@ -68,69 +61,89 @@ Parameters:
 - headers (object): map of header name → value. Caller-supplied headers are preserved byte-exact (Burp's default User-Agent/Accept etc. are NOT injected when headers are provided).
 - body (string OR object/array): request body. If object/array, it is serialized to compact JSON automatically.
 - raw_request (string): raw HTTP request text. When supplied without explicit port/use_tls, defaults to TLS:443 (modern web default). Bare LF line endings in the request line and headers become CRLF; the body is sent as typed. Content-Length is auto-recomputed if it does not match body bytes.
+- http2_headers (array of {name, value} or [name, value]): a native HTTP/2 request whose header list is sent as given, pseudo-headers included (":method", ":path", ":authority", ":scheme"): repeat, reorder, omit or malform them; CR/LF and uppercase names reach the wire. When the list has no pseudo-header, the four are derived from url/method and put first. Use with url (or host/port/use_tls) and body, not with raw_request or headers; sent with http_mode HTTP_2 (default) or HTTP_2_IGNORE_ALPN. No Content-Length is added: include a "content-length" field to send one.
 - host, port (int, 1-65535), use_tls (bool): explicit service overrides
 - http_mode (string): "AUTO" | "HTTP_1" | "HTTP_2" | "HTTP_2_IGNORE_ALPN". HTTP/3 is not available here or anywhere through Montoya — use Turbo (turbo_start_run with Engine.HTTP3) for HTTP/3.
 - connection_id (string): pins/reuses one Montoya connection, but the request still fully completes (response received) before this call returns — no pipelining. For multi-request-per-socket pipelining use http_send_pipeline.
+- follow_redirects (string): "never" | "always" | "same_host" | "in_scope" — Burp follows redirects and returns the final exchange (default: Burp's default, which does not follow).
+- sni (string): TLS server name to send instead of the host.
+- response_timeout_ms (int, 0 = none): Burp's own timeout for reading the response; on expiry Burp gives up and has_response is false.
+- verify_tls (bool, default false): make Burp verify the target's TLS certificate.
 - max_response_length (int): truncate response body in result
-- timeout_ms (number, 1-600000): hard timeout. Returns is_timeout=true and close_reason="timeout" on expiry. Montoya has no partial-read API, so a failed/timed-out send cannot report bytes_received or distinguish fin/rst — use http_send_pipeline when that detail matters.
+- timeout_ms (number, $TIMEOUT_DESCRIPTION): hard timeout. Returns is_timeout=true and close_reason="timeout" on expiry. Montoya has no partial-read API, so a failed/timed-out send cannot report bytes_received or distinguish fin/rst — use http_send_pipeline when that detail matters.
 - preserve_headers (bool, default true): when false, falls back to Burp's httpRequestFromUrl which adds default headers
 - auto_fix_content_length (bool, default true): when false, uses raw_request CL as-is. When true and the declared Content-Length didn't match the body, the result includes content_length_rewritten:{from,to}.
 
-Returns full response with headers, body, status code, and timing.""",
+Out-of-range numbers are clamped and reported in notes. Returns full response with headers, body, status code, and timing; reauthenticated:<macro> when a session login macro re-established the session and sent the request again.""",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("url") { put("type", "string"); put("description", "Target URL (use this OR raw_request)") }
-                    putJsonObject("method") { put("type", "string"); put("description", "HTTP method (default GET)") }
-                    putJsonObject("headers") { put("type", "object"); put("description", "Map of header name to value") }
-                    putJsonObject("body") { put("type", "string"); put("description", "Request body (string, or object/array serialized to JSON)") }
-                    putJsonObject("raw_request") { put("type", "string"); put("description", "Raw HTTP request text") }
-                    putJsonObject("host") { put("type", "string"); put("description", "Explicit target hostname override") }
-                    putJsonObject("port") { put("type", "integer"); put("description", "Explicit target port override (1-65535)") }
-                    putJsonObject("use_tls") { put("type", "boolean"); put("description", "Whether to use HTTPS (TLS)") }
+                    property("url", "string", "Target URL (use this OR raw_request)")
+                    property("method", "string", "HTTP method (default GET)")
+                    property("headers", "object", "Map of header name to value")
+                    property("body", "string", "Request body (string, or object/array serialized to JSON)")
+                    property("raw_request", "string", "Raw HTTP request text")
+                    putJsonObject("http2_headers") {
+                        put("type", "array")
+                        put("description", "Native HTTP/2 header list sent as given, pseudo-headers included: [{\"name\":\":path\",\"value\":\"/x\"}] or [[\":path\",\"/x\"]]")
+                    }
+                    property("host", "string", "Explicit target hostname override")
+                    property("port", "integer", "Explicit target port override (1-65535)")
+                    property("use_tls", "boolean", "Whether to use HTTPS (TLS)")
                     enumProperty("http_mode", HTTP_MODES, "HTTP version to use (default AUTO)")
-                    putJsonObject("connection_id") { put("type", "string"); put("description", "Reuse a prior connection") }
-                    putJsonObject("max_response_length") { put("type", "integer"); put("description", "Truncate response body in result") }
-                    putJsonObject("timeout_ms") { put("type", "number"); put("description", "Hard timeout in milliseconds (1-600000, default 25000)") }
-                    putJsonObject("preserve_headers") { put("type", "boolean"); put("description", "Preserve caller headers byte-exact (default true)") }
-                    putJsonObject("auto_fix_content_length") { put("type", "boolean"); put("description", "Recompute Content-Length to match body (default true)") }
+                    property("connection_id", "string", "Reuse a prior connection")
+                    enumProperty("follow_redirects", HttpSendOptions.REDIRECTS.keys.toList(), "Let Burp follow redirects (default: not followed)")
+                    property("sni", "string", "TLS server name to send instead of the host")
+                    property("response_timeout_ms", "integer", "Burp's own response read timeout (0 = none)")
+                    property("verify_tls", "boolean", "Verify the target's TLS certificate (default false)")
+                    property("max_response_length", "integer", "Truncate response body in result")
+                    property("timeout_ms", "number", "Hard timeout in milliseconds ($TIMEOUT_DESCRIPTION)")
+                    property("preserve_headers", "boolean", "Preserve caller headers byte-exact (default true)")
+                    property("auto_fix_content_length", "boolean", "Recompute Content-Length to match body (default true)")
                 },
                 required = emptyList()
             )
         ) { request ->
             try {
-                val args = request.params.arguments ?: emptyMap()
+                val args = ToolArgs(request.params.arguments ?: emptyMap())
 
-                val url = args["url"]?.jsonPrimitive?.contentOrNull
-                val rawRequest = args["raw_request"]?.jsonPrimitive?.contentOrNull
-                if (url == null && rawRequest == null) {
+                val url = args.string("url")
+                val rawRequest = args.string("raw_request")
+                val http2Fields = parseHttp2Headers(args["http2_headers"])
+                if (url == null && rawRequest == null && http2Fields == null) {
                     return@addTool toolError("Either 'url' or 'raw_request' must be provided")
                 }
-                val method = args["method"]?.jsonPrimitive?.contentOrNull
+                val method = args.string("method")
                 val body = args["body"].asBodyString()
-                val host = args["host"]?.jsonPrimitive?.contentOrNull
-                val port = args.intArg("port", PORTS)
-                val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull
-                val httpMode = args.enumArg("http_mode", HTTP_MODES)
-                val connectionId = args["connection_id"]?.jsonPrimitive?.contentOrNull
-                val maxResponseLength = args.intArg("max_response_length", LENGTHS)
-                val timeoutMs = args.longArg("timeout_ms", TIMEOUTS_MS) ?: DEFAULT_TIMEOUT_MS
-                val preserveHeaders = args["preserve_headers"]?.jsonPrimitive?.booleanOrNull ?: true
-                val autoFixContentLength = args["auto_fix_content_length"]?.jsonPrimitive?.booleanOrNull ?: true
+                val host = args.string("host")
+                val port = args.int("port", PORTS)
+                val useTls = args.bool("use_tls")
+                val httpMode = args.enum("http_mode", HTTP_MODES)
+                val connectionId = args.string("connection_id")
+                val maxResponseLength = args.clampedInt("max_response_length", LENGTHS)
+                val timeoutMs = args.timeoutMs("timeout_ms", DEFAULT_TIMEOUT_MS)
+                val preserveHeaders = args.bool("preserve_headers") ?: true
+                val autoFixContentLength = args.bool("auto_fix_content_length") ?: true
+                val options = HttpSendOptions(
+                    redirects = args.enum("follow_redirects", HttpSendOptions.REDIRECTS.keys.toList())?.let { HttpSendOptions.REDIRECTS.getValue(it) },
+                    sni = args.string("sni"),
+                    responseTimeoutMs = args.clampedLong("response_timeout_ms", 0L..ToolArgs.MAX_TIMEOUT_MS),
+                    verifyTls = args.bool("verify_tls") ?: false,
+                )
 
                 // Headers parsing — accepts object, array-of-pairs, array-of-{name,value}, raw header block.
                 // Surfaces a warning back to the caller when the input format is unusual or partly bad,
-                // instead of silently dropping headers (the previous bug).
+                // instead of silently dropping headers.
                 val headersInput = args["headers"]
                 val (headers, headersWarning) = headersInput.asStringMapResult()
-                val headersDropped = headersInput != null && headersInput !is JsonNull && headers == null
+                val headersDropped = headersInput != null && headers == null
 
                 val result = bridge.sendRequest(
                     url, method, headers, body, rawRequest, host, port, useTls,
                     httpMode, connectionId, maxResponseLength,
-                    timeoutMs, preserveHeaders, autoFixContentLength
+                    timeoutMs, preserveHeaders, autoFixContentLength,
+                    http2Fields, options,
                 )
 
-                // Augment result with header diagnostics if applicable.
                 val augmented = if (headersWarning != null || headersDropped) {
                     buildJsonObject {
                         result.forEach { (k, v) -> put(k, v) }
@@ -142,7 +155,7 @@ Returns full response with headers, body, status code, and timing.""",
                     }
                 } else result
 
-                toolJsonResult(augmented)
+                toolJsonResult(args.withNotes(augmented))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -161,29 +174,29 @@ Parameters:
 - requests (array, required): per-request objects with the same fields as http_send_request
 - http_mode (string): "AUTO" | "HTTP_1" | "HTTP_2" | "HTTP_2_IGNORE_ALPN"
 - max_response_length (int): truncate response bodies
-- timeout_ms (number, 1-600000): hard timeout for the entire batch
+- timeout_ms (number, $TIMEOUT_DESCRIPTION): hard timeout for the entire batch
 
 Returns array of results in original order, plus group_timings_ms and groups_dispatched.""",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("requests") { put("type", "array"); putJsonObject("items") { put("type", "object") }; put("description", "Per-request objects with the same fields as http_send_request") }
                     enumProperty("http_mode", HTTP_MODES, "HTTP version for every request (default AUTO)")
-                    putJsonObject("max_response_length") { put("type", "integer"); put("description", "Truncate response bodies") }
-                    putJsonObject("timeout_ms") { put("type", "number"); put("description", "Hard timeout for the entire batch in milliseconds (1-600000, default 25000)") }
+                    property("max_response_length", "integer", "Truncate response bodies")
+                    property("timeout_ms", "number", "Hard timeout for the entire batch in milliseconds ($TIMEOUT_DESCRIPTION)")
                 },
                 required = listOf("requests")
             )
         ) { request ->
             try {
-                val args = request.params.arguments ?: emptyMap()
+                val args = ToolArgs(request.params.arguments ?: emptyMap())
 
-                val requests = args.objectListArg("requests", "request")
+                val requests = args.objectList("requests", "request")
                     ?: return@addTool toolError("Parameter 'requests' is required (array of request objects)")
-                val httpMode = args.enumArg("http_mode", HTTP_MODES)
-                val maxResponseLength = args.intArg("max_response_length", LENGTHS)
-                val timeoutMs = args.longArg("timeout_ms", TIMEOUTS_MS) ?: DEFAULT_TIMEOUT_MS
+                val httpMode = args.enum("http_mode", HTTP_MODES)
+                val maxResponseLength = args.clampedInt("max_response_length", LENGTHS)
+                val timeoutMs = args.timeoutMs("timeout_ms", DEFAULT_TIMEOUT_MS)
 
-                toolJsonResult(bridge.sendRequestsParallel(requests, httpMode, maxResponseLength, timeoutMs))
+                toolJsonResult(args.withNotes(bridge.sendRequestsParallel(requests, httpMode, maxResponseLength, timeoutMs)))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -194,29 +207,29 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
         // ---------------------------------------------------------------
         server.addTool(
             name = "http_send_request_chain",
-            description = "Send a chain of HTTP requests sequentially with variable extraction between steps. Each step can extract values from the response using regex (capture groups) and inject them into subsequent steps via {{variable}} placeholders. Useful for CSRF tokens, session tokens, and multi-step workflows. A step's extract rules are checked (shape and regex) before its request is sent; timeout_ms bounds each step. Optional connection_id pins/reuses one Montoya connection across every step — steps stay fully sequential either way (no pipelining); for genuine multi-request-per-socket pipelining use http_send_pipeline instead.",
+            description = "Send a chain of HTTP requests sequentially with variable extraction between steps. Each step can extract values from its response with a regex (first capture group), a JSONPath or an XPath, and inject them into later steps via {{variable}} placeholders. Useful for CSRF tokens, session tokens, and multi-step workflows. A step's extract rules are checked before its request is sent; timeout_ms bounds each step. Optional connection_id pins/reuses one Montoya connection across every step — steps stay fully sequential either way (no pipelining); for genuine multi-request-per-socket pipelining use http_send_pipeline instead.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("steps") { put("type", "array"); putJsonObject("items") { put("type", "object") }; put("description", "Array of step objects with url/raw_request and an optional 'extract' key. 'extract' MUST be an ARRAY of {name,pattern,from} objects (from = \"body\" or \"header\"), e.g. extract:[{\"name\":\"csrf\",\"pattern\":\"name=csrf value=([^ ]+)\",\"from\":\"body\"}]. Passing a single object instead of an array is rejected with a validation error.") }
+                    putJsonObject("steps") { put("type", "array"); putJsonObject("items") { put("type", "object") }; put("description", "Array of step objects with url/raw_request and an optional 'extract' key. 'extract' MUST be an ARRAY of {name, pattern | json_path | xpath, from} objects (from = \"body\" (default) or \"header\"; a header rule takes a pattern over the 'Name: value' lines, every Set-Cookie included), e.g. extract:[{\"name\":\"csrf\",\"pattern\":\"name=csrf value=([^ ]+)\"},{\"name\":\"jwt\",\"json_path\":\"$.data.token\"}]. Passing a single object instead of an array is rejected with a validation error.") }
                     enumProperty("http_mode", HTTP_MODES, "HTTP version for every step (default AUTO)")
-                    putJsonObject("stop_on_error") { put("type", "boolean"); put("description", "Stop the chain on the first error (default true)") }
-                    putJsonObject("connection_id") { put("type", "string"); put("description", "Pin/reuse one connection across every step (sequential, not pipelined)") }
-                    putJsonObject("timeout_ms") { put("type", "number"); put("description", "Hard timeout per step in milliseconds (1-600000, default 25000)") }
+                    property("stop_on_error", "boolean", "Stop the chain on the first error (default true)")
+                    property("connection_id", "string", "Pin/reuse one connection across every step (sequential, not pipelined)")
+                    property("timeout_ms", "number", "Hard timeout per step in milliseconds ($TIMEOUT_DESCRIPTION)")
                 },
                 required = listOf("steps")
             )
         ) { request ->
             try {
-                val args = request.params.arguments ?: emptyMap()
+                val args = ToolArgs(request.params.arguments ?: emptyMap())
 
-                val steps = args.objectListArg("steps", "step")
+                val steps = args.objectList("steps", "step")
                     ?: return@addTool toolError("Parameter 'steps' is required (array of step objects with url/raw_request and optional extract definitions)")
-                val httpMode = args.enumArg("http_mode", HTTP_MODES)
-                val stopOnError = args["stop_on_error"]?.jsonPrimitive?.booleanOrNull ?: true
-                val connectionId = args["connection_id"]?.jsonPrimitive?.contentOrNull
-                val timeoutMs = args.longArg("timeout_ms", TIMEOUTS_MS) ?: DEFAULT_TIMEOUT_MS
+                val httpMode = args.enum("http_mode", HTTP_MODES)
+                val stopOnError = args.bool("stop_on_error") ?: true
+                val connectionId = args.string("connection_id")
+                val timeoutMs = args.timeoutMs("timeout_ms", DEFAULT_TIMEOUT_MS)
 
-                toolJsonResult(bridge.sendRequestChain(steps, httpMode, stopOnError, connectionId, timeoutMs))
+                toolJsonResult(args.withNotes(bridge.sendRequestChain(steps, httpMode, stopOnError, connectionId, timeoutMs)))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -230,16 +243,14 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
             description = "Get cookies from Burp Suite's cookie jar. Optionally filter by domain substring.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("domain") { put("type", "string"); put("description", "Optional domain substring filter") }
+                    property("domain", "string", "Optional domain substring filter")
                 },
                 required = emptyList()
             )
         ) { request ->
             try {
-                val args = request.params.arguments ?: emptyMap()
-                val domain = args["domain"]?.jsonPrimitive?.contentOrNull
-
-                toolJsonResult(bridge.getCookieJar(domain))
+                val args = ToolArgs(request.params.arguments ?: emptyMap())
+                toolJsonResult(bridge.getCookieJar(args.string("domain")))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -253,28 +264,24 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
             description = "Set a cookie in Burp Suite's cookie jar.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("name") { put("type", "string"); put("description", "Cookie name") }
-                    putJsonObject("value") { put("type", "string"); put("description", "Cookie value") }
-                    putJsonObject("domain") { put("type", "string"); put("description", "Cookie domain") }
-                    putJsonObject("path") { put("type", "string"); put("description", "Cookie path (default /)") }
-                    putJsonObject("expiration") { put("type", "string"); put("description", "Optional cookie expiration, ISO-8601 date-time with offset (e.g. 2027-01-01T00:00:00Z)") }
+                    property("name", "string", "Cookie name")
+                    property("value", "string", "Cookie value")
+                    property("domain", "string", "Cookie domain")
+                    property("path", "string", "Cookie path (default /)")
+                    property("expiration", "string", "Optional cookie expiration, ISO-8601 date-time with offset (e.g. 2027-01-01T00:00:00Z)")
                 },
                 required = listOf("name", "value", "domain")
             )
         ) { request ->
             try {
-                val args = request.params.arguments ?: emptyMap()
+                val args = ToolArgs(request.params.arguments ?: emptyMap())
 
-                val name = args["name"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Parameter 'name' is required")
-                val value = args["value"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Parameter 'value' is required")
-                val domain = args["domain"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Parameter 'domain' is required")
-                val path = args["path"]?.jsonPrimitive?.contentOrNull ?: "/"
-                val expiration = args["expiration"]?.jsonPrimitive?.contentOrNull
+                val name = args.string("name") ?: return@addTool toolError("Parameter 'name' is required")
+                val value = args.string("value") ?: return@addTool toolError("Parameter 'value' is required")
+                val domain = args.string("domain") ?: return@addTool toolError("Parameter 'domain' is required")
+                val path = args.string("path") ?: "/"
 
-                toolJsonResult(bridge.setCookie(name, value, domain, path, expiration))
+                toolJsonResult(bridge.setCookie(name, value, domain, path, args.string("expiration")))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -291,20 +298,18 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                 "dropping it, this is reported honestly rather than claiming success.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("name") { put("type", "string"); put("description", "Cookie name") }
-                    putJsonObject("domain") { put("type", "string"); put("description", "Cookie domain") }
-                    putJsonObject("path") { put("type", "string"); put("description", "Cookie path (default /)") }
+                    property("name", "string", "Cookie name")
+                    property("domain", "string", "Cookie domain")
+                    property("path", "string", "Cookie path (default /)")
                 },
                 required = listOf("name", "domain")
             )
         ) { request ->
             try {
-                val args = request.params.arguments ?: emptyMap()
-                val name = args["name"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Parameter 'name' is required")
-                val domain = args["domain"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Parameter 'domain' is required")
-                val path = args["path"]?.jsonPrimitive?.contentOrNull ?: "/"
+                val args = ToolArgs(request.params.arguments ?: emptyMap())
+                val name = args.string("name") ?: return@addTool toolError("Parameter 'name' is required")
+                val domain = args.string("domain") ?: return@addTool toolError("Parameter 'domain' is required")
+                val path = args.string("path") ?: "/"
 
                 toolJsonResult(bridge.deleteCookie(name, domain, path))
             } catch (e: Exception) {
@@ -320,21 +325,21 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
             description = "Analyze an HTTP response for keyword occurrences using Burp's built-in keyword analysis engine. Useful for identifying which keywords vary across multiple responses (e.g., during content discovery).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("response") { put("type", "string"); put("description", "Raw HTTP response string") }
+                    property("response", "string", "Raw HTTP response string")
                     putJsonObject("keywords") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Array of keyword strings") }
-                    putJsonObject("case_sensitive") { put("type", "boolean"); put("description", "Whether matching is case-sensitive (default false)") }
+                    property("case_sensitive", "boolean", "Whether matching is case-sensitive (default false)")
                 },
                 required = listOf("response", "keywords")
             )
         ) { request ->
             try {
-                val args = request.params.arguments ?: emptyMap()
+                val args = ToolArgs(request.params.arguments ?: emptyMap())
 
-                val response = args["response"]?.jsonPrimitive?.contentOrNull
+                val response = args.string("response")
                     ?: return@addTool toolError("Parameter 'response' is required (raw HTTP response string)")
                 val keywords = args["keywords"].asStringList()
                     ?: return@addTool toolError("Parameter 'keywords' is required (array of keyword strings)")
-                val caseSensitive = args["case_sensitive"]?.jsonPrimitive?.booleanOrNull ?: false
+                val caseSensitive = args.bool("case_sensitive") ?: false
 
                 toolJsonResult(bridge.analyzeKeywords(response, keywords, caseSensitive))
             } catch (e: Exception) {
@@ -356,7 +361,7 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
             )
         ) { request ->
             try {
-                val args = request.params.arguments ?: emptyMap()
+                val args = ToolArgs(request.params.arguments ?: emptyMap())
 
                 val responses = args["responses"].asStringList()
                     ?: return@addTool toolError("Parameter 'responses' is required (array of raw HTTP response strings)")
@@ -375,23 +380,24 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
         // ---------------------------------------------------------------
         server.addTool(
             name = "http_set_traffic_rule",
-            description = "Register a global HTTP traffic rule. Rules apply to all HTTP traffic (not just proxy). action=modify (default) adds/removes/replaces headers. " +
-                "action=drop or action=spoof_response (direction=request only) suppress the request entirely before it is sent, via Burp's Montoya API 2026.7+ " +
+            description = "Register a global HTTP traffic rule. Rules apply to all HTTP traffic (not just proxy). action=modify (default) adds/removes/replaces headers, " +
+                "written exactly as given: a header line or value may carry CR/LF, odd spacing or no colon (a second injected line, an obfuscated " +
+                "Transfer-Encoding, ...). action=drop or action=spoof_response (direction=request only) suppress the request entirely before it is sent, via Burp's Montoya API 2026.7+ " +
                 "(RequestToBeSentAction.drop()/.spoof()) — on an older Burp these fall back to sending the request unmodified and report it via a " +
                 "'http.traffic_rule.degraded' event. If rule_id matches an existing rule, it is replaced. Raijin's own unauthenticated probes " +
                 "(auth_diff, autorize, idor_hunt) only get rules whose tool_filter names EXTENSIONS.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("rule_id") { put("type", "string"); put("description", "Rule ID; if it matches an existing rule it is replaced (auto-generated if omitted)") }
+                    property("rule_id", "string", "Rule ID; if it matches an existing rule it is replaced (auto-generated if omitted)")
                     enumProperty("direction", DIRECTIONS, "Traffic the rule applies to")
-                    putJsonObject("match_url") { put("type", "string"); put("description", "Regex matched against the request URL (case-insensitive)") }
-                    putJsonObject("match_host") { put("type", "string"); put("description", "Host glob (*.example.com) or regex") }
-                    putJsonObject("match_header") { put("type", "string"); put("description", "Regex matched against the 'Name: value' header lines (case-insensitive)") }
+                    property("match_url", "string", "Regex matched against the request URL (case-insensitive)")
+                    property("match_host", "string", "Host glob (*.example.com) or regex")
+                    property("match_header", "string", "Regex matched against the 'Name: value' header lines (case-insensitive)")
                     enumProperty("action", RULE_ACTIONS, "modify (default) | drop | spoof_response. drop/spoof_response only take effect when direction=request; needs Burp's Montoya API 2026.7+ (falls back to sending the request on an older Burp).")
-                    putJsonObject("modify_add_header") { put("type", "string"); put("description", "Header line 'Name: value' to add (action=modify)") }
-                    putJsonObject("modify_remove_header") { put("type", "string"); put("description", "Header to remove (action=modify)") }
-                    putJsonObject("modify_replace_header") { put("type", "object"); put("description", "Map of header name to replacement value (action=modify)") }
-                    putJsonObject("spoof_response") { put("type", "string"); put("description", "Raw HTTP response text to return without sending the request (action=spoof_response, direction=request)") }
+                    property("modify_add_header", "string", "Header line to add, written as given ('Name: value', or anything else incl. CR/LF) (action=modify)")
+                    property("modify_remove_header", "string", "Header to remove (action=modify)")
+                    property("modify_replace_header", "object", "Map of header name to replacement value, written as given (action=modify)")
+                    property("spoof_response", "string", "Raw HTTP response text to return without sending the request (action=spoof_response, direction=request)")
                     putJsonObject("tool_filter") {
                         put("type", "array")
                         putJsonObject("items") {
@@ -400,20 +406,19 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                         }
                         put("description", "Only apply to traffic from these Burp tools (default: every tool). Raijin's internal unauthenticated probes run as EXTENSIONS and only get a rule whose tool_filter names EXTENSIONS.")
                     }
-                    putJsonObject("enabled") { put("type", "boolean"); put("description", "Whether the rule is active (default true)") }
+                    property("enabled", "boolean", "Whether the rule is active (default true)")
                 },
                 required = listOf("direction")
             )
         ) { request ->
             try {
-                val args = request.params.arguments ?: emptyMap()
+                val args = ToolArgs(request.params.arguments ?: emptyMap())
 
-                val ruleId = args["rule_id"]?.jsonPrimitive?.contentOrNull
-                    ?: stateManager.generateId("trule")
-                val direction = args.enumArg("direction", DIRECTIONS)?.lowercase()
+                val ruleId = args.string("rule_id") ?: stateManager.generateId("trule")
+                val direction = args.enum("direction", DIRECTIONS)
                     ?: return@addTool toolError("Parameter 'direction' is required ('request' or 'response')")
-                val action = args.enumArg("action", RULE_ACTIONS)?.lowercase() ?: "modify"
-                val spoofResponse = args["spoof_response"]?.jsonPrimitive?.contentOrNull
+                val action = args.enum("action", RULE_ACTIONS) ?: "modify"
+                val spoofResponse = args.string("spoof_response")
                 if (action == "spoof_response" && spoofResponse.isNullOrBlank()) {
                     return@addTool toolError("action=spoof_response requires 'spoof_response' (raw HTTP response text)")
                 }
@@ -421,8 +426,8 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                     return@addTool toolError("action=drop/spoof_response only apply to direction=request (a response has already been received by the time a direction=response rule runs — use action=modify with modify_replace_header/modify_add_header to rewrite it instead)")
                 }
 
-                val matchUrl = args["match_url"]?.jsonPrimitive?.contentOrNull
-                val matchHeader = args["match_header"]?.jsonPrimitive?.contentOrNull
+                val matchUrl = args.string("match_url")
+                val matchHeader = args.string("match_header")
                 for ((param, pattern) in listOf("match_url" to matchUrl, "match_header" to matchHeader)) {
                     if (pattern == null) continue
                     SafeRegex.validate(pattern, ignoreCase = true)?.let {
@@ -430,22 +435,15 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                     }
                 }
 
-                val addHeader = args["modify_add_header"]?.jsonPrimitive?.contentOrNull
-                if (addHeader != null && HeaderSafety.parseHeaderLine(addHeader) == null) {
-                    return@addTool toolError("Parameter 'modify_add_header' must be one 'Name: value' header line without CR/LF")
-                }
                 val replaceInput = args["modify_replace_header"]
-                val replaceHeader = if (replaceInput == null || replaceInput is JsonNull) null else {
-                    replaceInput.asStringMap()
-                        ?: return@addTool toolError("Parameter 'modify_replace_header' must be an object of header name to value")
+                val replaceHeader = replaceInput?.let {
+                    it.asStringMap() ?: return@addTool toolError("Parameter 'modify_replace_header' must be an object of header name to value")
                 }
-                replaceHeader?.forEach { (name, value) ->
-                    if (!HeaderSafety.isValidHeaderName(name) || !HeaderSafety.isValidHeaderValue(value)) {
-                        return@addTool toolError("modify_replace_header '$name': a header name needs no ':' and neither name nor value may contain CR/LF")
-                    }
+                if (replaceHeader?.keys?.any { it.isEmpty() } == true) {
+                    return@addTool toolError("modify_replace_header: a header name cannot be empty")
                 }
 
-                val toolFilter = args["tool_filter"]?.takeIf { it !is JsonNull }?.let { element ->
+                val toolFilter = args["tool_filter"]?.let { element ->
                     val names = element.asStringList()
                         ?: return@addTool toolError("Parameter 'tool_filter' must be an array of Burp tool names")
                     names.map { name ->
@@ -458,12 +456,12 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                     ruleId = ruleId,
                     direction = direction,
                     matchUrl = matchUrl,
-                    matchHost = args["match_host"]?.jsonPrimitive?.contentOrNull,
+                    matchHost = args.string("match_host"),
                     matchHeader = matchHeader,
-                    modifyAddHeader = addHeader,
-                    modifyRemoveHeader = args["modify_remove_header"]?.jsonPrimitive?.contentOrNull,
+                    modifyAddHeader = args.string("modify_add_header"),
+                    modifyRemoveHeader = args.string("modify_remove_header"),
                     modifyReplaceHeader = replaceHeader,
-                    enabled = args["enabled"]?.jsonPrimitive?.booleanOrNull ?: true,
+                    enabled = args.bool("enabled") ?: true,
                     action = action,
                     spoofResponse = spoofResponse,
                     toolFilter = toolFilter
@@ -495,14 +493,9 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
         ) { _ ->
             try {
                 val rules = stateManager.trafficRules.toList()
-
                 toolJsonResult(buildJsonObject {
                     put("total", rules.size)
-                    put("rules", buildJsonArray {
-                        rules.forEach { rule ->
-                            add(serializeTrafficRule(rule))
-                        }
-                    })
+                    put("rules", buildJsonArray { rules.forEach { add(serializeTrafficRule(it)) } })
                 })
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
@@ -517,16 +510,14 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
             description = "Remove a global HTTP traffic modification rule by its rule ID.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("rule_id") { put("type", "string"); put("description", "The rule ID to remove") }
+                    property("rule_id", "string", "The rule ID to remove")
                 },
                 required = listOf("rule_id")
             )
         ) { request ->
             try {
-                val args = request.params.arguments ?: emptyMap()
-
-                val ruleId = args["rule_id"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Parameter 'rule_id' is required")
+                val args = ToolArgs(request.params.arguments ?: emptyMap())
+                val ruleId = args.string("rule_id") ?: return@addTool toolError("Parameter 'rule_id' is required")
                 val removed = stateManager.trafficRules.removeIf { it.ruleId == ruleId }
 
                 toolJsonResult(buildJsonObject {
@@ -547,320 +538,80 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
             description = "Send a raw byte-level HTTP request for HTTP request smuggling and CRLF injection testing. Accepts either hex-encoded bytes (raw_request_hex; whitespace between digits is ignored) or request text (raw_request). Preserves exact byte sequences without normalization: raw_request's literal \\r\\n / \\n escapes are decoded only when the text contains no real line break, and a character above U+00FF sends the whole text as UTF-8 (use raw_request_hex for exact bytes). Requires host, port, and use_tls parameters. Sends ONE request and reads ONE response (Montoya's api.http().sendRequest has no partial-read API, so a failed/timed-out send cannot report bytes_received or distinguish fin/rst — it only returns is_timeout and close_reason=\"timeout\"|\"error\"). HTTP/2/3 and kettled H2-smuggling escape fields (^~, ^xNN, ...) are not available here — this is HTTP/1 only; for those, or for sending several requests over one socket and reading back several responses, use http_send_pipeline (HTTP/1.1 pipelining) or Turbo (turbo_start_run with Engine.HTTP2/HTTP3, kettled=True).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("raw_request_hex") { put("type", "string"); put("description", "Hex-encoded request bytes (use this OR raw_request)") }
-                    putJsonObject("raw_request") { put("type", "string"); put("description", "Request text; literal \\r\\n escapes are decoded only when it has no real line breaks") }
-                    putJsonObject("host") { put("type", "string"); put("description", "Target hostname") }
-                    putJsonObject("port") { put("type", "integer"); put("description", "Target port number (1-65535, default 443)") }
-                    putJsonObject("use_tls") { put("type", "boolean"); put("description", "Whether to use HTTPS (TLS)") }
-                    putJsonObject("tls") { put("type", "boolean"); put("description", "Alias for use_tls") }
-                    putJsonObject("https") { put("type", "boolean"); put("description", "Alias for use_tls") }
+                    property("raw_request_hex", "string", "Hex-encoded request bytes (use this OR raw_request)")
+                    property("raw_request", "string", "Request text; literal \\r\\n escapes are decoded only when it has no real line breaks")
+                    property("host", "string", "Target hostname")
+                    property("port", "integer", "Target port number (1-65535, default 443)")
+                    property("use_tls", "boolean", "Whether to use HTTPS (TLS)")
+                    property("tls", "boolean", "Alias for use_tls")
+                    property("https", "boolean", "Alias for use_tls")
                     enumProperty("http_mode", HTTP_MODES, "HTTP version to use (default AUTO)")
-                    putJsonObject("max_response_length") { put("type", "integer"); put("description", "Truncate response body in result") }
-                    putJsonObject("timeout_ms") { put("type", "number"); put("description", "Hard timeout in milliseconds (1-600000, default 25000)") }
+                    property("max_response_length", "integer", "Truncate response body in result")
+                    property("timeout_ms", "number", "Hard timeout in milliseconds ($TIMEOUT_DESCRIPTION)")
                 },
                 required = listOf("host")
             )
         ) { request ->
             try {
-                val args = request.params.arguments ?: emptyMap()
+                val args = ToolArgs(request.params.arguments ?: emptyMap())
 
-                val rawHex = args["raw_request_hex"]?.jsonPrimitive?.contentOrNull
-                val rawString = args["raw_request"]?.jsonPrimitive?.contentOrNull
-                val host = args["host"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Parameter 'host' is required")
+                val rawHex = args.string("raw_request_hex")
+                val rawString = args.string("raw_request")
+                val host = args.string("host") ?: return@addTool toolError("Parameter 'host' is required")
                 if (rawHex == null && rawString == null) {
                     return@addTool toolError("Either 'raw_request_hex' or 'raw_request' must be provided")
                 }
-                val port = args.intArg("port", PORTS) ?: 443
-                val useTls = args.tlsArg(port)
-                val httpMode = args.enumArg("http_mode", HTTP_MODES)
-                val maxResponseLength = args.intArg("max_response_length", LENGTHS)
-                val timeoutMs = args.longArg("timeout_ms", TIMEOUTS_MS) ?: DEFAULT_TIMEOUT_MS
+                val port = args.int("port", PORTS) ?: 443
+                val useTls = args.tls(port)
+                val httpMode = args.enum("http_mode", HTTP_MODES)
+                val maxResponseLength = args.clampedInt("max_response_length", LENGTHS)
+                val timeoutMs = args.timeoutMs("timeout_ms", DEFAULT_TIMEOUT_MS)
 
-                toolJsonResult(bridge.sendRawBytes(rawHex, rawString, host, port, useTls, httpMode, maxResponseLength, timeoutMs))
+                toolJsonResult(args.withNotes(bridge.sendRawBytes(rawHex, rawString, host, port, useTls, httpMode, maxResponseLength, timeoutMs)))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
         }
 
         // ---------------------------------------------------------------
-        // 12. http_send_pipeline
+        // 12. http_send_pipeline (raw-socket pipelining, its own file)
         // ---------------------------------------------------------------
-        server.addTool(
-            name = "http_send_pipeline",
-            description = """Send multiple raw HTTP/1.1 requests over ONE socket connection and read back multiple responses in order. Unlike every other http_* tool (which goes through Burp's Montoya API, strictly one request in / one response out), this opens its own raw socket — needed for HTTP desync / request-smuggling research (0.CL, stage1+stage2 probes) where a server may respond to one request with two responses, or where you need to observe exactly what came back before a connection died.
-
-HTTP/1.1 only — http_mode must be omitted or "HTTP_1". HTTP/2, HTTP/3 and kettled H2-smuggling escape fields are Turbo-only: use turbo_start_run with Engine.HTTP2 / Engine.HTTP3 / kettled=True for those.
-
-Never auto-fixes Content-Length — a deliberately wrong declared length is the point of this tool. If you want byte-exact control without a wrong Content-Length tripping you up, compute it yourself.
-
-Response framing is strict: a negative, non-numeric or conflicting Content-Length, a bad chunk size, or chunk data without its CRLF stops reading with close_reason "error" and the reason in error, instead of guessing. Chunked trailers are read up to their blank line and returned per response.
-
-Parameters:
-- host, port (1-65535), use_tls/tls/https (alias): target. use_tls defaults to true when port is 443.
-- requests (array, required): each item has raw_request (literal \r\n escapes are decoded only when the text has no real line break) or raw_request_hex (hex-encoded bytes), same convention as http_send_raw_bytes.
-- write_mode: "concat" (default; all requests written in one burst) or "single_write" (one write+flush per request, with write_pause_ms between them).
-- max_responses (int, 1-1000): how many responses to read before stopping (default: number of requests sent — but a 0.CL probe may produce MORE responses than requests, or fewer; set this explicitly for that case).
-- idle_timeout_ms (default 2000): abort if no bytes arrive for this long.
-- total_timeout_ms (default 15000): hard cap for the whole call.
-- keep_open (bool, default false): keep the socket open after this call so a LATER http_send_pipeline call can reuse it via connection_id. Only honored when every requested response framed cleanly and the server keeps the connection (no Connection: close, close-delimited body, or HTTP/1.0 response without keep-alive) — anything else closes the socket.
-- connection_id (string): reuse a socket kept open by a prior keep_open=true call. This registry is separate from Montoya's own connection_id on http_send_request — different transport layers, not interchangeable. If the id is unknown (evicted after 120s idle, or never existed) a fresh connection is opened and connection_reused:false is reported, rather than erroring.
-- max_response_length (int): truncate each response body in the result.
-
-Returns: connection_id, connection_reused, bytes_sent, bytes_received, responses (array of {index, status_line, status_code, headers, body, framing, trailers, warnings}), responses_received, close_reason ("max_responses"|"idle"|"total_timeout"|"fin"|"rst"|"error"|"switching_protocols"), connection_open.""",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    putJsonObject("host") { put("type", "string"); put("description", "Target hostname") }
-                    putJsonObject("port") { put("type", "integer"); put("description", "Target port number (1-65535, default 443)") }
-                    putJsonObject("use_tls") { put("type", "boolean"); put("description", "Whether to use HTTPS (TLS)") }
-                    putJsonObject("tls") { put("type", "boolean"); put("description", "Alias for use_tls") }
-                    putJsonObject("https") { put("type", "boolean"); put("description", "Alias for use_tls") }
-                    enumProperty("http_mode", PIPELINE_HTTP_MODES, "Must be omitted or \"HTTP_1\" — HTTP/2 and HTTP/3 are Turbo-only")
-                    putJsonObject("requests") {
-                        put("type", "array")
-                        putJsonObject("items") { put("type", "object") }
-                        put("description", "Array of {raw_request} or {raw_request_hex} items, sent over one connection")
-                    }
-                    enumProperty("write_mode", WRITE_MODES, "\"concat\" (default) or \"single_write\"")
-                    putJsonObject("write_pause_ms") { put("type", "number"); put("description", "Pause between writes in single_write mode (0-60000)") }
-                    putJsonObject("max_responses") { put("type", "integer"); put("description", "How many responses to read (1-1000, default: number of requests)") }
-                    putJsonObject("idle_timeout_ms") { put("type", "number"); put("description", "Abort if no bytes arrive for this long (1-600000, default 2000)") }
-                    putJsonObject("total_timeout_ms") { put("type", "number"); put("description", "Hard cap for the whole call (1-600000, default 15000)") }
-                    putJsonObject("keep_open") { put("type", "boolean"); put("description", "Keep the socket open for a later call to reuse via connection_id (default false)") }
-                    putJsonObject("connection_id") { put("type", "string"); put("description", "Reuse a socket kept open by a prior keep_open=true call") }
-                    putJsonObject("max_response_length") { put("type", "integer"); put("description", "Truncate each response body in the result") }
-                },
-                required = listOf("host", "requests")
-            )
-        ) { request ->
-            try {
-                val args = request.params.arguments ?: emptyMap()
-
-                val host = args["host"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Parameter 'host' is required")
-                val requests = args.objectListArg("requests", "request")
-                    ?: return@addTool toolError("Parameter 'requests' is required (array of {raw_request} or {raw_request_hex} objects)")
-                val port = args.intArg("port", PORTS) ?: 443
-                val useTls = args.tlsArg(port)
-                val httpMode = args.enumArg("http_mode", PIPELINE_HTTP_MODES)
-                val writeMode = args.enumArg("write_mode", WRITE_MODES)?.lowercase() ?: "concat"
-                val writePauseMs = args.longArg("write_pause_ms", WRITE_PAUSES_MS) ?: 0L
-                val maxResponses = args.intArg("max_responses", MAX_RESPONSES)
-                val idleTimeoutMs = args.longArg("idle_timeout_ms", TIMEOUTS_MS) ?: 2000L
-                val totalTimeoutMs = args.longArg("total_timeout_ms", TIMEOUTS_MS) ?: 15000L
-                val keepOpen = args["keep_open"]?.jsonPrimitive?.booleanOrNull ?: false
-                val connectionId = args["connection_id"]?.jsonPrimitive?.contentOrNull
-                val maxResponseLength = args.intArg("max_response_length", LENGTHS)
-
-                toolJsonResult(bridge.sendPipeline(
-                    host, port, useTls, httpMode, requests, writeMode, writePauseMs,
-                    maxResponses, idleTimeoutMs, totalTimeoutMs, keepOpen, connectionId, maxResponseLength
-                ))
-            } catch (e: Exception) {
-                toolError(e.message ?: "Unknown error")
-            }
-        }
+        HttpPipelineTools.register(server, bridge.pipeline)
 
         // ---------------------------------------------------------------
-        // 13. http_fuzz
+        // 13-14. http_fuzz, http_race (their own file)
         // ---------------------------------------------------------------
-        server.addTool(
-            name = "http_fuzz",
-            description = """Fuzz an HTTP request by injecting payloads at marked positions (sniper mode). Three position modes supported:
+        HttpAttackTools.register(server, bridge)
+    }
 
-1. FUZZ keyword (easiest): Put FUZZ where you want payloads injected. Example: GET /api?id=FUZZ HTTP/1.1\r\nHost: target.com\r\n\r\n
-2. Marker pairs (like Burp Intruder): Wrap values with § markers. Example: GET /api?id=§1§&name=§test§ HTTP/1.1\r\n... Each §value§ pair is an injection point; while one is fuzzed the others keep their value without the markers. An odd number of markers is rejected.
-3. Offset pairs (legacy): Provide positions array of non-overlapping [start, end) offsets into the request string as given.
-
-Use \r\n for line endings in the request string (bare LF in the request line and headers is converted; the body is sent as typed). Content-Length is recomputed after each substitution (left alone when Transfer-Encoding or several Content-Length headers are present); requests are sent as UTF-8. Runs sequentially (one request at a time); timeout_ms bounds each request, and a request that fails or times out is reported in its result entry without stopping the run. For concurrent fuzzing, build the payload variants yourself and use http_send_requests_parallel instead. Optional stop_on_match ({status_codes: [int], body_regex: string}) stops after the first response matching either condition (stopped_early:true in the result). Returns all responses with payload metadata.""",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    putJsonObject("request") { put("type", "string"); put("description", "Request string with FUZZ keyword or § markers") }
-                    putJsonObject("host") { put("type", "string"); put("description", "Target hostname") }
-                    putJsonObject("port") { put("type", "integer"); put("description", "Target port number (1-65535, default 443)") }
-                    putJsonObject("use_tls") { put("type", "boolean"); put("description", "Whether to use HTTPS (TLS)") }
-                    putJsonObject("tls") { put("type", "boolean"); put("description", "Alias for use_tls") }
-                    putJsonObject("https") { put("type", "boolean"); put("description", "Alias for use_tls") }
-                    enumProperty("http_mode", HTTP_MODES, "HTTP version to use (default AUTO)")
-                    putJsonObject("max_response_length") { put("type", "integer"); put("description", "Truncate response bodies") }
-                    putJsonObject("marker") { put("type", "string"); put("description", "Custom injection marker (default §)") }
-                    putJsonObject("positions") {
-                        put("type", "array")
-                        putJsonObject("items") { put("type", "array"); putJsonObject("items") { put("type", "integer") } }
-                        put("description", "Optional [start, end) offset pairs into the request string")
-                    }
-                    putJsonObject("payloads") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Array of payload strings") }
-                    enumProperty("payload_library", PayloadLibraries.names(), "Built-in payload set merged with 'payloads'")
-                    putJsonObject("stop_on_match") {
-                        put("type", "object")
-                        put("description", "Stop after the first matching response: {status_codes: [int], body_regex: string}")
-                    }
-                    putJsonObject("timeout_ms") { put("type", "number"); put("description", "Hard timeout per request in milliseconds (1-600000, default 25000)") }
-                },
-                required = listOf("request", "host")
-            )
-        ) { request ->
-            try {
-                val args = request.params.arguments ?: emptyMap()
-
-                val reqStr = args["request"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Parameter 'request' is required")
-                val host = args["host"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Parameter 'host' is required")
-                val port = args.intArg("port", PORTS) ?: 443
-                val useTls = args.tlsArg(port)
-                val httpMode = args.enumArg("http_mode", HTTP_MODES)
-                val maxResponseLength = args.intArg("max_response_length", LENGTHS)
-                val marker = args["marker"]?.jsonPrimitive?.contentOrNull
-                val timeoutMs = args.longArg("timeout_ms", TIMEOUTS_MS) ?: DEFAULT_TIMEOUT_MS
-
-                val stopOnMatchInput = args["stop_on_match"]
-                val stopOnMatch = if (stopOnMatchInput == null || stopOnMatchInput is JsonNull) null else {
-                    stopOnMatchInput.asJsonObjectSafe()
-                        ?: return@addTool toolError("Parameter 'stop_on_match' must be an object {status_codes: [int], body_regex: string}")
+    /**
+     * The `http2_headers` list: an array of `{name, value}` objects or `[name, value]` pairs, or an
+     * object (its members in order). Names and values are taken as given.
+     */
+    internal fun parseHttp2Headers(element: JsonElement?): List<Pair<String, String>>? = when (element) {
+        null, JsonNull -> null
+        is JsonObject -> element.entries.map { (name, value) -> name to text(value, "http2_headers.$name") }
+        is JsonArray -> element.mapIndexed { i, item ->
+            when (item) {
+                is JsonObject -> {
+                    val name = item["name"]?.let { text(it, "http2_headers[$i].name") }
+                    val value = item["value"]?.let { text(it, "http2_headers[$i].value") }
+                    require(name != null && value != null) { "http2_headers[$i] needs 'name' and 'value'" }
+                    name to value
                 }
-                val stopOnStatusCodes = parseStatusCodes(stopOnMatch?.get("status_codes"))
-                val stopOnBodyRegex = stopOnMatch?.get("body_regex")?.jsonPrimitive?.contentOrNull
-
-                // Positions are optional — FUZZ keyword and §marker§ modes auto-detect.
-                val positions = parsePositions(args["positions"])
-
-                val library = args.enumArg("payload_library", PayloadLibraries.names())
-                val libPayloads = library?.let { PayloadLibraries.get(it) }.orEmpty()
-                val payloads = args["payloads"].asStringList().orEmpty() + libPayloads
-                if (payloads.isEmpty()) {
-                    return@addTool toolError("Provide 'payloads' (array) and/or 'payload_library' (${PayloadLibraries.names().joinToString("|")})")
+                is JsonArray -> {
+                    require(item.size == 2) { "http2_headers[$i] must be a [name, value] pair" }
+                    text(item[0], "http2_headers[$i][0]") to text(item[1], "http2_headers[$i][1]")
                 }
-
-                toolJsonResult(bridge.fuzz(
-                    reqStr, host, port, useTls, positions, payloads, httpMode, maxResponseLength, marker,
-                    stopOnStatusCodes, stopOnBodyRegex, timeoutMs
-                ))
-            } catch (e: Exception) {
-                toolError(e.message ?: "Unknown error")
+                else -> throw IllegalArgumentException("http2_headers[$i] must be {name, value} or [name, value]")
             }
-        }
-
-        // ---------------------------------------------------------------
-        // 14. http_race
-        // ---------------------------------------------------------------
-        server.addTool(
-            name = "http_race",
-            description = """Race condition tester: dispatches N requests concurrently via Burp's parallel request engine for TOCTOU, double-spend, and limit bypass detection. Analyzes response variations (status codes, body lengths) to surface likely race conditions. Use the FUZZ keyword with 'payloads' for varied requests (payloads takes precedence over 'count'); Content-Length is recomputed after substitution. timeout_ms bounds the whole batch. NOTE: best-effort concurrency, NOT guaranteed single-packet/last-byte synchronization.""",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    putJsonObject("request") { put("type", "string"); put("description", "Request string (use FUZZ keyword for varied payloads)") }
-                    putJsonObject("host") { put("type", "string"); put("description", "Target hostname") }
-                    putJsonObject("port") { put("type", "integer"); put("description", "Target port number (1-65535, default 443)") }
-                    putJsonObject("use_tls") { put("type", "boolean"); put("description", "Whether to use HTTPS (TLS)") }
-                    putJsonObject("tls") { put("type", "boolean"); put("description", "Alias for use_tls") }
-                    putJsonObject("https") { put("type", "boolean"); put("description", "Alias for use_tls") }
-                    putJsonObject("count") { put("type", "integer"); put("description", "Number of simultaneous requests (1-1000, default 10)") }
-                    putJsonObject("payloads") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Optional payloads for FUZZ keyword") }
-                    enumProperty("http_mode", HTTP_MODES, "HTTP version to use (default AUTO)")
-                    putJsonObject("max_response_length") { put("type", "integer"); put("description", "Truncate response bodies") }
-                    putJsonObject("gate_delay") { put("type", "integer"); put("description", "Milliseconds to sleep before dispatching the batch (pre-dispatch gate, 0-60000). 0 dispatches immediately (default 100)") }
-                    putJsonObject("timeout_ms") { put("type", "number"); put("description", "Hard timeout for the whole batch in milliseconds (1-600000, default 25000)") }
-                },
-                required = listOf("request", "host")
-            )
-        ) { request ->
-            try {
-                val args = request.params.arguments ?: emptyMap()
-                val reqStr = args["request"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Parameter 'request' is required")
-                val host = args["host"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Parameter 'host' is required")
-                val port = args.intArg("port", PORTS) ?: 443
-                val useTls = args.tlsArg(port)
-                val count = args.intArg("count", RACE_COUNTS) ?: 10
-                val payloads = args["payloads"].asStringList()
-                val httpMode = args.enumArg("http_mode", HTTP_MODES)
-                val maxResponseLength = args.intArg("max_response_length", LENGTHS)
-                val gateDelay = args.longArg("gate_delay", GATE_DELAYS_MS) ?: 100L
-                val timeoutMs = args.longArg("timeout_ms", TIMEOUTS_MS) ?: DEFAULT_TIMEOUT_MS
-
-                toolJsonResult(bridge.raceCondition(reqStr, host, port, useTls, count, payloads, httpMode, maxResponseLength, gateDelay, timeoutMs))
-            } catch (e: Exception) {
-                toolError(e.message ?: "Unknown error")
-            }
-        }
+        }.also { require(it.isNotEmpty()) { "http2_headers must not be empty" } }
+        else -> throw IllegalArgumentException("http2_headers must be an array of {name, value} objects or [name, value] pairs")
     }
 
-    // ---------------------------------------------------------------
-    // Argument parsing: a bad value throws IllegalArgumentException with the message the
-    // handler's catch returns through toolError.
-    // ---------------------------------------------------------------
-
-    /** Integer argument [name] within [range]; null when absent. */
-    private fun Map<String, JsonElement>.longArg(name: String, range: LongRange): Long? {
-        val element = this[name]
-        if (element == null || element is JsonNull) return null
-        val value = element.asLongSafe() ?: throw IllegalArgumentException("Parameter '$name' must be an integer")
-        require(value in range) { "Parameter '$name' must be between ${range.first} and ${range.last} (got $value)" }
-        return value
-    }
-
-    private fun Map<String, JsonElement>.intArg(name: String, range: LongRange): Int? = longArg(name, range)?.toInt()
-
-    /** String argument [name] from the closed set [allowed] (case-insensitive); null when absent or blank. */
-    private fun Map<String, JsonElement>.enumArg(name: String, allowed: List<String>): String? {
-        val element = this[name]
-        if (element == null || element is JsonNull) return null
-        val value = (element as? JsonPrimitive)?.contentOrNull
-            ?: throw IllegalArgumentException("Parameter '$name' must be a string")
-        EnumValidation.error(value, allowed.toSet(), name)?.let {
-            throw IllegalArgumentException(it["error"]?.jsonPrimitive?.contentOrNull ?: "Parameter '$name' has an invalid value")
-        }
-        return value.trim().ifEmpty { null }
-    }
-
-    /** TLS flag from use_tls or its aliases; defaults to TLS on port 443. */
-    private fun Map<String, JsonElement>.tlsArg(port: Int): Boolean =
-        this["use_tls"]?.jsonPrimitive?.booleanOrNull
-            ?: this["tls"]?.jsonPrimitive?.booleanOrNull
-            ?: this["https"]?.jsonPrimitive?.booleanOrNull
-            ?: (port == 443)
-
-    /** Non-empty list of objects under [name]; null when absent. Every item must be an object. */
-    private fun Map<String, JsonElement>.objectListArg(name: String, what: String): List<JsonObject>? {
-        val element = this[name] ?: return null
-        val items = element.asJsonObjectList() ?: return null
-        val given = (element as? JsonArray)?.size ?: items.size
-        require(items.size == given) { "Every item in '$name' must be a $what object (${given - items.size} of $given are not)" }
-        require(items.isNotEmpty()) { "'$name' must contain at least one $what object" }
-        return items
-    }
-
-    private fun parsePositions(element: JsonElement?): List<Pair<Int, Int>>? {
-        if (element == null || element is JsonNull) return null
-        val items = element as? JsonArray
-            ?: throw IllegalArgumentException("'positions' must be an array of [start, end] integer pairs")
-        return items.mapIndexed { i, item ->
-            val pair = (item as? JsonArray)?.map { (it as? JsonPrimitive)?.intOrNull }
-            val start = pair?.getOrNull(0)
-            val end = pair?.getOrNull(1)
-            require(pair?.size == 2 && start != null && end != null) { "positions[$i] must be a [start, end] pair of integers" }
-            start to end
-        }
-    }
-
-    private fun parseStatusCodes(element: JsonElement?): List<Int>? {
-        if (element == null || element is JsonNull) return null
-        val items = element as? JsonArray
-        val codes = items?.map { (it as? JsonPrimitive)?.intOrNull }
-        require(codes != null && codes.none { it == null }) { "stop_on_match.status_codes must be an array of integers" }
-        return codes.filterNotNull()
-    }
-
-    /** Adds a string property whose value must be one of [values]. */
-    private fun JsonObjectBuilder.enumProperty(name: String, values: List<String>, description: String) {
-        putJsonObject(name) {
-            put("type", "string")
-            putJsonArray("enum") { values.forEach { add(it) } }
-            put("description", description)
-        }
-    }
+    private fun text(element: JsonElement, what: String): String =
+        (element as? JsonPrimitive)?.takeUnless { it is JsonNull }?.content
+            ?: throw IllegalArgumentException("$what must be a string")
 
     // ---------------------------------------------------------------
     // Helper: serialize a TrafficRule to JSON
@@ -880,6 +631,11 @@ Use \r\n for line endings in the request string (bare LF in the request line and
             if (rule.modifyReplaceHeader != null) {
                 put("modify_replace_header", buildJsonObject {
                     rule.modifyReplaceHeader.forEach { (k, v) -> put(k, v) }
+                })
+            }
+            if (rule.modifySetCookies != null) {
+                put("modify_set_cookies", buildJsonObject {
+                    rule.modifySetCookies.forEach { (k, v) -> put(k, v) }
                 })
             }
             if (rule.spoofResponse != null) put("spoof_response", rule.spoofResponse)
