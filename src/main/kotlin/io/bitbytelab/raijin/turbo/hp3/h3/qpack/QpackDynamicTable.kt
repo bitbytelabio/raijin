@@ -1,5 +1,6 @@
 package io.bitbytelab.raijin.turbo.hp3.h3.qpack
 
+import io.bitbytelab.raijin.turbo.hp3.h3.Http3Exception
 import java.nio.charset.StandardCharsets
 
 /**
@@ -9,6 +10,11 @@ import java.nio.charset.StandardCharsets
  * entry: the first entry inserted is index 0 and each insertion increments. An insertion evicts
  * from the oldest end until the new entry fits within the capacity, and an evicted index stays
  * spent — it is never reused, so a stale reference is an error rather than a different header.
+ *
+ * <p>The capacity starts at zero and only the peer's Set Dynamic Table Capacity instruction moves
+ * it, never past the maximum this end advertised (RFC 9204 sections 3.2.3 and 4.3.1). Both of the
+ * ways a peer can break that, and an insertion larger than the capacity it set (section 3.2.2),
+ * are refused with {@code QPACK_ENCODER_STREAM_ERROR}, which is what the RFC makes them.
  *
  * <p><b>One writer, many lock-free readers.</b> Insertions arrive on the peer's QPACK encoder
  * stream, which is a single stream read by a single thread, while every response in flight reads
@@ -25,8 +31,9 @@ class QpackDynamicTable(
     private val maxCapacity: Long,
 ) {
 
+    /** RFC 9204 section 3.2.3: "The initial capacity of the dynamic table is zero." */
     @Volatile
-    private var snapshot: Snapshot = Snapshot(emptyArray(), 0, 0, maxCapacity, maxCapacity)
+    private var snapshot: Snapshot = Snapshot(emptyArray(), 0, 0, 0, maxCapacity)
 
     /**
      * An immutable view of the table. Entries it holds stay readable even after the live table has
@@ -74,12 +81,19 @@ class QpackDynamicTable(
 
     /**
      * Appends an entry, which becomes the highest absolute index, evicting older entries to make
-     * room. An entry larger than the whole capacity empties the table without being inserted, which
-     * RFC 9204 section 3.2.2 describes explicitly.
+     * room. RFC 9204 section 3.2.2 makes an entry larger than the whole capacity an encoder error
+     * rather than something that empties the table, as it would in HPACK, so it is refused and the
+     * table left as it was.
      */
+    @Throws(QpackException::class)
     fun insert(entry: FieldLine) {
         val current = snapshot
         val entrySize = sizeOf(entry)
+        if (entrySize > current.capacity()) {
+            throw QpackException(Http3Exception.QPACK_ENCODER_STREAM_ERROR,
+                "peer inserted a " + entrySize + " octet entry into a dynamic table whose " +
+                    "capacity is " + current.capacity() + " octets (RFC 9204 section 3.2.2)")
+        }
         val entries = ArrayList(current.entries.asList())
         var size = current.size
         var evictedCount = current.evictedCount
@@ -87,11 +101,6 @@ class QpackDynamicTable(
         while (entries.isNotEmpty() && size + entrySize > current.capacity()) {
             size -= sizeOf(entries.removeAt(0))
             evictedCount++
-        }
-        if (size + entrySize > current.capacity()) {
-            snapshot = Snapshot(emptyArray(), evictedCount, 0, current.capacity(),
-                maxCapacity)
-            return
         }
         entries.add(entry)
         snapshot = Snapshot(entries.toTypedArray(), evictedCount,
@@ -114,9 +123,16 @@ class QpackDynamicTable(
 
     /**
      * Applies a Set Dynamic Table Capacity instruction, RFC 9204 section 4.3.1, evicting whatever
-     * no longer fits.
+     * no longer fits. A capacity above the advertised maximum is refused and changes nothing.
      */
+    @Throws(QpackException::class)
     fun setCapacity(newCapacity: Long) {
+        if (newCapacity !in 0..maxCapacity) {
+            throw QpackException(Http3Exception.QPACK_ENCODER_STREAM_ERROR,
+                "peer set the dynamic table capacity to " + newCapacity + " octets, outside the " +
+                    "0.." + maxCapacity + " advertised in SETTINGS_QPACK_MAX_TABLE_CAPACITY " +
+                    "(RFC 9204 section 4.3.1)")
+        }
         val current = snapshot
         val entries = ArrayList(current.entries.asList())
         var size = current.size

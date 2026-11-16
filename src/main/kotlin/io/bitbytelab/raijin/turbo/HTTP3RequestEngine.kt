@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.turbo
 
 import io.bitbytelab.raijin.turbo.hp3.quic.ControlledKwikQuicTransport
+import io.bitbytelab.raijin.turbo.hp3.quic.KwikThreads
 import io.bitbytelab.raijin.turbo.hp3.quic.QuicConfig
 import io.bitbytelab.raijin.turbo.http3.FirstByteTimingInputStream
 import io.bitbytelab.raijin.turbo.http3.GateConnection
@@ -29,16 +30,10 @@ import java.util.concurrent.atomic.AtomicReference
 
 /**
  * A thread for work that blocks inside Kwik: a handshake, or a response read. Virtual where the JVM
- * carries a blocked virtual thread without pinning a carrier, platform where it does not. Platform
- * threads are made daemon so a thread waiting on a response that never arrives cannot hold the JVM
- * open; virtual threads are daemon already.
+ * carries a blocked virtual thread without pinning a carrier, platform daemon where it does not; see
+ * [KwikThreads].
  */
-internal fun kwikBlockingThread(name: String): Thread.Builder =
-    if (HTTP3RequestEngine.prefersVirtualThreads(Runtime.version().feature())) {
-        Thread.ofVirtual().name(name)
-    } else {
-        Thread.ofPlatform().daemon().name(name)
-    }
+internal fun kwikBlockingThread(name: String): Thread.Builder = KwikThreads.blockingThread(name)
 
 internal fun interface Http3AdaptiveTaskStarter {
     fun start(name: String, task: () -> Unit)
@@ -68,6 +63,32 @@ internal inline fun tryAcquireAdaptiveTaskSlot(
     if (isRunning()) return true
     release()
     return false
+}
+
+/**
+ * Whether a gated request may still be waiting in the dispatch queue, which is the only time
+ * walking the queue for one is worth O(queue depth).
+ *
+ * <p>RequestEngine.queue() opens a gate's lifecycle and counts the request into the gate's
+ * `remaining` before the request reaches the queue, and staging counts it back out, so a queued
+ * gated request is always visible here first. A gate gets its batch when its first request is
+ * staged and keeps it until its lifecycle ends. So an active gate without a batch still has its
+ * requests queued, and one with a batch has requests queued exactly while some are unstaged.
+ * Checking only the gates in [batchedGates] keeps the cost at the number of gates in flight rather
+ * than every gate the run has ever registered.
+ *
+ * @param activeGateLifecycles gates queued and not yet finished
+ * @param batchedGates names of the gates whose batch is open
+ * @param unstagedRequests the requests a gate has queued and not yet staged
+ */
+internal inline fun gatedRequestMayBeQueued(
+    activeGateLifecycles: Int,
+    batchedGates: Collection<String>,
+    unstagedRequests: (String) -> Int,
+): Boolean {
+    if (activeGateLifecycles == 0) return false
+    if (activeGateLifecycles > batchedGates.size) return true
+    return batchedGates.any { gateName -> unstagedRequests(gateName) > 0 }
 }
 
 /**
@@ -146,10 +167,19 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
     private val resizeLock = Object()
     /**
      * Never guards ordinary request leases. It is the rendezvous a request parks on when the pool
-     * has no lease to give, and serializes gate-return publication with cancellation's final pool
-     * snapshot so a returned session cannot appear after cleanup has passed it.
+     * has no lease to give, and serializes every publication into the pool with the dispatcher's
+     * final pool snapshot so a session cannot appear after teardown has passed it.
      */
     private val poolLock = Object()
+
+    /**
+     * Set under [poolLock] when the dispatcher takes the pool snapshot it closes, and checked under
+     * it by everything that publishes a connection. runState alone cannot say this: a run that
+     * completes rather than being cancelled is still in state 2 when that snapshot is taken, so a
+     * connection still opening at that moment would be pooled after the pool's last sweep and
+     * never closed.
+     */
+    private var ordinaryPoolClosed = false
 
     /**
      * Copy-on-write so a request can walk the pool without taking anything. Writes are connections
@@ -460,7 +490,7 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
             if (runState.get() >= 3) return
             session = openConnection()
             synchronized(poolLock) {
-                if (runState.get() < 3) {
+                if (poolOpenForPublication()) {
                     val id = connections.incrementAndGet().toString()
                     ordinaryConnections.add(OrdinaryConnection(session, id))
                     handedOffSlot = true
@@ -605,6 +635,12 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
     }
 
     /**
+     * Whether a connection may still join the pool. Asked, and acted on, only under [poolLock],
+     * which is what makes the answer hold until the connection is in.
+     */
+    private fun poolOpenForPublication(): Boolean = runState.get() < 3 && !ordinaryPoolClosed
+
+    /**
      * Cancels a run whose responses have stopped arriving. This cannot live on the dispatcher
      * thread: shouldAbandonRun() cancels by blocking on the completion latch, and the dispatcher
      * is the thread that counts it down.
@@ -677,14 +713,24 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
                     if (runState.get() < 3 && tryAcquireConnectionSlot()) {
                         reservedSlot = true
                         val session = openConnection()
-                        if (runState.get() >= 3) {
-                            runCatching { session.close() }
-                        } else {
-                            val id = connections.incrementAndGet().toString()
+                        // Checked and published under poolLock, which the dispatcher's final pool
+                        // snapshot also takes: either this connection is in that snapshot and is
+                        // closed with the pool, or the pool has closed and it is closed here.
+                        val published = synchronized(poolLock) {
+                            if (poolOpenForPublication()) {
+                                val id = connections.incrementAndGet().toString()
+                                ordinaryConnections.add(OrdinaryConnection(session, id))
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        if (published) {
                             reservedSlot = false
-                            ordinaryConnections.add(OrdinaryConnection(session, id))
                             retireExcessOrdinaryConnections()
                             wakeAllPoolWaiters()
+                        } else {
+                            runCatching { session.close() }
                         }
                     }
                 } catch (exception: Throwable) {
@@ -922,9 +968,14 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
             batches.entries.toList().forEach { (gateName, batch) ->
                 if (!gateCollectors.containsKey(gateName)) finishBatch(gateName, batch)
             }
-            // Gate returns publish under the same monitor. Either a return wins and appears in
-            // this snapshot, or cancellation wins and the return sees runState >= 3 and closes.
-            val pooledAtCancellation = synchronized(poolLock) { ordinaryConnectionSnapshot() }
+            // Every publication into the pool is checked and made under the same monitor. Either
+            // it wins and appears in this snapshot, or it sees the pool closed and closes its own
+            // session. Closing the pool rather than relying on runState covers a run that completes
+            // as well as one that is cancelled: a completed run is still in state 2 here.
+            val pooledAtCancellation = synchronized(poolLock) {
+                ordinaryPoolClosed = true
+                ordinaryConnectionSnapshot()
+            }
             pooledAtCancellation.forEach { connection ->
                 retireOrdinaryConnection(connection, forceClose = true)
             }
@@ -962,7 +1013,7 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
     }
 
     private fun pollNextRequest(): Request? {
-        // Only walk the queue looking for a gated request when the run actually has a gate.
+        // Only walk the queue looking for a gated request when one may be in it.
         // LinkedBlockingQueue's iterator takes both queue locks once per element, so an
         // unconditional scan costs O(queue depth) per dispatch, and a non-streaming run gets an
         // unbounded queue. Measured on a 50k-deep queue that is 273us per request, which caps the
@@ -980,13 +1031,17 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
     }
 
     /**
-     * Whether any gated request has been queued. Gates are registered in [floodgates] by
-     * RequestEngine.queue() before the request reaches the queue, so a gated request can never
-     * become visible here without its gate being visible first, and the map is only cleared once
-     * the run is torn down. Read without the monitor on purpose: openGate() holds that monitor
-     * while it waits for this very thread to finish staging.
+     * Whether a gated request may still be waiting in the queue; see [gatedRequestMayBeQueued].
+     * Asking whether any gate had ever been registered kept the walk running for the rest of the
+     * run after the first gate, because [floodgates] is only cleared at teardown.
+     *
+     * <p>Read without the floodgates monitor on purpose: openGate() holds that monitor while it
+     * waits for this very thread to finish staging.
      */
-    private fun gatesInUse(): Boolean = floodgates.isNotEmpty()
+    private fun gatesInUse(): Boolean = gatedRequestMayBeQueued(
+        activeGateLifecycleCount(),
+        batches.keys,
+    ) { gateName -> floodgates[gateName]?.remaining?.get() ?: 0 }
 
     private fun dispatchOrdinary(request: Request) {
         // Taken on the dispatcher thread, before the request gets a thread of its own, so that a
@@ -1125,29 +1180,37 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
             }
 
             if (reservedSlot) {
-                try {
+                val connection = try {
                     val session = try {
                         openConnection()
                     } catch (exception: Throwable) {
                         recordConnectionOpenFailure(exception)
                         throw exception
                     }
-                    val id = connections.incrementAndGet().toString()
-                    if (runState.get() >= 3) {
-                        session.close()
+                    val opened = OrdinaryConnection(session, connections.incrementAndGet().toString())
+                    opened.tryLease(requestsPerConnection, maxConcurrentStreams)
+                    // Checked and published under poolLock like every other publication, so a
+                    // connection opened while the pool closes is closed here rather than missed
+                    // by the final sweep.
+                    val published = synchronized(poolLock) {
+                        poolOpenForPublication().also { open ->
+                            if (open) ordinaryConnections.add(opened)
+                        }
+                    }
+                    if (!published) {
+                        runCatching { session.close() }
                         throw IllegalStateException("HTTP/3 run was cancelled while opening a connection")
                     }
-                    return OrdinaryConnection(session, id).also { connection ->
-                        connection.tryLease(requestsPerConnection, maxConcurrentStreams)
-                        ordinaryConnections.add(connection)
-                        retireExcessOrdinaryConnections()
-                        wakeAllPoolWaiters()
-                    }
+                    opened
                 } catch (exception: Throwable) {
                     releaseConnectionSlot()
                     wakeAllPoolWaiters()
                     throw exception
                 }
+                // The pool owns the slot from here, so nothing below may hand it back.
+                retireExcessOrdinaryConnections()
+                wakeAllPoolWaiters()
+                return connection
             }
         }
         throw IllegalStateException("HTTP/3 run is no longer accepting requests")
@@ -1305,7 +1368,7 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
         val connected = lease.requestsCarried < requestsPerConnection &&
             runCatching { lease.session.isConnected() }.getOrDefault(false)
         val reusable = synchronized(poolLock) {
-            if (connected && runState.get() < 3) {
+            if (connected && poolOpenForPublication()) {
                 ordinaryConnections.add(OrdinaryConnection(lease.session, lease.id, lease.requestsCarried))
                 true
             } else {
@@ -1645,8 +1708,9 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
             if (session == null) return
             // Hand the connection back rather than closing it, so a later gate inherits its warm
             // congestion window instead of paying for another handshake. Only a batch that
-            // released cleanly can be handed back: any other outcome leaves half-written request
-            // streams dangling on the connection, along with reader threads still waiting.
+            // released cleanly, had every response answered and could finish every stream it
+            // staged can be handed back: any other outcome leaves request streams dangling on the
+            // connection, along with reader threads still waiting.
             val connectionId = connection.connectionId
             // A gate's requests count against its connection like any other. Without this the same
             // connection served every gate in a run however long it ran, and
@@ -1656,16 +1720,18 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
                 connectionId != null &&
                 batch.releasedCleanly() &&
                 carried < requestsPerConnection &&
-                runCatching { session.isConnected() }.getOrDefault(false)
+                runCatching { session.isConnected() }.getOrDefault(false) &&
+                // Last, because it writes: only a connection about to be handed back needs it.
+                connection.staged().all { staged -> staged.exchange.finishStream() }
             synchronized(gateSettlementLock) {
                 // Cancellation may have taken this token after its bounded drain while the probe
                 // above was blocked. That path already closed the session and returned its slot.
                 if (!unsettledGateConnections.remove(connection)) return
-                // Publication and cancellation's pool snapshot share poolLock, and runState is
-                // deliberately checked after the probe: either the returned session is swept, or
-                // this path closes it itself, exactly once.
+                // Publication and the dispatcher's final pool snapshot share poolLock, and whether
+                // the pool is still open is deliberately asked after the probe: either the returned
+                // session is swept, or this path closes it itself, exactly once.
                 val reusable = synchronized(poolLock) {
-                    if (connected && runState.get() < 3) {
+                    if (connected && poolOpenForPublication()) {
                         ordinaryConnections.add(OrdinaryConnection(session, connectionId!!, carried))
                         true
                     } else {
@@ -1991,17 +2057,10 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
         fun maxRequestsInFlight(virtualThreads: Boolean): Int =
             if (virtualThreads) MAX_REQUESTS_IN_FLIGHT_VIRTUAL else MAX_REQUESTS_IN_FLIGHT_PLATFORM
 
-        /**
-         * The first JDK where a virtual thread no longer pins its carrier while blocked inside a
-         * synchronized block (JEP 491). Below it, every thread this engine parks in Kwik costs a
-         * carrier regardless, so virtual threads are overhead with a ceiling attached.
-         */
-        private const val FIRST_JDK_WITHOUT_MONITOR_PINNING = 24
-
         /** Whether [jdkFeatureVersion] carries blocked virtual threads without pinning a carrier. */
         @JvmStatic
         fun prefersVirtualThreads(jdkFeatureVersion: Int): Boolean =
-            jdkFeatureVersion >= FIRST_JDK_WITHOUT_MONITOR_PINNING
+            KwikThreads.prefersVirtualThreads(jdkFeatureVersion)
 
         private fun authority(target: URL): String {
             val port = getEffectivePort(target)

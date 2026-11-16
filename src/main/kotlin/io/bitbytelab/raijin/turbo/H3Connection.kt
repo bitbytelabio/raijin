@@ -154,8 +154,17 @@ class H3Connection private constructor(
         fun open(
             transport: SdaCapableQuicTransport,
             responseTimeoutMillis: Long = DEFAULT_RESPONSE_TIMEOUT_MILLIS,
-        ): H3Connection =
-            H3Connection(transport, Http3ClientConnection.open(transport), responseTimeoutMillis)
+        ): H3Connection {
+            val client = try {
+                Http3ClientConnection.open(transport)
+            } catch (failure: Throwable) {
+                // The caller handed the transport over and gets nothing back to close it with, so
+                // a connection that fails to set up HTTP/3 would otherwise stay open on the wire.
+                runCatching { transport.close() }.exceptionOrNull()?.let(failure::addSuppressed)
+                throw failure
+            }
+            return H3Connection(transport, client, responseTimeoutMillis)
+        }
     }
 
     /** Response reads in progress, and the moment each one stops being worth waiting for. */
@@ -416,6 +425,37 @@ class StagedExchange internal constructor(
         if (response.completeExceptionally(cause)) {
             runCatching { stream.stopSending(Http3Exception.H3_REQUEST_CANCELLED) }
         }
+    }
+
+    /**
+     * Finishes this request's stream in the transport's own books once its response is in, and
+     * says whether it could. A connection with a stream it could not finish this way has to be
+     * closed rather than handed back to the pool.
+     *
+     * <p>A QPACK-blocked stage wrote and finished its whole request through the stream, so there
+     * is nothing to do. A datagram-released stage put its last bytes and FIN on the wire outside
+     * the stream, so Kwik still counts the stream as half-written: it never leaves Kwik's stream
+     * manager or flow control, and Kwik's connection-level flow-control count trails what the peer
+     * has received by those bytes. Writing the same bytes at the same offset and closing - a
+     * retransmission as far as QUIC is concerned, which the peer discards - ends the stream in
+     * Kwik exactly where the release ended it on the wire.
+     *
+     * <p>Never before the response has arrived: a release that did not reach the server must not
+     * be completed late, which would run a request the run has already reported as failed.
+     */
+    fun finishStream(): Boolean {
+        if (!response.isDone || response.isCompletedExceptionally) {
+            return false
+        }
+        val withheld = fragment ?: return true
+        // A release without a FIN left the request open on the wire too, and nothing will end it.
+        if (!withheld.fin()) {
+            return false
+        }
+        return runCatching {
+            stream.output().write(withheld.data())
+            stream.finishSending()
+        }.isSuccess
     }
 
     @Throws(IOException::class)

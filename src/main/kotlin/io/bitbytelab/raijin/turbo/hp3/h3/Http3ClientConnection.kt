@@ -8,6 +8,7 @@ import io.bitbytelab.raijin.turbo.hp3.h3.qpack.QpackDynamicTable
 import io.bitbytelab.raijin.turbo.hp3.h3.qpack.QpackEncoder
 import io.bitbytelab.raijin.turbo.hp3.h3.qpack.QpackEncoderStream
 import io.bitbytelab.raijin.turbo.hp3.h3.qpack.QpackException
+import io.bitbytelab.raijin.turbo.hp3.quic.KwikThreads
 import io.bitbytelab.raijin.turbo.hp3.quic.QuicStream
 import io.bitbytelab.raijin.turbo.hp3.quic.QuicTransport
 import java.io.ByteArrayOutputStream
@@ -105,13 +106,24 @@ class Http3ClientConnection private constructor(
      */
     private val gateInvariantBroken = AtomicBoolean()
 
+    /**
+     * Reads one stream the peer opened, on a thread of its own. Its control and QPACK streams are
+     * read for the life of the connection, blocked inside Kwik's monitor between instructions, so
+     * the thread is one that blocking there does not pin; see [KwikThreads].
+     */
     private fun dispatchPeerStream(stream: QuicStream) {
-        Thread.ofVirtual().name("h3-peer-stream-" + stream.id()).start {
-            try {
-                processPeerStream(stream)
-            } catch (failure: Throwable) {
-                failConnection(failure)
+        try {
+            KwikThreads.blockingThread("h3-peer-stream-" + stream.id()).start {
+                try {
+                    processPeerStream(stream)
+                } catch (failure: Throwable) {
+                    failConnection(failure)
+                }
             }
+        } catch (failure: Throwable) {
+            // A peer stream nobody reads may be the control stream carrying SETTINGS, which leaves
+            // the connection unable to do what it was opened for.
+            failConnection(failure)
         }
     }
 
@@ -217,6 +229,11 @@ class Http3ClientConnection private constructor(
             return null
         }
         val authority = authorityOf(request) ?: return null
+        // RFC 9204 section 3.2.2: the peer treats an insertion larger than its table as a
+        // connection error, so an authority too long for the table it offered is spelled out.
+        if (QpackDynamicTable.entrySize(authority) > peerCapacity) {
+            return null
+        }
         val held = holdingEncoderStream.get()
         // A gate is only a gate while the peer is missing something. The first hold on a
         // connection is covered by the insertion below, but every later one has to insert again:
@@ -283,13 +300,6 @@ class Http3ClientConnection private constructor(
         }
     }
 
-    @Throws(IOException::class)
-    private fun drainCriticalStream(input: InputStream, name: String) {
-        input.transferTo(OutputStream.nullOutputStream())
-        throw Http3Exception(Http3Exception.H3_CLOSED_CRITICAL_STREAM,
-            "peer closed its " + name + " stream")
-    }
-
     /**
      * Applies the peer's encoder instructions to our copy of its table, telling it how far we have
      * got so it can start referencing what it has sent.
@@ -302,6 +312,10 @@ class Http3ClientConnection private constructor(
             try {
                 more = QpackEncoderStream.readInstruction(input, peerTable)
             } catch (e: QpackException) {
+                // An instruction our copy of the table refuses already carries this code.
+                if (e.errorCode() == Http3Exception.QPACK_ENCODER_STREAM_ERROR) {
+                    throw e
+                }
                 throw Http3Exception(Http3Exception.QPACK_ENCODER_STREAM_ERROR, e.message)
             }
             if (!more) {
@@ -325,7 +339,7 @@ class Http3ClientConnection private constructor(
     private fun startDecoderStreamWriter() {
         Thread.ofVirtual().name("h3-qpack-decoder-writer").start {
             try {
-                while (!closing.get()) {
+                while (!closing.get() && !peerFailure.get()) {
                     decoderStreamWork.acquire()
                     decoderStreamWork.drainPermits()
                     writePendingDecoderInstructions()
@@ -363,6 +377,10 @@ class Http3ClientConnection private constructor(
         if (closing.get() || !peerFailure.compareAndSet(false, true)) {
             return
         }
+        // Nothing waiting on this connection will be answered now. Release the decoder-stream
+        // writer, which stops on seeing the failure, and anyone still waiting for SETTINGS.
+        decoderStreamWork.release()
+        peerSettingsSeen.countDown()
         val errorCode = if (failure is Http3Exception) {
             failure.errorCode()
         } else {
@@ -549,12 +567,19 @@ class Http3ClientConnection private constructor(
     /**
      * Reads a response, acknowledging on {@code streamId} any field section that referenced the
      * dynamic table. Acknowledging is what lets the peer reuse and evict its entries.
+     *
+     * <p>Interim responses are read past. RFC 9114 section 4.1 lets any number of them (1xx, such
+     * as {@code 103 Early Hints} or {@code 100 Continue}) precede the final response on the same
+     * stream, each a lone HEADERS frame with no content or trailers. Taking the first field section
+     * as the response would report the interim status as the answer and file the real response's
+     * header section as its trailers.
      */
     @Throws(IOException::class)
     fun readResponse(input: InputStream, streamId: Long): Http3Response {
         val reader = Http3FrameReader(input)
         var fields: List<FieldLine>? = null
         var trailers: List<FieldLine> = listOf()
+        var interimResponses = 0
         val body = ByteArrayOutputStream()
 
         var frame: Http3Frame?
@@ -567,20 +592,28 @@ class Http3ClientConnection private constructor(
             }
             if (f.type() == Http3FrameType.HEADERS) {
                 val section = QpackDecoder.decodeSection(f.payload(), peerTable)
+                // Every field section that leaned on the table is acknowledged, interim ones too.
                 if (section.requiredInsertCount() > 0 && streamId != NO_STREAM_TO_ACKNOWLEDGE) {
                     sectionsToAcknowledge.add(streamId)
                     decoderStreamWork.release()
                 }
-                if (fields == null) {
-                    fields = section.fields()
-                } else {
+                if (fields != null) {
                     // A second field section, after the body, is the trailer section.
                     trailers = section.fields()
+                } else if (isInterimResponse(section.fields())) {
+                    interimResponses++
+                } else {
+                    fields = section.fields()
                 }
             } else if (f.type() == Http3FrameType.DATA) {
                 if (fields == null) {
                     throw Http3Exception(Http3Exception.H3_FRAME_UNEXPECTED,
-                        "DATA arrived before any HEADERS frame")
+                        if (interimResponses == 0) {
+                            "DATA arrived before any HEADERS frame"
+                        } else {
+                            "DATA arrived after an interim (1xx) response, before the final " +
+                                "response's HEADERS frame"
+                        })
                 }
                 body.writeBytes(f.payload())
             }
@@ -589,7 +622,12 @@ class Http3ClientConnection private constructor(
 
         if (fields == null) {
             throw Http3Exception(Http3Exception.H3_FRAME_UNEXPECTED,
-                "response stream ended without a HEADERS frame")
+                if (interimResponses == 0) {
+                    "response stream ended without a HEADERS frame"
+                } else {
+                    "response stream ended after " + interimResponses +
+                        " interim (1xx) response(s) without a final response"
+                })
         }
         return Http3Response(fields, body.toByteArray(), trailers)
     }
@@ -734,8 +772,10 @@ class Http3ClientConnection private constructor(
 
     override fun close() {
         closing.set(true)
-        // Wake the decoder-stream writer so it sees the connection closing and stops.
+        // Wake everything still waiting on this connection: the decoder-stream writer, which stops
+        // on seeing it closing, and anyone waiting for SETTINGS that will not arrive now.
         decoderStreamWork.release()
+        peerSettingsSeen.countDown()
         transport.close()
     }
 
@@ -799,6 +839,16 @@ class Http3ClientConnection private constructor(
                 }
             }
             return null
+        }
+
+        /**
+         * Whether a field section is an interim response: its first {@code :status} is a 1xx code,
+         * RFC 9110 section 15.2. A missing or malformed status is not, so a response that broke
+         * the rules is reported as received rather than read past.
+         */
+        private fun isInterimResponse(fields: List<FieldLine>): Boolean {
+            val status = fields.firstOrNull { it.name() == ":status" }?.value() ?: return false
+            return status.length == 3 && status[0] == '1' && status.all { it in '0'..'9' }
         }
     }
 }
