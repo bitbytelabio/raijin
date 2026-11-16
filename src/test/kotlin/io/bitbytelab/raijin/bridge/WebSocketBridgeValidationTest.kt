@@ -127,11 +127,9 @@ class WebSocketBridgeValidationTest {
     }
 
     @Test
-    fun `since_index below -1 is rejected, -1 and above are accepted`() {
-        assertNotNull(WebSocketBridge.validateSinceIndex(-2))
-        assertNull(WebSocketBridge.validateSinceIndex(-1))
-        assertNull(WebSocketBridge.validateSinceIndex(0))
-        assertNull(WebSocketBridge.validateSinceIndex(Long.MAX_VALUE))
+    fun `the default wait fits in the longest one and in a common 60 s client timeout`() {
+        assertTrue(WebSocketBridge.DEFAULT_WAIT_MS in 1L..WebSocketBridge.MAX_WAIT_MS)
+        assertTrue(WebSocketBridge.DEFAULT_WAIT_MS < 60_000L)
     }
 
     @Test

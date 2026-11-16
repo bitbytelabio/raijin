@@ -3,6 +3,8 @@ package io.bitbytelab.raijin.state
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -10,7 +12,8 @@ import kotlin.test.assertTrue
 
 /**
  * Indexed message recording behind `websocket(action=get_messages, since_index=...)`: index
- * allocation and storage are one step, so a poller can never skip a frame.
+ * allocation and storage are one step, so a poller can never skip a frame. `awaitPage` is the same
+ * read for a caller that waits (`wait_message`, `fuzz`): it must neither poll nor miss a frame.
  */
 class WebSocketConnectionTest {
 
@@ -123,5 +126,169 @@ class WebSocketConnectionTest {
         assertTrue(c.markClosed())
         assertFalse(c.markClosed())
         assertEquals("closed", c.status)
+    }
+
+    @Test
+    fun `lastIndex follows the newest message`() {
+        val c = connection()
+        assertEquals(-1L, c.lastIndex())
+        c.append("server_to_client", "TEXT", "a", 1)
+        c.append("server_to_client", "TEXT", "b", 1)
+        assertEquals(1L, c.lastIndex())
+    }
+
+    @Test
+    fun `relabel changes the type of a retained message and ignores any other index`() {
+        val c = connection()
+        c.append("client_to_server", "TEXT", "a", 1)
+        c.append("client_to_server", "TEXT", "b", 1)
+
+        c.relabel(1, "TEXT_UNSENT")
+        c.relabel(7, "TEXT_UNSENT")
+        c.relabel(-1, "TEXT_UNSENT")
+
+        val messages = c.page(-1, 10).messages
+        assertEquals(listOf("TEXT", "TEXT_UNSENT"), messages.map { it.type })
+        assertEquals(listOf("a", "b"), messages.map { it.payload })
+    }
+
+    @Test
+    fun `a page says whether the connection was closed`() {
+        val c = connection()
+        assertFalse(c.page(-1, 10).closed)
+        c.markClosed()
+        assertTrue(c.page(-1, 10).closed)
+    }
+
+    // --- awaitPage: waiting for the next message instead of polling ---
+
+    /** Far longer than any of these tests should take: a wait that runs this long has missed its wake-up. */
+    private val longWait = TimeUnit.SECONDS.toNanos(30)
+
+    @Test
+    fun `awaitPage returns at once when a later message is already recorded`() {
+        val c = connection()
+        c.append("server_to_client", "TEXT", "a", 1)
+        c.append("server_to_client", "TEXT", "b", 1)
+
+        val started = System.nanoTime()
+        val page = c.awaitPage(0, 10, longWait)
+
+        assertEquals(listOf(1L), page.messages.map { it.index })
+        assertFalse(page.closed)
+        assertTrue(System.nanoTime() - started < longWait / 2, "must not wait when a message is there")
+    }
+
+    @Test
+    fun `awaitPage blocks until the next message is appended`() {
+        val c = connection()
+        c.append("client_to_server", "TEXT", "ping", 4)
+        val writer = thread {
+            Thread.sleep(150)
+            c.append("server_to_client", "TEXT", "pong", 4)
+        }
+
+        val page = c.awaitPage(0, 10, longWait)
+        writer.join()
+
+        assertEquals(listOf("pong"), page.messages.map { it.payload })
+    }
+
+    @Test
+    fun `awaitPage returns an empty page once its timeout has passed`() {
+        val c = connection()
+        val timeout = TimeUnit.MILLISECONDS.toNanos(200)
+
+        val started = System.nanoTime()
+        val page = c.awaitPage(-1, 10, timeout)
+        val waited = System.nanoTime() - started
+
+        assertTrue(page.messages.isEmpty())
+        assertFalse(page.closed)
+        assertTrue(waited >= timeout, "returned after ${waited / 1_000_000} ms")
+        assertTrue(waited < longWait / 2, "returned after ${waited / 1_000_000} ms")
+    }
+
+    @Test
+    fun `a zero timeout reads what is there without waiting`() {
+        val c = connection()
+        assertTrue(c.awaitPage(-1, 10, 0).messages.isEmpty())
+        c.append("server_to_client", "TEXT", "a", 1)
+        assertEquals(1, c.awaitPage(-1, 10, 0).messages.size)
+        // An index below -1 means the same as -1.
+        assertEquals(1, c.awaitPage(-9, 10, 0).messages.size)
+    }
+
+    @Test
+    fun `closing the connection releases a waiter`() {
+        val c = connection()
+        val closer = thread {
+            Thread.sleep(150)
+            c.markClosed()
+        }
+
+        val page = c.awaitPage(-1, 10, longWait)
+        closer.join()
+
+        assertTrue(page.messages.isEmpty())
+        assertTrue(page.closed)
+        // Nothing more arrives on a closed connection, so a later call does not wait either.
+        val started = System.nanoTime()
+        assertTrue(c.awaitPage(-1, 10, longWait).closed)
+        assertTrue(System.nanoTime() - started < longWait / 2)
+    }
+
+    @Test
+    fun `an interrupted waiter stops waiting`() {
+        val c = connection()
+        val failure = AtomicReference<Throwable>()
+        val waiter = thread {
+            try {
+                c.awaitPage(-1, 10, longWait)
+            } catch (t: Throwable) {
+                failure.set(t)
+            }
+        }
+        Thread.sleep(150)
+        waiter.interrupt()
+        waiter.join(TimeUnit.SECONDS.toMillis(20))
+
+        assertTrue(failure.get() is InterruptedException, "got ${failure.get()}")
+    }
+
+    @Test
+    fun `a waiter never misses a frame recorded by concurrent writers`() {
+        val c = connection()
+        val writers = 4
+        val perWriter = 400 // stays below MAX_MESSAGES, so nothing is evicted
+        val total = writers * perWriter
+        val pool = Executors.newFixedThreadPool(writers)
+        val start = CountDownLatch(1)
+        repeat(writers) { w ->
+            pool.execute {
+                start.await()
+                repeat(perWriter) { i ->
+                    c.append("server_to_client", "TEXT", "w$w-$i", 4)
+                    // Pauses let the waiter catch up and block, so both "found" and "woken" happen.
+                    if (i % 50 == 0) Thread.sleep(1)
+                }
+            }
+        }
+
+        val seen = ArrayList<Long>(total)
+        var since = -1L
+        start.countDown()
+        while (seen.size < total) {
+            // One message per call: each of them has to be found, or to wake the waiter.
+            val page = c.awaitPage(since, 1, longWait)
+            assertEquals(0L, page.missed)
+            val message = page.messages.singleOrNull() ?: break
+            seen += message.index
+            since = message.index
+        }
+        pool.shutdown()
+        assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS))
+
+        assertEquals((0L until total.toLong()).toList(), seen, "every index exactly once, in order")
     }
 }
