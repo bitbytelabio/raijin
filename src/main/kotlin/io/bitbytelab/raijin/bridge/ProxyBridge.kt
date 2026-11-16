@@ -25,19 +25,14 @@ import burp.api.montoya.proxy.http.ProxyRequestToBeSentAction
 import burp.api.montoya.proxy.http.ProxyResponseHandler
 import burp.api.montoya.proxy.http.ProxyResponseReceivedAction
 import burp.api.montoya.proxy.http.ProxyResponseToBeSentAction
-import io.bitbytelab.raijin.core.TextSimilarity
 import io.bitbytelab.raijin.events.EventBus
-import io.bitbytelab.raijin.safety.BoundedHttp
-import io.bitbytelab.raijin.safety.HeaderSafety
 import io.bitbytelab.raijin.safety.SafeRegex
-import io.bitbytelab.raijin.safety.ScopeGate
-import io.bitbytelab.raijin.state.AutorizeRule
 import io.bitbytelab.raijin.state.ProxyRule
 import io.bitbytelab.raijin.state.StateManager
+import io.bitbytelab.raijin.transport.AutorizeFileStore
+import io.bitbytelab.raijin.transport.AutorizeStore
 import kotlinx.serialization.json.*
 import java.time.Instant
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 
 /**
  * Bridge wrapping the Montoya Proxy API.
@@ -45,32 +40,37 @@ import java.util.concurrent.Executors
  * Provides MCP-friendly methods for reading proxy history, controlling
  * interception, annotating items, and managing proxy rules. Also creates
  * the [ProxyRequestHandler] and [ProxyResponseHandler] registered during
- * extension initialization.
+ * extension initialization, which apply the proxy rules, feed the hold queue
+ * of the intercept tools ([interceptHolds]) and the live Autorize tap.
+ *
+ * @param autorizeStore where the Autorize tap persists its matches; this project's are restored
+ *   on construction. Null keeps them in memory only.
  */
 class ProxyBridge(
     private val api: MontoyaApi,
     private val eventBus: EventBus,
     private val stateManager: StateManager,
-    private val findings: FindingsBridge
+    findings: FindingsBridge,
+    autorizeStore: AutorizeFileStore? = AutorizeStore.defaultStore,
 ) {
-    private val scopeGate = ScopeGate(api)
+    /** Messages held for the proxy intercept tools; see [ProxyInterceptHolds]. */
+    internal val interceptHolds = ProxyInterceptHolds(eventBus)
 
-    /**
-     * Runs live Autorize-style replays off the proxy handler thread. A dedicated pool (rather
-     * than a shared one) keeps this background work from ever competing with/blocking other
-     * Montoya callback dispatch; its futures are intentionally never awaited (see [maybeAutorize]).
-     */
-    private val autorizeExecutor: ExecutorService = Executors.newVirtualThreadPerTaskExecutor()
-
-    /** Admission and send-concurrency bounds for [autorizeExecutor]. */
-    private val autorizeGate = AutorizeReplayGate(AUTORIZE_MAX_QUEUED, AUTORIZE_MAX_CONCURRENT)
+    /** Live Autorize-style tap on proxied responses; see [AutorizeTap] and [AutorizeBridge] for rule CRUD. */
+    private val autorizeTap = AutorizeTap(api, eventBus, stateManager, findings, autorizeStore)
 
     /** Serialises rule writes so concurrent sets of one id cannot both append. */
     private val ruleLock = Any()
 
-    /** Shuts down background executors on extension unload. */
+    init {
+        // This project's Autorize matches are back before a rule can be set or traffic tapped.
+        autorizeTap.start()
+    }
+
+    /** Releases held messages (they are forwarded) and stops background work on extension unload. */
     fun shutdown() {
-        autorizeExecutor.shutdownNow()
+        interceptHolds.shutdown()
+        autorizeTap.shutdown()
     }
 
     // ---------------------------------------------------------------
@@ -81,7 +81,7 @@ class ProxyBridge(
      * Returns a slice of the HTTP proxy history with optional filtering.
      *
      * @param startIndex Zero-based offset into the filtered history.
-     * @param count Maximum number of items to return.
+     * @param count Maximum number of items to return; clamped to 0..[MAX_PAGE_SIZE] with a note in the result.
      * @param host Optional hostname filter (case-insensitive substring match).
      * @param method Optional HTTP method filter (exact, case-insensitive).
      * @param statusCode Optional exact status code filter.
@@ -147,8 +147,9 @@ class ProxyBridge(
         }
 
         val allItems = api.proxy().history(filter)
-        val safeStart = startIndex.coerceAtLeast(0)
-        val slice = page(allItems, safeStart, count)
+        val notes = mutableListOf<String>()
+        val safeStart = ProxyLimits.clamp("start_index", startIndex, 0, Int.MAX_VALUE, notes)
+        val slice = page(allItems, safeStart, ProxyLimits.clamp("count", count, 0, MAX_PAGE_SIZE, notes))
 
         return buildJsonObject {
             put("total_filtered", allItems.size)
@@ -159,6 +160,7 @@ class ProxyBridge(
                     add(serializeHistoryItem(item, includeRequest, includeResponse, maxResponseLength ?: 200_000))
                 }
             })
+            putNotes(notes)
         }
     }
 
@@ -168,7 +170,7 @@ class ProxyBridge(
      * @param pattern Regex pattern to match.
      * @param searchIn Where to search: "request", "response", or "both".
      * @param caseSensitive Whether the regex is case-sensitive.
-     * @param maxResults Maximum number of matching items to return.
+     * @param maxResults Maximum number of matching items to return; clamped to 0..[MAX_PAGE_SIZE] with a note in the result.
      * @param inScopeOnly When true, only search in-scope items.
      * @param includeRequest Whether to include the full request text.
      * @param includeResponse Whether to include the full response text.
@@ -216,7 +218,8 @@ class ProxyBridge(
         }
 
         val matches = api.proxy().history(filter)
-        val limited = page(matches, 0, maxResults)
+        val notes = mutableListOf<String>()
+        val limited = page(matches, 0, ProxyLimits.clamp("max_results", maxResults, 0, MAX_PAGE_SIZE, notes))
 
         return buildJsonObject {
             put("total_matches", matches.size)
@@ -228,6 +231,7 @@ class ProxyBridge(
                     add(serializeHistoryItem(item, includeRequest, includeResponse, maxResponseLength ?: 200_000))
                 }
             })
+            putNotes(notes)
         }
     }
 
@@ -235,38 +239,32 @@ class ProxyBridge(
      * Returns WebSocket proxy history with optional filtering.
      *
      * @param startIndex Zero-based offset.
-     * @param count Maximum number of items.
+     * @param count Maximum number of items; clamped to 0..[MAX_PAGE_SIZE] with a note in the result.
      * @param host Optional hostname filter.
      * @param direction Optional direction filter: "client_to_server", "server_to_client" or "both" (any case).
+     * @param webSocketId Optional Burp id of one proxied connection (`websocket_id` of an item).
+     * @param url Optional case-insensitive substring of the upgrade request's URL.
      * @return JSON object with items array.
      */
     fun getWebSocketHistory(
         startIndex: Int,
         count: Int,
         host: String?,
-        direction: String?
+        direction: String?,
+        webSocketId: Int? = null,
+        url: String? = null,
     ): JsonObject {
         val dirName = when (val d = WebSocketHistoryCriteria.parseDirection(direction)) {
             is WebSocketHistoryCriteria.DirectionFilter.All -> null
             is WebSocketHistoryCriteria.DirectionFilter.Only -> d.name
             is WebSocketHistoryCriteria.DirectionFilter.Invalid -> return buildJsonObject { put("error", d.message) }
         }
-        val criteria = WebSocketHistoryCriteria(host, dirName)
+        val criteria = WebSocketHistoryCriteria(host, dirName, webSocketId, url)
 
-        val filter = ProxyWebSocketHistoryFilter { item ->
-            try {
-                criteria.matches(
-                    upgradeHost = if (host != null) safe { item.upgradeRequest()?.httpService()?.host() } else null,
-                    direction = if (dirName != null) safe { item.direction().name } else null,
-                )
-            } catch (_: Exception) {
-                false
-            }
-        }
-
-        val allItems = api.proxy().webSocketHistory(filter)
-        val safeStart = startIndex.coerceAtLeast(0)
-        val slice = page(allItems, safeStart, count)
+        val allItems = api.proxy().webSocketHistory { item -> matchesCriteria(criteria, item) }
+        val notes = mutableListOf<String>()
+        val safeStart = ProxyLimits.clamp("start_index", startIndex, 0, Int.MAX_VALUE, notes)
+        val slice = page(allItems, safeStart, ProxyLimits.clamp("count", count, 0, MAX_PAGE_SIZE, notes))
 
         return buildJsonObject {
             put("total_filtered", allItems.size)
@@ -275,6 +273,7 @@ class ProxyBridge(
             put("items", buildJsonArray {
                 slice.forEach { item -> add(serializeWebSocketItem(item)) }
             })
+            putNotes(notes)
         }
     }
 
@@ -283,13 +282,17 @@ class ProxyBridge(
      *
      * @param pattern Regex pattern.
      * @param direction Optional direction filter.
-     * @param maxResults Maximum results.
+     * @param maxResults Maximum results; clamped to 0..[MAX_PAGE_SIZE] with a note in the result.
+     * @param webSocketId Optional Burp id of one proxied connection.
+     * @param url Optional case-insensitive substring of the upgrade request's URL.
      * @return JSON object with match results.
      */
     fun searchWebSocketHistory(
         pattern: String,
         direction: String?,
-        maxResults: Int
+        maxResults: Int,
+        webSocketId: Int? = null,
+        url: String? = null,
     ): JsonObject {
         SafeRegex.validate(pattern, ignoreCase = true)?.let { err ->
             return buildJsonObject { put("error", "Invalid regex pattern: $err") }
@@ -299,10 +302,11 @@ class ProxyBridge(
             is WebSocketHistoryCriteria.DirectionFilter.Only -> d.name
             is WebSocketHistoryCriteria.DirectionFilter.Invalid -> return buildJsonObject { put("error", d.message) }
         }
+        val criteria = WebSocketHistoryCriteria(null, dirName, webSocketId, url)
 
         val filter = ProxyWebSocketHistoryFilter { item ->
             try {
-                if (dirName != null && item.direction().name != dirName) return@ProxyWebSocketHistoryFilter false
+                if (!matchesCriteria(criteria, item)) return@ProxyWebSocketHistoryFilter false
                 val payloadText = safe { item.payload().toString() } ?: ""
                 SafeRegex.containsMatchIn(pattern, payloadText, ignoreCase = true)
             } catch (_: Exception) {
@@ -311,7 +315,8 @@ class ProxyBridge(
         }
 
         val matches = api.proxy().webSocketHistory(filter)
-        val limited = page(matches, 0, maxResults)
+        val notes = mutableListOf<String>()
+        val limited = page(matches, 0, ProxyLimits.clamp("max_results", maxResults, 0, MAX_PAGE_SIZE, notes))
 
         return buildJsonObject {
             put("total_matches", matches.size)
@@ -320,7 +325,23 @@ class ProxyBridge(
             put("items", buildJsonArray {
                 limited.forEach { item -> add(serializeWebSocketItem(item)) }
             })
+            putNotes(notes)
         }
+    }
+
+    /**
+     * Whether [item] passes [criteria]. Each value is read only when its criterion is set, and
+     * guarded: a message Burp cannot describe never matches a criterion that needs the value.
+     */
+    private fun matchesCriteria(criteria: WebSocketHistoryCriteria, item: ProxyWebSocketMessage): Boolean = try {
+        criteria.matches(
+            upgradeHost = if (criteria.host != null) safe { item.upgradeRequest()?.httpService()?.host() } else null,
+            direction = if (criteria.direction != null) safe { item.direction().name } else null,
+            webSocketId = if (criteria.webSocketId != null) safe { item.webSocketId() } else null,
+            upgradeUrl = if (criteria.url != null) safe { item.upgradeRequest()?.url() } else null,
+        )
+    } catch (_: Exception) {
+        false
     }
 
     // ---------------------------------------------------------------
@@ -347,10 +368,11 @@ class ProxyBridge(
         return buildJsonObject { put("intercept_enabled", false) }
     }
 
-    /** Returns the current intercept state. */
+    /** Returns the current intercept state: Burp's own Intercept switch, and Raijin's hold queue. */
     fun isInterceptEnabled(): JsonObject {
         return buildJsonObject {
             put("intercept_enabled", api.proxy().isInterceptEnabled)
+            put("hold", interceptHolds.status())
         }
     }
 
@@ -475,8 +497,17 @@ class ProxyBridge(
                     rule.modifyReplaceHeader.forEach { (k, v) -> put(k, v) }
                 })
             }
+            if (rule.modifySetHeader != null) {
+                put("modify_set_header", buildJsonObject {
+                    rule.modifySetHeader.forEach { (k, v) -> put(k, v) }
+                })
+            }
             if (rule.modifyBodyRegex != null) put("modify_body_regex", rule.modifyBodyRegex)
             if (rule.modifyBodyReplacement != null) put("modify_body_replacement", rule.modifyBodyReplacement)
+            if (rule.modifyMethod != null) put("modify_method", rule.modifyMethod)
+            if (rule.modifyPath != null) put("modify_path", rule.modifyPath)
+            if (rule.modifyPathRegex != null) put("modify_path_regex", rule.modifyPathRegex)
+            if (rule.modifyStatus != null) put("modify_status", rule.modifyStatus)
             if (rule.tagComment != null) put("tag_comment", rule.tagComment)
             if (rule.tagHighlight != null) put("tag_highlight", rule.tagHighlight)
         }
@@ -488,9 +519,11 @@ class ProxyBridge(
 
     /**
      * Creates a [ProxyRequestHandler] that:
-     * 1. Evaluates proxy rules from [StateManager.proxyRules] against each request.
-     * 2. Applies matching rule actions (modify, drop, tag).
-     * 3. Emits "proxy.request" events to the [EventBus].
+     * 1. Emits "proxy.request" events to the [EventBus].
+     * 2. Evaluates proxy rules from [StateManager.proxyRules] against each request and applies the
+     *    matching rule actions (modify, drop, tag).
+     * 3. Just before the request is sent, offers it to the intercept hold queue ([interceptHolds]),
+     *    which parks it while an agent inspects, edits, forwards or drops it.
      */
     fun createRequestHandler(): ProxyRequestHandler {
         return object : ProxyRequestHandler {
@@ -506,16 +539,29 @@ class ProxyBridge(
             }
 
             override fun handleRequestToBeSent(interceptedRequest: InterceptedRequest): ProxyRequestToBeSentAction {
-                return ProxyRequestToBeSentAction.continueWith(interceptedRequest)
+                val held = try {
+                    interceptHolds.holdRequest(interceptedRequest.messageId(), interceptedRequest) {
+                        safe { interceptedRequest.isInScope() } ?: false
+                    }
+                } catch (_: Exception) {
+                    null
+                } ?: return ProxyRequestToBeSentAction.continueWith(interceptedRequest)
+                if (held.drop) return ProxyRequestToBeSentAction.drop()
+                val annotations = safe { interceptedRequest.annotations() }
+                    ?: return ProxyRequestToBeSentAction.continueWith(held.message)
+                return ProxyRequestToBeSentAction.continueWith(held.message, annotations)
             }
         }
     }
 
     /**
      * Creates a [ProxyResponseHandler] that:
-     * 1. Evaluates proxy rules from [StateManager.proxyRules] against each response.
-     * 2. Applies matching rule actions (modify, drop, tag).
-     * 3. Emits "proxy.response" events to the [EventBus].
+     * 1. Emits "proxy.response" events to the [EventBus].
+     * 2. Feeds the live Autorize tap ([AutorizeTap]), which never blocks the handler.
+     * 3. Evaluates proxy rules from [StateManager.proxyRules] against each response and applies the
+     *    matching rule actions (modify, drop, tag).
+     * 4. Just before the response goes back to the client, offers it to the intercept hold queue
+     *    ([interceptHolds]).
      */
     fun createResponseHandler(): ProxyResponseHandler {
         return object : ProxyResponseHandler {
@@ -524,7 +570,7 @@ class ProxyBridge(
                 emitResponseEvent(interceptedResponse)
 
                 // Live Autorize-style tap: fire-and-forget, never blocks this handler.
-                maybeAutorize(interceptedResponse)
+                autorizeTap.onResponse(interceptedResponse)
 
                 return try {
                     applyResponseRules(interceptedResponse)
@@ -535,7 +581,19 @@ class ProxyBridge(
             }
 
             override fun handleResponseToBeSent(interceptedResponse: InterceptedResponse): ProxyResponseToBeSentAction {
-                return ProxyResponseToBeSentAction.continueWith(interceptedResponse)
+                val held = try {
+                    interceptHolds.holdResponse(
+                        interceptedResponse.messageId(),
+                        interceptedResponse,
+                        safe { interceptedResponse.request() },
+                    ) { safe { interceptedResponse.request()?.isInScope() } ?: false }
+                } catch (_: Exception) {
+                    null
+                } ?: return ProxyResponseToBeSentAction.continueWith(interceptedResponse)
+                if (held.drop) return ProxyResponseToBeSentAction.drop()
+                val annotations = safe { interceptedResponse.annotations() }
+                    ?: return ProxyResponseToBeSentAction.continueWith(held.message)
+                return ProxyResponseToBeSentAction.continueWith(held.message, annotations)
             }
         }
     }
@@ -556,7 +614,7 @@ class ProxyBridge(
                     return ProxyRequestReceivedAction.drop()
                 }
                 "modify" -> {
-                    currentRequest = applyRequestModifications(rule, currentRequest)
+                    currentRequest = ProxyRuleEdits.applyTo(rule, currentRequest)
                     emitRuleApplied(rule, "modify", url)
                 }
                 "tag" -> {
@@ -584,7 +642,7 @@ class ProxyBridge(
                     return ProxyResponseReceivedAction.drop()
                 }
                 "modify" -> {
-                    currentResponse = applyResponseModifications(rule, currentResponse)
+                    currentResponse = ProxyRuleEdits.applyTo(rule, currentResponse)
                     emitRuleApplied(rule, "modify", url)
                 }
                 "tag" -> {
@@ -612,170 +670,6 @@ class ProxyBridge(
             put("url", url)
             put("timestamp", Instant.now().toString())
         })
-    }
-
-    // ---------------------------------------------------------------
-    // Live Autorize-style tap: clone matching traffic, replay under a second identity in the
-    // background, diff against the already-captured response. See AutorizeBridge for rule CRUD.
-    // ---------------------------------------------------------------
-
-    /**
-     * Checks [response] against every enabled [io.bitbytelab.raijin.state.AutorizeRule], and for each
-     * match not yet tested, submits a background replay+diff to [autorizeExecutor]. Never blocks or
-     * throws into the caller — this runs on Burp's proxy handler thread for every single response.
-     */
-    private fun maybeAutorize(response: InterceptedResponse) {
-        val rules = stateManager.autorizeRules
-        if (rules.none { it.enabled }) return
-        // Admissions taken but not yet handed to a submitted task; released in `finally`.
-        var admitted = 0
-        try {
-            val request = response.request() ?: return
-            val url = request.url()
-            val method = request.method()
-            val contentType = safe { response.headerValue("Content-Type") }
-
-            // Cheap per-rule filters and the dedup guard run first; the request and response are
-            // only stringified when at least one rule will actually replay.
-            val replays = ArrayList<AutorizeRule>(1)
-            for (rule in rules) {
-                if (!rule.enabled || !autorizeRuleMatches(rule, request, method, url, contentType)) continue
-                // Queue full: leave the endpoint unmarked so a later hit can still test it.
-                if (!autorizeGate.tryAdmit()) break
-                admitted++
-                if (stateManager.autorizeSeenOnce(StateManager.autorizeSeenKey(rule.ruleId, method, url))) {
-                    replays += rule
-                } else {
-                    autorizeGate.release()
-                    admitted--
-                }
-            }
-            if (replays.isEmpty()) return
-
-            val captured = AuthDiffVerdict.LevelResult(
-                "captured",
-                response.statusCode().toInt(),
-                response.bodyToString(),
-                contentType,
-                safe { response.headerValue("Location") },
-            )
-            val rawRequest = request.toString()
-            val rawResponse = response.toString()
-
-            for (rule in replays) {
-                autorizeExecutor.execute {
-                    try {
-                        autorizeGate.withSendSlot {
-                            autorizeReplayAndAssess(rule, request, method, url, captured, rawRequest, rawResponse)
-                        }
-                    } catch (_: Exception) {
-                        // Best-effort background check; a failure here must never surface as a proxy error.
-                    } finally {
-                        autorizeGate.release()
-                    }
-                }
-                admitted--
-            }
-        } catch (_: Exception) {
-            // Same: tapping must never disrupt the live proxy flow.
-        } finally {
-            repeat(admitted) { autorizeGate.release() }
-        }
-    }
-
-    /** Per-rule filters: method, URL exclude-regex, host include-glob, scope, and static-asset skip. */
-    private fun autorizeRuleMatches(rule: AutorizeRule, request: HttpRequest, method: String, url: String, contentType: String?): Boolean {
-        if (rule.methods != null && method.uppercase() !in rule.methods) return false
-        if (rule.excludeUrlRegex != null && SafeRegex.containsMatchIn(rule.excludeUrlRegex, url, ignoreCase = true)) return false
-        if (rule.includeHostPattern != null) {
-            val host = safe { request.httpService().host() } ?: ""
-            if (!SafeRegex.matchesHostPattern(rule.includeHostPattern, host)) return false
-        }
-        if (rule.inScopeOnly) {
-            val inScope = safe { api.scope().isInScope(url) } ?: true
-            if (!inScope) return false
-        }
-        if (rule.ignoreStaticAssets && StaticAssetHeuristic.looksStatic(contentType, url)) return false
-        return true
-    }
-
-    /**
-     * Replays [originalRequest] under each of [rule]'s identities (same mutation idiom as
-     * [AnalysisBridge.authDiff]: a named header override, or stripping common auth headers for
-     * none/unauth/anonymous), diffs against the already-captured response via [AuthDiffVerdict]
-     * (no need to resend the original — it's already in hand), and on a critical/high verdict
-     * records an [io.bitbytelab.raijin.state.AutorizeMatch] and pushes to [findings].
-     */
-    private fun autorizeReplayAndAssess(
-        rule: AutorizeRule,
-        originalRequest: HttpRequest,
-        method: String,
-        url: String,
-        captured: AuthDiffVerdict.LevelResult,
-        rawRequest: String,
-        rawResponse: String,
-    ) {
-        // Hard safety backstop: respects the operator's global scope policy for this outbound
-        // replay send, independent of rule.inScopeOnly (which only filters which traffic is tapped).
-        if (scopeGate.deny(url) != null) return
-
-        val levels = mutableListOf(captured)
-        for (identity in rule.identities) {
-            val name = (identity["name"] as? JsonPrimitive)?.contentOrNull ?: "unknown"
-            val headerName = (identity["header_name"] as? JsonPrimitive)?.contentOrNull
-            val headerValue = (identity["header_value"] as? JsonPrimitive)?.contentOrNull
-
-            var mutated = originalRequest
-            if (headerName != null && headerValue != null) {
-                if (!HeaderSafety.isValidHeaderName(headerName) || !HeaderSafety.isValidHeaderValue(headerValue)) continue
-                mutated = mutated.withRemovedHeader(headerName).withHeader(headerName, headerValue)
-            } else if (name.equals("none", true) || name.equals("unauth", true) || name.equals("anonymous", true)) {
-                mutated = mutated
-                    .withRemovedHeader("Authorization")
-                    .withRemovedHeader("Cookie")
-                    .withRemovedHeader("X-API-Key")
-                    .withRemovedHeader("X-Auth-Token")
-            }
-
-            val sent = try { BoundedHttp.sendInternal(api, mutated) } catch (_: Exception) { null } ?: continue
-            val resp = sent.response() ?: continue
-            levels.add(
-                AuthDiffVerdict.LevelResult(
-                    name,
-                    safe { resp.statusCode().toInt() } ?: 0,
-                    safe { resp.bodyToString() } ?: "",
-                    safe { resp.headerValue("Content-Type") },
-                    safe { resp.headerValue("Location") },
-                )
-            )
-        }
-        if (levels.size < 2) return
-
-        val verdict = AuthDiffVerdict.assess(
-            levels,
-            similarity = { a, b -> TextSimilarity.dice(a, b) },
-            url = url,
-            allSimilarThreshold = (rule.similarityThreshold + 5.0).coerceAtMost(100.0),
-            unauthMatchThreshold = rule.similarityThreshold,
-        )
-        val actionable = verdict.filter { it.severity == "critical" || it.severity == "high" }
-        if (actionable.isEmpty()) return
-
-        val findingsJson = actionable.map { f -> buildJsonObject { put("severity", f.severity); put("id", f.id); put("detail", f.detail) } }
-        stateManager.addAutorizeMatch(rule.ruleId, method, url, captured.status, findingsJson, rawRequest, rawResponse)
-        val evidence = BodyText.render(rawResponse, 2000, label = "response").text
-        for (f in actionable) {
-            findings.add(
-                type = f.id,
-                severity = f.severity,
-                url = url,
-                location = "method:$method",
-                detail = f.detail,
-                evidence = evidence,
-                request = rawRequest,
-                response = rawResponse,
-            )
-        }
     }
 
     // ---------------------------------------------------------------
@@ -866,78 +760,6 @@ class ProxyBridge(
             }
         }
         return true
-    }
-
-    // ---------------------------------------------------------------
-    // Modification helpers
-    // ---------------------------------------------------------------
-
-    /**
-     * Applies a rule's modification directives to an HTTP request.
-     * Returns a new (possibly modified) request; the original is not mutated.
-     */
-    private fun applyRequestModifications(rule: ProxyRule, request: HttpRequest): HttpRequest {
-        var modified = request
-
-        // Add header
-        if (rule.modifyAddHeader != null) {
-            HeaderSafety.parseHeaderLine(rule.modifyAddHeader)?.let { (name, value) ->
-                modified = modified.withAddedHeader(name, value)
-            }
-        }
-
-        // Remove header
-        if (rule.modifyRemoveHeader != null) {
-            modified = modified.withRemovedHeader(rule.modifyRemoveHeader)
-        }
-
-        // Replace headers
-        rule.modifyReplaceHeader?.forEach { (headerName, headerValue) ->
-            modified = modified.withUpdatedHeader(headerName, headerValue)
-        }
-
-        // Body regex replacement
-        if (rule.modifyBodyRegex != null && rule.modifyBodyReplacement != null) {
-            val body = modified.bodyToString()
-            val newBody = SafeRegex.replace(rule.modifyBodyRegex, body, rule.modifyBodyReplacement, ignoreCase = true)
-            modified = modified.withBody(newBody)
-        }
-
-        return modified
-    }
-
-    /**
-     * Applies a rule's modification directives to an HTTP response.
-     * Returns a new (possibly modified) response; the original is not mutated.
-     */
-    private fun applyResponseModifications(rule: ProxyRule, response: HttpResponse): HttpResponse {
-        var modified = response
-
-        // Add header
-        if (rule.modifyAddHeader != null) {
-            HeaderSafety.parseHeaderLine(rule.modifyAddHeader)?.let { (name, value) ->
-                modified = modified.withAddedHeader(name, value)
-            }
-        }
-
-        // Remove header
-        if (rule.modifyRemoveHeader != null) {
-            modified = modified.withRemovedHeader(rule.modifyRemoveHeader)
-        }
-
-        // Replace headers
-        rule.modifyReplaceHeader?.forEach { (headerName, headerValue) ->
-            modified = modified.withUpdatedHeader(headerName, headerValue)
-        }
-
-        // Body regex replacement
-        if (rule.modifyBodyRegex != null && rule.modifyBodyReplacement != null) {
-            val body = modified.bodyToString()
-            val newBody = SafeRegex.replace(rule.modifyBodyRegex, body, rule.modifyBodyReplacement, ignoreCase = true)
-            modified = modified.withBody(newBody)
-        }
-
-        return modified
     }
 
     // ---------------------------------------------------------------
@@ -1154,6 +976,10 @@ class ProxyBridge(
         return items.subList(start, end)
     }
 
+    private fun JsonObjectBuilder.putNotes(notes: List<String>) {
+        if (notes.isNotEmpty()) put("notes", buildJsonArray { notes.forEach { add(it) } })
+    }
+
     /** Runs a Montoya accessor that may throw on malformed data (e.g. MalformedRequestException). */
     private inline fun <T> safe(block: () -> T): T? = try {
         block()
@@ -1225,12 +1051,6 @@ class ProxyBridge(
         /** Largest page any history read returns. */
         const val MAX_PAGE_SIZE = 1000
 
-        /** Autorize replays admitted at once (queued or running); further matches wait for a later hit. */
-        private const val AUTORIZE_MAX_QUEUED = 100
-
-        /** Autorize replays sending at the same time. */
-        private const val AUTORIZE_MAX_CONCURRENT = 10
-
         private val RULE_TYPES = setOf("request", "response")
         private val RULE_ACTIONS = setOf("modify", "drop", "tag")
 
@@ -1248,8 +1068,10 @@ class ProxyBridge(
         }
 
         /**
-         * Checks a proxy rule before it reaches live traffic, where an invalid regex or header would
-         * otherwise make it silently never match or never apply. Returns an error message or null.
+         * Checks a proxy rule before it reaches live traffic, where an invalid regex would otherwise
+         * make it silently never match. Header names and values are not held to the HTTP grammar:
+         * CR/LF and any other character are written as given ([ProxyRuleEdits.error] lists what a
+         * modification may not do). Returns an error message or null.
          */
         internal fun validateRule(rule: ProxyRule): String? {
             if (rule.type.lowercase() !in RULE_TYPES) return "Invalid rule type '${rule.type}'. Allowed: request, response"
@@ -1265,27 +1087,11 @@ class ProxyBridge(
                     return "Invalid tag_highlight '$it'. Valid values: ${HighlightColorName.validValues()}"
                 }
             }
-            rule.modifyAddHeader?.let {
-                if (HeaderSafety.parseHeaderLine(it) == null) {
-                    return "modify_add_header must be one 'Name: Value' line without CR/LF (got '$it')"
-                }
-            }
-            rule.modifyRemoveHeader?.let {
-                if (!HeaderSafety.isValidHeaderName(it)) return "modify_remove_header must be a header name without ':' or CR/LF (got '$it')"
-            }
-            rule.modifyReplaceHeader?.forEach { (name, value) ->
-                if (!HeaderSafety.isValidHeaderName(name) || !HeaderSafety.isValidHeaderValue(value)) {
-                    return "modify_replace_header entry '$name' needs a header name without ':' and a value without CR/LF"
-                }
-            }
-            if (rule.modifyBodyRegex != null && rule.modifyBodyReplacement == null) {
-                return "modify_body_replacement is required with modify_body_regex (use \"\" to delete matches)"
-            }
-            val modifies = rule.modifyAddHeader != null || rule.modifyRemoveHeader != null ||
-                !rule.modifyReplaceHeader.isNullOrEmpty() || rule.modifyBodyRegex != null
-            if (rule.action.equals("modify", ignoreCase = true) && !modifies) {
+            ProxyRuleEdits.error(rule)?.let { return it }
+            if (rule.action.equals("modify", ignoreCase = true) && !ProxyRuleEdits.modifies(rule)) {
+                val specific = if (rule.type.equals("request", ignoreCase = true)) "modify_method, modify_path" else "modify_status"
                 return "action 'modify' needs at least one of modify_add_header, modify_remove_header, " +
-                    "modify_replace_header, modify_body_regex"
+                    "modify_replace_header, modify_set_header, modify_body_regex, $specific"
             }
             return null
         }

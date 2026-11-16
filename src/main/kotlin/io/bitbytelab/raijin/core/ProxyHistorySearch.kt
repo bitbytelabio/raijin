@@ -143,15 +143,28 @@ data class HistoryCriteria(
 /**
  * Pure filter logic for the proxy WebSocket history tools, extracted from
  * [io.bitbytelab.raijin.bridge.ProxyBridge.getWebSocketHistory]. An unknown direction is an
- * error rather than a silently dropped filter, and a host filter never matches a message whose
- * upgrade host is unknown.
+ * error rather than a silently dropped filter, and a host or URL filter never matches a message
+ * whose upgrade request is unknown.
+ *
+ * @property webSocketId Burp's id of the proxied connection a message travelled on (`websocket_id` of an item).
+ * @property url Case-insensitive substring of the upgrade request's URL.
  */
-data class WebSocketHistoryCriteria(val host: String? = null, val direction: String? = null) {
+data class WebSocketHistoryCriteria(
+    val host: String? = null,
+    val direction: String? = null,
+    val webSocketId: Int? = null,
+    val url: String? = null,
+) {
 
-    /** [upgradeHost] is null when unknown; [direction] is a Montoya `Direction` constant name. */
-    fun matches(upgradeHost: String?, direction: String?): Boolean {
+    /**
+     * [upgradeHost] and [upgradeUrl] are null when unknown; [direction] is a Montoya `Direction`
+     * constant name; [webSocketId] is the message's connection id, null when unreadable.
+     */
+    fun matches(upgradeHost: String?, direction: String?, webSocketId: Int? = null, upgradeUrl: String? = null): Boolean {
         if (host != null && (upgradeHost == null || !upgradeHost.contains(host, ignoreCase = true))) return false
         if (this.direction != null && direction != this.direction) return false
+        if (this.webSocketId != null && webSocketId != this.webSocketId) return false
+        if (url != null && (upgradeUrl == null || !upgradeUrl.contains(url, ignoreCase = true))) return false
         return true
     }
 

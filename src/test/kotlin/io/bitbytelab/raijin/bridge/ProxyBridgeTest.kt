@@ -95,12 +95,18 @@ class ProxyBridgeTest {
         }
     }
 
-    private fun wsMessage(id: Int, upgradeHost: String?, direction: Direction): ProxyWebSocketMessage {
+    private fun wsMessage(
+        id: Int,
+        upgradeHost: String?,
+        direction: Direction,
+        webSocketId: Int = 1,
+        path: String = "/ws",
+    ): ProxyWebSocketMessage {
         val upgrade = upgradeHost?.let { host ->
             fake(HttpRequest::class.java) { name, _ ->
                 when (name) {
                     "httpService" -> service(host)
-                    "url" -> "wss://$host/ws"
+                    "url" -> "wss://$host$path"
                     else -> null
                 }
             }
@@ -108,7 +114,7 @@ class ProxyBridgeTest {
         return fake(ProxyWebSocketMessage::class.java) { name, _ ->
             when (name) {
                 "id" -> id
-                "webSocketId" -> 1
+                "webSocketId" -> webSocketId
                 "listenerPort" -> 8080
                 "direction" -> direction
                 "upgradeRequest" -> upgrade
@@ -131,11 +137,14 @@ class ProxyBridgeTest {
             }
         }
         val api = fake(MontoyaApi::class.java) { name, _ -> if (name == "proxy") proxy else null }
-        return ProxyBridge(api, EventBus(), state, FindingsBridge(state)).also { bridges += it }
+        return ProxyBridge(api, EventBus(), state, FindingsBridge(state), autorizeStore = null).also { bridges += it }
     }
 
     private fun ids(result: JsonObject, key: String = "index"): List<Int> =
         result["items"]!!.jsonArray.map { it.jsonObject[key]!!.jsonPrimitive.int }
+
+    private fun notes(result: JsonObject): List<String> =
+        result["notes"]?.jsonArray?.map { it.jsonPrimitive.content }.orEmpty()
 
     // ---- history reads --------------------------------------------------
 
@@ -183,6 +192,24 @@ class ProxyBridgeTest {
     }
 
     @Test
+    fun `paging values outside the supported range are served at the bound with a note instead of an error`() {
+        val b = bridge((1..1200).map { historyItem(it, "a.test", "GET", 200) })
+
+        val oversized = b.getHistory(0, 5000, null, null, null, null, false)
+        assertNull(oversized["error"])
+        assertEquals(ProxyBridge.MAX_PAGE_SIZE, oversized["returned"]!!.jsonPrimitive.int)
+        assertTrue(notes(oversized).single().startsWith("count 5000"), notes(oversized).toString())
+
+        val negativeStart = b.getHistory(-1, 1, null, null, null, null, false)
+        assertTrue(notes(negativeStart).single().startsWith("start_index -1"))
+        assertTrue(notes(b.getHistory(0, 10, null, null, null, null, false)).isEmpty(), "an in-range page has no notes")
+
+        val search = b.searchHistory("GET", "request", false, 2000, false)
+        assertEquals(ProxyBridge.MAX_PAGE_SIZE, search["returned"]!!.jsonPrimitive.int)
+        assertTrue(notes(search).single().startsWith("max_results 2000"))
+    }
+
+    @Test
     fun `search skips malformed requests without failing`() {
         val b = bridge(listOf(historyItem(1, "a.test", "GET", 200), historyItem(2, "a.test", null, 200)))
         val found = b.searchHistory("/p\\d", "url", false, 100, false)
@@ -204,6 +231,28 @@ class ProxyBridgeTest {
         val b = bridge(wsItems = listOf(wsMessage(1, "chat.test", Direction.CLIENT_TO_SERVER)))
         assertNotNull(b.getWebSocketHistory(0, 100, null, "sideways")["error"])
         assertNotNull(b.searchWebSocketHistory(".*", "sideways", 100)["error"])
+    }
+
+    @Test
+    fun `websocket history filters by connection id and upgrade url`() {
+        val b = bridge(
+            wsItems = listOf(
+                wsMessage(1, "chat.test", Direction.CLIENT_TO_SERVER, webSocketId = 7, path = "/socket/chat"),
+                wsMessage(2, "chat.test", Direction.SERVER_TO_CLIENT, webSocketId = 8, path = "/socket/feed"),
+                wsMessage(3, null, Direction.SERVER_TO_CLIENT, webSocketId = 7),
+            )
+        )
+
+        assertEquals(listOf(1, 3), ids(b.getWebSocketHistory(0, 100, null, null, webSocketId = 7), "id"))
+        assertEquals(listOf(2), ids(b.getWebSocketHistory(0, 100, null, null, url = "/SOCKET/feed"), "id"))
+        // A URL filter never matches a message whose upgrade request is unknown.
+        assertEquals(listOf(1), ids(b.getWebSocketHistory(0, 100, null, null, webSocketId = 7, url = "chat"), "id"))
+        assertEquals(listOf(1), ids(b.searchWebSocketHistory(".*", null, 100, webSocketId = 7, url = "/socket"), "id"))
+        assertEquals(emptyList(), ids(b.searchWebSocketHistory(".*", "client_to_server", 100, webSocketId = 8), "id"))
+
+        val capped = b.getWebSocketHistory(0, 4000, null, null)
+        assertEquals(3, capped["returned"]!!.jsonPrimitive.int)
+        assertTrue(notes(capped).single().startsWith("count 4000"))
     }
 
     // ---- rules ----------------------------------------------------------
@@ -255,7 +304,7 @@ class ProxyBridgeTest {
     }
 
     @Test
-    fun `invalid patterns, actions and headers are rejected before reaching live traffic`() {
+    fun `invalid patterns and actions are rejected before reaching live traffic`() {
         assertNotNull(ProxyBridge.validateRule(rule(matchUrl = "(unclosed")))
         assertNotNull(ProxyBridge.validateRule(rule(matchHost = "[a-")))
         assertNotNull(ProxyBridge.validateRule(rule(action = "explode")))
@@ -265,8 +314,66 @@ class ProxyBridgeTest {
         assertNotNull(ProxyBridge.validateRule(rule(action = "modify")), "modify with nothing to modify")
         assertNotNull(ProxyBridge.validateRule(rule(action = "modify", bodyRegex = "a")), "body regex without replacement")
         assertNotNull(ProxyBridge.validateRule(rule(action = "modify", addHeader = "no colon")))
-        assertNotNull(ProxyBridge.validateRule(rule(action = "modify", addHeader = "X-A: 1\r\nX-B: 2")))
-        assertNotNull(ProxyBridge.validateRule(rule(action = "modify", replaceHeader = mapOf("X-A" to "1\r\nX-B: 2"))))
+    }
+
+    @Test
+    fun `header values and names are written as given, CR LF included`() {
+        // Header injection, request smuggling and parser-differential tests need exactly these.
+        assertNull(ProxyBridge.validateRule(rule(action = "modify", addHeader = "X-A: 1\r\nX-B: 2")))
+        assertNull(ProxyBridge.validateRule(rule(action = "modify", addHeader = "Transfer-Encoding : chunked")))
+        assertNull(ProxyBridge.validateRule(rule(action = "modify", replaceHeader = mapOf("X-A" to "1\r\nX-B: 2"))))
+        assertNull(
+            ProxyBridge.validateRule(
+                ProxyRule(ruleId = "r", type = "request", action = "modify", modifySetHeader = mapOf("Host" to "a.test\r\nX-Forwarded-Host: b.test"))
+            )
+        )
+        assertNull(ProxyBridge.validateRule(ProxyRule(ruleId = "r", type = "request", action = "modify", modifyRemoveHeader = "X-Bad:Name")))
+
+        val state = StateManager()
+        val stored = bridge(state = state).setRule(rule("prule-crlf", action = "modify", addHeader = "X-A: 1\r\nX-B: 2"))
+        assertNull(stored["error"])
+        assertEquals("X-A: 1\r\nX-B: 2", state.proxyRules.single().modifyAddHeader)
+    }
+
+    @Test
+    fun `method, path and status modifications are checked against the rule type`() {
+        fun request(method: String? = null, path: String? = null, pathRegex: String? = null) = ProxyRule(
+            ruleId = "r", type = "request", action = "modify", modifyMethod = method, modifyPath = path, modifyPathRegex = pathRegex,
+        )
+        fun response(status: Int) = ProxyRule(ruleId = "r", type = "response", action = "modify", modifyStatus = status)
+
+        assertNull(ProxyBridge.validateRule(request(method = "PUT")))
+        assertNull(ProxyBridge.validateRule(request(path = "/admin?debug=1")))
+        assertNull(ProxyBridge.validateRule(request(path = "/v2/$1", pathRegex = "^/v1/(.*)")))
+        assertNull(ProxyBridge.validateRule(response(302)))
+        assertNull(ProxyBridge.validateRule(response(0)), "status 0 is a legitimate malformed answer")
+
+        assertNotNull(ProxyBridge.validateRule(request(method = " ")))
+        assertNotNull(ProxyBridge.validateRule(request(pathRegex = "^/v1")), "a path regex needs its replacement")
+        assertNotNull(ProxyBridge.validateRule(request(path = "/x", pathRegex = "(")))
+        assertNotNull(ProxyBridge.validateRule(response(ProxyRuleEdits.MAX_STATUS + 1)))
+        assertNotNull(ProxyBridge.validateRule(ProxyRule(ruleId = "r", type = "request", action = "modify", modifyStatus = 200)))
+        assertNotNull(ProxyBridge.validateRule(ProxyRule(ruleId = "r", type = "response", action = "modify", modifyMethod = "GET")))
+    }
+
+    @Test
+    fun `listed rules show every modification they make`() {
+        val b = bridge()
+        b.setRule(
+            ProxyRule(
+                ruleId = "prule-req", type = "request", action = "modify", modifyMethod = "POST",
+                modifyPath = "/v2/$1", modifyPathRegex = "^/v1/(.*)", modifySetHeader = mapOf("Authorization" to "Bearer x"),
+            )
+        )
+        b.setRule(ProxyRule(ruleId = "prule-resp", type = "response", action = "modify", modifyStatus = 200))
+
+        val listed = b.listRules(null)["rules"]!!.jsonArray.associateBy { it.jsonObject["rule_id"]!!.jsonPrimitive.content }
+        val request = listed.getValue("prule-req").jsonObject
+        assertEquals("POST", request["modify_method"]!!.jsonPrimitive.content)
+        assertEquals("/v2/$1", request["modify_path"]!!.jsonPrimitive.content)
+        assertEquals("^/v1/(.*)", request["modify_path_regex"]!!.jsonPrimitive.content)
+        assertEquals("Bearer x", request["modify_set_header"]!!.jsonObject["Authorization"]!!.jsonPrimitive.content)
+        assertEquals(200, listed.getValue("prule-resp").jsonObject["modify_status"]!!.jsonPrimitive.int)
     }
 
     // ---- host patterns --------------------------------------------------

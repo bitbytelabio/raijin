@@ -1,14 +1,21 @@
 package io.bitbytelab.raijin.bridge
 
+import io.bitbytelab.raijin.state.AutorizeReplay
+import io.bitbytelab.raijin.state.AutorizeRule
 import io.bitbytelab.raijin.state.StateManager
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -30,6 +37,8 @@ class AutorizeBridgeTest {
         assertNotNull(error, "expected an error mentioning '$mentions'")
         assertTrue(mentions in error, error)
     }
+
+    private fun notes(result: JsonObject): List<String> = result["notes"]?.jsonArray?.map { it.jsonPrimitive.content }.orEmpty()
 
     @Test
     fun `setting a rule resets its dedup guard on create and on update`() {
@@ -59,11 +68,13 @@ class AutorizeBridgeTest {
         assertError(b.setRule(null, twoIdentities, true, null, null, null, true, Double.NaN, true), "similarity_threshold")
 
         val headerWithoutValue = buildJsonObject { put("name", "low"); put("header_name", "Cookie") }
-        val crlfValue = buildJsonObject { put("name", "low"); put("header_name", "Cookie"); put("header_value", "a=1\r\nX-Injected: 1") }
         val nameless = buildJsonObject { put("header_name", "Cookie"); put("header_value", "a=1") }
-        for (bad in listOf(headerWithoutValue, crlfValue, nameless)) {
+        val headersNotAMap = buildJsonObject { put("name", "low"); put("headers", "not a map") }
+        val blankRemoval = buildJsonObject { put("name", "low"); putJsonArray("remove_headers") { add(" ") } }
+        for (bad in listOf(headerWithoutValue, nameless, headersNotAMap, blankRemoval)) {
             assertError(b.setRule(null, listOf(identity("admin"), bad), true, null, null, null, true, 90.0, true), "identities[1]")
         }
+        assertError(b.setRule(null, listOf(identity("none"), identity("NONE")), true, null, null, null, true, 90.0, true), "unique")
         assertEquals(0, b.listRules()["count"]?.jsonPrimitive?.int)
 
         val ok = b.setRule(null, twoIdentities, true, "*.example.com", "\\.(png|css)$", listOf("get", "post"), true, 0.0, true)
@@ -72,6 +83,21 @@ class AutorizeBridgeTest {
             listOf("GET", "POST"),
             b.listRules()["rules"]!!.jsonArray[0].jsonObject["methods"]!!.jsonArray.map { it.jsonPrimitive.content },
         )
+    }
+
+    @Test
+    fun `identity headers are replayed as written, CR LF included, and may come as a map with removals`() {
+        val b = AutorizeBridge(StateManager())
+        val injected = buildJsonObject { put("name", "low"); put("header_name", "Cookie"); put("header_value", "a=1\r\nX-Injected: 1") }
+        val mapped = buildJsonObject {
+            put("name", "tenant-b")
+            putJsonObject("headers") { put("Authorization", "Bearer b"); put("X-Tenant", "b") }
+            putJsonArray("remove_headers") { add("X-Csrf-Token") }
+        }
+        assertNull(b.setRule(null, listOf(injected, mapped), true, null, null, null, true, 90.0, true)["error"])
+        val identities = b.listRules()["rules"]!!.jsonArray.single().jsonObject["identities"]!!.jsonArray
+        assertEquals("a=1\r\nX-Injected: 1", identities[0].jsonObject["header_value"]!!.jsonPrimitive.content)
+        assertEquals("b", identities[1].jsonObject["headers"]!!.jsonObject["X-Tenant"]!!.jsonPrimitive.content)
     }
 
     @Test
@@ -102,12 +128,36 @@ class AutorizeBridgeTest {
     }
 
     @Test
-    fun `setRule requires at least 2 identities`() {
+    fun `setRule needs an identity that changes the request`() {
         val b = AutorizeBridge(StateManager())
-        val r = b.setRule(null, listOf(identity("none")), true, null, null, null, true, 90.0, true)
-        assertEquals(true, r["error"]?.jsonPrimitive?.contentOrNull?.contains("identities"))
+        assertError(b.setRule(null, emptyList(), true, null, null, null, true, 90.0, true), "identities")
+        assertError(b.setRule(null, listOf(identity("admin")), true, null, null, null, true, 90.0, true), "No identity changes the request")
         assertEquals(0, b.listRules()["count"]?.jsonPrimitive?.int)
+
+        // The captured response is the authenticated reference, so one unauthenticated identity is enough.
+        assertNull(b.setRule(null, listOf(identity("none")), true, null, null, null, true, 90.0, true)["error"])
+        val noted = b.setRule(null, twoIdentities, true, null, null, null, true, 90.0, true)
+        assertTrue(notes(noted).any { "'admin'" in it && "not replayed" in it }, notes(noted).toString())
     }
+
+    @Test
+    fun `state-changing methods are skipped unless the rule opts in, and the choice survives updates`() {
+        val b = AutorizeBridge(StateManager())
+        val created = b.setRule(null, twoIdentities, true, null, null, listOf("GET", "POST", "DELETE"), true, 90.0, true)
+        val ruleId = created["rule_id"]!!.jsonPrimitive.content
+        assertTrue(notes(created).any { "DELETE, POST" in it && "include_mutating" in it }, notes(created).toString())
+        assertFalse(b.listRules()["rules"]!!.jsonArray.single().jsonObject["include_mutating"]!!.jsonPrimitive.boolean)
+
+        val optedIn = b.setRule(ruleId, null, null, null, null, null, null, null, null, includeMutating = true)
+        assertTrue(notes(optedIn).any { "include_mutating is on" in it })
+        b.setRule(ruleId, null, null, null, null, null, null, 80.0, null)
+        assertTrue(b.listRules()["rules"]!!.jsonArray.single().jsonObject["include_mutating"]!!.jsonPrimitive.boolean)
+
+        assertEquals(AutorizePolicy.SKIPPED_MUTATING, AutorizePolicy.methodSkip(stateRule(includeMutating = false), "post"))
+        assertNull(AutorizePolicy.methodSkip(stateRule(includeMutating = true), "PATCH"))
+    }
+
+    private fun stateRule(includeMutating: Boolean) = AutorizeRule("arule-x", twoIdentities, includeMutating = includeMutating)
 
     @Test
     fun `setRule creates a rule and listRules returns it`() {
@@ -202,12 +252,16 @@ class AutorizeBridgeTest {
 
     @Test
     fun `removeRule removes an existing rule and reports a miss for an unknown id`() {
-        val b = AutorizeBridge(StateManager())
+        val state = StateManager()
+        val b = AutorizeBridge(state)
         val r1 = b.setRule(null, listOf(identity("admin"), identity("none")), true, null, null, null, true, 90.0, true)
         val ruleId = r1["rule_id"]!!.jsonPrimitive.content
+        state.autorizeActivity.count(ruleId, AutorizePolicy.REPLAYED)
+        assertEquals(1L, b.listRules()["rules"]!!.jsonArray[0].jsonObject["activity"]!!.jsonObject["replayed"]!!.jsonPrimitive.long)
 
         assertEquals(true, b.removeRule(ruleId)["removed"]?.jsonPrimitive?.contentOrNull?.toBoolean())
         assertEquals(0, b.listRules()["count"]?.jsonPrimitive?.int)
+        assertTrue(state.autorizeActivity.of(ruleId).isEmpty(), "a removed rule's tallies go with it")
 
         val miss = b.removeRule("arule-does-not-exist")
         assertEquals(false, miss["removed"]?.jsonPrimitive?.contentOrNull?.toBoolean())
@@ -232,6 +286,56 @@ class AutorizeBridgeTest {
         val paged = b.listMatches(null, null, 1, 1)
         assertEquals(3, paged["total"]?.jsonPrimitive?.int)
         assertEquals(1, paged["returned"]?.jsonPrimitive?.int)
+    }
+
+    @Test
+    fun `out-of-range paging is served at the bound with a note instead of an error`() {
+        val stateManager = StateManager()
+        val b = AutorizeBridge(stateManager)
+        repeat(3) { stateManager.addAutorizeMatch("arule-1", "GET", "http://x/$it", 200, emptyList(), "req", "resp") }
+
+        val big = b.listMatches(null, null, -3, 1000)
+        assertNull(big["error"])
+        assertEquals(3, big["returned"]!!.jsonPrimitive.int)
+        assertEquals(
+            listOf("start_index -3 is outside 0..2147483647; used 0", "count 1000 is outside 1..${AutorizeBridge.MAX_MATCH_PAGE}; used ${AutorizeBridge.MAX_MATCH_PAGE}"),
+            notes(big),
+        )
+        assertEquals(1, b.listMatches(null, null, 0, 0)["returned"]!!.jsonPrimitive.int)
+        assertTrue(notes(b.listMatches(null, null, 0, 50)).isEmpty())
+    }
+
+    @Test
+    fun `a match shows the original next to each identity's replay, in full when asked for by id`() {
+        val stateManager = StateManager()
+        val b = AutorizeBridge(stateManager)
+        val longBody = "x".repeat(10_000)
+        val match = stateManager.addAutorizeMatch(
+            "arule-1", "GET", "http://x/a", 200, emptyList(),
+            "GET /a HTTP/1.1\r\nCookie: admin\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\n$longBody",
+            replays = listOf(
+                AutorizeReplay("low", 200, "GET /a HTTP/1.1\r\nCookie: low\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\n$longBody"),
+                AutorizeReplay("none", 302, "GET /a HTTP/1.1\r\n\r\n", "HTTP/1.1 302 Found\r\nLocation: /login\r\n\r\n"),
+            ),
+            softDenial = true,
+        )
+
+        val listed = b.listMatches(null, null, 0, 50)["matches"]!!.jsonArray.single().jsonObject
+        assertTrue(listed["soft_denial"]!!.jsonPrimitive.boolean)
+        val summary = listed["replays"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(listOf("low", "none"), summary.map { it["identity"]!!.jsonPrimitive.content })
+        assertEquals(listOf(200, 302), summary.map { it["status"]!!.jsonPrimitive.int })
+        assertNull(summary[0]["response"], "a list summarises replays unless include_replays")
+        assertTrue("[truncated" in listed["response"]!!.jsonPrimitive.content, "a list cuts long bodies")
+        assertTrue(listed["response"]!!.jsonPrimitive.content.startsWith("HTTP/1.1 200 OK\r\n\r\n"), "the head is kept whole")
+
+        val withReplays = b.listMatches(null, null, 0, 50, includeReplays = true)["matches"]!!.jsonArray.single().jsonObject
+        assertTrue("Cookie: low" in withReplays["replays"]!!.jsonArray[0].jsonObject["request"]!!.jsonPrimitive.content)
+
+        val detail = b.listMatches(null, null, 0, 50, matchId = match.id)["matches"]!!.jsonArray.single().jsonObject
+        val lowResponse = detail["replays"]!!.jsonArray[0].jsonObject["response"]!!.jsonPrimitive.content
+        assertTrue(lowResponse.endsWith(longBody), "a match asked for by id shows each replay at length")
+        assertNotNull(b.listMatches(null, null, 0, 50, matchId = 999)["error"])
     }
 
     @Test

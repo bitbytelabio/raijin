@@ -64,6 +64,26 @@ class HistoryCriteriaTest {
     }
 
     @Test
+    fun `websocket connection filter compares the connection id`() {
+        val criteria = WebSocketHistoryCriteria(webSocketId = 7)
+        assertTrue(criteria.matches(null, null, webSocketId = 7))
+        assertFalse(criteria.matches(null, null, webSocketId = 8))
+        assertFalse(criteria.matches(null, null, webSocketId = null), "an unreadable id never matches")
+    }
+
+    @Test
+    fun `websocket url filter is a case-insensitive substring of the upgrade URL`() {
+        val criteria = WebSocketHistoryCriteria(url = "/Socket/Chat")
+        assertTrue(criteria.matches(null, null, upgradeUrl = "wss://app.test/socket/chat?room=1"))
+        assertFalse(criteria.matches(null, null, upgradeUrl = "wss://app.test/socket/feed"))
+        assertFalse(criteria.matches(null, null, upgradeUrl = null), "an unknown upgrade request never matches")
+
+        val combined = WebSocketHistoryCriteria(host = "app", direction = "CLIENT_TO_SERVER", webSocketId = 3, url = "chat")
+        assertTrue(combined.matches("app.test", "CLIENT_TO_SERVER", 3, "wss://app.test/chat"))
+        assertFalse(combined.matches("app.test", "CLIENT_TO_SERVER", 4, "wss://app.test/chat"), "every filter must match")
+    }
+
+    @Test
     fun `direction accepts either case, and both or nothing means no filter`() {
         assertEquals(DirectionFilter.Only("CLIENT_TO_SERVER"), WebSocketHistoryCriteria.parseDirection("client_to_server"))
         assertEquals(DirectionFilter.Only("SERVER_TO_CLIENT"), WebSocketHistoryCriteria.parseDirection(" SERVER_TO_CLIENT "))

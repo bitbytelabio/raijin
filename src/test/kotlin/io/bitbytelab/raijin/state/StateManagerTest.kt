@@ -4,6 +4,7 @@ import burp.api.montoya.core.Registration
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class StateManagerTest {
@@ -56,11 +57,31 @@ class StateManagerTest {
     }
 
     @Test
-    fun `seen key ignores the query string and method case`() {
+    fun `seen key keeps the query string but not the method case`() {
         assertEquals(
-            StateManager.autorizeSeenKey("arule-1", "get", "https://x/a?id=1"),
+            StateManager.autorizeSeenKey("arule-1", "get", "https://x/a?id=1&sort=asc"),
+            StateManager.autorizeSeenKey("arule-1", "GET", "https://x/a?sort=asc&id=1"),
+        )
+        assertNotEquals(
+            StateManager.autorizeSeenKey("arule-1", "GET", "https://x/a?id=1"),
             StateManager.autorizeSeenKey("arule-1", "GET", "https://x/a?id=2"),
         )
+        assertEquals(
+            "arule-1|GET|https://x/a",
+            StateManager.autorizeEndpointKey("arule-1", "get", "https://x/a?id=2"),
+        )
+    }
+
+    @Test
+    fun `query variants of one endpoint stop being replayed past the ceiling`() {
+        val sm = StateManager()
+        val endpoint = StateManager.autorizeEndpointKey("arule-1", "GET", "https://x/search")
+        repeat(AutorizeSeenGuard.MAX_QUERY_VARIANTS) {
+            assertTrue(sm.autorizeSeenOnce(StateManager.autorizeSeenKey("arule-1", "GET", "https://x/search?q=term$it"), endpoint))
+        }
+        assertFalse(sm.autorizeSeenOnce(StateManager.autorizeSeenKey("arule-1", "GET", "https://x/search?q=more"), endpoint))
+        sm.clearAutorizeMatches("arule-1", resetSeen = true)
+        assertTrue(sm.autorizeSeenOnce(StateManager.autorizeSeenKey("arule-1", "GET", "https://x/search?q=more"), endpoint))
     }
 
     @Test

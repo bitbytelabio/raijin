@@ -13,9 +13,10 @@ import kotlinx.serialization.json.*
 
 /**
  * Registers the live Autorize-style tap tools: configure/list/remove rules that clone and
- * replay matching proxy traffic under a second identity in the background, and list/clear the
- * flagged mismatches. The actual tap runs in [io.bitbytelab.raijin.bridge.ProxyBridge]; this is
- * just CRUD against [io.bitbytelab.raijin.state.StateManager] via [AutorizeBridge].
+ * replay matching proxy traffic under other identities in the background, and list/clear the
+ * flagged mismatches. The tap itself is [io.bitbytelab.raijin.bridge.AutorizeTap] (run by
+ * [io.bitbytelab.raijin.bridge.ProxyBridge]); this is just CRUD against
+ * [io.bitbytelab.raijin.state.StateManager] via [AutorizeBridge].
  */
 object AutorizeTools {
 
@@ -28,16 +29,19 @@ object AutorizeTools {
                 "filters is cloned and replayed under each of 'identities' in the background, then diffed against " +
                 "the already-captured response (same engine as auth_diff/access_control_sweep). A critical/high " +
                 "mismatch is recorded here AND pushed to findings(action=add). Browse the app as normal after " +
-                "setting the rule — no need to resend anything yourself. Setting a rule (new or updated) re-tests " +
-                "endpoints it already replayed.",
+                "setting the rule — no need to resend anything yourself. State-changing methods (POST, PUT, DELETE, " +
+                "PATCH) are not replayed unless include_mutating=true, and originals that were not authenticated " +
+                "(no credentials, or answered 401) or answered 404 are skipped. Matches persist per Burp project and " +
+                "are emitted as 'autorize.match' events. Setting a rule (new or updated) re-tests endpoints it already replayed.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("rule_id") { put("type", "string"); put("description", "Omit to create a new rule; pass an existing id to update it") }
-                    putJsonObject("identities") { put("type", "array"); putJsonObject("items") { put("type", "object") }; put("description", "At least 2, required when creating a rule: [{\"name\":\"none\"}] to test unauthenticated, or [{\"name\":\"low_priv\",\"header_name\":\"Cookie\",\"header_value\":\"session=...\"}] for a second session. Omit on an update to keep the rule's existing identities.") }
+                    putJsonObject("identities") { put("type", "array"); putJsonObject("items") { put("type", "object") }; put("description", "Required when creating a rule: at least one identity that changes the request. Each is {name, header_name?, header_value?, headers?, remove_headers?} as in auth_diff: every header it names replaces the captured request's header of that name, remove_headers drops headers, and a name of none/unauth/anonymous strips every credential header. The captured response is the authenticated reference, e.g. [{\"name\":\"low_priv\",\"header_name\":\"Cookie\",\"header_value\":\"session=...\"},{\"name\":\"none\"}]. An identity that would resend the request unchanged is not replayed; header names and values are written as given. Omit on an update to keep the rule's existing identities.") }
                     putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Only tap requests Burp's scope considers in scope (default true on create; omit on an update to keep the existing value)") }
                     putJsonObject("include_host_pattern") { put("type", "string"); put("description", "Optional host glob ('*.example.com') or regex; omit to tap every host (or, on an update, to keep the existing value)") }
                     putJsonObject("exclude_url_regex") { put("type", "string"); put("description", "Optional URL regex; matching requests are skipped (omit on an update to keep the existing value)") }
-                    putJsonObject("methods") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Optional HTTP methods to tap; omit to tap every method (or, on an update, to keep the existing filter)") }
+                    putJsonObject("methods") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Optional HTTP methods to tap; omit to tap every method include_mutating allows (or, on an update, to keep the existing filter)") }
+                    putJsonObject("include_mutating") { put("type", "boolean"); put("description", "Also replay POST, PUT, DELETE and PATCH requests: each replay repeats the action once per identity (default false on create, also when 'methods' names them; omit on an update to keep the existing value)") }
                     putJsonObject("ignore_static_assets") { put("type", "boolean"); put("description", "Skip responses that look like a static asset (default true on create; omit on an update to keep the existing value)") }
                     putJsonObject("similarity_threshold") { put("type", "number"); put("minimum", 0); put("maximum", 100); put("description", "Body-similarity percent (0-100) controlling match strictness (default 90 on create; omit on an update to keep the existing value)") }
                     putJsonObject("enabled") { put("type", "boolean"); put("description", "Whether the rule taps traffic (default true on create; omit on an update to keep the existing value — it does NOT re-enable a disabled rule)") }
@@ -63,6 +67,7 @@ object AutorizeTools {
                     ignoreStaticAssets = a.bool("ignore_static_assets"),
                     similarityThreshold = a.number("similarity_threshold"),
                     enabled = a.bool("enabled"),
+                    includeMutating = a.bool("include_mutating"),
                 )
                 toolJsonResult(result)
             } catch (e: Exception) {
@@ -103,8 +108,10 @@ object AutorizeTools {
 
         server.addTool(
             name = "autorize_list_matches",
-            description = "List flagged mismatches recorded by live Autorize-style taps, newest first. Each one is " +
-                "also in findings(action=list) if it was critical/high severity.",
+            description = "List flagged mismatches recorded by live Autorize-style taps, newest first, with the original " +
+                "exchange and what each identity received when replayed (match_id shows one in full). A critical/high one is " +
+                "also in findings(action=list); a soft denial (soft_denial: true) is one the denial-wording heuristic turned " +
+                "informational, kept for review. Matches persist across reloads, per Burp project.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("rule_id") { put("type", "string"); put("description", "Optional: limit to one rule") }
@@ -114,7 +121,9 @@ object AutorizeTools {
                         put("description", "Optional: only matches with a finding at least this severe")
                     }
                     putJsonObject("start_index") { put("type", "integer"); put("minimum", 0); put("description", "Zero-based offset (default 0)") }
-                    putJsonObject("count") { put("type", "integer"); put("minimum", 1); put("maximum", AutorizeBridge.MAX_MATCH_PAGE); put("description", "Max results (default 50, max ${AutorizeBridge.MAX_MATCH_PAGE})") }
+                    putJsonObject("count") { put("type", "integer"); put("minimum", 1); put("description", "Max results (default 50; above ${AutorizeBridge.MAX_MATCH_PAGE} is served as ${AutorizeBridge.MAX_MATCH_PAGE} with a note)") }
+                    putJsonObject("match_id") { put("type", "integer"); put("description", "Return only this match, with the original and every identity's replayed request and response at length") }
+                    putJsonObject("include_replays") { put("type", "boolean"); put("description", "Include each identity's replayed request and response in the list (default false: identity, status and response length only)") }
                 },
                 required = emptyList()
             )
@@ -126,8 +135,10 @@ object AutorizeTools {
                 val result = bridge.listMatches(
                     ruleId = a.string("rule_id"),
                     minSeverity = minSeverity?.trim(),
-                    startIndex = a.int("start_index", 0..Int.MAX_VALUE) ?: 0,
-                    count = a.int("count", 1..AutorizeBridge.MAX_MATCH_PAGE) ?: 50,
+                    startIndex = a.integer("start_index") ?: 0,
+                    count = a.integer("count") ?: 50,
+                    matchId = a.long("match_id"),
+                    includeReplays = a.bool("include_replays") ?: false,
                 )
                 toolJsonResult(result)
             } catch (e: Exception) {
@@ -172,15 +183,17 @@ object AutorizeTools {
             ?: throw IllegalArgumentException("Parameter '$name' must be a number")
     }
 
-    /** Optional integer argument; a non-integer or a value outside [range] throws, reported as a tool error. */
-    private fun Map<String, JsonElement>.int(name: String, range: IntRange): Int? {
+    /** Optional integer argument as a Long; a non-integer throws, reported as a tool error. */
+    private fun Map<String, JsonElement>.long(name: String): Long? {
         val element = this[name]
         if (element == null || element is JsonNull) return null
-        val value = element.asLongSafe() ?: throw IllegalArgumentException("Parameter '$name' must be an integer")
-        require(value >= range.first && value <= range.last) {
-            if (range.last == Int.MAX_VALUE) "Parameter '$name' must be at least ${range.first} (got $value)"
-            else "Parameter '$name' must be between ${range.first} and ${range.last} (got $value)"
-        }
-        return value.toInt()
+        return element.asLongSafe() ?: throw IllegalArgumentException("Parameter '$name' must be an integer")
     }
+
+    /**
+     * Optional integer argument without a range: the bridge serves an out-of-range value at the
+     * nearest bound and says so in `notes`. A non-integer throws, reported as a tool error.
+     */
+    private fun Map<String, JsonElement>.integer(name: String): Int? =
+        long(name)?.coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong())?.toInt()
 }

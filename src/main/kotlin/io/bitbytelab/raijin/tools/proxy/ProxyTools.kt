@@ -1,8 +1,13 @@
 package io.bitbytelab.raijin.tools.proxy
 
+import io.bitbytelab.raijin.bridge.HoldPolicy
+import io.bitbytelab.raijin.bridge.InterceptEdit
 import io.bitbytelab.raijin.bridge.ProxyBridge
+import io.bitbytelab.raijin.bridge.ProxyInterceptHolds
+import io.bitbytelab.raijin.bridge.ProxyRuleEdits
 import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.core.asLongSafe
+import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.core.asStringMap
 import io.bitbytelab.raijin.state.ProxyRule
 import io.bitbytelab.raijin.state.StateManager
@@ -14,7 +19,8 @@ import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
 /**
- * Registers all 13 proxy MCP tools onto the given [Server].
+ * Registers the proxy MCP tools onto the given [Server]: history and WebSocket history, Burp's
+ * Intercept switch and Raijin's hold queue, annotations, rules and auto-auth.
  *
  * Each tool delegates to the [ProxyBridge] and catches exceptions so
  * that errors are returned as structured JSON inside a [CallToolResult]
@@ -26,9 +32,16 @@ object ProxyTools {
     private val RULE_ACTIONS = listOf("modify", "drop", "tag")
     private val WS_DIRECTIONS = listOf("client_to_server", "server_to_client", "both")
     private val SEARCH_TARGETS = listOf("url", "request", "response", "both")
+    private val HOLD_TARGETS = listOf("request", "response", "both")
 
     private const val MATCH_HOST_DESCRIPTION =
         "Host to match: a glob such as '*.example.com' or a regex such as '.*\\.example\\.com' (whole host, case-insensitive)"
+
+    private const val MODIFY_ADD_HEADER_DESCRIPTION =
+        "Header to add when action is 'modify', as one 'Name: Value' line, written as given (CR/LF and any other character included)"
+
+    private const val MODIFY_SET_HEADER_DESCRIPTION =
+        "Map of header names to values when action is 'modify': each replaces the header (every occurrence, so it is never sent twice) or is added when absent"
 
     fun register(server: Server, bridge: ProxyBridge, stateManager: StateManager) {
 
@@ -41,7 +54,7 @@ object ProxyTools {
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     intProp("start_index", "Start index of history entries (default 0)", min = 0)
-                    intProp("count", "Maximum number of entries to return (default 100, max ${ProxyBridge.MAX_PAGE_SIZE}; 0 returns only total_filtered)", min = 0, max = ProxyBridge.MAX_PAGE_SIZE)
+                    intProp("count", "Maximum number of entries to return (default 100; above ${ProxyBridge.MAX_PAGE_SIZE} is served as ${ProxyBridge.MAX_PAGE_SIZE} with a note; 0 returns only total_filtered)", min = 0)
                     putJsonObject("host") { put("type", "string"); put("description", "Filter by host (case-insensitive substring)") }
                     putJsonObject("method") { put("type", "string"); put("description", "Filter by HTTP method") }
                     intProp("status_code", "Filter by exact status code; items without a response never match", min = 0, max = 999)
@@ -58,8 +71,8 @@ object ProxyTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val result = bridge.getHistory(
-                    startIndex = args.int("start_index", 0..Int.MAX_VALUE) ?: 0,
-                    count = args.int("count", 0..ProxyBridge.MAX_PAGE_SIZE) ?: 100,
+                    startIndex = args.integer("start_index") ?: 0,
+                    count = args.integer("count") ?: 100,
                     host = args.string("host"),
                     method = args.string("method"),
                     statusCode = args.int("status_code", 0..999),
@@ -87,7 +100,7 @@ object ProxyTools {
                     putJsonObject("pattern") { put("type", "string"); put("description", "Regex pattern to search for") }
                     enumProp("search_in", SEARCH_TARGETS, "Where to search: 'url', 'request', 'response', or 'both' (default 'both' = url+request+response)")
                     putJsonObject("case_sensitive") { put("type", "boolean"); put("description", "Case-sensitive matching (default false)") }
-                    intProp("max_results", "Maximum number of results (default 100, max ${ProxyBridge.MAX_PAGE_SIZE})", min = 0, max = ProxyBridge.MAX_PAGE_SIZE)
+                    intProp("max_results", "Maximum number of results (default 100; above ${ProxyBridge.MAX_PAGE_SIZE} is served as ${ProxyBridge.MAX_PAGE_SIZE} with a note)", min = 0)
                     putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Restrict to in-scope items (default false)") }
                     putJsonObject("include_request") { put("type", "boolean"); put("description", "Include full request text (default false). Also unmasks sensitive request header values (Cookie, Authorization, …) which are otherwise redacted in request_headers") }
                     putJsonObject("include_response") { put("type", "boolean"); put("description", "Include full response text (default false)") }
@@ -111,7 +124,7 @@ object ProxyTools {
                     pattern = pattern,
                     searchIn = searchIn,
                     caseSensitive = args.bool("case_sensitive", false),
-                    maxResults = args.int("max_results", 0..ProxyBridge.MAX_PAGE_SIZE) ?: 100,
+                    maxResults = args.integer("max_results") ?: 100,
                     inScopeOnly = args.bool("in_scope_only", false),
                     includeRequest = args.bool("include_request", false),
                     includeResponse = args.bool("include_response", false),
@@ -128,13 +141,15 @@ object ProxyTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "proxy_websocket_history",
-            description = "Get WebSocket proxy history entries with optional filtering by host and direction (client_to_server or server_to_client).",
+            description = "Get WebSocket proxy history entries with optional filtering by connection (websocket_id), upgrade URL, host and direction (client_to_server or server_to_client).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     intProp("start_index", "Start index of history entries (default 0)", min = 0)
-                    intProp("count", "Maximum number of entries to return (default 100, max ${ProxyBridge.MAX_PAGE_SIZE})", min = 0, max = ProxyBridge.MAX_PAGE_SIZE)
+                    intProp("count", "Maximum number of entries to return (default 100; above ${ProxyBridge.MAX_PAGE_SIZE} is served as ${ProxyBridge.MAX_PAGE_SIZE} with a note)", min = 0)
                     putJsonObject("host") { put("type", "string"); put("description", "Filter by upgrade host (case-insensitive substring)") }
                     enumProp("direction", WS_DIRECTIONS, "Direction filter (case-insensitive): 'client_to_server', 'server_to_client', or 'both' (default, no filter)")
+                    intProp("websocket_id", "Only messages of this proxied connection (the 'websocket_id' of an item)", min = 0)
+                    putJsonObject("url") { put("type", "string"); put("description", "Only messages whose upgrade request URL contains this (case-insensitive)") }
                 },
                 required = emptyList()
             )
@@ -142,10 +157,12 @@ object ProxyTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val result = bridge.getWebSocketHistory(
-                    startIndex = args.int("start_index", 0..Int.MAX_VALUE) ?: 0,
-                    count = args.int("count", 0..ProxyBridge.MAX_PAGE_SIZE) ?: 100,
+                    startIndex = args.integer("start_index") ?: 0,
+                    count = args.integer("count") ?: 100,
                     host = args.string("host"),
                     direction = args.string("direction"),
+                    webSocketId = args.integer("websocket_id"),
+                    url = args.string("url"),
                 )
                 toolJsonResult(result)
             } catch (e: Exception) {
@@ -158,12 +175,14 @@ object ProxyTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "proxy_websocket_history_search",
-            description = "Search WebSocket proxy history using a regex pattern on message payloads. Can filter by direction.",
+            description = "Search WebSocket proxy history using a regex pattern on message payloads. Can filter by direction, connection (websocket_id) and upgrade URL.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("pattern") { put("type", "string"); put("description", "Regex pattern to search message payloads") }
                     enumProp("direction", WS_DIRECTIONS, "Direction filter (case-insensitive): 'client_to_server', 'server_to_client', or 'both' (default, no filter)")
-                    intProp("max_results", "Maximum number of results (default 100, max ${ProxyBridge.MAX_PAGE_SIZE})", min = 0, max = ProxyBridge.MAX_PAGE_SIZE)
+                    intProp("max_results", "Maximum number of results (default 100; above ${ProxyBridge.MAX_PAGE_SIZE} is served as ${ProxyBridge.MAX_PAGE_SIZE} with a note)", min = 0)
+                    intProp("websocket_id", "Only messages of this proxied connection (the 'websocket_id' of an item)", min = 0)
+                    putJsonObject("url") { put("type", "string"); put("description", "Only messages whose upgrade request URL contains this (case-insensitive)") }
                 },
                 required = listOf("pattern")
             )
@@ -177,7 +196,9 @@ object ProxyTools {
                 val result = bridge.searchWebSocketHistory(
                     pattern = pattern,
                     direction = args.string("direction"),
-                    maxResults = args.int("max_results", 0..ProxyBridge.MAX_PAGE_SIZE) ?: 100,
+                    maxResults = args.integer("max_results") ?: 100,
+                    webSocketId = args.integer("websocket_id"),
+                    url = args.string("url"),
                 )
                 toolJsonResult(result)
             } catch (e: Exception) {
@@ -190,7 +211,7 @@ object ProxyTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "proxy_intercept_enable",
-            description = "Enable proxy interception. When enabled, requests/responses will be held for review before forwarding.",
+            description = "Turn on Burp's own proxy interception: the Intercept tab holds each message for a person at Burp to review. To hold messages for yourself instead, use action 'hold'.",
             inputSchema = ToolSchema(properties = buildJsonObject {}, required = emptyList())
         ) { _ ->
             try {
@@ -205,7 +226,7 @@ object ProxyTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "proxy_intercept_disable",
-            description = "Disable proxy interception. Requests/responses will pass through without being held.",
+            description = "Turn off Burp's own proxy interception: messages pass through Burp's Intercept tab without being held. Raijin's hold queue is separate (action 'release').",
             inputSchema = ToolSchema(properties = buildJsonObject {}, required = emptyList())
         ) { _ ->
             try {
@@ -220,11 +241,150 @@ object ProxyTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "proxy_intercept_status",
-            description = "Get the current proxy interception state (enabled or disabled).",
+            description = "Get the proxy interception state: Burp's own Intercept switch, and Raijin's hold queue (armed, filters, held count, totals).",
             inputSchema = ToolSchema(properties = buildJsonObject {}, required = emptyList())
         ) { _ ->
             try {
                 toolJsonResult(bridge.isInterceptEnabled())
+            } catch (e: Exception) {
+                toolError(e.message ?: "Unknown error")
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Raijin's hold queue: hold, list_held, forward, drop, release
+        // ---------------------------------------------------------------
+        server.addTool(
+            name = "proxy_intercept_hold",
+            description = "Hold proxied requests and/or responses that match the filters until you forward, edit or drop them " +
+                "(Raijin's own queue; Burp's Intercept tab is separate). Messages are held just before they are sent, after " +
+                "Burp's Intercept tab and the proxy rules, so what you see and edit is what goes on the wire. A held message " +
+                "nobody decides on within timeout_seconds is forwarded unchanged, and after 3 such timeouts in a row holding " +
+                "stops by itself, so traffic is never stuck. Call again to change the filters; action 'release' stops holding.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    enumProp("target", HOLD_TARGETS, "What to hold: 'request' (default), 'response' or 'both'")
+                    putJsonObject("match_host") { put("type", "string"); put("description", "$MATCH_HOST_DESCRIPTION; omit to hold every host") }
+                    putJsonObject("match_url") { put("type", "string"); put("description", "Regex (case-insensitive) searched in the full URL; omit to hold every URL") }
+                    putJsonObject("match_method") { put("type", "string"); put("description", "HTTP method to hold (case-insensitive); for a response, the method of its request") }
+                    putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Only hold messages Burp's scope considers in scope (default false)") }
+                    intProp("timeout_seconds", "Seconds one message is held without a decision before it is forwarded unchanged (default ${HoldPolicy.DEFAULT_TIMEOUT_SECONDS}, 1-${HoldPolicy.MAX_TIMEOUT_SECONDS}; other values are clamped with a note)", min = 1)
+                    intProp("max_held", "Most messages held at once; more pass straight through (default ${HoldPolicy.DEFAULT_MAX_HELD}, 1-${HoldPolicy.MAX_HELD}; other values are clamped with a note)", min = 1)
+                    intProp("max_messages", "Stop holding after this many messages (default: no limit)", min = 1)
+                },
+                required = emptyList()
+            )
+        ) { request ->
+            try {
+                val args = request.params.arguments ?: emptyMap()
+                val result = bridge.interceptHolds.arm(
+                    target = args.string("target"),
+                    matchHost = args.string("match_host"),
+                    matchUrl = args.string("match_url"),
+                    matchMethod = args.string("match_method"),
+                    inScopeOnly = args.bool("in_scope_only", false),
+                    timeoutSeconds = args.integer("timeout_seconds"),
+                    maxHeld = args.integer("max_held"),
+                    maxMessages = args.integer("max_messages"),
+                )
+                toolJsonResult(result)
+            } catch (e: Exception) {
+                toolError(e.message ?: "Unknown error")
+            }
+        }
+
+        server.addTool(
+            name = "proxy_intercept_list_held",
+            description = "List the messages held right now, oldest first, with their raw text, optionally waiting for one to arrive. " +
+                "Each has an 'id' for actions 'forward' and 'drop', and 'expires_in_ms' before it is forwarded unchanged.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    intProp("wait_seconds", "When nothing is held, wait up to this many seconds for a message (default 0, max ${ProxyInterceptHolds.MAX_WAIT_SECONDS})", min = 0)
+                    putJsonObject("include_raw") { put("type", "boolean"); put("description", "Include each message's raw text (default true)") }
+                    intProp("max_length", "Body characters returned per message (default ${ProxyInterceptHolds.DEFAULT_RAW_LENGTH}); the request or status line and headers are always complete", min = 1)
+                },
+                required = emptyList()
+            )
+        ) { request ->
+            try {
+                val args = request.params.arguments ?: emptyMap()
+                toolJsonResult(
+                    bridge.interceptHolds.listHeld(
+                        waitSeconds = args.integer("wait_seconds"),
+                        includeRaw = args.bool("include_raw", true),
+                        maxLength = args.integer("max_length"),
+                    )
+                )
+            } catch (e: Exception) {
+                toolError(e.message ?: "Unknown error")
+            }
+        }
+
+        server.addTool(
+            name = "proxy_intercept_forward",
+            description = "Forward a held message, edited or as it is, or every held message unchanged (all=true). " +
+                "Edits apply in this order: raw (the whole replacement message), then method, path, status_code, remove_headers, " +
+                "set_headers, body. Nothing is held to the HTTP grammar: header names and values may carry CR/LF or any other character.",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    intProp("id", "Id of the held message (from action 'list_held')", min = 1)
+                    putJsonObject("all") { put("type", "boolean"); put("description", "Forward every held message unchanged (default false)") }
+                    putJsonObject("raw") { put("type", "string"); put("description", "Whole replacement message, request or response. Header line endings become CRLF; the body is sent as written. A request still goes to the held request's host, port and protocol") }
+                    putJsonObject("auto_fix_content_length") { put("type", "boolean"); put("description", "With raw: correct a single mismatching Content-Length (default true). A message framed by Transfer-Encoding or several Content-Length headers is never touched") }
+                    putJsonObject("method") { put("type", "string"); put("description", "Held request: HTTP method to send instead") }
+                    putJsonObject("path") { put("type", "string"); put("description", "Held request: path and query string to send instead") }
+                    intProp("status_code", "Held response: status code to answer with instead", min = 0, max = ProxyRuleEdits.MAX_STATUS)
+                    putJsonObject("set_headers") { put("type", "object"); put("description", "Headers to set, name to value: each replaces every occurrence of that header, or is added when absent") }
+                    putJsonObject("remove_headers") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Header names to remove (every occurrence)") }
+                    putJsonObject("body") { put("type", "string"); put("description", "Body to send instead") }
+                },
+                required = emptyList()
+            )
+        ) { request ->
+            try {
+                val args = request.params.arguments ?: emptyMap()
+                val edit = InterceptEdit(
+                    raw = args.string("raw"),
+                    autoFixContentLength = args.bool("auto_fix_content_length", true),
+                    method = args.string("method"),
+                    path = args.string("path"),
+                    statusCode = args.integer("status_code"),
+                    setHeaders = args.headerMap("set_headers").orEmpty(),
+                    removeHeaders = args.nameList("remove_headers"),
+                    body = args.string("body"),
+                )
+                toolJsonResult(bridge.interceptHolds.forward(args.long("id"), args.bool("all", false), edit))
+            } catch (e: Exception) {
+                toolError(e.message ?: "Unknown error")
+            }
+        }
+
+        server.addTool(
+            name = "proxy_intercept_drop",
+            description = "Drop a held message so it never reaches the server (request) or the browser (response), or drop every held message (all=true).",
+            inputSchema = ToolSchema(
+                properties = buildJsonObject {
+                    intProp("id", "Id of the held message (from action 'list_held')", min = 1)
+                    putJsonObject("all") { put("type", "boolean"); put("description", "Drop every held message (default false)") }
+                },
+                required = emptyList()
+            )
+        ) { request ->
+            try {
+                val args = request.params.arguments ?: emptyMap()
+                toolJsonResult(bridge.interceptHolds.drop(args.long("id"), args.bool("all", false)))
+            } catch (e: Exception) {
+                toolError(e.message ?: "Unknown error")
+            }
+        }
+
+        server.addTool(
+            name = "proxy_intercept_release",
+            description = "Stop holding and forward every held message unchanged.",
+            inputSchema = ToolSchema(properties = buildJsonObject {}, required = emptyList())
+        ) { _ ->
+            try {
+                toolJsonResult(bridge.interceptHolds.release())
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -262,7 +422,7 @@ object ProxyTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "proxy_set_request_rule",
-            description = "Set a proxy request interception rule. Rules can match on host, URL, method, header, or body patterns and perform actions: 'modify' (add/remove/replace headers, body regex replacement), 'drop' (silently drop the request), or 'tag' (annotate in proxy history). If rule_id matches an existing rule, it is replaced.",
+            description = "Set a proxy request interception rule. Rules can match on host, URL, method, header, or body patterns and perform actions: 'modify' (add/remove/replace/set headers, body regex replacement, method, path), 'drop' (silently drop the request), or 'tag' (annotate in proxy history). Headers are written as given, CR/LF included. If rule_id matches an existing rule, it is replaced.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("rule_id") { put("type", "string"); put("description", "Rule ID; auto-generated if omitted") }
@@ -272,11 +432,15 @@ object ProxyTools {
                     putJsonObject("match_method") { put("type", "string"); put("description", "HTTP method to match (exact, case-insensitive)") }
                     putJsonObject("match_header") { put("type", "string"); put("description", "Regex (case-insensitive) searched in the 'Name: value' header lines") }
                     putJsonObject("match_body") { put("type", "string"); put("description", "Regex (case-insensitive) searched in the body") }
-                    putJsonObject("modify_add_header") { put("type", "string"); put("description", "Header to add when action is 'modify', as one 'Name: Value' line") }
-                    putJsonObject("modify_remove_header") { put("type", "string"); put("description", "Header name to remove when action is 'modify'") }
-                    putJsonObject("modify_replace_header") { put("type", "object"); put("description", "Map of header names to replacement values") }
+                    putJsonObject("modify_add_header") { put("type", "string"); put("description", MODIFY_ADD_HEADER_DESCRIPTION) }
+                    putJsonObject("modify_remove_header") { put("type", "string"); put("description", "Header name to remove (every occurrence) when action is 'modify'") }
+                    putJsonObject("modify_replace_header") { put("type", "object"); put("description", "Map of header names to values, applied to headers the request already has") }
+                    putJsonObject("modify_set_header") { put("type", "object"); put("description", MODIFY_SET_HEADER_DESCRIPTION) }
                     putJsonObject("modify_body_regex") { put("type", "string"); put("description", "Regex for body replacement (requires modify_body_replacement)") }
                     putJsonObject("modify_body_replacement") { put("type", "string"); put("description", "Replacement for body regex matches (\"\" deletes them)") }
+                    putJsonObject("modify_method") { put("type", "string"); put("description", "HTTP method to send instead when action is 'modify'") }
+                    putJsonObject("modify_path") { put("type", "string"); put("description", "Path and query string to send instead when action is 'modify'; with modify_path_regex, the replacement for each match ($1 refers to a group, \"\" deletes)") }
+                    putJsonObject("modify_path_regex") { put("type", "string"); put("description", "Regex (case-insensitive) searched in the path and query string; its matches are replaced by modify_path") }
                     putJsonObject("tag_comment") { put("type", "string"); put("description", "Comment to attach when action is 'tag'") }
                     enumProp("tag_highlight", HIGHLIGHT_COLORS, "Highlight color when action is 'tag'")
                     putJsonObject("enabled") { put("type", "boolean"); put("description", "Whether the rule is active (default true)") }
@@ -299,7 +463,7 @@ object ProxyTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "proxy_set_response_rule",
-            description = "Set a proxy response interception rule. Rules can match on host, URL, status code, header, or body patterns and perform actions: 'modify' (add/remove/replace headers, body regex replacement), 'drop' (silently drop the response), or 'tag' (annotate in proxy history). If rule_id matches an existing rule, it is replaced.",
+            description = "Set a proxy response interception rule. Rules can match on host, URL, status code, header, or body patterns and perform actions: 'modify' (add/remove/replace/set headers, body regex replacement, status code), 'drop' (silently drop the response), or 'tag' (annotate in proxy history). Headers are written as given, CR/LF included. If rule_id matches an existing rule, it is replaced.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("rule_id") { put("type", "string"); put("description", "Rule ID; auto-generated if omitted") }
@@ -309,11 +473,13 @@ object ProxyTools {
                     putJsonObject("match_header") { put("type", "string"); put("description", "Regex (case-insensitive) searched in the 'Name: value' header lines") }
                     putJsonObject("match_body") { put("type", "string"); put("description", "Regex (case-insensitive) searched in the body") }
                     intProp("match_status", "Status code to match", min = 0, max = 999)
-                    putJsonObject("modify_add_header") { put("type", "string"); put("description", "Header to add when action is 'modify', as one 'Name: Value' line") }
-                    putJsonObject("modify_remove_header") { put("type", "string"); put("description", "Header name to remove when action is 'modify'") }
-                    putJsonObject("modify_replace_header") { put("type", "object"); put("description", "Map of header names to replacement values") }
+                    putJsonObject("modify_add_header") { put("type", "string"); put("description", MODIFY_ADD_HEADER_DESCRIPTION) }
+                    putJsonObject("modify_remove_header") { put("type", "string"); put("description", "Header name to remove (every occurrence) when action is 'modify'") }
+                    putJsonObject("modify_replace_header") { put("type", "object"); put("description", "Map of header names to values, applied to headers the response already has") }
+                    putJsonObject("modify_set_header") { put("type", "object"); put("description", MODIFY_SET_HEADER_DESCRIPTION) }
                     putJsonObject("modify_body_regex") { put("type", "string"); put("description", "Regex for body replacement (requires modify_body_replacement)") }
                     putJsonObject("modify_body_replacement") { put("type", "string"); put("description", "Replacement for body regex matches (\"\" deletes them)") }
+                    intProp("modify_status", "Status code to answer with instead when action is 'modify'", min = 0, max = ProxyRuleEdits.MAX_STATUS)
                     putJsonObject("tag_comment") { put("type", "string"); put("description", "Comment to attach when action is 'tag'") }
                     enumProp("tag_highlight", HIGHLIGHT_COLORS, "Highlight color when action is 'tag'")
                     putJsonObject("enabled") { put("type", "boolean"); put("description", "Whether the rule is active (default true)") }
@@ -382,7 +548,7 @@ object ProxyTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "proxy_auto_auth",
-            description = "Convenience tool: auto-inject an authentication header into all proxy requests matching a host pattern. Creates a proxy request rule that adds the specified header. Use proxy_remove_rule with the returned rule_id to remove it later. Parameters: header_name (default 'Authorization'), header_value (required), host_pattern (glob or regex, default '.*' for all hosts).",
+            description = "Convenience tool: auto-inject an authentication header into all proxy requests matching a host pattern. Creates a proxy request rule that sets the header: one the request already has is replaced (never sent twice), a missing one is added. Use proxy_rule(action=remove) with the returned rule_id to remove it later. Parameters: header_name (default 'Authorization'), header_value (required), host_pattern (glob or regex, default '.*' for all hosts).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("header_name") { put("type", "string"); put("description", "Header name to inject (default 'Authorization')") }
@@ -405,7 +571,7 @@ object ProxyTools {
                     type = "request",
                     matchHost = hostPattern,
                     action = "modify",
-                    modifyAddHeader = "$headerName: $headerValue",
+                    modifySetHeader = mapOf(headerName to headerValue),
                     enabled = true
                 ))
                 if (stored["error"] != null) return@addTool toolJsonResult(stored)
@@ -415,7 +581,7 @@ object ProxyTools {
                     put("status", "active")
                     put("header", "$headerName: $headerValue")
                     put("host_pattern", hostPattern)
-                    put("note", "Use proxy_remove_rule with rule_id to deactivate")
+                    put("note", "Use proxy_rule(action=remove) with rule_id to deactivate")
                 })
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
@@ -429,28 +595,30 @@ object ProxyTools {
      */
     private fun buildRule(args: Map<String, JsonElement>, type: String, stateManager: StateManager): ProxyRule? {
         val action = args.string("action")?.trim()?.lowercase() ?: return null
-        val replaceHeader = args["modify_replace_header"]?.takeUnless { it is JsonNull }?.let { element ->
-            element.asStringMap()
-                ?: throw IllegalArgumentException("Parameter 'modify_replace_header' must be an object of header name to value")
-        }
+        val request = type == "request"
         return ProxyRule(
             ruleId = args.string("rule_id") ?: stateManager.generateId("prule"),
             type = type,
             matchHost = args.string("match_host"),
             matchUrl = args.string("match_url"),
-            matchMethod = if (type == "request") args.string("match_method") else null,
+            matchMethod = if (request) args.string("match_method") else null,
             matchHeader = args.string("match_header"),
             matchBody = args.string("match_body"),
-            matchStatus = if (type == "response") args.int("match_status", 0..999) else null,
+            matchStatus = if (!request) args.int("match_status", 0..999) else null,
             action = action,
             modifyAddHeader = args.string("modify_add_header"),
             modifyRemoveHeader = args.string("modify_remove_header"),
-            modifyReplaceHeader = replaceHeader,
+            modifyReplaceHeader = args.headerMap("modify_replace_header"),
             modifyBodyRegex = args.string("modify_body_regex"),
             modifyBodyReplacement = args.string("modify_body_replacement"),
             tagComment = args.string("tag_comment"),
             tagHighlight = args.string("tag_highlight"),
-            enabled = args.bool("enabled", true)
+            enabled = args.bool("enabled", true),
+            modifyMethod = if (request) args.string("modify_method") else null,
+            modifyPath = if (request) args.string("modify_path") else null,
+            modifyPathRegex = if (request) args.string("modify_path_regex") else null,
+            modifyStatus = if (!request) args.integer("modify_status") else null,
+            modifySetHeader = args.headerMap("modify_set_header"),
         )
     }
 
@@ -473,6 +641,33 @@ object ProxyTools {
             else "Parameter '$name' must be between ${range.first} and ${range.last} (got $value)"
         }
         return value.toInt()
+    }
+
+    /** Optional integer argument as a Long; a non-integer throws, reported as a tool error. */
+    private fun Map<String, JsonElement>.long(name: String): Long? {
+        val element = this[name]
+        if (element == null || element is JsonNull) return null
+        return element.asLongSafe() ?: throw IllegalArgumentException("Parameter '$name' must be an integer")
+    }
+
+    /**
+     * Optional integer argument without a range: the bridge serves an out-of-range value at the
+     * nearest bound and says so in `notes`. A non-integer throws, reported as a tool error.
+     */
+    private fun Map<String, JsonElement>.integer(name: String): Int? =
+        long(name)?.coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong())?.toInt()
+
+    /** Optional map of header name to value; anything else throws, reported as a tool error. */
+    private fun Map<String, JsonElement>.headerMap(name: String): Map<String, String>? =
+        this[name]?.takeUnless { it is JsonNull }?.let { element ->
+            element.asStringMap() ?: throw IllegalArgumentException("Parameter '$name' must be an object of header name to value")
+        }
+
+    /** Optional list of header names (a single string is one name); anything else throws, reported as a tool error. */
+    private fun Map<String, JsonElement>.nameList(name: String): List<String> {
+        val element = this[name]
+        if (element == null || element is JsonNull) return emptyList()
+        return element.asStringList() ?: throw IllegalArgumentException("Parameter '$name' must be a list of header names")
     }
 
     private fun JsonObjectBuilder.intProp(name: String, description: String, min: Int? = null, max: Int? = null) {

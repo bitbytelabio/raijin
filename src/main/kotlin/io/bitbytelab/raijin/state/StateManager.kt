@@ -4,7 +4,6 @@ import burp.api.montoya.core.Registration
 import burp.api.montoya.http.message.HttpRequestResponse
 import burp.api.montoya.http.message.requests.HttpRequest
 import kotlinx.serialization.json.JsonObject
-import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.CopyOnWriteArrayList
@@ -23,14 +22,21 @@ import java.util.concurrent.atomic.AtomicLong
  * @property matchBody Optional body content regex to match.
  * @property matchStatus Optional HTTP status code to match (response rules only).
  * @property action What to do when matched: "modify", "drop", or "tag".
- * @property modifyAddHeader Header to add (format "Name: Value").
- * @property modifyRemoveHeader Header name to remove.
- * @property modifyReplaceHeader Map of header names to replacement values.
+ * @property modifyAddHeader Header to add (format "Name: Value", written as given: CR/LF and any other character included).
+ * @property modifyRemoveHeader Header name to remove (every occurrence).
+ * @property modifyReplaceHeader Map of header names to replacement values (headers the message already has).
  * @property modifyBodyRegex Regex pattern for body replacement.
  * @property modifyBodyReplacement Replacement string for body regex matches.
  * @property tagComment Comment to set on the proxy history item.
  * @property tagHighlight Highlight color to set on the proxy history item.
  * @property enabled Whether this rule is currently active.
+ * @property modifyMethod HTTP method to send instead (request rules).
+ * @property modifyPath New path including the query string (request rules); with [modifyPathRegex],
+ *   the replacement for each match of that regex in the current path.
+ * @property modifyPathRegex Regex searched in the path and query string; its matches are replaced by [modifyPath].
+ * @property modifyStatus Status code to answer with instead (response rules).
+ * @property modifySetHeader Map of header names to values: each replaces the header when the message has
+ *   it (every occurrence, so it is never sent twice) and is added otherwise.
  */
 data class ProxyRule(
     val ruleId: String,
@@ -49,7 +55,12 @@ data class ProxyRule(
     val modifyBodyReplacement: String? = null,
     val tagComment: String? = null,
     val tagHighlight: String? = null,
-    @Volatile var enabled: Boolean = true
+    @Volatile var enabled: Boolean = true,
+    val modifyMethod: String? = null,
+    val modifyPath: String? = null,
+    val modifyPathRegex: String? = null,
+    val modifyStatus: Int? = null,
+    val modifySetHeader: Map<String, String>? = null,
 )
 
 /**
@@ -89,62 +100,6 @@ data class CollaboratorClientState(
     val client: Any,
     val server: String,
     val createdAt: String
-)
-
-/**
- * A live "replay under a second identity" tap on proxy traffic — Autorize's core idea (replay
- * captured traffic under a lower-privilege session and diff) applied continuously instead of to
- * a caller-supplied request list. Matching proxied responses are cloned, replayed under each of
- * [identities] in the background by [io.bitbytelab.raijin.bridge.ProxyBridge], and diffed via
- * [io.bitbytelab.raijin.bridge.AuthDiffVerdict] against the already-captured response.
- *
- * @property ruleId Unique identifier (e.g. "arule-001").
- * @property identities Replay identities, same `{name, header_name?, header_value?}` shape as auth_diff/access_control_sweep.
- * @property inScopeOnly When true (default), only taps requests Burp's scope considers in scope.
- * @property includeHostPattern Optional hostname glob (e.g. "*.example.com"); null taps every host.
- * @property excludeUrlRegex Optional URL regex; matching requests are skipped.
- * @property methods Optional set of HTTP methods (uppercase) to tap; null taps every method.
- * @property ignoreStaticAssets When true (default), skip responses that look like a static asset.
- * @property similarityThreshold Body-similarity percent (0-100) controlling how strictly a replay must match to be flagged.
- * @property enabled Whether this rule is currently tapping traffic.
- * @property createdAt ISO-8601 timestamp of rule creation.
- */
-data class AutorizeRule(
-    val ruleId: String,
-    val identities: List<JsonObject>,
-    val inScopeOnly: Boolean = true,
-    val includeHostPattern: String? = null,
-    val excludeUrlRegex: String? = null,
-    val methods: Set<String>? = null,
-    val ignoreStaticAssets: Boolean = true,
-    val similarityThreshold: Double = 90.0,
-    @Volatile var enabled: Boolean = true,
-    val createdAt: String = Instant.now().toString(),
-)
-
-/**
- * One flagged mismatch recorded by a live [AutorizeRule] tap.
- *
- * @property id Monotonically increasing id for ordering/paging.
- * @property ruleId The [AutorizeRule] that produced this match.
- * @property timestamp ISO-8601 timestamp of the replay.
- * @property method HTTP method of the original request.
- * @property url URL of the original request.
- * @property originalStatus Status code of the already-captured (original) response.
- * @property findings Serialized [io.bitbytelab.raijin.bridge.AuthDiffVerdict.Finding]s (one per flagged identity comparison).
- * @property request Raw original request text (evidence).
- * @property response Raw original response text (evidence).
- */
-data class AutorizeMatch(
-    val id: Long,
-    val ruleId: String,
-    val timestamp: String,
-    val method: String,
-    val url: String,
-    val originalStatus: Int,
-    val findings: List<JsonObject>,
-    val request: String,
-    val response: String,
 )
 
 /**
@@ -297,27 +252,34 @@ class StateManager {
     /** Live Autorize-style proxy taps (clone + replay matching traffic under a second identity, in the background). */
     val autorizeRules = CopyOnWriteArrayList<AutorizeRule>()
 
-    /** Flagged mismatches recorded by [autorizeRules] taps, newest first. */
-    val autorizeMatches = ConcurrentLinkedDeque<AutorizeMatch>()
-    private val autorizeMatchIdCounter = AtomicLong(0)
-    private val autorizeMatchCount = java.util.concurrent.atomic.AtomicInteger(0)
-    private val maxAutorizeMatches = 2000
+    private val autorizeLog = AutorizeMatchLog()
+
+    /** Flagged mismatches recorded by [autorizeRules] taps, newest first. Change them through [addAutorizeMatch] / [clearAutorizeMatches]. */
+    val autorizeMatches: ConcurrentLinkedDeque<AutorizeMatch> get() = autorizeLog.matches
+
+    /** Listeners notified of each recorded match (durable persistence); restored matches are not announced. */
+    val autorizeMatchListeners: CopyOnWriteArrayList<(AutorizeMatch) -> Unit> get() = autorizeLog.addListeners
+
+    /** Listeners notified after matches were cleared (durable persistence sync). */
+    val autorizeMatchClearListeners: CopyOnWriteArrayList<() -> Unit> get() = autorizeLog.clearListeners
+
+    /** Capacity of the retained match log (for callers restoring it on startup). */
+    val autorizeMatchCapacity: Int get() = autorizeLog.capacity
+
+    /** What each rule's tap did with the traffic it saw (replayed, flagged, skipped and why). */
+    val autorizeActivity = AutorizeActivity()
+
+    /** Dedup guard so a repeatedly-hit endpoint isn't replayed on every single proxied request; keyed by [autorizeSeenKey]. */
+    private val autorizeSeen = AutorizeSeenGuard()
 
     /**
-     * Dedup guard so a repeatedly-hit endpoint isn't replayed on every single proxied request.
-     * Keyed by [autorizeSeenKey]. A crude cap-and-clear (rather than an LRU) is enough here:
-     * a full reset just means some endpoints get retested, which is harmless.
+     * True the first time [key] is seen while its [endpoint] ([autorizeEndpointKey]) has query
+     * variants to spare (caller should proceed); false otherwise (caller should skip).
      */
-    private val autorizeSeen = ConcurrentHashMap<String, Long>()
-    private val maxAutorizeSeenEntries = 20_000
+    fun autorizeSeenOnce(key: String, endpoint: String = key.substringBefore('?')): Boolean =
+        autorizeSeen.seenOnce(key, endpoint)
 
-    /** True the first time [key] is seen (caller should proceed); false on a repeat (caller should skip). */
-    fun autorizeSeenOnce(key: String): Boolean {
-        if (autorizeSeen.size > maxAutorizeSeenEntries) autorizeSeen.clear()
-        return autorizeSeen.putIfAbsent(key, System.currentTimeMillis()) == null
-    }
-
-    /** Records a flagged [AutorizeRule] mismatch, evicting the oldest beyond [maxAutorizeMatches]. */
+    /** Records a flagged [AutorizeRule] mismatch; see [AutorizeMatchLog.add] for the bounds. */
     fun addAutorizeMatch(
         ruleId: String,
         method: String,
@@ -326,45 +288,29 @@ class StateManager {
         findings: List<JsonObject>,
         request: String,
         response: String,
-    ): AutorizeMatch {
-        val entry = AutorizeMatch(
-            id = autorizeMatchIdCounter.incrementAndGet(),
-            ruleId = ruleId,
-            timestamp = Instant.now().toString(),
-            method = method,
-            url = url,
-            originalStatus = originalStatus,
-            findings = findings,
-            request = request,
-            response = response,
-        )
-        autorizeMatches.addFirst(entry)
-        autorizeMatchCount.incrementAndGet()
-        while (autorizeMatchCount.get() > maxAutorizeMatches) {
-            if (autorizeMatches.pollLast() != null) autorizeMatchCount.decrementAndGet() else break
-        }
-        return entry
+        replays: List<AutorizeReplay> = emptyList(),
+        softDenial: Boolean = false,
+    ): AutorizeMatch =
+        autorizeLog.add(ruleId, method, url, originalStatus, findings, request, response, replays, softDenial)
+
+    /**
+     * Seeds the matches from the durable store on startup (newest first) WITHOUT notifying
+     * persistence listeners. Match ids continue past the restored ones, and so does the shared id
+     * counter past the rule ids they name, so a new rule is never given the id of a rule whose
+     * matches were restored.
+     */
+    fun restoreAutorizeMatches(entries: List<AutorizeMatch>) {
+        autorizeLog.restore(entries)
+        val maxSuffix = entries.maxOfOrNull { it.ruleId.substringAfterLast('-').toLongOrNull() ?: 0L } ?: 0L
+        idCounter.accumulateAndGet(maxSuffix) { current, restored -> maxOf(current, restored) }
     }
 
     /** Clears seen-request dedup keys (either all or for a specific [ruleId]). */
-    fun clearAutorizeSeen(ruleId: String? = null) {
-        if (ruleId == null) autorizeSeen.clear() else autorizeSeen.keys.removeIf { it.startsWith("$ruleId|") }
-    }
+    fun clearAutorizeSeen(ruleId: String? = null) = autorizeSeen.clear(ruleId)
 
     /** Clears matches (optionally scoped to one rule) and, when [resetSeen] is true, the dedup guard too. */
     fun clearAutorizeMatches(ruleId: String?, resetSeen: Boolean) {
-        if (ruleId == null) {
-            autorizeMatches.clear()
-            autorizeMatchCount.set(0)
-        } else {
-            val iter = autorizeMatches.iterator()
-            while (iter.hasNext()) {
-                if (iter.next().ruleId == ruleId) {
-                    iter.remove()
-                    autorizeMatchCount.decrementAndGet()
-                }
-            }
-        }
+        autorizeLog.clear(ruleId)
         if (resetSeen) clearAutorizeSeen(ruleId)
     }
 
@@ -490,14 +436,18 @@ class StateManager {
         mcpActivityCount.set(0)
         mcpActivityListeners.clear()
         autorizeRules.clear()
-        autorizeMatches.clear()
-        autorizeMatchCount.set(0)
-        autorizeSeen.clear()
+        autorizeLog.reset()
+        autorizeSeen.clear(null)
+        autorizeActivity.clear()
     }
 
     companion object {
-        /** Dedup key for one Autorize replay: rule, method and URL without its query string. */
+        /** Dedup key for one Autorize replay: rule, method, URL path and query parameters ([AutorizeSeenGuard.key]). */
         fun autorizeSeenKey(ruleId: String, method: String, url: String): String =
-            "$ruleId|${method.uppercase()}|${url.substringBefore('?')}"
+            AutorizeSeenGuard.key(ruleId, method, url)
+
+        /** The endpoint a seen key belongs to: rule, method and URL without its query ([AutorizeSeenGuard.endpointKey]). */
+        fun autorizeEndpointKey(ruleId: String, method: String, url: String): String =
+            AutorizeSeenGuard.endpointKey(ruleId, method, url)
     }
 }

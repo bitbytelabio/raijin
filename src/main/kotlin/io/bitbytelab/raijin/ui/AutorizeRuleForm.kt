@@ -1,30 +1,56 @@
 package io.bitbytelab.raijin.ui
 
+import io.bitbytelab.raijin.bridge.AuthIdentityApplier
 import io.bitbytelab.raijin.bridge.AutorizeBridge
-import io.bitbytelab.raijin.safety.HeaderSafety
 import io.bitbytelab.raijin.safety.SafeRegex
 import io.bitbytelab.raijin.state.AutorizeRule
 import io.bitbytelab.raijin.state.StateManager
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 
-/** One replay identity of an Autorize rule: the `{name, header_name?, header_value?}` shape auth_diff uses. */
-internal data class AutorizeIdentity(val name: String, val headerName: String = "", val headerValue: String = "") {
+/**
+ * One replay identity of an Autorize rule: the `{name, header_name?, header_value?, headers?,
+ * remove_headers?}` shape auth_diff uses ([AuthIdentityApplier]). The editor shows one header
+ * ([headerName] / [headerValue]) and [removeHeaders]; [otherHeaders] carries the further headers an
+ * identity set through MCP may send, so editing the rule in the tab keeps them.
+ */
+internal data class AutorizeIdentity(
+    val name: String,
+    val headerName: String = "",
+    val headerValue: String = "",
+    val removeHeaders: List<String> = emptyList(),
+    val otherHeaders: Map<String, String> = emptyMap(),
+) {
     fun toJson(): JsonObject = buildJsonObject {
         put("name", name)
         if (headerName.isNotEmpty()) {
             put("header_name", headerName)
             put("header_value", headerValue)
         }
+        if (otherHeaders.isNotEmpty()) putJsonObject("headers") { otherHeaders.forEach { (k, v) -> put(k, v) } }
+        if (removeHeaders.isNotEmpty()) putJsonArray("remove_headers") { removeHeaders.forEach { add(it) } }
     }
+
+    /** Replaying this identity would send the captured request unchanged ([AuthIdentityApplier.Identity.sendsRequestUnchanged]). */
+    val sendsRequestUnchanged: Boolean get() = AuthIdentityApplier.parse(toJson()).sendsRequestUnchanged
 
     companion object {
         fun from(json: JsonObject): AutorizeIdentity {
-            fun text(key: String) = runCatching { json[key]?.jsonPrimitive?.contentOrNull }.getOrNull().orEmpty()
-            return AutorizeIdentity(text("name"), text("header_name"), text("header_value"))
+            val parsed = AuthIdentityApplier.parse(json)
+            val first = parsed.headers.firstOrNull()
+            return AutorizeIdentity(
+                name = runCatching { json["name"]?.jsonPrimitive?.contentOrNull }.getOrNull().orEmpty(),
+                headerName = first?.first.orEmpty(),
+                headerValue = first?.second.orEmpty(),
+                removeHeaders = parsed.removeHeaders,
+                otherHeaders = parsed.headers.drop(1).toMap(LinkedHashMap()),
+            )
         }
     }
 }
@@ -43,30 +69,32 @@ internal data class AutorizeRuleForm(
     val ignoreStaticAssets: Boolean = true,
     val similarityThreshold: Double = 90.0,
     val enabled: Boolean = true,
+    val includeMutating: Boolean = false,
 ) {
-    /** The first problem with this form, or null when it can be saved. */
+    /**
+     * The first problem with this form, or null when it can be saved. Header names and values are
+     * not held to the HTTP grammar: the replay writes them as given.
+     */
     fun validate(): String? {
-        if (identities.size < 2) {
-            return "Add at least 2 identities, e.g. a low-privilege session and 'unauth'. Each one is replayed against the captured request."
+        if (identities.isEmpty()) {
+            return "Add at least one identity, e.g. a low-privilege session or 'unauth'. Each one is replayed against the captured request."
         }
         val seen = HashSet<String>()
         for (identity in identities) {
             val name = identity.name
             if (name.isBlank()) return "Every identity needs a name."
             if (!seen.add(name.lowercase())) return "Identity names must be unique: '$name' appears twice."
-            if (identity.headerName.isEmpty()) {
+            if (identity.headerName.isBlank()) {
                 if (identity.headerValue.isNotEmpty()) return "Identity '$name': a header value needs a header name."
                 continue
-            }
-            if (!HeaderSafety.isValidHeaderName(identity.headerName)) {
-                return "Identity '$name': '${identity.headerName}' is not a valid header name (no ':' or line breaks)."
             }
             if (identity.headerValue.isEmpty()) {
                 return "Identity '$name': enter the ${identity.headerName} value to replay with (e.g. the low-privilege session)."
             }
-            if (!HeaderSafety.isValidHeaderValue(identity.headerValue)) {
-                return "Identity '$name': the header value must not contain line breaks."
-            }
+        }
+        if (identities.all { it.sendsRequestUnchanged }) {
+            return "No identity changes the request: give one a header (e.g. a low-privilege Cookie), headers to remove, " +
+                "or name one unauth, none or anonymous to replay without credentials."
         }
         if (similarityThreshold.isNaN() || similarityThreshold !in 0.0..100.0) {
             return "Similarity threshold must be between 0 and 100."
@@ -109,6 +137,7 @@ internal data class AutorizeRuleForm(
             ignoreStaticAssets = ignoreStaticAssets,
             similarityThreshold = similarityThreshold,
             enabled = enabled,
+            includeMutating = includeMutating,
         )
     }
 
@@ -127,17 +156,23 @@ internal data class AutorizeRuleForm(
             ignoreStaticAssets = rule.ignoreStaticAssets,
             similarityThreshold = rule.similarityThreshold,
             enabled = rule.enabled,
+            includeMutating = rule.includeMutating,
         )
 
         /** "get, Post;PUT" -> [GET, POST, PUT]; blank -> null (every method). */
         fun parseMethods(text: String): List<String>? =
             text.split(',', ';', ' ', '\t').map { it.trim().uppercase() }.filter { it.isNotEmpty() }.distinct().ifEmpty { null }
 
+        /** "Cookie, X-Csrf-Token" -> [Cookie, X-Csrf-Token]; header names as written, one entry per name. */
+        fun parseHeaderNames(text: String): List<String> =
+            text.split(',').map { it.trim() }.filter { it.isNotEmpty() }.distinctBy { it.lowercase() }
+
         /** One-line summary of a rule's traffic filters for the rules table. */
         fun filtersSummary(rule: AutorizeRule): String = buildList {
             if (rule.inScopeOnly) add("in scope")
             rule.includeHostPattern?.let { add("host $it") }
             rule.methods?.let { add(it.sorted().joinToString(",")) }
+            if (rule.includeMutating) add("+ state-changing")
             rule.excludeUrlRegex?.let { add("skip /$it/") }
             if (rule.ignoreStaticAssets) add("no static")
         }.joinToString(" · ").ifEmpty { "all traffic" }

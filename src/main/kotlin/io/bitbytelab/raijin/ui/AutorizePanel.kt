@@ -47,9 +47,10 @@ import javax.swing.table.DefaultTableModel
 
 /**
  * The Autorize tab: live proxy taps that replay matching traffic under other identities (driven by
- * ProxyBridge), and the mismatches they flagged. Rules go through [AutorizeBridge], the path the
- * `autorize` MCP tool uses, so the operator and the agent edit one rule set. [refresh] re-reads
- * [StateManager]; the tables change only when the state did.
+ * AutorizeTap), and the mismatches they flagged, each shown as the captured original next to what
+ * every identity sent and received. Rules go through [AutorizeBridge], the path the `autorize` MCP
+ * tool uses, so the operator and the agent edit one rule set. [refresh] re-reads [StateManager];
+ * the tables change only when the state did.
  */
 internal class AutorizePanel(
     private val api: MontoyaApi,
@@ -84,21 +85,29 @@ internal class AutorizePanel(
     private var matchesKey: List<Any?>? = null
     private var matchesById: Map<Long, AutorizeMatch> = emptyMap()
     private val matchesModel = SnapshotTableModel(
-        arrayOf("#", "Time", "Rule", "Severity", "Method", "URL", "Status", "Verdict"),
+        arrayOf("#", "Time", "Rule", "Severity", "Method", "URL", "Status", "Replays", "Verdict"),
         mapOf(0 to SnapshotTableModel.LONG, 6 to SnapshotTableModel.INT),
     )
     private val matchesTable = JTable(matchesModel)
     private val resetSeenCheck = JCheckBox("Replay seen endpoints again")
     private val statusLabel = TintedLabel { RaijinTheme.muted() }
 
-    // ── Detail ───────────────────────────────────────────────────────────────
+    // ── Detail: the verdict, and the captured original next to one identity's replay ─────────
     private val verdictArea = JTextArea(PLACEHOLDER)
-    private val requestEditor = api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY)
-    private val responseEditor = api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY)
+    private val originalRequestEditor = api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY)
+    private val originalResponseEditor = api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY)
+    private val replayRequestEditor = api.userInterface().createHttpRequestEditor(EditorOptions.READ_ONLY)
+    private val replayResponseEditor = api.userInterface().createHttpResponseEditor(EditorOptions.READ_ONLY)
+    private val originalLabel = JLabel(ORIGINAL_TITLE)
+    private val replayChooser = JComboBox<String>()
+    private val replayStatus = TintedLabel { RaijinTheme.muted() }
     private val highlightField = JTextField(18)
     private var shownMatchId: Long? = null
+    private var shownMatch: AutorizeMatch? = null
     // A rebuild clears and restores the selection; the detail must not flicker through "nothing selected".
     private var rebuildingMatches = false
+    // Refilling the identity chooser fires selection events that are not the operator's choice.
+    private var fillingReplayChooser = false
 
     init {
         rulesTable.fillsViewportHeight = true; rulesTable.rowHeight = 22; rulesTable.setShowGrid(false)
@@ -128,9 +137,10 @@ internal class AutorizePanel(
             getColumn(2).apply { preferredWidth = 90; maxWidth = 130 }
             getColumn(3).apply { preferredWidth = 80; maxWidth = 100; cellRenderer = SeverityRenderer() }
             getColumn(4).apply { preferredWidth = 60; maxWidth = 80; cellRenderer = MethodRenderer() }
-            getColumn(5).preferredWidth = 420
+            getColumn(5).preferredWidth = 380
             getColumn(6).apply { preferredWidth = 55; maxWidth = 70; cellRenderer = StatusCodeRenderer() }
-            getColumn(7).preferredWidth = 220
+            getColumn(7).preferredWidth = 160
+            getColumn(8).preferredWidth = 220
         }
         matchesTable.selectionModel.addListSelectionListener { e ->
             if (!e.valueIsAdjusting && !rebuildingMatches) showSelectedMatch()
@@ -139,8 +149,10 @@ internal class AutorizePanel(
 
         verdictArea.isEditable = false; verdictArea.font = RaijinTheme.editorFont(11f)
         verdictArea.lineWrap = true; verdictArea.wrapStyleWord = true
-        highlightField.toolTipText = "Text to highlight in the request and response"
+        highlightField.toolTipText = "Text to highlight in the original and the replayed messages"
         highlightField.document.addDocumentListener(documentListener { applyHighlight() })
+        replayChooser.toolTipText = "The identity whose replay is shown next to the original"
+        replayChooser.addActionListener { if (!fillingReplayChooser) showReplay(shownMatch, replayChooser.selectedIndex) }
 
         ruleFilter.addActionListener { refreshMatches() }
         severityFilter.addActionListener { refreshMatches() }
@@ -162,10 +174,33 @@ internal class AutorizePanel(
         val rulesScroll = JScrollPane(rulesTable).apply { border = BorderFactory.createTitledBorder("Rules") }
         val matchesScroll = JScrollPane(matchesTable).apply { border = BorderFactory.createTitledBorder("Flagged matches") }
 
+        val originalTabs = JTabbedPane(JTabbedPane.TOP).apply {
+            addTab("Request", originalRequestEditor.uiComponent())
+            addTab("Response", originalResponseEditor.uiComponent())
+        }
+        val replayTabs = JTabbedPane(JTabbedPane.TOP).apply {
+            addTab("Request", replayRequestEditor.uiComponent())
+            addTab("Response", replayResponseEditor.uiComponent())
+        }
+        // Both sides show the same part of the exchange, the responses first.
+        originalTabs.addChangeListener { if (replayTabs.selectedIndex != originalTabs.selectedIndex) replayTabs.selectedIndex = originalTabs.selectedIndex }
+        replayTabs.addChangeListener { if (originalTabs.selectedIndex != replayTabs.selectedIndex) originalTabs.selectedIndex = replayTabs.selectedIndex }
+        originalTabs.selectedIndex = 1
+        val originalSide = JPanel(BorderLayout()).apply {
+            add(JPanel(FlowLayout(FlowLayout.LEFT, 6, 2)).apply { add(originalLabel) }, BorderLayout.NORTH)
+            add(originalTabs, BorderLayout.CENTER)
+        }
+        val replaySide = JPanel(BorderLayout()).apply {
+            add(JPanel(FlowLayout(FlowLayout.LEFT, 6, 2)).apply {
+                add(JLabel("Replayed as:")); add(replayChooser); add(replayStatus)
+            }, BorderLayout.NORTH)
+            add(replayTabs, BorderLayout.CENTER)
+        }
+        val compare = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, originalSide, replaySide).apply { resizeWeight = 0.5; dividerSize = 5 }
+
         val detailTabs = JTabbedPane(JTabbedPane.TOP)
         detailTabs.addTab("Verdict", JScrollPane(verdictArea))
-        detailTabs.addTab("Request", requestEditor.uiComponent())
-        detailTabs.addTab("Response", responseEditor.uiComponent())
+        detailTabs.addTab("Original vs replay", compare)
         val detail = JPanel(BorderLayout())
         detail.add(JPanel(FlowLayout(FlowLayout.LEFT, 6, 2)).apply {
             add(JLabel("Highlight:")); add(highlightField)
@@ -187,7 +222,8 @@ internal class AutorizePanel(
 
     private fun refreshRules() {
         val rules = stateManager.autorizeRules.toList()
-        val counts = stateManager.autorizeMatches.groupingBy { it.ruleId }.eachCount()
+        val matches = stateManager.autorizeMatches.toList()
+        val counts = matches.groupingBy { it.ruleId }.eachCount()
         val rows = rules.map { r ->
             listOf<Any?>(
                 r.enabled, r.ruleId, AutorizeRuleForm.identityNames(r), AutorizeRuleForm.filtersSummary(r),
@@ -204,7 +240,9 @@ internal class AutorizePanel(
             if (row != null) rulesTable.setRowSelectionInterval(row, row)
         }
         updateRuleFilter((rules.map { it.ruleId } + counts.keys).distinct().sorted())
-        statusLabel.text = "Rules: ${rules.size} (${rules.count { it.enabled }} on) · Matches: ${counts.values.sum()}"
+        val softDenials = matches.count { it.softDenial }
+        statusLabel.text = "Rules: ${rules.size} (${rules.count { it.enabled }} on) · Matches: ${matches.size}" +
+            if (softDenials > 0) " ($softDenials soft denials)" else ""
     }
 
     private fun updateRuleFilter(ids: List<String>) {
@@ -227,7 +265,7 @@ internal class AutorizePanel(
         val rows = matches.map { m ->
             listOf(
                 m.id, shortTime(m.timestamp), m.ruleId, topSeverity(m).uppercase(), m.method, m.url,
-                m.originalStatus.takeIf { it > 0 }, verdictIds(m),
+                m.originalStatus.takeIf { it > 0 }, replaySummary(m), verdictSummary(m),
             )
         }
         rebuildingMatches = true
@@ -257,23 +295,58 @@ internal class AutorizePanel(
         val match = selectedMatch()
         if (match?.id == shownMatchId) return
         shownMatchId = match?.id
+        shownMatch = match
+        fillReplayChooser(match)
         if (match == null) {
             verdictArea.text = PLACEHOLDER
-            requestEditor.clear()
-            responseEditor.clear()
+            originalLabel.text = ORIGINAL_TITLE
+            originalRequestEditor.clear()
+            originalResponseEditor.clear()
+            showReplay(null, -1)
             return
         }
         verdictArea.text = verdictText(match)
         verdictArea.caretPosition = 0
-        requestEditor.showRaw(match.request, match.url)
-        responseEditor.showRaw(match.response)
+        originalLabel.text = "$ORIGINAL_TITLE: ${match.originalStatus}"
+        originalRequestEditor.showRaw(match.request, match.url)
+        originalResponseEditor.showRaw(match.response)
+        showReplay(match, if (match.replays.isEmpty()) -1 else 0)
+    }
+
+    /** Lists [match]'s replayed identities in the chooser, the first one selected. */
+    private fun fillReplayChooser(match: AutorizeMatch?) {
+        fillingReplayChooser = true
+        try {
+            val names = match?.replays?.map { "${it.identity} (${it.status})" }.orEmpty()
+            replayChooser.model = DefaultComboBoxModel(names.toTypedArray())
+            replayChooser.isEnabled = names.size > 1
+        } finally {
+            fillingReplayChooser = false
+        }
+    }
+
+    /** Shows what the identity at [index] of [match]'s replays sent and received. */
+    private fun showReplay(match: AutorizeMatch?, index: Int) {
+        val replay = match?.replays?.getOrNull(index)
+        if (match == null || replay == null) {
+            replayRequestEditor.clear()
+            replayResponseEditor.clear()
+            replayStatus.text = if (match == null) "" else "No replay stored with this match"
+            return
+        }
+        replayStatus.text = "status ${replay.status}" +
+            if (replay.status == match.originalStatus) ", as the original" else ", original ${match.originalStatus}"
+        replayRequestEditor.showRaw(replay.request, match.url)
+        replayResponseEditor.showRaw(replay.response)
         applyHighlight()
     }
 
     private fun applyHighlight() {
         val expression = highlightField.text
-        try { requestEditor.setSearchExpression(expression) } catch (_: Exception) {}
-        try { responseEditor.setSearchExpression(expression) } catch (_: Exception) {}
+        try { originalRequestEditor.setSearchExpression(expression) } catch (_: Exception) {}
+        try { originalResponseEditor.setSearchExpression(expression) } catch (_: Exception) {}
+        try { replayRequestEditor.setSearchExpression(expression) } catch (_: Exception) {}
+        try { replayResponseEditor.setSearchExpression(expression) } catch (_: Exception) {}
     }
 
     private fun verdictText(m: AutorizeMatch): String = buildString {
@@ -281,33 +354,54 @@ internal class AutorizePanel(
         append("Rule: ${m.ruleId}")
         appendLine(rule?.let { "  ·  identities: ${AutorizeRuleForm.identityNames(it)}" } ?: "  (rule deleted)")
         appendLine("Request: ${m.method} ${m.url}")
-        appendLine("Captured response status: ${m.originalStatus}")
+        appendLine("Original (captured) response status: ${m.originalStatus}")
+        if (m.replays.isNotEmpty()) {
+            appendLine("Replayed as: " + m.replays.joinToString(", ") { "${it.identity} → ${it.status}" })
+        }
         appendLine("Time: ${m.timestamp}")
+        if (m.softDenial) {
+            appendLine()
+            appendLine(
+                "Soft denial: an identity got a success status whose body reads as a refusal (a login page or a " +
+                    "denial message), so the verdict is informational. Judged on status and body similarity alone it " +
+                    "would be flagged: compare the responses to decide."
+            )
+        }
         for (finding in m.findings) {
             appendLine()
             appendLine("[${text(finding, "severity").uppercase()}] ${text(finding, "id")}")
             text(finding, "detail").takeIf { it.isNotEmpty() }?.let { appendLine(it) }
         }
         appendLine()
-        append("Request and Response show the captured original; the replays under each identity are summarised above.")
+        append(
+            if (m.replays.isEmpty()) "'Original vs replay' shows the captured original; no replay was stored with this match."
+            else "'Original vs replay' shows the captured original next to what each identity sent and received."
+        )
     }
 
     private fun showMatchMenu(viewRow: Int, e: MouseEvent) {
         val id = matchesModel.getValueAt(matchesTable.convertRowIndexToModel(viewRow), 0) as? Long ?: return
         val match = matchesById[id] ?: return
         val menu = JPopupMenu()
-        menu.add(JMenuItem("Send to Repeater").apply {
-            addActionListener {
-                try {
-                    api.repeater().sendToRepeater(HttpRequest.httpRequest(HttpService.httpService(match.url), match.request), "Autorize-${match.ruleId}")
-                } catch (ex: Exception) {
-                    api.logging().logToError("Raijin UI: Send to Repeater failed: ${ex.message}")
-                }
-            }
+        menu.add(JMenuItem("Send Original to Repeater").apply {
+            addActionListener { sendToRepeater(match, match.request, "Autorize-${match.ruleId}") }
         })
+        match.replays.forEach { replay ->
+            menu.add(JMenuItem("Send Replay as ${replay.identity} to Repeater").apply {
+                addActionListener { sendToRepeater(match, replay.request, "Autorize-${match.ruleId}-${replay.identity}") }
+            })
+        }
         menu.add(JMenuItem("Copy URL").apply { addActionListener { copyToClipboard(match.url) } })
         menu.add(JMenuItem("Copy Verdict").apply { addActionListener { copyToClipboard(verdictText(match)) } })
         menu.show(e.component, e.x, e.y)
+    }
+
+    private fun sendToRepeater(match: AutorizeMatch, rawRequest: String, caption: String) {
+        try {
+            api.repeater().sendToRepeater(HttpRequest.httpRequest(HttpService.httpService(match.url), rawRequest), caption)
+        } catch (ex: Exception) {
+            api.logging().logToError("Raijin UI: Send to Repeater failed: ${ex.message}")
+        }
     }
 
     // ── Rule editing ─────────────────────────────────────────────────────────
@@ -378,14 +472,21 @@ internal class AutorizePanel(
 
     /** Shows the rule editor until the input validates or the operator cancels. */
     private fun editRule(title: String, initial: AutorizeRuleForm): AutorizeRuleForm? {
-        val identityModel = DefaultTableModel(arrayOf("Name", "Header name", "Header value"), 0)
-        initial.identities.forEach { identityModel.addRow(arrayOf(it.name, it.headerName, it.headerValue)) }
+        // The last column keeps the headers an identity set through MCP sends beyond the one shown; it is not displayed.
+        val identityModel = DefaultTableModel(arrayOf("Name", "Header name", "Header value", "Remove headers", "Other headers"), 0)
+        initial.identities.forEach {
+            identityModel.addRow(arrayOf(it.name, it.headerName, it.headerValue, it.removeHeaders.joinToString(", "), it.otherHeaders))
+        }
         val identityTable = JTable(identityModel).apply {
             rowHeight = 22
             putClientProperty("terminateEditOnFocusLost", true)
-            preferredScrollableViewportSize = Dimension(600, 110)
+            preferredScrollableViewportSize = Dimension(660, 110)
+            removeColumn(columnModel.getColumn(OTHER_HEADERS_COLUMN))
         }
-        val addIdentity = JButton("Add").apply { addActionListener { identityModel.addRow(arrayOf("", "", "")) } }
+        identityTable.columnModel.getColumn(3).headerValue = "Remove headers (comma-separated)"
+        val addIdentity = JButton("Add").apply {
+            addActionListener { identityModel.addRow(arrayOf("", "", "", "", emptyMap<String, String>())) }
+        }
         val removeIdentity = JButton("Remove").apply {
             addActionListener {
                 if (identityTable.isEditing) identityTable.cellEditor.stopCellEditing()
@@ -394,6 +495,9 @@ internal class AutorizePanel(
         }
         val inScope = JCheckBox("In-scope requests only", initial.inScopeOnly)
         val ignoreStatic = JCheckBox("Skip static assets", initial.ignoreStaticAssets)
+        val includeMutating = JCheckBox("Replay POST, PUT, DELETE and PATCH", initial.includeMutating).apply {
+            toolTipText = "Off: state-changing requests are never replayed. On: each replay repeats the action once per identity."
+        }
         val enabled = JCheckBox("Enabled", initial.enabled)
         val hostField = JTextField(initial.includeHostPattern.orEmpty(), 28).apply {
             toolTipText = "Glob such as *.example.com, or a regex. Blank: every host."
@@ -402,7 +506,7 @@ internal class AutorizePanel(
             toolTipText = "Requests whose URL matches this regex are not replayed (e.g. logout). Blank: none."
         }
         val methodsField = JTextField(initial.methods?.joinToString(", ").orEmpty(), 28).apply {
-            toolTipText = "Comma-separated, e.g. GET, POST. Blank: every method."
+            toolTipText = "Comma-separated, e.g. GET, POST. Blank: every method (state-changing ones only with the box below)."
         }
         val threshold = JSpinner(SpinnerNumberModel(initial.similarityThreshold.coerceIn(0.0, 100.0), 0.0, 100.0, 1.0)).apply {
             toolTipText = "How similar (percent) a replayed response must be to the captured one to count as the same content"
@@ -427,14 +531,18 @@ internal class AutorizePanel(
         full(JScrollPane(identityTable))
         full(JPanel(FlowLayout(FlowLayout.LEFT, 4, 0)).apply { add(addIdentity); add(removeIdentity) })
         full(TintedLabel(
-            "A header name and value replace that header. 'none', 'unauth' or 'anonymous' without a header " +
-                "strips Authorization, Cookie, X-API-Key and X-Auth-Token."
+            "A header name and value replace that header; Remove headers drops headers. 'none', 'unauth' or " +
+                "'anonymous' strip every credential header (Authorization, Cookie, X-API-Key, ...) and the headers " +
+                "the other identities set. An identity that changes nothing is not replayed."
         ) { RaijinTheme.muted() })
+        if (initial.identities.any { it.otherHeaders.isNotEmpty() }) {
+            full(TintedLabel("Identities set through MCP send more headers than the table shows; they are kept.") { RaijinTheme.muted() })
+        }
         field("Host pattern:", hostField)
         field("Exclude URL regex:", excludeField)
         field("Methods:", methodsField)
         field("Similarity threshold (%):", threshold)
-        full(JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply { add(inScope); add(ignoreStatic); add(enabled) })
+        full(JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply { add(inScope); add(ignoreStatic); add(includeMutating); add(enabled) })
         full(error)
 
         while (true) {
@@ -445,9 +553,14 @@ internal class AutorizePanel(
             val identities = (0 until identityModel.rowCount)
                 .map { r ->
                     fun cell(column: Int) = identityModel.getValueAt(r, column)?.toString()?.trim().orEmpty()
-                    AutorizeIdentity(cell(0), cell(1), cell(2))
+                    val other = (identityModel.getValueAt(r, OTHER_HEADERS_COLUMN) as? Map<*, *>)
+                        ?.entries?.associate { (k, v) -> k.toString() to v.toString() }.orEmpty()
+                    AutorizeIdentity(cell(0), cell(1), cell(2), AutorizeRuleForm.parseHeaderNames(cell(3)), other)
                 }
-                .filterNot { it.name.isEmpty() && it.headerName.isEmpty() && it.headerValue.isEmpty() }
+                .filterNot {
+                    it.name.isEmpty() && it.headerName.isEmpty() && it.headerValue.isEmpty() &&
+                        it.removeHeaders.isEmpty() && it.otherHeaders.isEmpty()
+                }
             val result = AutorizeRuleForm(
                 identities = identities,
                 inScopeOnly = inScope.isSelected,
@@ -457,6 +570,7 @@ internal class AutorizePanel(
                 ignoreStaticAssets = ignoreStatic.isSelected,
                 similarityThreshold = (threshold.value as? Number)?.toDouble() ?: initial.similarityThreshold,
                 enabled = enabled.isSelected,
+                includeMutating = includeMutating.isSelected,
             )
             error.text = result.validate() ?: return result
         }
@@ -464,7 +578,9 @@ internal class AutorizePanel(
 
     private companion object {
         const val ALL_RULES = "All rules"
-        const val PLACEHOLDER = "Select a flagged match to see the verdict and the captured request and response."
+        const val PLACEHOLDER = "Select a flagged match to see the verdict, the captured original and what each identity received."
+        const val ORIGINAL_TITLE = "Original (captured)"
+        const val OTHER_HEADERS_COLUMN = 4
         const val RANK_HIGH = 2
         const val RANK_CRITICAL = 3
         val TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss")
@@ -481,6 +597,12 @@ internal class AutorizePanel(
         fun topSeverity(m: AutorizeMatch): String = m.findings.map { text(it, "severity") }.maxByOrNull(::rank).orEmpty()
 
         fun verdictIds(m: AutorizeMatch): String = m.findings.map { text(it, "id") }.filter { it.isNotEmpty() }.distinct().joinToString(", ")
+
+        /** The Verdict column: the finding ids, marked when the match is a soft denial. */
+        fun verdictSummary(m: AutorizeMatch): String = if (m.softDenial) "soft denial · ${verdictIds(m)}" else verdictIds(m)
+
+        /** The Replays column: each replayed identity and the status it got. */
+        fun replaySummary(m: AutorizeMatch): String = m.replays.joinToString(" · ") { "${it.identity} ${it.status}" }
 
         fun shortTime(iso: String): String = try {
             LocalDateTime.ofInstant(Instant.parse(iso), ZoneId.systemDefault()).format(TIME_FORMAT)
