@@ -67,8 +67,8 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
     private var currentRequest: Request? = null
     private val lock = Object()
     private var descending = true
-    private var initialized = false
-    private var sortModifiedAfterInit = false
+    @Volatile private var initialized = false
+    @Volatile private var sortModifiedAfterInit = false
     private val panelUpdater: Timer
     private val storePoller: Timer
 
@@ -76,17 +76,25 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
         model.clear()
     }
 
-    /** Stops UI polling timers when the Turbo dialog closes or extension unloads. */
+    /** Stops UI polling timers when the Turbo dialog closes or extension unloads. Idempotent. */
     fun dispose() {
         storePoller.stop()
         panelUpdater.stop()
     }
 
+    // The table is shown once per run and never re-parented: leaving the component tree (dialog
+    // disposed, run reconfigured) means its timers have nothing left to update.
+    override fun removeNotify() {
+        super.removeNotify()
+        dispose()
+    }
+
     fun hasSortBeenModified(): Boolean = sortModifiedAfterInit
 
     fun setCurrentRequest(req: Request?) {
+        if (req == null) return
         synchronized(lock) {
-            currentRequest = req!!
+            currentRequest = req
             val montoyaService = req.montoyaReq?.httpService() ?: service.toMontoya()
             requestEditor.request = HttpRequest.httpRequest(montoyaService, MontoyaBytes.byteArray(*req.getRequestAsBytes()))
             val responseBytes = Utils.replaceFirst(
@@ -102,13 +110,18 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
         }
     }
 
+    /** Sorts by [column]. Callable from any thread (Jython scripts run off the EDT). */
     fun setSortOrder(column: Int, descending: Boolean) {
+        require(column in 0 until model.columnCount) { "Sort column must be 0..${model.columnCount - 1}, got $column" }
         if (initialized) {
             sortModifiedAfterInit = true
         }
-        this.descending = descending
-        val order = if (descending) SortOrder.DESCENDING else SortOrder.ASCENDING
-        issueTable.rowSorter.sortKeys = listOf(RowSorter.SortKey(column, order))
+        val apply = {
+            this.descending = descending
+            val order = if (descending) SortOrder.DESCENDING else SortOrder.ASCENDING
+            issueTable.rowSorter.sortKeys = listOf(RowSorter.SortKey(column, order))
+        }
+        if (SwingUtilities.isEventDispatchThread()) apply() else SwingUtilities.invokeLater(apply)
     }
 
     internal fun autoSortByAnomalyRank() {

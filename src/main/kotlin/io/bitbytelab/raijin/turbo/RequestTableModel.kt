@@ -40,7 +40,7 @@ class RequestTableModel: AbstractTableModel() {
                 8 -> java.lang.Long::class.java
                 9 -> String::class.java
                 10 -> java.lang.Integer::class.java
-                11 -> java.lang.Integer::class.java
+                11 -> String::class.java
 
                 else -> throw RuntimeException("Invalid column requested")
             }
@@ -81,15 +81,8 @@ class RequestTableModel: AbstractTableModel() {
         return false
     }
 
-    fun getRequest(index: Int): Request? {
-        return try {
-            requests[index]
-        } catch (ex: ArrayIndexOutOfBoundsException) {
-            Utils.out("Couldn't get request at index $index")
-            throw ex
-        }
-
-    }
+    /** The request at model row [index], or null when out of range (e.g. -1 from an empty selection). */
+    fun getRequest(index: Int): Request? = requests.getOrNull(index)
 
     companion object {
         internal val columns = listOf("Row", "Payload", "Status", "Anomaly rank", "Words", "Length", "TTFB", "TTLB", "Arrival", "Label", "Queue ID", "Connection ID")
@@ -108,6 +101,14 @@ class RequestTableModel: AbstractTableModel() {
 //            Utilities.showError(e)
 //            e.printStackTrace()
         }
+    }
+
+    /** Appends [reqs] with a single insert event (EDT only). */
+    fun addRows(reqs: List<Request>) {
+        if (reqs.isEmpty()) return
+        val first = requests.size
+        requests.addAll(reqs)
+        fireTableRowsInserted(first, requests.lastIndex)
     }
 
     fun clear() {
