@@ -36,6 +36,20 @@ class TruncatedHttpBodyTest {
     }
 
     @Test
+    fun `a limited body with one huge line is capped by characters`() {
+        val huge = "A".repeat(TruncatedHttpBody.MAX_CHARS + 10)
+        val limited = TruncatedHttpBody(huge, limit = 100)
+
+        assertEquals(TruncatedHttpBody.MAX_CHARS, limited.content.length)
+        assertTrue(limited.truncated)
+        assertEquals(huge.length, limited.totalLength)
+
+        val whole = TruncatedHttpBody(huge, limit = 0)
+        assertEquals(huge, whole.content)
+        assertFalse(whole.truncated)
+    }
+
+    @Test
     fun `returns full body when it has fewer lines than limit`() {
         val body = TruncatedHttpBody("short", limit = 100)
 

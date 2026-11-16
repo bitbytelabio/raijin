@@ -206,9 +206,9 @@ object TurboTools {
         server.addTool(
             name = "turbo_run_result",
             description = "Full request and response of one result of a Turbo run. The response body is cut to its " +
-                "first body_limit lines (response_body_truncated, response_body_total_lines and " +
-                "response_body_total_length describe the whole body); set export=true to write the complete " +
-                "exchange to files instead.",
+                "first body_limit lines and at most 200,000 characters (response_body_truncated, " +
+                "response_body_total_lines and response_body_total_length describe the whole body); " +
+                "body_limit=0 returns it whole, and export=true writes the complete exchange to files instead.",
             inputSchema = ToolSchema(
                 properties = obj(
                     runId,
