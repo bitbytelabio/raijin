@@ -214,9 +214,11 @@ object ToolConsolidation {
             ),
         ),
         Group(
-            "probe", "Guided probes on in-scope targets: CORS, GraphQL, injection, access control, IDOR, JWT.",
+            "probe",
+            "Guided probes on in-scope targets: CORS, web cache poisoning/deception, GraphQL, injection, access control, IDOR, JWT.",
             mapOf(
-                "cors" to "cors_probe", "graphql" to "graphql_probe", "injection" to "injection_probe",
+                "cors" to "cors_probe", "cache" to "cache_probe", "graphql" to "graphql_probe",
+                "injection" to "injection_probe",
                 "access_control" to "access_control_sweep", "idor" to "idor_hunt", "jwt" to "jwt_attack",
             ),
         ),
