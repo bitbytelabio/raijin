@@ -29,4 +29,12 @@ class TurboRunsPanelTest {
         assertEquals(RunRowsChange.Structure, diffRunRows(old, listOf(row("a"))))
         assertEquals(RunRowsChange.Structure, diffRunRows(old, listOf(row("b"), row("a"))))
     }
+
+    @Test
+    fun `stop and delete need a selected run with nothing in flight for it`() {
+        assertEquals(false, runActionsEnabled(null, emptySet()))
+        assertEquals(true, runActionsEnabled("a", emptySet()))
+        assertEquals(false, runActionsEnabled("a", setOf("a")))
+        assertEquals(true, runActionsEnabled("b", setOf("a")))
+    }
 }

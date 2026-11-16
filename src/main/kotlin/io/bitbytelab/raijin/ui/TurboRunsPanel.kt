@@ -47,6 +47,9 @@ internal fun diffRunRows(old: List<RunRow>, new: List<RunRow>): RunRowsChange {
     return if (changed.isEmpty()) RunRowsChange.None else RunRowsChange.Updated(changed)
 }
 
+/** Stop / Delete apply to the selected run, unless one of them is still in flight for it. */
+internal fun runActionsEnabled(selectedId: String?, busy: Set<String>): Boolean = selectedId != null && selectedId !in busy
+
 /**
  * The Turbo sub-tab: every run in the shared [TurboModule.runManager] (started from the script
  * dialog or by an MCP client), with stop / delete, a button that opens the script dialog, and a
@@ -83,7 +86,21 @@ class TurboRunsPanel : JPanel(BorderLayout()) {
 
     private val table = JTable(model)
     private val status = JLabel(" ")
+    private val notice = TintedLabel(" ") { RaijinTheme.error() }
     private val refreshTimer = Timer(1000) { refresh() }.apply { isRepeats = true }
+
+    /**
+     * Stop and Delete abort the run, which can block for up to 30 s while its engine winds down, so
+     * they run here instead of on the EDT. [dispose] shuts the pool down.
+     */
+    private val tasks = UiTasks { desc, e ->
+        SwingUtilities.invokeLater { notice.text = "  $desc failed: ${e.message ?: e.javaClass.simpleName}" }
+    }
+
+    /** Runs with a Stop or Delete in flight. EDT only. */
+    private val busyRuns = mutableSetOf<String>()
+    private val stopBtn = JButton("Stop")
+    private val deleteBtn = JButton("Delete")
 
     /** True while [refresh] rebuilds the table, so the selection churn does not reload the detail pane. */
     private var refreshing = false
@@ -99,7 +116,9 @@ class TurboRunsPanel : JPanel(BorderLayout()) {
         autoResizeMode = JTable.AUTO_RESIZE_OFF
         setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
     }
-    private val detailHeader = JLabel(" ")
+    /** The shown run's status, which colours [detailHeader] at paint time (so it follows theme switches). */
+    private var detailStatus: String? = null
+    private val detailHeader = TintedLabel(" ") { statusColour(detailStatus) }
     private val scriptArea = readOnlyArea()
     private val baseRequestArea = readOnlyArea()
     private val requestViewer: HttpRequestEditor? =
@@ -126,7 +145,9 @@ class TurboRunsPanel : JPanel(BorderLayout()) {
             table.columnModel.getColumn(i).preferredWidth = w
         }
         table.selectionModel.addListSelectionListener {
-            if (!it.valueIsAdjusting && !refreshing) showDetail(selectedRun())
+            if (it.valueIsAdjusting) return@addListSelectionListener
+            if (!refreshing) showDetail(selectedRun())
+            updateRunButtons()
         }
         resultsTable.selectionModel.addListSelectionListener {
             if (!it.valueIsAdjusting) showResult(selectedResult())
@@ -136,8 +157,8 @@ class TurboRunsPanel : JPanel(BorderLayout()) {
             toolTipText = "Open the Turbo script dialog (or right-click a request > Send to Raijin Turbo)"
             addActionListener { TurboModule.openBlankDialog() }
         }
-        val stopBtn = JButton("Stop").apply { addActionListener { selectedId()?.let { TurboModule.runManager.stopRun(it); refresh() } } }
-        val deleteBtn = JButton("Delete").apply { addActionListener { selectedId()?.let { TurboModule.runManager.deleteRun(it); refresh() } } }
+        stopBtn.addActionListener { onSelectedRun("Stopping") { TurboModule.runManager.stopRun(it) } }
+        deleteBtn.addActionListener { onSelectedRun("Deleting") { TurboModule.runManager.deleteRun(it) } }
         val copyBtn = JButton("Copy run id").apply {
             addActionListener { selectedId()?.let { java.awt.Toolkit.getDefaultToolkit().systemClipboard.setContents(java.awt.datatransfer.StringSelection(it), null) } }
         }
@@ -145,6 +166,7 @@ class TurboRunsPanel : JPanel(BorderLayout()) {
         val bar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4))
         listOf(newBtn, stopBtn, deleteBtn, copyBtn).forEach { bar.add(it) }
         bar.add(status)
+        bar.add(notice)
 
         val split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(table), buildDetailPane()).apply {
             resizeWeight = 0.35
@@ -159,9 +181,37 @@ class TurboRunsPanel : JPanel(BorderLayout()) {
         refresh()
     }
 
-    /** Stops the periodic UI refresh timer on extension unload. */
+    /** Stops the periodic UI refresh timer and the Stop/Delete pool on extension unload. */
     fun dispose() {
         refreshTimer.stop()
+        tasks.dispose()
+    }
+
+    /**
+     * Runs [op] on the selected run's id off the EDT; Stop and Delete stay disabled for that run
+     * until it returns, then the table refreshes.
+     */
+    private fun onSelectedRun(verb: String, op: (String) -> Unit) {
+        val id = selectedId() ?: return
+        if (!busyRuns.add(id)) return
+        notice.text = " "
+        updateRunButtons()
+        tasks.execute("$verb run $id") {
+            try {
+                op(id)
+            } finally {
+                SwingUtilities.invokeLater {
+                    busyRuns.remove(id)
+                    if (!tasks.isDisposed) refresh()
+                }
+            }
+        }
+    }
+
+    private fun updateRunButtons() {
+        val enabled = runActionsEnabled(selectedId(), busyRuns)
+        stopBtn.isEnabled = enabled
+        deleteBtn.isEnabled = enabled
     }
 
     private fun buildDetailPane(): JComponent {
@@ -229,7 +279,9 @@ class TurboRunsPanel : JPanel(BorderLayout()) {
             }
         }
         val running = next.count { it.status == "running" }
-        status.text = "  ${next.size} runs, $running running"
+        val busy = if (busyRuns.isEmpty()) "" else ", ${busyRuns.size} stopping"
+        status.text = "  ${next.size} runs, $running running$busy"
+        updateRunButtons()
         updateDetail()
     }
 
@@ -253,14 +305,14 @@ class TurboRunsPanel : JPanel(BorderLayout()) {
         val run = detailRun ?: run {
             detailHeader.text = " Select a run to see its results and script."
             detailHeader.toolTipText = null
-            detailHeader.foreground = RaijinTheme.muted()
+            showDetailStatus(null)
             return
         }
         val handler = run.handler
         val runStatus = handler.status()
         detailHeader.text = " #${run.sequenceNumber + 1} (${run.source}, $runStatus): ${handler.statusString()}"
         detailHeader.toolTipText = handler.failureSummary() ?: detailHeader.text
-        detailHeader.foreground = statusColour(runStatus)
+        showDetailStatus(runStatus)
         // Compared with what was last set, not the text area (which may normalise line endings).
         val code = handler.code
         if (code != shownCode) {
@@ -288,6 +340,12 @@ class TurboRunsPanel : JPanel(BorderLayout()) {
             detailShown = count
             resultsModel.addRows(added)
         }
+    }
+
+    private fun showDetailStatus(runStatus: String?) {
+        if (runStatus == detailStatus) return
+        detailStatus = runStatus
+        detailHeader.repaint()
     }
 
     private fun showResult(req: Request?) {

@@ -9,9 +9,12 @@ import java.awt.FlowLayout
 import java.awt.GridBagConstraints
 import java.awt.GridBagLayout
 import java.awt.Insets
+import java.awt.Toolkit
+import java.awt.datatransfer.StringSelection
 import javax.swing.BorderFactory
 import javax.swing.JButton
 import javax.swing.JComboBox
+import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JOptionPane
 import javax.swing.JPanel
@@ -22,7 +25,6 @@ import javax.swing.JTextArea
 import javax.swing.JTextField
 import javax.swing.SwingUtilities
 import javax.swing.border.EmptyBorder
-import java.util.concurrent.CompletableFuture
 
 /** What the payload_overrides box holds. */
 internal sealed interface OverridesInput {
@@ -69,22 +71,62 @@ internal fun copyableTokens(result: JsonObject): List<String> {
 internal fun ringKeyIds(listResult: JsonObject): List<String> =
     ringKeys(listResult).mapNotNull { (it["key_id"] as? JsonPrimitive)?.contentOrNullSafe() }
 
+/** The `jwt_attack` modes each listed key reports it can serve, by key id. */
+internal fun ringKeyModes(listResult: JsonObject): Map<String, List<String>> =
+    ringKeys(listResult).mapNotNull { key ->
+        val id = (key["key_id"] as? JsonPrimitive)?.contentOrNullSafe() ?: return@mapNotNull null
+        id to keyModes(key)
+    }.toMap()
+
+private fun keyModes(key: JsonObject): List<String> =
+    (key["modes"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNullSafe() } ?: emptyList()
+
 private fun ringKeys(listResult: JsonObject): List<JsonObject> =
     (listResult["keys"] as? JsonArray)?.mapNotNull { it as? JsonObject } ?: emptyList()
+
+/**
+ * Why [mode] cannot run with key ring id [keyId], or null when it can. A blank [keyId] passes when
+ * the mode also works without a key ([keyOptional]). A key missing from [modes] (listed before the
+ * ring changed) passes too: the bridge then gives the real answer.
+ */
+internal fun keyModeBlocker(mode: String, keyId: String?, modes: Map<String, List<String>>, keyOptional: Boolean): String? {
+    if (keyId.isNullOrBlank()) return if (keyOptional) null else "Pick a key ring id first"
+    val supported = modes[keyId] ?: return null
+    if (mode in supported) return null
+    val can = if (supported.isEmpty()) "no jwt_attack mode" else supported.joinToString(", ")
+    return "Key '$keyId' cannot run $mode (it supports: $can)"
+}
+
+/** The document a `header_url` result says to serve at the `jku` / `x5u` URL. */
+internal data class HostedDocument(val url: String, val contentType: String, val body: String)
+
+/** The `host` object of a signed `header_url` result, or null when the result has none. */
+internal fun hostedDocument(result: JsonObject): HostedDocument? {
+    val host = result["host"] as? JsonObject ?: return null
+    fun text(name: String) = (host[name] as? JsonPrimitive)?.takeIf { it.isString }?.content
+    val body = text("body") ?: return null
+    return HostedDocument(url = text("url").orEmpty(), contentType = text("content_type").orEmpty(), body = body)
+}
 
 /**
  * The JWT tab: decode/analyze a token, sign it, run the `jwt_attack` modes, JWE encrypt/decrypt,
  * and manage the key ring — a thin Swing wrapper over [JwtBridge], calling it directly (no MCP
  * round-trip, mirroring how [TurboRunsPanel] and the Collaborator tab in [RaijinTab] work). Every
  * action's raw JSON result is pretty-printed into the shared output pane at the bottom rather than
- * a narrower, hand-picked summary, so nothing the bridge reports is hidden.
+ * a narrower, hand-picked summary, so nothing the bridge reports is hidden. A signed `header_url`
+ * result also shows the JWK set / certificate chain to serve, beside the result.
  *
- * Bridge operations that can take long (crack with a large wordlist, RSA 4096 generation, PEM
- * parsing) run on a pool thread; only the in-memory ring listing stays on the EDT.
+ * Bridge operations run on the panel's own [UiTasks] pool (crack with a large wordlist, RSA 4096
+ * generation and PEM parsing can take long), which [dispose] stops; only the in-memory ring
+ * listing stays on the EDT.
  */
 class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
 
     private val prettyJson = Json { prettyPrint = true; prettyPrintIndent = "  " }
+
+    private val tasks = UiTasks { desc, e ->
+        SwingUtilities.invokeLater { showError("$desc failed: ${e.message ?: e.javaClass.simpleName}") }
+    }
 
     private val tokenField = JTextArea(3, 60).apply {
         lineWrap = true; wrapStyleWord = true; font = RaijinTheme.editorFont(11f)
@@ -97,12 +139,33 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
         wrapStyleWord = true
         text = "Results appear here."
     }
+    private val outputScroll = JScrollPane(output)
 
     /** The result currently shown in [output]; what "Copy token from result" reads. */
     private var lastResult: JsonObject? = null
 
+    /** Bumped by every background run; only the newest run's result reaches [output]. */
+    private var runSeq = 0
+
+    // ---- the document a signed header_url result says to serve ----
+    private var hosted: HostedDocument? = null
+    private val hostUrlField = JTextField(30).apply { isEditable = false }
+    private val hostTypeField = JTextField(20).apply { isEditable = false }
+    private val hostBody = JTextArea(8, 40).apply {
+        isEditable = false
+        lineWrap = true
+        font = RaijinTheme.editorFont(11f)
+    }
+    private val hostPanel = buildHostPanel()
+    private val resultSplit = JSplitPane(JSplitPane.HORIZONTAL_SPLIT).apply {
+        resizeWeight = 0.5
+        dividerSize = 5
+    }
+    /** Holds [outputScroll] alone, or [resultSplit] (output | hosted document) when there is a document. */
+    private val resultHolder = JPanel(BorderLayout()).apply { add(outputScroll, BorderLayout.CENTER) }
+
     private val keyRingModel = object : javax.swing.table.AbstractTableModel() {
-        private val columns = arrayOf("Key id", "kty", "alg", "crv", "Public only")
+        private val columns = arrayOf("Key id", "kty", "alg", "crv", "Public only", "Modes")
         var rows: List<JsonObject> = emptyList()
         override fun getRowCount() = rows.size
         override fun getColumnCount() = columns.size
@@ -114,7 +177,8 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
                 1 -> row["kty"]?.jsonPrimitive?.contentOrNullSafe() ?: ""
                 2 -> row["alg"]?.jsonPrimitive?.contentOrNullSafe() ?: ""
                 3 -> row["crv"]?.jsonPrimitive?.contentOrNullSafe() ?: ""
-                else -> row["public_only"]?.toString() ?: ""
+                4 -> row["public_only"]?.toString() ?: ""
+                else -> keyModes(row).joinToString(", ")
             }
         }
     }
@@ -129,18 +193,82 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
         }
         output.caretPosition = 0
         output.tone = if (result["error"] != null) ToneArea.Tone.ERROR else ToneArea.Tone.NORMAL
+        showHosted(hostedDocument(result))
     }
 
     private fun showError(message: String) = show(buildJsonObject { put("error", message) })
 
-    /** Runs [op] off the EDT, then shows its result and runs [after] on the EDT. */
+    /** Shows [doc] beside the result, or hides the document pane when [doc] is null. */
+    private fun showHosted(doc: HostedDocument?) {
+        val wasShown = hosted != null
+        hosted = doc
+        if (doc != null) {
+            hostUrlField.text = doc.url
+            hostUrlField.caretPosition = 0
+            hostTypeField.text = doc.contentType
+            hostBody.text = doc.body
+            hostBody.caretPosition = 0
+        }
+        if (wasShown == (doc != null)) return
+        resultHolder.removeAll()
+        if (doc != null) {
+            resultSplit.leftComponent = outputScroll
+            resultSplit.rightComponent = hostPanel
+            resultHolder.add(resultSplit, BorderLayout.CENTER)
+        } else {
+            resultSplit.leftComponent = null
+            resultSplit.rightComponent = null
+            resultHolder.add(outputScroll, BorderLayout.CENTER)
+        }
+        resultHolder.revalidate()
+        resultHolder.repaint()
+    }
+
+    private fun buildHostPanel(): JComponent {
+        val fields = JPanel(GridBagLayout())
+        val gbc = GridBagConstraints().apply { insets = Insets(2, 4, 2, 4); anchor = GridBagConstraints.WEST }
+        gbc.gridy = 0; gbc.gridx = 0; fields.add(JLabel("URL:"), gbc)
+        gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL; gbc.weightx = 1.0; fields.add(hostUrlField, gbc)
+        gbc.gridy = 1; gbc.gridx = 0; gbc.fill = GridBagConstraints.NONE; gbc.weightx = 0.0; fields.add(JLabel("Content-Type:"), gbc)
+        gbc.gridx = 1; gbc.fill = GridBagConstraints.HORIZONTAL; gbc.weightx = 1.0; fields.add(hostTypeField, gbc)
+
+        val copyDoc = JButton("Copy document").apply {
+            toolTipText = "Copies the document exactly as it has to be served"
+            addActionListener { hosted?.let { copyToClipboard(it.body) } }
+        }
+        val copyUrl = JButton("Copy URL").apply { addActionListener { hosted?.let { copyToClipboard(it.url) } } }
+        val bar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2)).apply { add(copyDoc); add(copyUrl) }
+
+        return JPanel(BorderLayout(0, 2)).apply {
+            border = BorderFactory.createTitledBorder("Serve at the header URL")
+            add(fields, BorderLayout.NORTH)
+            add(JScrollPane(hostBody), BorderLayout.CENTER)
+            add(bar, BorderLayout.SOUTH)
+        }
+    }
+
+    private fun copyToClipboard(text: String) =
+        Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(text), null)
+
+    /**
+     * Runs [op] off the EDT, then on the EDT shows its result (unless a newer run started meanwhile)
+     * and runs [after].
+     */
     private fun runInBackground(label: String, op: () -> JsonObject, after: (() -> Unit)? = null) {
+        val seq = ++runSeq
         lastResult = null
+        showHosted(null)
         output.tone = ToneArea.Tone.MUTED
         output.text = "$label..."
-        CompletableFuture.supplyAsync(op).whenComplete { result, failure ->
+        tasks.execute(label) {
+            val result = try {
+                op()
+            } catch (e: Exception) {
+                buildJsonObject { put("error", "$label failed: ${e.message ?: e.javaClass.simpleName}") }
+            }
             SwingUtilities.invokeLater {
-                show(result ?: buildJsonObject { put("error", "$label failed: ${failure?.cause?.message ?: failure?.message}") })
+                if (tasks.isDisposed) return@invokeLater
+                if (seq == runSeq) show(result)
                 after?.invoke()
             }
         }
@@ -181,17 +309,42 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
 
     private val ringCombos = mutableListOf<JComboBox<String>>()
 
+    /** What each ring key can do, from the last listing; drives [gates]. */
+    private var ringModes: Map<String, List<String>> = emptyMap()
+
+    /** Re-evaluates one button's enabled state against [ringModes] and its key combo. */
+    private val gates = mutableListOf<() -> Unit>()
+
     /** A key_id dropdown kept in sync with the ring by [refreshRing]. */
     private fun keyIdCombo(): JComboBox<String> {
         val combo = JComboBox<String>()
         ringCombos.add(combo)
-        fillCombo(combo, ringKeyIds(bridge.keys(action = "list")))
+        val listed = bridge.keys(action = "list")
+        ringModes = ringKeyModes(listed)
+        fillCombo(combo, ringKeyIds(listed))
         return combo
+    }
+
+    /**
+     * Keeps [button] enabled only while the key picked in [combo] can run [mode] (or, with
+     * [keyOptional], no key is picked); the tooltip says why it is disabled.
+     */
+    private fun gate(button: JButton, combo: JComboBox<String>, mode: String, keyOptional: Boolean) {
+        val tip = button.toolTipText
+        val update: () -> Unit = {
+            val blocker = keyModeBlocker(mode, combo.selectedItem as? String, ringModes, keyOptional)
+            button.isEnabled = blocker == null
+            button.toolTipText = blocker ?: tip
+        }
+        combo.addActionListener { update() }
+        gates += update
+        update()
     }
 
     /** Reloads the key table and every key_id dropdown, keeping each one's current selection. */
     private fun refreshRing() {
         val listed = bridge.keys(action = "list")
+        ringModes = ringKeyModes(listed)
         val keepRow = selectedKeyId()
         keyRingModel.rows = ringKeys(listed)
         keyRingModel.fireTableDataChanged()
@@ -202,6 +355,7 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
             ?.let { keyRingTable.setRowSelectionInterval(it, it) }
         val ids = ringKeyIds(listed)
         ringCombos.forEach { fillCombo(it, ids) }
+        gates.forEach { it() }
     }
 
     private fun fillCombo(combo: JComboBox<String>, ids: List<String>) {
@@ -234,7 +388,7 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
 
         val outputPanel = JPanel(BorderLayout())
         outputPanel.border = BorderFactory.createTitledBorder("Result")
-        outputPanel.add(JScrollPane(output), BorderLayout.CENTER)
+        outputPanel.add(resultHolder, BorderLayout.CENTER)
         val copyBtn = JButton("Copy token from result").apply {
             toolTipText = "Puts the result's token (or a forge_none variant you pick, or a decrypted nested token) into the Token box above"
             addActionListener { copyTokenFromResult() }
@@ -249,6 +403,9 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
         add(tokenPanel, BorderLayout.NORTH)
         add(split, BorderLayout.CENTER)
     }
+
+    /** Stops the background pool; results of runs still in flight are dropped. */
+    fun dispose() = tasks.dispose()
 
     private fun copyTokenFromResult() {
         val tokens = lastResult?.let(::copyableTokens).orEmpty()
@@ -315,14 +472,10 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
         gbc.gridx = 2; panel.add(refreshButton(), gbc)
         val signKeyBtn = JButton("Sign with key").apply {
             addActionListener {
-                val id = keyCombo.selectedItem as? String
-                if (id.isNullOrBlank()) {
-                    showError("Pick a key ring id first")
-                    return@addActionListener
-                }
-                runAttack(mode = "sign_key", keyId = id, alg = comboText(algCombo), overridesText = overridesField.text)
+                runAttack(mode = "sign_key", keyId = selectedKey(keyCombo), alg = comboText(algCombo), overridesText = overridesField.text)
             }
         }
+        gate(signKeyBtn, keyCombo, "sign_key", keyOptional = false)
         gbc.gridx = 3; panel.add(signKeyBtn, gbc)
 
         gbc.gridy = row++; gbc.gridx = 0; panel.add(JLabel("alg:"), gbc)
@@ -343,10 +496,13 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
         val gbc = GridBagConstraints().apply { insets = Insets(4, 6, 4, 6); anchor = GridBagConstraints.WEST }
 
         val publicKeyArea = JTextArea(3, 28).apply { lineWrap = true; wrapStyleWord = true }
-        val keyCombo = keyIdCombo()
+        val keyCombo = keyIdCombo().apply {
+            toolTipText = "Ring key for alg_confusion (instead of public_key), embed_jwk, and a signed header_url"
+        }
+        val algCombo = algCombo(JWS_ALGS, "Blank = each mode's default (HS256 for alg_confusion, the key's own alg for a ring key)")
         val wordlistField = JTextField(24).apply { toolTipText = "Comma-separated candidate secrets; blank = built-in list" }
-        val headerCombo = JComboBox(arrayOf("jku", "x5u"))
-        val urlField = JTextField(24)
+        val headerCombo = JComboBox(JwtBridge.URL_HEADERS.toTypedArray())
+        val urlField = JTextField(24).apply { toolTipText = "A URL you control, where the target can fetch the document" }
         val overridesField = JTextField(24)
 
         var row = 0
@@ -354,17 +510,24 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
         gbc.gridx = 1; gbc.gridwidth = 2; panel.add(JScrollPane(publicKeyArea), gbc); gbc.gridwidth = 1
         row++
 
-        gbc.gridy = row; gbc.gridx = 0; panel.add(JLabel("...or key_id:"), gbc)
+        gbc.gridy = row; gbc.gridx = 0; panel.add(JLabel("key_id:"), gbc)
         gbc.gridx = 1; panel.add(keyCombo, gbc)
         gbc.gridx = 2; panel.add(refreshButton(), gbc)
         val algConfusionBtn = JButton("alg_confusion").apply {
             toolTipText = "RS->HS confusion: sign with the server's public key as the HMAC secret"
             addActionListener {
-                val id = keyCombo.selectedItem as? String
-                runAttack(mode = "alg_confusion", publicKey = publicKeyArea.text.ifBlank { null }, keyId = id?.ifBlank { null }, overridesText = overridesField.text)
+                runAttack(
+                    mode = "alg_confusion", publicKey = publicKeyArea.text.ifBlank { null }, keyId = selectedKey(keyCombo),
+                    alg = comboText(algCombo), overridesText = overridesField.text
+                )
             }
         }
+        gate(algConfusionBtn, keyCombo, "alg_confusion", keyOptional = true)
         gbc.gridx = 3; panel.add(algConfusionBtn, gbc)
+        row++
+
+        gbc.gridy = row; gbc.gridx = 0; panel.add(JLabel("alg:"), gbc)
+        gbc.gridx = 1; panel.add(algCombo, gbc)
         row++
 
         gbc.gridy = row; gbc.gridx = 0; panel.add(JLabel("wordlist:"), gbc)
@@ -385,11 +548,16 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
         gbc.gridy = row; gbc.gridx = 0; panel.add(JLabel("url"), gbc)
         gbc.gridx = 1; panel.add(urlField, gbc)
         val headerUrlBtn = JButton("header_url").apply {
-            toolTipText = "Set jku/x5u to a URL you control, for a JWKS-fetch SSRF/forgery check"
+            toolTipText = "Point jku/x5u at url. With a key_id the token is signed with that key and the JWK set " +
+                "(jku) or certificate chain (x5u) to serve at url appears beside the result; without one only the header changes"
             addActionListener {
-                runAttack(mode = "header_url", header = headerCombo.selectedItem as? String, url = urlField.text.ifBlank { null }, overridesText = overridesField.text)
+                runAttack(
+                    mode = "header_url", header = headerCombo.selectedItem as? String, url = urlField.text.ifBlank { null },
+                    keyId = selectedKey(keyCombo), alg = comboText(algCombo), overridesText = overridesField.text
+                )
             }
         }
+        gate(headerUrlBtn, keyCombo, "header_url", keyOptional = true)
         gbc.gridx = 3; panel.add(headerUrlBtn, gbc)
         row++
 
@@ -404,19 +572,20 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
             toolTipText = "Unsigned token variants (alg:none, case permutations)"
             addActionListener { runAttack(mode = "forge_none", overridesText = overridesField.text) }
         })
-        quickBar.add(JButton("embed_jwk").apply {
+        val embedJwkBtn = JButton("embed_jwk").apply {
             toolTipText = "Sign and embed the public JWK in the header (needs key_id above)"
             addActionListener {
-                val id = keyCombo.selectedItem as? String
-                runAttack(mode = "embed_jwk", keyId = id?.ifBlank { null }, overridesText = overridesField.text)
+                runAttack(mode = "embed_jwk", keyId = selectedKey(keyCombo), alg = comboText(algCombo), overridesText = overridesField.text)
             }
-        })
+        }
+        gate(embedJwkBtn, keyCombo, "embed_jwk", keyOptional = false)
+        quickBar.add(embedJwkBtn)
         quickBar.add(JButton("empty_hmac").apply {
-            addActionListener { runAttack(mode = "empty_hmac", overridesText = overridesField.text) }
+            addActionListener { runAttack(mode = "empty_hmac", alg = comboText(algCombo), overridesText = overridesField.text) }
         })
         quickBar.add(JButton("psychic").apply {
             toolTipText = "ES256/ES384/ES512 token with a zero ECDSA signature (CVE-2022-21449-style)"
-            addActionListener { runAttack(mode = "psychic", overridesText = overridesField.text) }
+            addActionListener { runAttack(mode = "psychic", alg = comboText(algCombo), overridesText = overridesField.text) }
         })
         panel.add(quickBar, gbc)
 
@@ -445,21 +614,18 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
         gbc.gridy = row++; gbc.gridx = 0; panel.add(JLabel("enc:"), gbc)
         gbc.gridx = 1; panel.add(encCombo, gbc)
 
-        fun keyId(): String? = (keyCombo.selectedItem as? String)?.ifBlank { null }
         val encryptBtn = JButton("Encrypt").apply {
             toolTipText = "Encrypt the Token box (any text, typically a signed JWT) into a compact JWE"
             addActionListener {
-                val id = keyId() ?: return@addActionListener showError("encrypt needs a key ring id")
-                runAttack(mode = "encrypt", keyId = id, alg = comboText(algCombo), enc = comboText(encCombo))
+                runAttack(mode = "encrypt", keyId = selectedKey(keyCombo), alg = comboText(algCombo), enc = comboText(encCombo))
             }
         }
+        gate(encryptBtn, keyCombo, "encrypt", keyOptional = false)
         val decryptBtn = JButton("Decrypt").apply {
             toolTipText = "Decrypt the compact JWE in the Token box (alg and enc come from its header)"
-            addActionListener {
-                val id = keyId() ?: return@addActionListener showError("decrypt needs a key ring id")
-                runAttack(mode = "decrypt", keyId = id)
-            }
+            addActionListener { runAttack(mode = "decrypt", keyId = selectedKey(keyCombo)) }
         }
+        gate(decryptBtn, keyCombo, "decrypt", keyOptional = false)
         gbc.gridy = row; gbc.gridx = 0; gbc.gridwidth = 3
         panel.add(JPanel(FlowLayout(FlowLayout.LEFT, 6, 4)).apply { add(encryptBtn); add(decryptBtn) }, gbc)
 
@@ -516,7 +682,7 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
         importPanel.add(JScrollPane(importArea), BorderLayout.CENTER)
         importPanel.add(importBtn, BorderLayout.EAST)
 
-        val exportFormatCombo = JComboBox(arrayOf("jwk", "pem"))
+        val exportFormatCombo = JComboBox(JwtBridge.EXPORT_FORMATS.toTypedArray())
         val exportPrivateCheck = javax.swing.JCheckBox("include private")
         val exportBtn = JButton("Export selected").apply {
             addActionListener {
@@ -554,6 +720,9 @@ class JwtPanel(private val bridge: JwtBridge) : JPanel(BorderLayout(0, 4)) {
         return keyRingModel.rows.getOrNull(keyRingTable.convertRowIndexToModel(row))
             ?.get("key_id")?.jsonPrimitive?.contentOrNullSafe()
     }
+
+    /** The key ring id picked in [combo]; null when blank. */
+    private fun selectedKey(combo: JComboBox<String>): String? = (combo.selectedItem as? String)?.ifBlank { null }
 
     /** Editable alg dropdown: blank first (bridge default), then the common values; any other value can be typed. */
     private fun algCombo(values: List<String>, tip: String) = JComboBox((listOf("") + values).toTypedArray()).apply {
