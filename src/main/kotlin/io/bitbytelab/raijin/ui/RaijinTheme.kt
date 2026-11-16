@@ -4,6 +4,8 @@ import burp.api.montoya.MontoyaApi
 import burp.api.montoya.ui.Theme
 import java.awt.*
 import javax.swing.*
+import javax.swing.border.AbstractBorder
+import javax.swing.border.Border
 import javax.swing.border.EmptyBorder
 
 /**
@@ -59,10 +61,7 @@ object RaijinTheme {
     /** Flat header: logo, name, tagline and a version chip. No fills — it sits on Burp's panel colour. */
     fun brandHeader(version: String): JComponent {
         val header = JPanel(BorderLayout(10, 0))
-        header.border = BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(0, 0, 1, 0, border()),
-            EmptyBorder(8, 12, 8, 12)
-        )
+        header.border = BorderFactory.createCompoundBorder(ruleBorder(0, 0, 1, 0), EmptyBorder(8, 12, 8, 12))
 
         logo(32)?.let { header.add(JLabel(it), BorderLayout.WEST) }
 
@@ -70,8 +69,8 @@ object RaijinTheme {
         text.add(JLabel("Raijin").apply {
             font = displayFont(18f, Font.BOLD); alignmentX = Component.LEFT_ALIGNMENT
         })
-        text.add(JLabel("AI-driven MCP control and Turbo request engine for Burp Suite").apply {
-            font = displayFont(11f); foreground = muted(); alignmentX = Component.LEFT_ALIGNMENT
+        text.add(TintedLabel("AI-driven MCP control and Turbo request engine for Burp Suite") { muted() }.apply {
+            font = displayFont(11f); alignmentX = Component.LEFT_ALIGNMENT
         })
         header.add(text, BorderLayout.CENTER)
 
@@ -120,10 +119,47 @@ object RaijinTheme {
     }
 
     /**
+     * A [top]/[left]/[bottom]/[right]-pixel rule in Burp's current border colour. The colour is read
+     * on every paint; a `MatteBorder` would keep the colour of the theme it was created under.
+     */
+    fun ruleBorder(top: Int, left: Int, bottom: Int, right: Int): Border = object : AbstractBorder() {
+        override fun getBorderInsets(c: Component, insets: Insets): Insets {
+            insets.set(top, left, bottom, right)
+            return insets
+        }
+
+        override fun paintBorder(c: Component, g: Graphics, x: Int, y: Int, width: Int, height: Int) {
+            val previous = g.color
+            g.color = border()
+            if (top > 0) g.fillRect(x, y, width, top)
+            if (bottom > 0) g.fillRect(x, y + height - bottom, width, bottom)
+            if (left > 0) g.fillRect(x, y, left, height)
+            if (right > 0) g.fillRect(x + width - right, y, right, height)
+            g.color = previous
+        }
+    }
+
+    /**
      * Hands [c] to Burp's own theming (so request/response editors and our widgets all use the
      * current Look and Feel). Call again after Burp's theme changes.
      */
     fun apply(c: Component) {
         try { api?.userInterface()?.applyThemeToComponent(c) } catch (_: Exception) { /* never break the UI */ }
     }
+}
+
+/**
+ * A label whose text colour comes from [tint] on every paint, so a semantic colour follows Burp's
+ * dark/light switch. `foreground = RaijinTheme.success()` would keep the variant of the theme active
+ * when it was assigned. A null tint, or one returning null, leaves the Look and Feel's label colour.
+ */
+open class TintedLabel(text: String = "", tint: (() -> Color?)? = null) : JLabel(text) {
+    // Null while JLabel's constructor runs (it may already ask for the foreground), set right after.
+    var tint: (() -> Color?)? = tint
+        set(value) {
+            field = value
+            repaint()
+        }
+
+    override fun getForeground(): Color? = tint?.invoke() ?: super.getForeground()
 }

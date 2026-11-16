@@ -8,7 +8,6 @@ import burp.api.montoya.ui.editor.HttpRequestEditor
 import burp.api.montoya.ui.editor.HttpResponseEditor
 import io.bitbytelab.raijin.bridge.BridgeFactory
 import io.bitbytelab.raijin.core.BuildInfo
-import io.bitbytelab.raijin.core.ConnectionInfo
 import io.bitbytelab.raijin.core.RaijinExtension
 import io.bitbytelab.raijin.core.RebindOutcome
 import io.bitbytelab.raijin.events.EventBus
@@ -16,21 +15,15 @@ import io.bitbytelab.raijin.state.McpActivityEntry
 import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.state.StoredFinding
 import io.bitbytelab.raijin.transport.ActivityStore
-import io.bitbytelab.raijin.transport.BindHostPolicy
 import io.bitbytelab.raijin.transport.FindingsStore
 import io.bitbytelab.raijin.transport.McpServerManager
 import kotlinx.serialization.json.*
 import java.awt.*
-import java.awt.datatransfer.StringSelection
-import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
-import java.io.File
-import java.text.NumberFormat
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
-import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -47,9 +40,14 @@ import javax.swing.table.DefaultTableModel
  * 2. Proxy Explorer  — Browse/search proxy history with Burp-native viewers
  * 3. Scanner         — Live scanner findings with severity/confidence display
  * 4. Findings        — Agent-recorded findings (findings_add tool working memory)
- * 5. Collaborator    — Create OOB clients, generate payloads, poll interactions
- * 6. Rules           — View/manage proxy, traffic, and session rules
- * 7. Server          — Server config, connection info, stats
+ * 5. Autorize        — Live replay rules and the access-control mismatches they flagged
+ * 6. Collaborator    — Create OOB clients, generate payloads, poll interactions; client list
+ * 7. Rules           — Proxy, traffic, session and WebSocket rules; target scope
+ * 8. JWT, Turbo      — Token tooling and Turbo runs
+ * 9. Server          — Connection info, tool policy, bind address and remote security, stats
+ *
+ * Every timer, listener, subscription and worker the tab starts is released by [dispose], so a
+ * reload leaves nothing running (and leaves listeners it does not own, such as persistence, alone).
  */
 class RaijinTab(
     private val api: MontoyaApi,
@@ -57,113 +55,43 @@ class RaijinTab(
     private val eventBus: EventBus,
     private val stateManager: StateManager,
     private val bridges: BridgeFactory.Bridges,
-    private val bindHost: String,
-    private val rebindNow: (String, Boolean) -> RebindOutcome
+    bindHost: String,
+    rebindNow: (String, Boolean) -> RebindOutcome
 ) {
     companion object {
         const val MAX_TABLE_ROWS = 2000
         private val TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
         private val FINDING_TIME_FORMAT = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss")
-        private val NUMBER_FORMAT: NumberFormat = NumberFormat.getIntegerInstance()
     }
 
     private val mainPanel = JPanel(BorderLayout(0, 0))
     private val tabbedPane = JTabbedPane(JTabbedPane.TOP)
-    private val serverStartTime = System.currentTimeMillis()
     private val totalToolCalls = AtomicLong(0)
     private val totalErrors = AtomicLong(0)
     private val perToolCounts = ConcurrentHashMap<String, AtomicLong>()
-    private val refreshTimer: Timer
+
+    // dispose() runs these newest first; the background pool is registered first, so it stops last.
+    private val disposer = Disposer { what, e -> api.logging().logToError("Raijin UI: releasing $what failed: ${e.message}") }
+    private val tasks = UiTasks { desc, e -> reportBackgroundError(desc, e) }
 
     // Fetch buttons captured so tabs can lazily auto-load on first view.
     private var proxyFetchButton: JButton? = null
     private var scannerFetchButton: JButton? = null
-    private var turboRunsPanel: TurboRunsPanel? = null
-    private var collaboratorSubId: String? = null
-    private var activityListener: ((McpActivityEntry) -> Unit)? = null
 
-    // Activity tab state
+    // State read by the tab builders init calls, so it is declared (and set) before init runs.
     private val activityById = ConcurrentHashMap<Long, McpActivityEntry>()
     private var activityFilter = "all"
     private var activitySearch = ""
+    private var shownActivityId: Long? = null
     private val activityPrettyJson = Json { prettyPrint = true; prettyPrintIndent = "  " }
-
-    init {
-        tabbedPane.font = tabbedPane.font.deriveFont(12f)
-        tabbedPane.addTab("MCP Activity", buildActivityTab())
-        tabbedPane.addTab("Proxy Explorer", buildProxyTab())
-        tabbedPane.addTab("Scanner", buildScannerTab())
-        tabbedPane.addTab("Findings", buildFindingsTab())
-        tabbedPane.addTab("Collaborator", buildCollaboratorTab())
-        tabbedPane.addTab("Rules", buildRulesTab())
-        tabbedPane.addTab("JWT", JwtPanel(bridges.jwt))
-        val runsPanel = TurboRunsPanel().also { turboRunsPanel = it }
-        tabbedPane.addTab("Turbo", runsPanel)
-        tabbedPane.addTab("Server", buildServerTab())
-        mainPanel.add(RaijinTheme.brandHeader(BuildInfo.VERSION), BorderLayout.NORTH)
-        mainPanel.add(tabbedPane, BorderLayout.CENTER)
-
-        // Render persisted MCP activity (the deque is seeded on startup by the dashboard
-        // persistence), rebuild the id->entry lookup, and seed the counters BEFORE wiring the
-        // live listener so new calls increment on top without double-counting.
-        initActivityFromRestore()
-        wireActivityListener()
-
-        refreshTimer = Timer(1500) {
-            refreshServerTab()
-            refreshRulesTab()
-            refreshFindingsTab()
-            // Activity stats (incl. Events count from the event bus) must refresh on
-            // the timer too — otherwise the bar is frozen until an MCP tool call fires
-            // the activity listener, so "Events: 0" never updates from proxy traffic.
-            updateActivityStats()
-        }
-        refreshTimer.isRepeats = true
-        refreshTimer.start()
-
-        // Lazily load Proxy/Scanner the first time each tab is shown, so they are
-        // not permanently blank waiting for a manual Fetch click (tab order:
-        // 0 Activity, 1 Proxy, 2 Scanner, 3 Findings, 4 Collaborator, 5 Rules, 6 Server).
-        var proxyLoaded = false
-        var scannerLoaded = false
-        tabbedPane.addChangeListener {
-            when (tabbedPane.selectedIndex) {
-                1 -> if (!proxyLoaded) { proxyLoaded = true; proxyFetchButton?.doClick() }
-                2 -> if (!scannerLoaded) { scannerLoaded = true; scannerFetchButton?.doClick() }
-                3 -> rebuildFindingsTable()
-            }
-        }
-
-        // Burp's own theming covers every widget here (including its request/response editors);
-        // Raijin adds nothing but semantic colours (see RaijinTheme), so dark and light both work.
-        RaijinTheme.apply(mainPanel)
-    }
-
-    fun getComponent(): Component = mainPanel
-    fun dispose() {
-        refreshTimer.stop()
-        turboRunsPanel?.dispose()
-        collaboratorSubId?.let { eventBus.unsubscribe(it) }
-        activityListener?.let { stateManager.mcpActivityListeners.remove(it) }
-    }
-    fun log(level: String, category: String, message: String) {
-        when (level.uppercase()) {
-            "ERROR", "FATAL" -> api.logging().logToError("Raijin [$category]: $message")
-            "WARN", "WARNING" -> api.logging().logToOutput("Raijin [WARN/$category]: $message")
-            "INFO" -> api.logging().logToOutput("Raijin: $message")
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  TAB 1: MCP ACTIVITY
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private lateinit var activityTableModel: DefaultTableModel
-    private lateinit var activityTable: JTable
-    private lateinit var activityRequestEditor: HttpRequestEditor
-    private lateinit var activityResponseEditor: HttpResponseEditor
-    private lateinit var activityDetailInfo: JTextArea
-    private lateinit var activityStatsLabel: JLabel
+    private val proxyHistoryCache = mutableListOf<JsonObject>()
+    private var scannerIssuesCache = listOf<JsonObject>()
+    private val findingsCache = mutableListOf<StoredFinding>()
+    private var findingsSeverityFilter = "Any"
+    private var findingsSearch = ""
+    private var findingsSnapshot: List<String> = emptyList()
+    private var shownFindingId: String? = null
+    private var rebuildingFindings = false
 
     private val httpToolNames = setOf(
         "http_send_request", "http_send_requests_parallel", "http_send_request_chain",
@@ -187,16 +115,107 @@ class RaijinTab(
         "scancheck_create_passive", "scancheck_create_active", "scancheck_list", "scancheck_remove"
     )
 
+    private val autorizePanel = AutorizePanel(api, stateManager, bridges.autorize, tasks)
+    private val serverPanel = ServerPanel(api, eventBus, stateManager, bindHost, rebindNow, tasks) { totalToolCalls.get() }
+
+    init {
+        try {
+            buildTabs()
+        } catch (t: Throwable) {
+            // A tab that fails to build is never handed to the extension, whose unload handler
+            // therefore cannot dispose it: release what was already started here.
+            disposer.dispose()
+            throw t
+        }
+    }
+
+    private fun buildTabs() {
+        disposer.add("background tasks") { tasks.dispose() }
+        tabbedPane.font = tabbedPane.font.deriveFont(12f)
+        tabbedPane.addTab("MCP Activity", buildActivityTab())
+        val proxyTab = buildProxyTab().also { tabbedPane.addTab("Proxy Explorer", it) }
+        val scannerTab = buildScannerTab().also { tabbedPane.addTab("Scanner", it) }
+        val findingsTab = buildFindingsTab().also { tabbedPane.addTab("Findings", it) }
+        tabbedPane.addTab("Autorize", autorizePanel)
+        tabbedPane.addTab("Collaborator", buildCollaboratorTab())
+        tabbedPane.addTab("Rules", buildRulesTab())
+        tabbedPane.addTab("JWT", JwtPanel(bridges.jwt))
+        val runsPanel = TurboRunsPanel()
+        disposer.add("Turbo runs panel") { runsPanel.dispose() }
+        tabbedPane.addTab("Turbo", runsPanel)
+        tabbedPane.addTab("Server", serverPanel)
+        mainPanel.add(RaijinTheme.brandHeader(BuildInfo.VERSION), BorderLayout.NORTH)
+        mainPanel.add(tabbedPane, BorderLayout.CENTER)
+
+        // Render persisted MCP activity (the deque is seeded on startup by the dashboard
+        // persistence), rebuild the id->entry lookup, and seed the counters BEFORE wiring the
+        // live listener so new calls increment on top without double-counting.
+        initActivityFromRestore()
+        wireActivityListener()
+
+        val refreshTimer = Timer(1500) {
+            serverPanel.refresh()
+            refreshRulesTab()
+            refreshFindingsTab()
+            refreshCollaboratorClients()
+            autorizePanel.refresh()
+            // Activity stats (incl. Events count from the event bus) must refresh on
+            // the timer too — otherwise the bar is frozen until an MCP tool call fires
+            // the activity listener, so "Events: 0" never updates from proxy traffic.
+            updateActivityStats()
+        }
+        refreshTimer.isRepeats = true
+        refreshTimer.start()
+        disposer.add("refresh timer") { refreshTimer.stop() }
+
+        // Lazily load Proxy/Scanner the first time each tab is shown, so they are
+        // not permanently blank waiting for a manual Fetch click.
+        var proxyLoaded = false
+        var scannerLoaded = false
+        tabbedPane.addChangeListener {
+            when (tabbedPane.selectedComponent) {
+                proxyTab -> if (!proxyLoaded) { proxyLoaded = true; proxyFetchButton?.doClick() }
+                scannerTab -> if (!scannerLoaded) { scannerLoaded = true; scannerFetchButton?.doClick() }
+                findingsTab -> rebuildFindingsTable()
+            }
+        }
+
+        // Burp's own theming covers every widget here (including its request/response editors);
+        // Raijin adds nothing but semantic colours (see RaijinTheme), so dark and light both work.
+        RaijinTheme.apply(mainPanel)
+    }
+
+    fun getComponent(): Component = mainPanel
+
+    /** Releases everything the tab started (timers, listeners, subscriptions, workers). Idempotent. */
+    fun dispose() = disposer.dispose()
+
+    fun log(level: String, category: String, message: String) {
+        when (level.uppercase()) {
+            "ERROR", "FATAL" -> api.logging().logToError("Raijin [$category]: $message")
+            "WARN", "WARNING" -> api.logging().logToOutput("Raijin [WARN/$category]: $message")
+            "INFO" -> api.logging().logToOutput("Raijin: $message")
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  TAB 1: MCP ACTIVITY
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private lateinit var activityTableModel: DefaultTableModel
+    private lateinit var activityTable: JTable
+    private lateinit var activityRequestEditor: HttpRequestEditor
+    private lateinit var activityResponseEditor: HttpResponseEditor
+    private lateinit var activityDetailInfo: JTextArea
+    private lateinit var activityStatsLabel: JLabel
+
     private fun buildActivityTab(): JPanel {
         val panel = JPanel(BorderLayout(0, 0))
 
         // Stats bar
         activityStatsLabel = JLabel("  Calls: 0  |  Errors: 0  |  Events: 0")
         activityStatsLabel.font = RaijinTheme.editorFont(11f)
-        activityStatsLabel.border = BorderFactory.createCompoundBorder(
-            BorderFactory.createMatteBorder(0, 0, 1, 0, RaijinTheme.border()),
-            EmptyBorder(4, 8, 4, 8)
-        )
+        activityStatsLabel.border = BorderFactory.createCompoundBorder(RaijinTheme.ruleBorder(0, 0, 1, 0), EmptyBorder(4, 8, 4, 8))
 
         // Filter bar
         val filterBar = JPanel(FlowLayout(FlowLayout.LEFT, 4, 3))
@@ -243,16 +262,19 @@ class RaijinTab(
             stateManager.clearMcpActivity()
             eventBus.clear()
             clearViewOnly()
-            CompletableFuture.runAsync { ActivityStore.deleteForProject(project) }
+            tasks.persist("Delete saved MCP activity") {
+                ActivityStore.deleteForProject(project)
+                ActivityStore.lastError?.let { api.logging().logToError("Raijin: deleting saved MCP activity failed: $it") }
+            }
         }
         filterBar.add(deleteSavedBtn)
 
         // Persistence toggle + always-visible status so neither default silently surprises anyone.
-        val persistStatus = JLabel()
+        val persistStatus = TintedLabel { if (ActivityStore.enabled) RaijinTheme.success() else RaijinTheme.muted() }
         fun refreshPersistStatus() {
             persistStatus.text = if (ActivityStore.enabled) "  Saved: ON → disk" else "  Saved: OFF (session only)"
-            persistStatus.foreground = if (ActivityStore.enabled) RaijinTheme.success() else RaijinTheme.muted()
             persistStatus.toolTipText = if (ActivityStore.enabled) ActivityStore.path() else "MCP activity is not saved to disk"
+            persistStatus.repaint()
         }
         val persistCheck = JCheckBox("Persist", ActivityStore.enabled); persistCheck.font = persistCheck.font.deriveFont(11f)
         persistCheck.toolTipText = "Save MCP activity to disk so it survives Burp restarts. Off = this session only."
@@ -260,11 +282,14 @@ class RaijinTab(
             val enabled = persistCheck.isSelected
             ActivityStore.enabled = enabled
             api.persistence().preferences().setBoolean("mcp_persist_activity", enabled)
-            // Flush on enable: save what's already in memory, off the Swing EDT.
+            // Flush on enable: save what's already in memory. The store takes the snapshot under its
+            // file lock, so a write racing this one cannot be overwritten with older data.
             if (enabled) {
-                val snapshot = stateManager.mcpActivity.toList()
                 val project = currentProject()
-                CompletableFuture.runAsync { ActivityStore.flushProject(snapshot, project) }
+                tasks.persist("Save MCP activity") {
+                    ActivityStore.flushProject(project) { stateManager.mcpActivity.toList() }
+                    ActivityStore.lastError?.let { api.logging().logToError("Raijin: saving MCP activity failed: $it") }
+                }
             }
             refreshPersistStatus()
         }
@@ -338,8 +363,8 @@ class RaijinTab(
                 updateActivityStats()
             }
         }
-        activityListener = listener
-        stateManager.mcpActivityListeners.add(listener)
+        // Removes this instance only: the persistence listener in the same list must outlive the tab.
+        disposer.listen("MCP activity listener", stateManager.mcpActivityListeners, listener)
     }
 
     /**
@@ -393,9 +418,18 @@ class RaijinTab(
     }
 
     private fun showActivityDetail() {
-        val vr = activityTable.selectedRow; if (vr < 0) return
-        val id = activityTableModel.getValueAt(activityTable.convertRowIndexToModel(vr), 0) as? Long ?: return
-        val entry = activityById[id] ?: return
+        val vr = activityTable.selectedRow
+        val id = if (vr >= 0) activityTableModel.getValueAt(activityTable.convertRowIndexToModel(vr), 0) as? Long else null
+        val entry = id?.let { activityById[it] }
+        // A live row inserted above moves the selection without changing it: leave the viewers alone.
+        if (entry != null && entry.id == shownActivityId) return
+        shownActivityId = entry?.id
+        if (entry == null) {
+            activityDetailInfo.text = "Select an activity row to view details."
+            activityRequestEditor.clear()
+            activityResponseEditor.clear()
+            return
+        }
         activityDetailInfo.text = "Tool: ${entry.toolName}  |  Duration: ${entry.durationMs}ms  |  Error: ${entry.isError}\n" +
             "URL: ${entry.url}\nHost: ${entry.host}\n\n" +
             "Arguments:\n${prettyActivityJson(entry.argsSummary)}\n\n" +
@@ -404,8 +438,8 @@ class RaijinTab(
         val rr = entry.requestResponse
         val req = try { rr?.request() } catch (_: Exception) { null }
         val resp = try { rr?.response() } catch (_: Exception) { null }
-        try { activityRequestEditor.setRequest(req ?: HttpRequest.httpRequest()) } catch (_: Exception) {}
-        try { activityResponseEditor.setResponse(resp ?: HttpResponse.httpResponse()) } catch (_: Exception) {}
+        try { if (req != null) activityRequestEditor.request = req else activityRequestEditor.clear() } catch (_: Exception) {}
+        try { if (resp != null) activityResponseEditor.response = resp else activityResponseEditor.clear() } catch (_: Exception) {}
     }
 
     /**
@@ -458,7 +492,6 @@ class RaijinTab(
     private lateinit var proxyTable: JTable
     private lateinit var proxyRequestEditor: HttpRequestEditor
     private lateinit var proxyResponseEditor: HttpResponseEditor
-    private var proxyHistoryCache = mutableListOf<JsonObject>()
 
     private fun buildProxyTab(): JPanel {
         val panel = JPanel(BorderLayout(0, 0))
@@ -510,38 +543,17 @@ class RaijinTab(
         proxyTable.selectionModel.addListSelectionListener { e -> if (!e.valueIsAdjusting) showProxyDetail() }
         proxyTable.addMouseListener(ContextMenuListener { row, ev -> showProxyContextMenu(row, ev) })
 
-        // Fetch action
+        // Fetch action. The filters are read here on the EDT; only the bridge call runs in the background.
         proxyFetchButton = fetchBtn
         fetchBtn.addActionListener {
-            SwingWorker(api, "Fetching proxy history...") {
-                val host = hostField.text.trim().ifEmpty { null }
-                val method = if (methodCombo.selectedIndex == 0) null else methodCombo.selectedItem as String
-                val status = statusField.text.trim().toIntOrNull()
-                val count = countField.text.trim().toIntOrNull() ?: 100
-                val result = bridges.proxy.getHistory(0, count, host, method, status, null, scopeCheck.isSelected, true, true, null)
-                if (showBridgeError(result, "Fetch proxy history")) return@SwingWorker
-                val items = result["items"]?.jsonArray ?: JsonArray(emptyList())
-                SwingUtilities.invokeLater {
-                    // Cache and table must be rebuilt together on the EDT — clearing the
-                    // cache on the worker thread left a window where a click indexed an
-                    // empty cache against a still-populated table.
-                    proxyHistoryCache.clear()
-                    proxyTableModel.rowCount = 0
-                    for (item in items) {
-                        val obj = item.jsonObject
-                        proxyHistoryCache.add(obj)
-                        proxyTableModel.addRow(arrayOf<Any?>(
-                            obj["index"]?.jsonPrimitive?.intOrNull ?: 0,
-                            obj["method"]?.jsonPrimitive?.contentOrNull ?: "",
-                            obj["url"]?.jsonPrimitive?.contentOrNull ?: "",
-                            obj["host"]?.jsonPrimitive?.contentOrNull ?: "",
-                            obj["status_code"]?.jsonPrimitive?.intOrNull as Int?,
-                            obj["response_mime_type"]?.jsonPrimitive?.contentOrNull ?: "",
-                            obj["response_length"]?.jsonPrimitive?.intOrNull ?: 0
-                        ))
-                    }
-                }
-            }
+            val host = hostField.text.trim().ifEmpty { null }
+            val method = if (methodCombo.selectedIndex == 0) null else methodCombo.selectedItem as String
+            val status = statusField.text.trim().toIntOrNull()
+            val count = countField.text.trim().toIntOrNull() ?: 100
+            val inScope = scopeCheck.isSelected
+            tasks.compute("Fetch proxy history", {
+                bridges.proxy.getHistory(0, count, host, method, status, null, inScope, true, true, null)
+            }) { result -> if (!showBridgeError(result, "Fetch proxy history")) showProxyItems(result) }
         }
 
         // Search action. searchHistory returns the same "items" array shape as
@@ -549,28 +561,10 @@ class RaijinTab(
         // key silently emptied the table for every search.
         searchBtn.addActionListener {
             val pattern = searchField.text.trim(); if (pattern.isEmpty()) return@addActionListener
-            SwingWorker(api, "Searching proxy history...") {
-                val result = bridges.proxy.searchHistory(pattern, "both", false, 200, scopeCheck.isSelected, true, true, null)
-                if (showBridgeError(result, "Search proxy history")) return@SwingWorker
-                val items = result["items"]?.jsonArray ?: JsonArray(emptyList())
-                SwingUtilities.invokeLater {
-                    proxyHistoryCache.clear()
-                    proxyTableModel.rowCount = 0
-                    for (item in items) {
-                        val obj = item.jsonObject
-                        proxyHistoryCache.add(obj)
-                        proxyTableModel.addRow(arrayOf<Any?>(
-                            obj["index"]?.jsonPrimitive?.intOrNull ?: 0,
-                            obj["method"]?.jsonPrimitive?.contentOrNull ?: "",
-                            obj["url"]?.jsonPrimitive?.contentOrNull ?: "",
-                            obj["host"]?.jsonPrimitive?.contentOrNull ?: "",
-                            obj["status_code"]?.jsonPrimitive?.intOrNull as Int?,
-                            obj["response_mime_type"]?.jsonPrimitive?.contentOrNull ?: "",
-                            obj["response_length"]?.jsonPrimitive?.intOrNull ?: 0
-                        ))
-                    }
-                }
-            }
+            val inScope = scopeCheck.isSelected
+            tasks.compute("Search proxy history", {
+                bridges.proxy.searchHistory(pattern, "both", false, 200, inScope, true, true, null)
+            }) { result -> if (!showBridgeError(result, "Search proxy history")) showProxyItems(result) }
         }
 
         val split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(proxyTable), detailTabs)
@@ -579,11 +573,37 @@ class RaijinTab(
         return panel
     }
 
+    /**
+     * Rebuilds the cache and the table together on the EDT: clearing the cache on a worker thread
+     * left a window where a click indexed an empty cache against a still-populated table.
+     */
+    private fun showProxyItems(result: JsonObject) {
+        val items = result["items"] as? JsonArray ?: JsonArray(emptyList())
+        proxyHistoryCache.clear()
+        proxyTableModel.rowCount = 0
+        for (item in items) {
+            val obj = item as? JsonObject ?: continue
+            proxyHistoryCache.add(obj)
+            proxyTableModel.addRow(arrayOf<Any?>(
+                obj["index"]?.jsonPrimitive?.intOrNull ?: 0,
+                obj["method"]?.jsonPrimitive?.contentOrNull ?: "",
+                obj["url"]?.jsonPrimitive?.contentOrNull ?: "",
+                obj["host"]?.jsonPrimitive?.contentOrNull ?: "",
+                obj["status_code"]?.jsonPrimitive?.intOrNull as Int?,
+                obj["response_mime_type"]?.jsonPrimitive?.contentOrNull ?: "",
+                obj["response_length"]?.jsonPrimitive?.intOrNull ?: 0
+            ))
+        }
+    }
+
     private fun showProxyDetail() {
-        val vr = proxyTable.selectedRow; if (vr < 0) return
-        val mr = proxyTable.convertRowIndexToModel(vr)
-        if (mr >= proxyHistoryCache.size) return
-        val item = proxyHistoryCache[mr]
+        val vr = proxyTable.selectedRow
+        val item = if (vr >= 0) proxyHistoryCache.getOrNull(proxyTable.convertRowIndexToModel(vr)) else null
+        if (item == null) {
+            proxyRequestEditor.clear()
+            proxyResponseEditor.clear()
+            return
+        }
         try {
             val reqStr = item["request"]?.jsonPrimitive?.contentOrNull
             if (reqStr != null) {
@@ -591,16 +611,20 @@ class RaijinTab(
                 val port = item["port"]?.jsonPrimitive?.intOrNull ?: 443
                 val tls = item["secure"]?.jsonPrimitive?.booleanOrNull ?: (port == 443)
                 val service = burp.api.montoya.http.HttpService.httpService(host, port, tls)
-                proxyRequestEditor.setRequest(HttpRequest.httpRequest(service, reqStr))
+                proxyRequestEditor.request = HttpRequest.httpRequest(service, reqStr)
             } else {
-                proxyRequestEditor.setRequest(HttpRequest.httpRequest())
+                proxyRequestEditor.clear()
             }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+            proxyRequestEditor.clear()
+        }
         try {
             val respStr = item["response"]?.jsonPrimitive?.contentOrNull
-            if (respStr != null) proxyResponseEditor.setResponse(HttpResponse.httpResponse(respStr))
-            else proxyResponseEditor.setResponse(HttpResponse.httpResponse())
-        } catch (_: Exception) {}
+            if (respStr != null) proxyResponseEditor.response = HttpResponse.httpResponse(respStr)
+            else proxyResponseEditor.clear()
+        } catch (_: Exception) {
+            proxyResponseEditor.clear()
+        }
     }
 
     private fun showProxyContextMenu(viewRow: Int, e: MouseEvent) {
@@ -637,7 +661,6 @@ class RaijinTab(
     private lateinit var scannerTableModel: DefaultTableModel
     private lateinit var scannerDetailArea: JTextArea
     private lateinit var scannerRequestEditor: HttpRequestEditor
-    private var scannerIssuesCache = listOf<JsonObject>()
 
     /** Extracts the host from a serialized issue url (the bridge emits baseUrl, not host). */
     private fun hostOf(url: String): String = try {
@@ -685,11 +708,14 @@ class RaijinTab(
         detailTabs.addTab("Details", JScrollPane(scannerDetailArea))
         detailTabs.addTab("Request Evidence", scannerRequestEditor.uiComponent())
 
-        fun showScannerDetail(issuesCache: List<JsonObject>) {
-            val vr = scannerTable.selectedRow; if (vr < 0) return
-            val mr = scannerTable.convertRowIndexToModel(vr)
-            if (mr >= issuesCache.size) return
-            val issue = issuesCache[mr]
+        fun showScannerDetail() {
+            val vr = scannerTable.selectedRow
+            val issue = if (vr >= 0) scannerIssuesCache.getOrNull(scannerTable.convertRowIndexToModel(vr)) else null
+            if (issue == null) {
+                scannerDetailArea.text = "Select an issue to view its details."
+                scannerRequestEditor.clear()
+                return
+            }
             val url = issue["url"]?.jsonPrimitive?.contentOrNull ?: ""
             val sb = StringBuilder()
             sb.appendLine("Name: ${issue["name"]?.jsonPrimitive?.contentOrNull ?: ""}")
@@ -714,43 +740,41 @@ class RaijinTab(
                 val reqText = pair?.get("request")?.jsonPrimitive?.contentOrNull
                 val reqUrl = pair?.get("request_url")?.jsonPrimitive?.contentOrNull?.ifEmpty { null } ?: url
                 if (!reqText.isNullOrBlank() && reqUrl.isNotEmpty()) {
-                    scannerRequestEditor.setRequest(
+                    scannerRequestEditor.request =
                         HttpRequest.httpRequest(burp.api.montoya.http.HttpService.httpService(reqUrl), reqText)
-                    )
                 } else {
-                    scannerRequestEditor.setRequest(HttpRequest.httpRequest())
+                    scannerRequestEditor.clear()
                 }
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+                scannerRequestEditor.clear()
+            }
         }
         scannerTable.selectionModel.addListSelectionListener { e ->
-            if (!e.valueIsAdjusting) showScannerDetail(scannerIssuesCache)
+            if (!e.valueIsAdjusting) showScannerDetail()
         }
 
+        // The filters are read here on the EDT; only the bridge call runs in the background.
         scannerFetchButton = fetchBtn
         fetchBtn.addActionListener {
-            SwingWorker(api, "Fetching scanner issues...") {
-                val urlPrefix = urlField.text.trim().ifEmpty { null }
-                val sev = if (sevCombo.selectedIndex == 0) null else (sevCombo.selectedItem as String).lowercase()
-                val conf = if (confCombo.selectedIndex == 0) null else (confCombo.selectedItem as String).lowercase()
-                val result = bridges.scanner.getAllIssues(urlPrefix, sev, conf, 500)
-                if (showBridgeError(result, "Fetch scanner issues")) return@SwingWorker
-                val items = result["issues"]?.jsonArray ?: JsonArray(emptyList())
-                val fetched = items.map { it.jsonObject }
-                SwingUtilities.invokeLater {
-                    scannerIssuesCache = fetched
-                    scannerTableModel.rowCount = 0
-                    for (issue in fetched) {
-                        val url = issue["url"]?.jsonPrimitive?.contentOrNull ?: ""
-                        scannerTableModel.addRow(arrayOf(
-                            issue["severity"]?.jsonPrimitive?.contentOrNull ?: "",
-                            issue["confidence"]?.jsonPrimitive?.contentOrNull ?: "",
-                            issue["name"]?.jsonPrimitive?.contentOrNull ?: "",
-                            url,
-                            hostOf(url)
-                        ))
-                    }
-                    countLabel.text = "Issues: ${fetched.size}"
+            val urlPrefix = urlField.text.trim().ifEmpty { null }
+            val sev = if (sevCombo.selectedIndex == 0) null else (sevCombo.selectedItem as String).lowercase()
+            val conf = if (confCombo.selectedIndex == 0) null else (confCombo.selectedItem as String).lowercase()
+            tasks.compute("Fetch scanner issues", { bridges.scanner.getAllIssues(urlPrefix, sev, conf, 500) }) { result ->
+                if (showBridgeError(result, "Fetch scanner issues")) return@compute
+                val fetched = (result["issues"] as? JsonArray).orEmpty().filterIsInstance<JsonObject>()
+                scannerIssuesCache = fetched
+                scannerTableModel.rowCount = 0
+                for (issue in fetched) {
+                    val url = issue["url"]?.jsonPrimitive?.contentOrNull ?: ""
+                    scannerTableModel.addRow(arrayOf(
+                        issue["severity"]?.jsonPrimitive?.contentOrNull ?: "",
+                        issue["confidence"]?.jsonPrimitive?.contentOrNull ?: "",
+                        issue["name"]?.jsonPrimitive?.contentOrNull ?: "",
+                        url,
+                        hostOf(url)
+                    ))
                 }
+                countLabel.text = "Issues: ${fetched.size}"
             }
         }
 
@@ -770,10 +794,6 @@ class RaijinTab(
     private lateinit var findingsRequestEditor: HttpRequestEditor
     private lateinit var findingsResponseEditor: HttpResponseEditor
     private lateinit var findingsCountLabel: JLabel
-    private val findingsCache = mutableListOf<StoredFinding>()
-    private var findingsSeverityFilter = "Any"
-    private var findingsSearch = ""
-    private var findingsSnapshot: List<String> = emptyList()
 
     private fun buildFindingsTab(): JPanel {
         val panel = JPanel(BorderLayout(0, 0))
@@ -844,7 +864,9 @@ class RaijinTab(
         detailTabs.addTab("Request", findingsRequestEditor.uiComponent())
         detailTabs.addTab("Response", findingsResponseEditor.uiComponent())
 
-        findingsTable.selectionModel.addListSelectionListener { e -> if (!e.valueIsAdjusting) showFindingDetail() }
+        findingsTable.selectionModel.addListSelectionListener { e ->
+            if (!e.valueIsAdjusting && !rebuildingFindings) showFindingDetail()
+        }
         findingsTable.addMouseListener(ContextMenuListener { row, e -> showFindingsContextMenu(row, e) })
 
         val split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(findingsTable), detailTabs)
@@ -873,27 +895,34 @@ class RaijinTab(
         }.getOrNull()
 
         SwingUtilities.invokeLater {
-            findingsCache.clear()
-            findingsTableModel.rowCount = 0
-            for (f in stateManager.findings.filter { passesFindingsFilter(it) }) {
-                findingsCache.add(f)
-                val time = try {
-                    LocalDateTime.ofInstant(Instant.parse(f.createdAt), ZoneId.systemDefault()).format(FINDING_TIME_FORMAT)
-                } catch (_: Exception) { f.createdAt.takeLast(12) }
-                findingsTableModel.addRow(arrayOf<Any?>(
-                    f.id, f.severity.ifEmpty { "-" }, f.cvssScore.ifEmpty { "-" }, f.type,
-                    f.owaspCategory, f.url, f.location.ifEmpty { "-" }, time
-                ))
-            }
-            findingsSnapshot = stateManager.findings.map { it.id }
-            findingsCountLabel.text = "Findings: ${stateManager.findings.size}"
-            // Restore selection if the row survived the rebuild
-            if (selectedId != null) {
-                val row = (0 until findingsTableModel.rowCount).firstOrNull {
-                    findingsTableModel.getValueAt(it, 0)?.toString() == selectedId
+            // The rebuild clears and restores the selection; the detail must not flicker through "nothing selected".
+            rebuildingFindings = true
+            try {
+                findingsCache.clear()
+                findingsTableModel.rowCount = 0
+                for (f in stateManager.findings.filter { passesFindingsFilter(it) }) {
+                    findingsCache.add(f)
+                    val time = try {
+                        LocalDateTime.ofInstant(Instant.parse(f.createdAt), ZoneId.systemDefault()).format(FINDING_TIME_FORMAT)
+                    } catch (_: Exception) { f.createdAt.takeLast(12) }
+                    findingsTableModel.addRow(arrayOf<Any?>(
+                        f.id, f.severity.ifEmpty { "-" }, f.cvssScore.ifEmpty { "-" }, f.type,
+                        f.owaspCategory, f.url, f.location.ifEmpty { "-" }, time
+                    ))
                 }
-                if (row != null && row < findingsTable.rowCount) findingsTable.setRowSelectionInterval(row, row)
+                findingsSnapshot = stateManager.findings.map { it.id }
+                findingsCountLabel.text = "Findings: ${stateManager.findings.size}"
+                // Restore selection if the row survived the rebuild
+                if (selectedId != null) {
+                    val row = (0 until findingsTableModel.rowCount).firstOrNull {
+                        findingsTableModel.getValueAt(it, 0)?.toString() == selectedId
+                    }
+                    if (row != null && row < findingsTable.rowCount) findingsTable.setRowSelectionInterval(row, row)
+                }
+            } finally {
+                rebuildingFindings = false
             }
+            showFindingDetail()
         }
     }
 
@@ -910,8 +939,16 @@ class RaijinTab(
         if (modelRow in 0 until findingsCache.size) findingsCache[modelRow] else null
 
     private fun showFindingDetail() {
-        val vr = findingsTable.selectedRow; if (vr < 0) return
-        val f = findingAt(findingsTable.convertRowIndexToModel(vr)) ?: return
+        val vr = findingsTable.selectedRow
+        val f = if (vr >= 0) findingAt(findingsTable.convertRowIndexToModel(vr)) else null
+        if (f != null && f.id == shownFindingId) return
+        shownFindingId = f?.id
+        if (f == null) {
+            findingsDetailArea.text = "Findings the agent records via the findings_add tool appear here automatically."
+            findingsRequestEditor.clear()
+            findingsResponseEditor.clear()
+            return
+        }
         val sb = StringBuilder()
         sb.appendLine("ID: ${f.id}")
         sb.appendLine("Type: ${f.type}")
@@ -937,25 +974,10 @@ class RaijinTab(
         findingsDetailArea.text = sb.toString()
         findingsDetailArea.caretPosition = 0
 
-        // Recorded evidence viewers. Service is derived from the finding URL; a raw
-        // fallback covers non-URL entries. Both editors simply stay on the previous
-        // item when the finding carries no evidence for them.
-        try {
-            if (f.request.isNotEmpty()) {
-                val req = try {
-                    HttpRequest.httpRequest(burp.api.montoya.http.HttpService.httpService(f.url), f.request)
-                } catch (_: Exception) {
-                    HttpRequest.httpRequest(f.request)
-                }
-                findingsRequestEditor.setRequest(req)
-            } else {
-                findingsRequestEditor.setRequest(HttpRequest.httpRequest())
-            }
-        } catch (_: Exception) {}
-        try {
-            if (f.response.isNotEmpty()) findingsResponseEditor.setResponse(HttpResponse.httpResponse(f.response))
-            else findingsResponseEditor.setResponse(HttpResponse.httpResponse())
-        } catch (_: Exception) {}
+        // Recorded evidence viewers. The service comes from the finding URL, with a raw fallback
+        // for non-URL entries; a viewer the finding has no evidence for is emptied.
+        findingsRequestEditor.showRaw(f.request, f.url)
+        findingsResponseEditor.showRaw(f.response)
     }
 
     private fun showFindingsContextMenu(viewRow: Int, e: MouseEvent) {
@@ -995,12 +1017,21 @@ class RaijinTab(
      * after the next extension reload.
      */
     private fun syncFindingsStore() {
-        FindingsStore.replaceProject(currentProject(), stateManager.findings.toList())
+        val project = currentProject()
+        // Snapshotted under the store's file lock, so a removal racing this write cannot resurrect a finding.
+        tasks.persist("Save findings") {
+            FindingsStore.replaceProject(project) { stateManager.findings.toList() }
+            FindingsStore.lastError?.let { api.logging().logToError("Raijin: saving findings failed: $it") }
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  TAB 5: COLLABORATOR
     // ═══════════════════════════════════════════════════════════════════════
+
+    private lateinit var collabTabs: JTabbedPane
+    private lateinit var collabClientsModel: SnapshotTableModel
+    private lateinit var collabClientsTable: JTable
 
     private fun buildCollaboratorTab(): JPanel {
         val panel = JPanel(BorderLayout(0, 4))
@@ -1043,7 +1074,23 @@ class RaijinTab(
         interTable.columnModel.getColumn(3).preferredWidth = 120
         interTable.columnModel.getColumn(4).preferredWidth = 350
         val interScroll = JScrollPane(interTable)
-        interScroll.border = BorderFactory.createTitledBorder("Interactions")
+
+        // Read-only list of the Collaborator clients the agent or this tab created.
+        collabClientsModel = SnapshotTableModel(arrayOf("Client ID", "Server", "Created"))
+        collabClientsTable = JTable(collabClientsModel)
+        collabClientsTable.fillsViewportHeight = true; collabClientsTable.rowHeight = 22; collabClientsTable.setShowGrid(false)
+        collabClientsTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
+        collabClientsTable.addMouseListener(ContextMenuListener { row, e ->
+            val id = collabClientsModel.getValueAt(row, 0)?.toString() ?: return@ContextMenuListener
+            val server = collabClientsModel.getValueAt(row, 1)?.toString().orEmpty()
+            val menu = JPopupMenu()
+            menu.add(JMenuItem("Copy Client ID").apply { addActionListener { copyToClipboard(id) } })
+            if (server.isNotEmpty()) menu.add(JMenuItem("Copy Server").apply { addActionListener { copyToClipboard(server) } })
+            menu.show(e.component, e.x, e.y)
+        })
+        collabTabs = JTabbedPane(JTabbedPane.TOP)
+        collabTabs.addTab("Interactions", interScroll)
+        collabTabs.addTab("Clients", JScrollPane(collabClientsTable))
 
         // Maps a serialized interaction (the shape produced by
         // CollaboratorBridge.serializeInteraction) to a table row. The bridge
@@ -1086,35 +1133,32 @@ class RaijinTab(
         // emits one collaborator.interaction event per hit on every poll — from
         // an MCP tool call OR this panel's Poll button — so the table now fills
         // even when the operator never touched these controls.
-        collaboratorSubId = eventBus.subscribeInternal(listOf("collaborator.interaction")) { event ->
+        val subscription = eventBus.subscribeInternal(listOf("collaborator.interaction")) { event ->
             addInteraction(event.data)
         }
+        disposer.add("Collaborator interaction events") { eventBus.unsubscribe(subscription) }
 
         val currentClientId = AtomicReference("")
 
         createBtn.addActionListener {
-            SwingWorker(api, "Creating collaborator client...") {
-                val result = bridges.collaborator.createClient()
-                if (showBridgeError(result, "Create collaborator client")) return@SwingWorker
+            tasks.compute("Create collaborator client", { bridges.collaborator.createClient() }) { result ->
+                if (showBridgeError(result, "Create collaborator client")) return@compute
                 val cid = result["client_id"]?.jsonPrimitive?.contentOrNull ?: ""
                 val server = result["server"]?.jsonPrimitive?.contentOrNull ?: ""
                 currentClientId.set(cid)
-                SwingUtilities.invokeLater {
-                    clientIdField.text = cid; serverField.text = server
-                    generateBtn.isEnabled = cid.isNotEmpty(); pollBtn.isEnabled = cid.isNotEmpty()
-                }
+                clientIdField.text = cid; serverField.text = server
+                generateBtn.isEnabled = cid.isNotEmpty(); pollBtn.isEnabled = cid.isNotEmpty()
+                refreshCollaboratorClients()
             }
         }
 
         generateBtn.addActionListener {
             val cid = currentClientId.get()
             if (cid.isEmpty()) return@addActionListener
-            SwingWorker(api, "Generating payload...") {
-                val result = bridges.collaborator.generatePayload(cid, null)
+            tasks.compute("Generate payload", { bridges.collaborator.generatePayload(cid, null) }) { result ->
+                if (showBridgeError(result, "Generate payload")) return@compute
                 val payload = result["payload"]?.jsonPrimitive?.contentOrNull ?: ""
-                SwingUtilities.invokeLater {
-                    payloadField.text = payload; copyPayloadBtn.isEnabled = payload.isNotEmpty()
-                }
+                payloadField.text = payload; copyPayloadBtn.isEnabled = payload.isNotEmpty()
             }
         }
 
@@ -1123,43 +1167,59 @@ class RaijinTab(
         pollBtn.addActionListener {
             val cid = currentClientId.get()
             if (cid.isEmpty()) return@addActionListener
-            SwingWorker(api, "Polling interactions...") {
-                val result = bridges.collaborator.pollInteractions(cid, null, null)
-                if (showBridgeError(result, "Poll interactions")) return@SwingWorker
+            tasks.compute("Poll interactions", { bridges.collaborator.pollInteractions(cid, null, null) }) { result ->
+                if (showBridgeError(result, "Poll interactions")) return@compute
                 // pollInteractions already emits collaborator.interaction events
                 // that the subscription above renders (deduped). Route the direct
                 // results through the same path so manual polls of THIS panel's
                 // client also appear, regardless of event timing.
-                val interactions = result["interactions"]?.jsonArray ?: JsonArray(emptyList())
-                interactions.forEach { addInteraction(it.jsonObject) }
+                (result["interactions"] as? JsonArray).orEmpty().forEach { (it as? JsonObject)?.let(::addInteraction) }
             }
         }
 
-        panel.add(topPanel, BorderLayout.NORTH); panel.add(interScroll, BorderLayout.CENTER)
+        panel.add(topPanel, BorderLayout.NORTH); panel.add(collabTabs, BorderLayout.CENTER)
         return panel
+    }
+
+    /** Timer hook for the read-only client list: rebuilt only when the set of clients changed. */
+    private fun refreshCollaboratorClients() {
+        val rows = stateManager.collaboratorClients.values
+            .sortedBy { it.createdAt }
+            .map { listOf<Any?>(it.clientId, it.server, it.createdAt) }
+        collabClientsModel.update(rows, collabClientsTable)
+        setTabTitle(collabTabs, 1, "Clients (${rows.size})")
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  TAB 6: RULES MANAGER
     // ═══════════════════════════════════════════════════════════════════════
 
-    private lateinit var proxyRulesModel: DefaultTableModel
-    private lateinit var trafficRulesModel: DefaultTableModel
-    private lateinit var sessionRulesModel: DefaultTableModel
+    private lateinit var rulesTabbed: JTabbedPane
+    private lateinit var proxyRulesModel: SnapshotTableModel
+    private lateinit var proxyRulesTable: JTable
+    private lateinit var trafficRulesModel: SnapshotTableModel
+    private lateinit var trafficRulesTable: JTable
+    private lateinit var sessionRulesModel: SnapshotTableModel
+    private lateinit var sessionRulesTable: JTable
+    private lateinit var wsRulesModel: SnapshotTableModel
+    private lateinit var wsRulesTable: JTable
 
     private fun buildRulesTab(): JPanel {
         val panel = JPanel(BorderLayout(0, 0))
         panel.border = EmptyBorder(8, 8, 8, 8)
 
-        val rulesTabbed = JTabbedPane(JTabbedPane.TOP)
+        rulesTabbed = JTabbedPane(JTabbedPane.TOP)
+        fun rulesTable(model: SnapshotTableModel) = JTable(model).apply {
+            fillsViewportHeight = true; rowHeight = 22
+            setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
+        }
 
         // Proxy Rules
-        proxyRulesModel = object : DefaultTableModel(arrayOf("ID", "Type", "Action", "Match Host", "Match URL", "Match Method", "Enabled"), 0) {
-            override fun isCellEditable(r: Int, c: Int) = false
-            override fun getColumnClass(c: Int) = if (c == 6) java.lang.Boolean::class.java else String::class.java
-        }
-        val proxyRulesTable = JTable(proxyRulesModel)
-        proxyRulesTable.fillsViewportHeight = true; proxyRulesTable.rowHeight = 22
+        proxyRulesModel = SnapshotTableModel(
+            arrayOf("ID", "Type", "Action", "Match Host", "Match URL", "Match Method", "Enabled"),
+            mapOf(6 to SnapshotTableModel.BOOLEAN),
+        )
+        proxyRulesTable = rulesTable(proxyRulesModel)
         proxyRulesTable.addMouseListener(ContextMenuListener { row, e ->
             val menu = JPopupMenu()
             val ruleId = proxyRulesModel.getValueAt(row, 0)?.toString() ?: return@ContextMenuListener
@@ -1172,15 +1232,14 @@ class RaijinTab(
             }})
             menu.show(e.component, e.x, e.y)
         })
-        rulesTabbed.addTab("Proxy Rules (${stateManager.proxyRules.size})", JScrollPane(proxyRulesTable))
+        rulesTabbed.addTab("Proxy Rules", JScrollPane(proxyRulesTable))
 
         // Traffic Rules
-        trafficRulesModel = object : DefaultTableModel(arrayOf("ID", "Direction", "Match URL", "Match Host", "Add Header", "Enabled"), 0) {
-            override fun isCellEditable(r: Int, c: Int) = false
-            override fun getColumnClass(c: Int) = if (c == 5) java.lang.Boolean::class.java else String::class.java
-        }
-        val trafficRulesTable = JTable(trafficRulesModel)
-        trafficRulesTable.fillsViewportHeight = true; trafficRulesTable.rowHeight = 22
+        trafficRulesModel = SnapshotTableModel(
+            arrayOf("ID", "Direction", "Match URL", "Match Host", "Add Header", "Enabled"),
+            mapOf(5 to SnapshotTableModel.BOOLEAN),
+        )
+        trafficRulesTable = rulesTable(trafficRulesModel)
         trafficRulesTable.addMouseListener(ContextMenuListener { row, e ->
             val menu = JPopupMenu()
             val ruleId = trafficRulesModel.getValueAt(row, 0)?.toString() ?: return@ContextMenuListener
@@ -1193,271 +1252,78 @@ class RaijinTab(
             }})
             menu.show(e.component, e.x, e.y)
         })
-        rulesTabbed.addTab("Traffic Rules (${stateManager.trafficRules.size})", JScrollPane(trafficRulesTable))
+        rulesTabbed.addTab("Traffic Rules", JScrollPane(trafficRulesTable))
 
         // Session Rules
-        sessionRulesModel = object : DefaultTableModel(arrayOf("Name", "Scope", "Extract From", "Inject Into", "Last Value", "Enabled"), 0) {
-            override fun isCellEditable(r: Int, c: Int) = false
-            override fun getColumnClass(c: Int) = if (c == 5) java.lang.Boolean::class.java else String::class.java
-        }
-        val sessionRulesTable = JTable(sessionRulesModel)
-        sessionRulesTable.fillsViewportHeight = true; sessionRulesTable.rowHeight = 22
-        rulesTabbed.addTab("Session Rules (${stateManager.sessionRules.size})", JScrollPane(sessionRulesTable))
+        sessionRulesModel = SnapshotTableModel(
+            arrayOf("Name", "Scope", "Extract From", "Inject Into", "Last Value", "Enabled"),
+            mapOf(5 to SnapshotTableModel.BOOLEAN),
+        )
+        sessionRulesTable = rulesTable(sessionRulesModel)
+        rulesTabbed.addTab("Session Rules", JScrollPane(sessionRulesTable))
+
+        // WebSocket intercept rules: read-only here, the agent manages them with the websocket tool.
+        wsRulesModel = SnapshotTableModel(
+            arrayOf("ID", "Direction", "Action", "Match URL", "Match Message", "Modify", "Tag", "Enabled"),
+            mapOf(7 to SnapshotTableModel.BOOLEAN),
+        )
+        wsRulesTable = rulesTable(wsRulesModel)
+        rulesTabbed.addTab("WebSocket Rules", JScrollPane(wsRulesTable))
+
+        // Burp's target scope, read-only.
+        val scopeViewer = ScopeViewerPanel(bridges.scope, eventBus, tasks)
+        disposer.add("scope viewer") { scopeViewer.dispose() }
+        rulesTabbed.addTab("Scope", scopeViewer)
 
         val refreshBtn = JButton("Refresh")
         refreshBtn.addActionListener { refreshRulesTab() }
         val btnPanel = JPanel(FlowLayout(FlowLayout.RIGHT)); btnPanel.add(refreshBtn)
 
         panel.add(btnPanel, BorderLayout.NORTH); panel.add(rulesTabbed, BorderLayout.CENTER)
-        refreshRulesTab()
+        onEdt { refreshRulesTab() }
         return panel
     }
 
+    /** Timer hook: a table is rebuilt only when its rules changed, and keeps the selected rule selected. */
     private fun refreshRulesTab() {
-        SwingUtilities.invokeLater {
-            // Proxy rules
-            proxyRulesModel.rowCount = 0
-            for (r in stateManager.proxyRules) {
-                proxyRulesModel.addRow(arrayOf<Any?>(r.ruleId, r.type, r.action, r.matchHost ?: "*", r.matchUrl ?: "*", r.matchMethod ?: "*", r.enabled))
-            }
-            // Traffic rules
-            trafficRulesModel.rowCount = 0
-            for (r in stateManager.trafficRules) {
-                trafficRulesModel.addRow(arrayOf<Any?>(r.ruleId, r.direction, r.matchUrl ?: "*", r.matchHost ?: "*", r.modifyAddHeader ?: "", r.enabled))
-            }
-            // Session rules
-            sessionRulesModel.rowCount = 0
-            for (r in stateManager.sessionRules) {
-                sessionRulesModel.addRow(arrayOf<Any?>(r.ruleName, r.scope, r.extractFrom, r.injectInto, r.lastExtractedValue ?: "(none)", r.enabled))
-            }
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  TAB 7: SERVER
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private lateinit var serverUptimeLabel: JLabel
-    private lateinit var serverEventsLabel: JLabel
-    private lateinit var serverToolCallsLabel: JLabel
-    private lateinit var serverWsLabel: JLabel
-    private lateinit var serverCollabLabel: JLabel
-    private lateinit var serverScanLabel: JLabel
-
-    // Live-refreshable connection surfaces (updated on a hot rebind, no reload needed).
-    private lateinit var serverPrimaryUrlLabel: JLabel
-    private lateinit var serverSecondaryUrlLabel: JLabel
-    private lateinit var serverDashboardUrlLabel: JLabel
-    private lateinit var serverConfigArea: JTextArea
-    private lateinit var serverCommandArea: JTextArea
-
-    private fun buildServerTab(): JPanel {
-        val panel = JPanel(BorderLayout(0, 0))
-        panel.border = EmptyBorder(12, 12, 12, 12)
-
-        val content = JPanel(GridBagLayout())
-        val gbc = GridBagConstraints().apply { insets = Insets(4, 8, 4, 8); anchor = GridBagConstraints.WEST; fill = GridBagConstraints.HORIZONTAL }
-
-        fun addRow(row: Int, label: String, valueLabel: JLabel) {
-            gbc.gridy = row; gbc.gridx = 0; gbc.weightx = 0.0; content.add(JLabel(label).apply { font = font.deriveFont(Font.BOLD) }, gbc)
-            gbc.gridx = 1; gbc.weightx = 1.0; valueLabel.font = RaijinTheme.editorFont(12f); content.add(valueLabel, gbc)
-        }
-
-        // Connection info
-        gbc.gridy = 0; gbc.gridx = 0; gbc.gridwidth = 2; gbc.weightx = 1.0
-        content.add(JLabel("Connection Information").apply { font = font.deriveFont(Font.BOLD, 14f) }, gbc)
-        gbc.gridwidth = 1
-
-        serverPrimaryUrlLabel = JLabel(ConnectionInfo.primaryMcpUrlForHost(bindHost)); addRow(1, "MCP (Streamable HTTP):", serverPrimaryUrlLabel)
-        serverSecondaryUrlLabel = JLabel(ConnectionInfo.secondaryMcpUrlForHost(bindHost)); addRow(2, "MCP (secondary):", serverSecondaryUrlLabel)
-        serverDashboardUrlLabel = JLabel(ConnectionInfo.dashboardUrlForHost(bindHost)); addRow(3, "Dashboard:", serverDashboardUrlLabel)
-
-        gbc.gridy = 4; gbc.gridx = 0; gbc.gridwidth = 2
-        content.add(JSeparator(), gbc); gbc.gridwidth = 1
-
-        // Server bind address (GitHub issue #4). The embedded servers are started before this UI
-        // is built, so a change here takes effect on extension reload. A non-loopback address is
-        // security-gated: the operator must confirm the network exposure, which also enables the
-        // mcp_allow_remote_bind opt-in the startup gate (BindHostPolicy) requires.
-        gbc.gridy = 5; gbc.gridx = 0; gbc.gridwidth = 2
-        content.add(JLabel("Server Bind Address").apply { font = font.deriveFont(Font.BOLD, 14f) }, gbc)
-        gbc.gridwidth = 1
-
-        gbc.gridy = 6; gbc.gridx = 0; gbc.weightx = 0.0
-        content.add(JLabel("Bind host:").apply { font = font.deriveFont(Font.BOLD) }, gbc)
-        val bindHostField = JTextField(bindHost, 18)
-        bindHostField.font = RaijinTheme.editorFont(12f)
-        gbc.gridx = 1; gbc.weightx = 1.0
-        content.add(bindHostField, gbc)
-
-        val allowRemoteCheck = JCheckBox("Allow remote (non-loopback) bind — exposes tools to your network")
-        allowRemoteCheck.isSelected =
-            try { api.persistence().preferences().getBoolean("mcp_allow_remote_bind") ?: false } catch (_: Exception) { false }
-        gbc.gridy = 7; gbc.gridx = 0; gbc.gridwidth = 2; gbc.weightx = 1.0
-        content.add(allowRemoteCheck, gbc); gbc.gridwidth = 1
-
-        val saveBindHostBtn = JButton("Save & Rebind Now")
-        saveBindHostBtn.addActionListener {
-            val effective = bindHostField.text.trim().ifEmpty { "127.0.0.1" }
-            when (BindHostPolicy.classify(effective)) {
-                BindHostPolicy.Kind.INVALID -> {
-                    JOptionPane.showMessageDialog(
-                        panel,
-                        "\"$effective\" is not a valid IP address or hostname.",
-                        "Invalid Bind Address", JOptionPane.ERROR_MESSAGE
-                    )
-                    return@addActionListener
-                }
-                BindHostPolicy.Kind.LOOPBACK -> { /* safe default — no confirmation needed */ }
-                else -> {
-                    val ok = JOptionPane.showConfirmDialog(
-                        panel,
-                        "Binding to \"$effective\" makes Raijin's tools, the dashboard, and your\n" +
-                            "captured proxy history (requests, cookies, tokens) reachable from your network.\n" +
-                            "There is no authentication, so anyone who can reach this port could use them.\n\nRebind now and expose to the network?",
-                        "Confirm network exposure", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE
-                    )
-                    if (ok != JOptionPane.YES_OPTION) return@addActionListener
-                    allowRemoteCheck.isSelected = true  // confirming exposure enables the gate
-                }
-            }
-            val allowRemote = allowRemoteCheck.isSelected
-            api.persistence().preferences().setString("mcp_bind_host", effective)
-            api.persistence().preferences().setBoolean("mcp_allow_remote_bind", allowRemote)
-
-            // Rebind the live sockets off the EDT (stop+restart blocks a few seconds); any active
-            // MCP client is disconnected by this, exactly as a reload would be.
-            saveBindHostBtn.isEnabled = false
-            val prevText = saveBindHostBtn.text
-            saveBindHostBtn.text = "Rebinding…"
-            Thread {
-                val outcome = try { rebindNow(effective, allowRemote) }
-                    catch (e: Exception) { RebindOutcome(effective, false, false, false, e.message) }
-                SwingUtilities.invokeLater {
-                    saveBindHostBtn.isEnabled = true
-                    saveBindHostBtn.text = prevText
-                    serverPrimaryUrlLabel.text = ConnectionInfo.primaryMcpUrlForHost(outcome.effectiveHost)
-                    serverSecondaryUrlLabel.text = ConnectionInfo.secondaryMcpUrlForHost(outcome.effectiveHost)
-                    serverDashboardUrlLabel.text = ConnectionInfo.dashboardUrlForHost(outcome.effectiveHost)
-                    serverConfigArea.text = ConnectionInfo.clientConfigJson(host = outcome.effectiveHost)
-                    serverCommandArea.text = ConnectionInfo.claudeCodeCommand(host = outcome.effectiveHost)
-                    val msg = buildString {
-                        append(
-                            if (outcome.boundOk) "Rebound live to ${outcome.effectiveHost} — no reload needed."
-                            else "Rebind attempted on ${outcome.effectiveHost} but it did NOT come up — check Extensions → Output."
-                        )
-                        if (outcome.downgraded) append("\n\n${outcome.message}")
-                        if (outcome.exposed) append("\n\nSECURITY: now reachable from your network — Raijin has no authentication, so nothing else protects it.")
-                    }
-                    JOptionPane.showMessageDialog(
-                        panel, msg, "Raijin",
-                        if (outcome.boundOk && !outcome.exposed) JOptionPane.INFORMATION_MESSAGE else JOptionPane.WARNING_MESSAGE
-                    )
-                }
-            }.apply { isDaemon = true; name = "raijin-rebind" }.start()
-        }
-        gbc.gridy = 8; gbc.gridx = 1; gbc.weightx = 0.0
-        content.add(saveBindHostBtn, gbc)
-
-        gbc.gridy = 9; gbc.gridx = 0; gbc.gridwidth = 2
-        content.add(JSeparator(), gbc); gbc.gridwidth = 1
-
-        // MCP config
-        gbc.gridy = 10; gbc.gridx = 0; gbc.gridwidth = 2
-        content.add(JLabel("MCP Client Config").apply { font = font.deriveFont(Font.BOLD, 14f) }, gbc)
-        gbc.gridwidth = 1
-
-        serverConfigArea = JTextArea(ConnectionInfo.clientConfigJson(host = bindHost))
-        val configArea = serverConfigArea
-        configArea.isEditable = false; configArea.font = RaijinTheme.editorFont(11f)
-        configArea.lineWrap = true; configArea.wrapStyleWord = false; configArea.rows = 3
-        gbc.gridy = 11; gbc.gridx = 0; gbc.gridwidth = 2
-        content.add(configArea, gbc)
-        val copyConfigBtn = JButton("Copy Config")
-        copyConfigBtn.addActionListener { copyToClipboard(configArea.text) }
-        gbc.gridy = 12; gbc.gridx = 0; gbc.gridwidth = 1; gbc.weightx = 0.0
-        content.add(copyConfigBtn, gbc)
-        gbc.gridwidth = 1
-
-        gbc.gridy = 13; gbc.gridx = 0; gbc.gridwidth = 2
-        content.add(
-            JLabel("Claude Code:").apply { font = font.deriveFont(Font.ITALIC, 11f) },
-            gbc
-        )
-        gbc.gridwidth = 1
-
-        serverCommandArea = JTextArea(ConnectionInfo.claudeCodeCommand(host = bindHost))
-        val commandArea = serverCommandArea
-        commandArea.isEditable = false; commandArea.font = RaijinTheme.editorFont(11f)
-        commandArea.lineWrap = true; commandArea.wrapStyleWord = false; commandArea.rows = 2
-        gbc.gridy = 14; gbc.gridx = 0; gbc.gridwidth = 2
-        content.add(commandArea, gbc)
-        val copyCommandBtn = JButton("Copy Command")
-        copyCommandBtn.addActionListener { copyToClipboard(commandArea.text) }
-        gbc.gridy = 15; gbc.gridx = 0; gbc.gridwidth = 1; gbc.weightx = 0.0
-        content.add(copyCommandBtn, gbc)
-        gbc.gridwidth = 1
-
-        gbc.gridy = 16; gbc.gridx = 0; gbc.gridwidth = 2
-        content.add(JSeparator(), gbc); gbc.gridwidth = 1
-
-        // Live stats
-        gbc.gridy = 17; gbc.gridx = 0; gbc.gridwidth = 2
-        content.add(JLabel("Live Statistics").apply { font = font.deriveFont(Font.BOLD, 14f) }, gbc)
-        gbc.gridwidth = 1
-
-        serverUptimeLabel = JLabel("00:00:00"); addRow(18, "Uptime:", serverUptimeLabel)
-        serverToolCallsLabel = JLabel("0"); addRow(19, "Total MCP Tool Calls:", serverToolCallsLabel)
-        serverEventsLabel = JLabel("0"); addRow(20, "Event Buffer:", serverEventsLabel)
-        serverWsLabel = JLabel("0"); addRow(21, "WebSocket Connections:", serverWsLabel)
-        serverCollabLabel = JLabel("0"); addRow(22, "Collaborator Clients:", serverCollabLabel)
-        serverScanLabel = JLabel("0"); addRow(23, "Active Scan Tasks:", serverScanLabel)
-
-        // Filler
-        gbc.gridy = 24; gbc.gridx = 0; gbc.weighty = 1.0; gbc.gridwidth = 2
-        content.add(JLabel(), gbc)
-
-        panel.add(JScrollPane(content), BorderLayout.CENTER)
-        return panel
-    }
-
-    private fun refreshServerTab() {
-        SwingUtilities.invokeLater {
-            val elapsed = System.currentTimeMillis() - serverStartTime
-            val h = elapsed / 3600000; val m = (elapsed % 3600000) / 60000; val s = (elapsed % 60000) / 1000
-            serverUptimeLabel.text = String.format("%02d:%02d:%02d", h, m, s)
-            serverToolCallsLabel.text = NUMBER_FORMAT.format(totalToolCalls.get())
-            serverEventsLabel.text = "${eventBus.size()} events buffered"
-            serverWsLabel.text = "${stateManager.websocketConnections.size} active"
-            serverCollabLabel.text = "${stateManager.collaboratorClients.size} active"
-            serverScanLabel.text = "${stateManager.scanTasks.size} active"
-        }
+        proxyRulesModel.update(stateManager.proxyRules.map { r ->
+            listOf<Any?>(r.ruleId, r.type, r.action, r.matchHost ?: "*", r.matchUrl ?: "*", r.matchMethod ?: "*", r.enabled)
+        }, proxyRulesTable)
+        trafficRulesModel.update(stateManager.trafficRules.map { r ->
+            listOf<Any?>(r.ruleId, r.direction, r.matchUrl ?: "*", r.matchHost ?: "*", r.modifyAddHeader ?: "", r.enabled)
+        }, trafficRulesTable)
+        sessionRulesModel.update(stateManager.sessionRules.map { r ->
+            listOf<Any?>(r.ruleName, r.scope, r.extractFrom, r.injectInto, r.lastExtractedValue ?: "(none)", r.enabled)
+        }, sessionRulesTable)
+        wsRulesModel.update(stateManager.websocketInterceptRules.map { r ->
+            listOf<Any?>(
+                r.ruleId, r.direction, r.action, r.matchUrl ?: "*", r.matchMessage ?: "*",
+                r.modifyRegex?.let { "$it → ${r.modifyReplacement.orEmpty()}" }.orEmpty(), r.tagComment.orEmpty(), r.enabled,
+            )
+        }, wsRulesTable)
+        setTabTitle(rulesTabbed, 0, "Proxy Rules (${proxyRulesModel.rowCount})")
+        setTabTitle(rulesTabbed, 1, "Traffic Rules (${trafficRulesModel.rowCount})")
+        setTabTitle(rulesTabbed, 2, "Session Rules (${sessionRulesModel.rowCount})")
+        setTabTitle(rulesTabbed, 3, "WebSocket Rules (${wsRulesModel.rowCount})")
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  SHARED UTILITIES
     // ═══════════════════════════════════════════════════════════════════════
 
-    private fun copyToClipboard(text: String) {
-        Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(text), null)
+    /** Retitles [tabs] at [index] only when the text changed (the timer calls this every tick). */
+    private fun setTabTitle(tabs: JTabbedPane, index: Int, title: String) {
+        if (tabs.getTitleAt(index) != title) tabs.setTitleAt(index, title)
     }
 
-
-    /** Runs a block on a background thread, catching errors. */
-    private fun SwingWorker(api: MontoyaApi, desc: String, block: () -> Unit) {
-        Thread {
-            try { block() } catch (e: Exception) {
-                api.logging().logToError("Raijin UI: $desc failed: ${e.message}")
-                // Surface the failure to the user instead of silently leaving an
-                // empty table — "errored" must not look identical to "no data".
-                SwingUtilities.invokeLater {
-                    JOptionPane.showMessageDialog(
-                        mainPanel, "${e.message ?: e.javaClass.simpleName}",
-                        desc.removeSuffix("..."), JOptionPane.WARNING_MESSAGE
-                    )
-                }
-            }
-        }.apply { isDaemon = true; name = "Raijin-UI"; start() }
+    /** A failed background job: logged and shown, so "errored" never looks like "no data". */
+    private fun reportBackgroundError(desc: String, e: Exception) {
+        api.logging().logToError("Raijin UI: $desc failed: ${e.message}")
+        SwingUtilities.invokeLater {
+            JOptionPane.showMessageDialog(
+                mainPanel, e.message ?: e.javaClass.simpleName, "$desc failed", JOptionPane.WARNING_MESSAGE
+            )
+        }
     }
 
     /**
@@ -1475,48 +1341,7 @@ class RaijinTab(
         return true
     }
 
-    // ── Shared Renderers ───────────────────────────────────────────────────
-
-    private class MethodRenderer : DefaultTableCellRenderer() {
-        init { horizontalAlignment = CENTER }
-        override fun getTableCellRendererComponent(t: JTable, v: Any?, s: Boolean, f: Boolean, r: Int, c: Int): Component {
-            val comp = super.getTableCellRendererComponent(t, v, s, f, r, c)
-            if (!s) foreground = when (v?.toString()) {
-                "GET" -> RaijinTheme.success(); "POST" -> RaijinTheme.info()
-                "PUT" -> RaijinTheme.warning(); "DELETE" -> RaijinTheme.error()
-                "PATCH" -> RaijinTheme.purple(); else -> RaijinTheme.muted()
-            }
-            return comp
-        }
-    }
-
-    private class StatusCodeRenderer : DefaultTableCellRenderer() {
-        init { horizontalAlignment = CENTER }
-        override fun getTableCellRendererComponent(t: JTable, v: Any?, s: Boolean, f: Boolean, r: Int, c: Int): Component {
-            val comp = super.getTableCellRendererComponent(t, v, s, f, r, c)
-            if (!s && v != null) {
-                val code = (v as? Int) ?: 0
-                foreground = when { code in 200..299 -> RaijinTheme.success(); code in 300..399 -> RaijinTheme.info(); code in 400..499 -> RaijinTheme.warning(); code >= 500 -> RaijinTheme.error(); else -> RaijinTheme.muted() }
-            }
-            return comp
-        }
-    }
-
-    private class SeverityRenderer : DefaultTableCellRenderer() {
-        init { horizontalAlignment = CENTER }
-        override fun getTableCellRendererComponent(t: JTable, v: Any?, s: Boolean, f: Boolean, r: Int, c: Int): Component {
-            val comp = super.getTableCellRendererComponent(t, v, s, f, r, c)
-            if (!s) foreground = when (v?.toString()?.uppercase()) {
-                "CRITICAL" -> RaijinTheme.critical()
-                "HIGH" -> RaijinTheme.error(); "MEDIUM" -> RaijinTheme.warning()
-                "LOW" -> RaijinTheme.info()
-                "INFORMATION", "INFO" -> RaijinTheme.muted()
-                else -> t.foreground
-            }
-            font = font.deriveFont(Font.BOLD)
-            return comp
-        }
-    }
+    // ── Shared Renderers (the method, status and severity ones live in UiSupport) ──
 
     /** Colors a CVSS score cell by qualitative band (0–10 scale; blank stays muted). */
     private class CvssRenderer : DefaultTableCellRenderer() {
@@ -1542,19 +1367,6 @@ class RaijinTab(
             val comp = super.getTableCellRendererComponent(t, v, s, f, r, c)
             if (!s) foreground = colorFor(classifier(v?.toString() ?: "")) ?: t.foreground
             return comp
-        }
-    }
-
-    /** Reusable right-click mouse listener. */
-    private class ContextMenuListener(private val handler: (Int, MouseEvent) -> Unit) : MouseAdapter() {
-        override fun mousePressed(e: MouseEvent) = check(e)
-        override fun mouseReleased(e: MouseEvent) = check(e)
-        private fun check(e: MouseEvent) {
-            if (e.isPopupTrigger) {
-                val table = e.component as JTable
-                val row = table.rowAtPoint(e.point)
-                if (row >= 0) { table.setRowSelectionInterval(row, row); handler(row, e) }
-            }
         }
     }
 }
