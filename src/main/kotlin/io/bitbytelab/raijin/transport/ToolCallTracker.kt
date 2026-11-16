@@ -54,7 +54,7 @@ object ToolCallTracker {
     /** A word after the family prefix that marks a read-only tool (turbo_run_status, websocket_list, ...). */
     private val READ_ONLY_WORDS = setOf(
         "get", "list", "status", "result", "results", "script", "search", "templates", "issues",
-        "docs", "example", "examples", "messages", "history", "info"
+        "docs", "example", "examples", "messages", "history", "info", "wait"
     )
 
     private val MUTATING_TOOL_NAMES = setOf(

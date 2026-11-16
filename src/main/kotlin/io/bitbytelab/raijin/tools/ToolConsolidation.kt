@@ -114,6 +114,8 @@ object ToolConsolidation {
                 "websocket_", "websocket_create", "websocket_send_text", "websocket_send_binary",
                 "websocket_close", "websocket_list", "websocket_get_messages",
                 "websocket_set_intercept_rule",
+                "websocket_wait_message", "websocket_fuzz",
+                "websocket_list_intercept_rules", "websocket_remove_intercept_rule",
             ) + mapOf("history" to "proxy_websocket_history", "history_search" to "proxy_websocket_history_search"),
             renames = mapOf("set_intercept_rule" to RULE_ACTION),
         ),
