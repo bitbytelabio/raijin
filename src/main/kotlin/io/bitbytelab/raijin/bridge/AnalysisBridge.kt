@@ -1,11 +1,13 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
+import burp.api.montoya.core.ByteArray as BurpByteArray
 import io.bitbytelab.raijin.safety.BoundedHttp
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.sitemap.SiteMapFilter
+import io.bitbytelab.raijin.core.BodyText
 import io.bitbytelab.raijin.core.TextSimilarity
 import io.bitbytelab.raijin.safety.SafeRegex
 import io.bitbytelab.raijin.safety.ScopeGate
@@ -445,22 +447,35 @@ class AnalysisBridge(private val api: MontoyaApi) {
     }
 
     /**
-     * Searches response bodies across proxy history for a regex pattern.
+     * Searches response bodies across proxy history for a regex pattern (case-insensitive).
+     *
+     * The pattern is caller-supplied, so every match goes through [SafeRegex]: an invalid pattern
+     * is reported instead of thrown, one body holds the search for at most [SEARCH_BODY_TIMEOUT_MS],
+     * and the whole call stops after [SEARCH_BUDGET_MS] with what it found so far (`incomplete`).
      *
      * @param pattern Regex pattern to search for.
-     * @param maxResults Maximum number of matching results.
+     * @param maxResults Maximum number of matching results (1..[SEARCH_MAX_RESULTS]).
      * @param inScopeOnly Whether to limit search to in-scope items.
      */
     fun searchResponseBodies(pattern: String, maxResults: Int, inScopeOnly: Boolean): JsonObject {
         SafeRegex.validate(pattern, ignoreCase = true)?.let { err ->
             return buildJsonObject { put("error", "Invalid regex: $err") }
         }
+        val limit = maxResults.coerceIn(1, SEARCH_MAX_RESULTS)
 
         val proxyHistory = api.proxy().history()
+        val deadline = System.nanoTime() + SEARCH_BUDGET_MS * 1_000_000
+        var scanned = 0
+        var oversize = 0
+        var incomplete = false
         val matches = buildJsonArray {
             var matchCount = 0
             for (entry in proxyHistory) {
-                if (matchCount >= maxResults) break
+                if (matchCount >= limit) break
+                if (System.nanoTime() > deadline) {
+                    incomplete = true
+                    break
+                }
 
                 try {
                     val req = entry.finalRequest() ?: continue
@@ -470,21 +485,21 @@ class AnalysisBridge(private val api: MontoyaApi) {
                     if (inScopeOnly && !api.scope().isInScope(url)) continue
 
                     val responseBody = resp.bodyToString()
-                    val matchResult = SafeRegex.find(pattern, responseBody, ignoreCase = true)
-                    if (matchResult != null) {
-                        addJsonObject {
-                            put("url", url)
-                            put("method", req.method())
-                            put("status_code", resp.statusCode())
-                            put("match_value", matchResult.value)
-                            put("match_position", matchResult.range.first)
-                            // Snippet around the match
-                            val snippetStart = maxOf(0, matchResult.range.first - 50)
-                            val snippetEnd = minOf(responseBody.length, matchResult.range.last + 51)
-                            put("snippet", responseBody.substring(snippetStart, snippetEnd))
-                        }
-                        matchCount++
+                    scanned++
+                    if (responseBody.length > SEARCH_MAX_BODY_CHARS) {
+                        oversize++
+                        continue
                     }
+                    val match = matchBody(pattern, responseBody) ?: continue
+                    addJsonObject {
+                        put("url", url)
+                        put("method", req.method())
+                        put("status_code", resp.statusCode())
+                        put("match_value", match.value)
+                        put("match_position", match.position)
+                        put("snippet", match.snippet)
+                    }
+                    matchCount++
                 } catch (_: Exception) {
                     // Skip entries that fail to parse
                 }
@@ -495,21 +510,35 @@ class AnalysisBridge(private val api: MontoyaApi) {
             put("pattern", pattern)
             put("in_scope_only", inScopeOnly)
             put("match_count", matches.size)
-            put("max_results", maxResults)
+            put("max_results", limit)
+            put("entries_scanned", scanned)
+            if (oversize > 0) put("skipped_oversize_bodies", oversize)
+            if (incomplete) {
+                put("incomplete", true)
+                put(
+                    "note",
+                    "Stopped after ${SEARCH_BUDGET_MS / 1000}s with part of the history searched: narrow it with in_scope_only or use a cheaper pattern."
+                )
+            }
             put("matches", matches)
         }
     }
 
     /**
-     * Auth level diffing: sends the same request with different auth headers and
-     * compares responses to detect authorization issues.
+     * Auth level diffing: sends the same request as each identity and compares the responses to
+     * detect authorization issues. Identities are applied by [AuthIdentityApplier]; a level that
+     * gets no HTTP response (timeout, connection error) is reported under `errors` and takes no
+     * part in the comparison.
      *
      * @param request Base HTTP request string
      * @param host Target host
      * @param port Target port
      * @param useTls Use TLS
-     * @param authLevels List of auth level objects, each with: name, header_name, header_value (or "none" for unauthenticated)
-     * @param compareFields What to compare: status_code, body, headers, body_length (default: all)
+     * @param authLevels Identity objects: name plus header_name/header_value, headers and/or
+     *   remove_headers; a name of none / unauth / anonymous sends the request without credentials
+     * @param compareFields What to compare: any of [AUTH_DIFF_FIELDS] (default: all)
+     * @param deniedRegex Optional regex; a response whose body matches it is treated as denied
+     *   whatever its status (applications that refuse with a 200)
      */
     fun authDiff(
         request: String,
@@ -517,186 +546,86 @@ class AnalysisBridge(private val api: MontoyaApi) {
         port: Int,
         useTls: Boolean,
         authLevels: List<JsonObject>,
-        compareFields: List<String>?
+        compareFields: List<String>?,
+        deniedRegex: String? = null
     ): JsonObject {
         if (request.isBlank()) {
             return buildJsonObject {
                 put("error", "Empty request: provide a raw HTTP request (e.g. 'GET /api/resource HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n').")
             }
         }
+        if (authLevels.size < 2) {
+            return buildJsonObject {
+                put("error", "Provide at least 2 auth levels to compare, e.g. an authenticated level plus {\"name\":\"none\"}.")
+            }
+        }
+        val fields = compareFields?.map { it.trim().lowercase() }?.filter { it.isNotEmpty() }?.takeIf { it.isNotEmpty() }
+            ?: AUTH_DIFF_FIELDS
+        fields.firstOrNull { it !in AUTH_DIFF_FIELDS }?.let { bad ->
+            return buildJsonObject {
+                put("error", "Parameter 'compare_fields' has invalid value '$bad'. Allowed: ${AUTH_DIFF_FIELDS.joinToString(", ")}")
+            }
+        }
+        deniedRegex?.let { pattern ->
+            SafeRegex.validate(pattern, ignoreCase = true)?.let { err ->
+                return buildJsonObject { put("error", "Invalid denied_regex: $err") }
+            }
+        }
+        val identities = authLevels.mapIndexed { i, level -> AuthIdentityApplier.parse(level, defaultName = "level_${i + 1}") }
+        AuthIdentityApplier.indistinguishableError(identities)?.let { err ->
+            return buildJsonObject { put("error", err) }
+        }
         return try {
+            val scope = scopeGate.check((if (useTls) "https" else "http") + "://$host:$port/")
+            scope.deny?.let { return it }
             val service = HttpService.httpService(host, port, useTls)
-            scopeGate.deny((if (useTls) "https" else "http") + "://$host:$port/")?.let { return it }
             // Normalize request
             val baseRequest = normalizeCrlf(request)
-
-            data class AuthResult(
-                val levelName: String,
-                val statusCode: Int,
-                val bodyLength: Int,
-                val body: String,
-                val headers: Map<String, String>,
-                val responseTime: Long,
-                val contentType: String? = null,
-                val location: String? = null
-            )
-
-            val results = mutableListOf<AuthResult>()
-
-            val errors = mutableListOf<String>()
+            val identityHeaders = AuthIdentityApplier.identityHeaders(identities)
 
             // Every level hits the same path (only headers vary across the loop below) — used
             // only for AuthDiffVerdict's static-asset downgrade (file-extension fallback).
             val sharedUrl = try { HttpRequest.httpRequest(service, baseRequest).url() } catch (_: Exception) { null }
 
-            for (level in authLevels) {
-                val levelName = level["name"]?.jsonPrimitive?.contentOrNull ?: "unknown"
-                val headerName = level["header_name"]?.jsonPrimitive?.contentOrNull
-                val headerValue = level["header_value"]?.jsonPrimitive?.contentOrNull
+            val results = mutableListOf<AuthLevelResponse>()
+            val errors = mutableListOf<String>()
 
+            for (identity in identities) {
                 try {
-                    // Build request with this auth level
-                    var httpRequest = HttpRequest.httpRequest(service, baseRequest)
-
-                    if (headerName != null && headerValue != null) {
-                        // Remove existing auth header and add new one
-                        httpRequest = httpRequest.withRemovedHeader(headerName).withHeader(headerName, headerValue)
-                    } else if (
-                        levelName.equals("none", ignoreCase = true) ||
-                        levelName.equals("unauth", ignoreCase = true) ||
-                        levelName.equals("anonymous", ignoreCase = true)
-                    ) {
-                        // Remove common auth headers for unauthenticated test
-                        httpRequest = httpRequest
-                            .withRemovedHeader("Authorization")
-                            .withRemovedHeader("Cookie")
-                            .withRemovedHeader("X-API-Key")
-                            .withRemovedHeader("X-Auth-Token")
-                    }
+                    val applied = AuthIdentityApplier.apply(baseRequest, identity, identityHeaders)
+                    val httpRequest = HttpRequest.httpRequest(
+                        service, BurpByteArray.byteArray(*AuthIdentityApplier.wireBytes(applied.request))
+                    )
 
                     val startTime = System.nanoTime()
-                    val result = BoundedHttp.sendInternal(api, httpRequest)
+                    val resp = BoundedHttp.sendInternal(api, httpRequest)?.response()
                     val elapsed = (System.nanoTime() - startTime) / 1_000_000
 
-                    val resp = result?.response()
-                    if (resp == null) {
-                        errors.add("Level '$levelName' failed: no response received (timeout or connection error)")
+                    val status = resp?.statusCode()?.toInt() ?: 0
+                    // No response, or one without a status: a failed level, not a level that answered "0".
+                    if (resp == null || status == 0) {
+                        errors.add(levelFailure(identity.name, elapsed))
                         continue
                     }
-                    results.add(AuthResult(
-                        levelName = levelName,
-                        statusCode = resp.statusCode().toInt(),
+                    results.add(AuthLevelResponse(
+                        level = identity.name,
+                        statusCode = status,
                         bodyLength = resp.body()?.length() ?: 0,
                         body = resp.bodyToString() ?: "",
                         headers = resp.headers()?.associate { it.name() to it.value() } ?: emptyMap(),
-                        responseTime = elapsed,
+                        responseTimeMs = elapsed,
                         contentType = try { resp.headerValue("Content-Type") } catch (_: Exception) { null },
-                        location = try { resp.headerValue("Location") } catch (_: Exception) { null }
+                        location = try { resp.headerValue("Location") } catch (_: Exception) { null },
+                        applied = applied,
+                        sentUnchanged = identity.sendsRequestUnchanged
                     ))
                 } catch (e: Exception) {
-                    errors.add("Level '$levelName' failed: ${describe(e)}")
+                    errors.add("Level '${identity.name}' failed: ${describe(e)}")
                 }
             }
 
-            // Compare results
-            val fields = compareFields ?: listOf("status_code", "body_length", "body", "headers")
-            val differences = mutableListOf<JsonObject>()
-
-            // Compare each pair
-            for (i in results.indices) {
-                for (j in i + 1 until results.size) {
-                    val a = results[i]
-                    val b = results[j]
-                    val diffs = mutableListOf<JsonObject>()
-
-                    if ("status_code" in fields && a.statusCode != b.statusCode) {
-                        diffs.add(buildJsonObject {
-                            put("field", "status_code")
-                            put("${a.levelName}", a.statusCode)
-                            put("${b.levelName}", b.statusCode)
-                        })
-                    }
-                    if ("body_length" in fields && a.bodyLength != b.bodyLength) {
-                        diffs.add(buildJsonObject {
-                            put("field", "body_length")
-                            put("${a.levelName}", a.bodyLength)
-                            put("${b.levelName}", b.bodyLength)
-                            put("length_diff", Math.abs(a.bodyLength - b.bodyLength))
-                        })
-                    }
-                    if ("body" in fields && a.body != b.body) {
-                        // Find specific body differences
-                        val similarity = calculateSimilarity(a.body, b.body)
-                        diffs.add(buildJsonObject {
-                            put("field", "body_content")
-                            put("similarity_percent", similarity)
-                            put("bodies_identical", false)
-                        })
-                    }
-                    if ("headers" in fields) {
-                        val diffHeaders = mutableListOf<String>()
-                        val allHeaders = (a.headers.keys + b.headers.keys).distinct()
-                        for (h in allHeaders) {
-                            if (a.headers[h] != b.headers[h]) diffHeaders.add(h)
-                        }
-                        if (diffHeaders.isNotEmpty()) {
-                            diffs.add(buildJsonObject {
-                                put("field", "headers")
-                                put("different_headers", buildJsonArray { diffHeaders.forEach { add(it) } })
-                            })
-                        }
-                    }
-
-                    if (diffs.isNotEmpty()) {
-                        differences.add(buildJsonObject {
-                            put("level_a", a.levelName)
-                            put("level_b", b.levelName)
-                            put("differences", buildJsonArray { diffs.forEach { add(it) } })
-                        })
-                    }
-                }
-            }
-
-            // Security analysis
-            val statusCodes = results.map { it.statusCode }.distinct()
-            val allSameStatus = statusCodes.size == 1
-            val allSameBody = results.map { it.body }.distinct().size == 1
-
-            val verdict = AuthDiffVerdict.assess(
-                results.map { AuthDiffVerdict.LevelResult(it.levelName, it.statusCode, it.body, it.contentType, it.location) },
-                similarity = { x, y -> calculateSimilarity(x, y) },
-                url = sharedUrl
-            )
-
-            buildJsonObject {
-                put("auth_levels_tested", results.size)
-                put("responses", buildJsonArray {
-                    results.forEach { r ->
-                        add(buildJsonObject {
-                            put("level", r.levelName)
-                            put("status_code", r.statusCode)
-                            put("body_length", r.bodyLength)
-                            put("response_time_ms", r.responseTime)
-                            put("body_preview", r.body.take(500))
-                        })
-                    }
-                })
-                put("differences", buildJsonArray { differences.forEach { add(it) } })
-                put("findings", buildJsonArray {
-                    verdict.forEach {
-                        add(buildJsonObject {
-                            put("severity", it.severity)
-                            put("id", it.id)
-                            put("detail", it.detail)
-                        })
-                    }
-                })
-                put("all_same_status", allSameStatus)
-                put("all_same_body", allSameBody)
-                if (errors.isNotEmpty()) {
-                    put("errors", buildJsonArray { errors.forEach { add(it) } })
-                }
-            }
+            val report = authDiffReport(results, errors, fields, sharedUrl, deniedRegex)
+            scope.warning?.let { JsonObject(report + ("scope_warning" to JsonPrimitive(it))) } ?: report
         } catch (e: Exception) {
             buildJsonObject { put("error", "Auth diff failed: ${describe(e)}") }
         }
@@ -1014,5 +943,201 @@ class AnalysisBridge(private val api: MontoyaApi) {
             path.substringBefore("?").substringBefore("#")
                 .split("/")
                 .filter { it.isNotEmpty() }
+
+        /** Response fields `auth_diff` can compare between two levels. */
+        val AUTH_DIFF_FIELDS = listOf("status_code", "body_length", "body", "headers")
+
+        /** Largest `max_results` of a response-body search. */
+        const val SEARCH_MAX_RESULTS = 500
+
+        /** Whole-call budget of a response-body search; it returns what it has when this runs out. */
+        const val SEARCH_BUDGET_MS = 20_000L
+
+        /** Longest time one body may hold the search (a pattern that backtracks on it is abandoned). */
+        const val SEARCH_BODY_TIMEOUT_MS = 500L
+
+        /** Bodies longer than this are not searched; they are counted as skipped. */
+        const val SEARCH_MAX_BODY_CHARS = 2_000_000
+
+        private const val SEARCH_MATCH_CHARS = 500
+        private const val SEARCH_CONTEXT_CHARS = 50
+        private const val PREVIEW_CHARS = 500
+
+        /** [value] is the matched text (capped), [snippet] the match with some context around it. */
+        data class BodyMatch(val value: String, val position: Int, val snippet: String)
+
+        /**
+         * First match of the caller-supplied [pattern] in [body], or null when there is none, the
+         * pattern is invalid, or matching ran out of time. Output is capped and safe to serialize
+         * whatever the body holds.
+         */
+        fun matchBody(pattern: String, body: String): BodyMatch? {
+            val match = SafeRegex.find(
+                pattern, body, ignoreCase = true,
+                maxInputLen = SEARCH_MAX_BODY_CHARS, timeoutMs = SEARCH_BODY_TIMEOUT_MS
+            ) ?: return null
+            val start = match.range.first
+            val shownEnd = minOf(match.range.last + 1, start + SEARCH_MATCH_CHARS)
+            val snippet = body.substring(
+                maxOf(0, start - SEARCH_CONTEXT_CHARS),
+                minOf(body.length, shownEnd + SEARCH_CONTEXT_CHARS)
+            )
+            return BodyMatch(
+                value = BodyText.stripLoneSurrogates(BodyText.truncate(match.value, SEARCH_MATCH_CHARS)),
+                position = start,
+                snippet = BodyText.stripLoneSurrogates(snippet)
+            )
+        }
+
+        /** The `errors` entry for a level that produced no HTTP response within [elapsedMs]. */
+        fun levelFailure(levelName: String, elapsedMs: Long, timeoutMs: Long = BoundedHttp.DEFAULT_TIMEOUT_MS): String =
+            if (elapsedMs >= timeoutMs) {
+                "Level '$levelName' failed: timed out after $elapsedMs ms without a response"
+            } else {
+                "Level '$levelName' failed: no response received (connection error)"
+            }
+
+        /**
+         * Builds the `auth_diff` result from the levels that answered. Pure: the bridge only
+         * supplies what came back, so the comparison and the verdict are unit tested.
+         *
+         * @param fields which of [AUTH_DIFF_FIELDS] to compare pairwise.
+         * @param url the shared target URL, for the static-asset downgrade.
+         * @param deniedRegex an already validated caller pattern that marks a response as denied.
+         */
+        fun authDiffReport(
+            results: List<AuthLevelResponse>,
+            errors: List<String>,
+            fields: List<String> = AUTH_DIFF_FIELDS,
+            url: String? = null,
+            deniedRegex: String? = null
+        ): JsonObject {
+            val differences = mutableListOf<JsonObject>()
+
+            // Compare each pair
+            for (i in results.indices) {
+                for (j in i + 1 until results.size) {
+                    val a = results[i]
+                    val b = results[j]
+                    val diffs = mutableListOf<JsonObject>()
+
+                    if ("status_code" in fields && a.statusCode != b.statusCode) {
+                        diffs.add(buildJsonObject {
+                            put("field", "status_code")
+                            put(a.level, a.statusCode)
+                            put(b.level, b.statusCode)
+                        })
+                    }
+                    if ("body_length" in fields && a.bodyLength != b.bodyLength) {
+                        diffs.add(buildJsonObject {
+                            put("field", "body_length")
+                            put(a.level, a.bodyLength)
+                            put(b.level, b.bodyLength)
+                            put("length_diff", kotlin.math.abs(a.bodyLength - b.bodyLength))
+                        })
+                    }
+                    if ("body" in fields && a.body != b.body) {
+                        diffs.add(buildJsonObject {
+                            put("field", "body_content")
+                            put("similarity_percent", TextSimilarity.dice(a.body, b.body))
+                            put("bodies_identical", false)
+                        })
+                    }
+                    if ("headers" in fields) {
+                        val diffHeaders = (a.headers.keys + b.headers.keys).distinct().filter { a.headers[it] != b.headers[it] }
+                        if (diffHeaders.isNotEmpty()) {
+                            diffs.add(buildJsonObject {
+                                put("field", "headers")
+                                put("different_headers", buildJsonArray { diffHeaders.forEach { add(it) } })
+                            })
+                        }
+                    }
+
+                    if (diffs.isNotEmpty()) {
+                        differences.add(buildJsonObject {
+                            put("level_a", a.level)
+                            put("level_b", b.level)
+                            put("differences", buildJsonArray { diffs.forEach { add(it) } })
+                        })
+                    }
+                }
+            }
+
+            // Security analysis
+            val verdict = AuthDiffVerdict.assess(
+                results.map { AuthDiffVerdict.LevelResult(it.level, it.statusCode, it.body, it.contentType, it.location) },
+                similarity = TextSimilarity::dice,
+                url = url,
+                denied = { level ->
+                    AuthDenialHeuristic.looksDenied(level.body) || (
+                        deniedRegex != null && SafeRegex.containsMatchIn(
+                            deniedRegex, level.body, ignoreCase = true, maxInputLen = SEARCH_MAX_BODY_CHARS
+                        )
+                        )
+                }
+            )
+
+            val notes = mutableListOf<String>()
+            results.filter { it.sentUnchanged }.forEach {
+                notes += "Level '${it.level}' sets no header and is not named none/unauth/anonymous: it was sent with the request's own credentials."
+            }
+            if (results.size < 2) notes += "Fewer than two levels answered, so nothing could be compared: see errors."
+
+            return buildJsonObject {
+                put("auth_levels_tested", results.size)
+                put("responses", buildJsonArray {
+                    results.forEach { r ->
+                        add(buildJsonObject {
+                            put("level", r.level)
+                            put("status_code", r.statusCode)
+                            put("body_length", r.bodyLength)
+                            put("response_time_ms", r.responseTimeMs)
+                            r.location?.takeIf { it.isNotBlank() }?.let { put("redirect_location", it) }
+                            r.applied?.let { applied ->
+                                if (applied.set.isNotEmpty()) put("headers_set", strings(applied.set))
+                                if (applied.removed.isNotEmpty()) put("headers_removed", strings(applied.removed))
+                                if (applied.keptCredentials.isNotEmpty()) put("credential_headers_kept", strings(applied.keptCredentials))
+                            }
+                            put("body_preview", BodyText.render(r.body, PREVIEW_CHARS, label = "response body").text)
+                        })
+                    }
+                })
+                put("differences", buildJsonArray { differences.forEach { add(it) } })
+                put("findings", buildJsonArray {
+                    verdict.forEach {
+                        add(buildJsonObject {
+                            put("severity", it.severity)
+                            put("id", it.id)
+                            put("detail", it.detail)
+                        })
+                    }
+                })
+                put("all_same_status", results.map { it.statusCode }.distinct().size == 1)
+                put("all_same_body", results.map { it.body }.distinct().size == 1)
+                if (notes.isNotEmpty()) put("notes", strings(notes))
+                if (errors.isNotEmpty()) put("errors", strings(errors))
+            }
+        }
+
+        private fun strings(values: List<String>): JsonArray = buildJsonArray { values.forEach { add(it) } }
     }
 }
+
+/**
+ * One auth level's answer, as [AnalysisBridge.authDiffReport] compares it.
+ *
+ * @param applied what [AuthIdentityApplier] did to the request for this level.
+ * @param sentUnchanged the level changed nothing about the request (it carries the captured credentials).
+ */
+internal data class AuthLevelResponse(
+    val level: String,
+    val statusCode: Int,
+    val body: String,
+    val bodyLength: Int = body.length,
+    val headers: Map<String, String> = emptyMap(),
+    val responseTimeMs: Long = 0,
+    val contentType: String? = null,
+    val location: String? = null,
+    val applied: AuthIdentityApplier.Applied? = null,
+    val sentUnchanged: Boolean = false
+)

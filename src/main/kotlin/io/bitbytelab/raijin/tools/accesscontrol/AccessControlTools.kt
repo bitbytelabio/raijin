@@ -2,9 +2,9 @@ package io.bitbytelab.raijin.tools.accesscontrol
 
 import io.bitbytelab.raijin.bridge.AccessControlBridge
 import io.bitbytelab.raijin.core.asJsonObjectList
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -16,8 +16,10 @@ object AccessControlTools {
             description = "Batch broken-access-control / IDOR test: replays each request under every identity and " +
                 "flags where a lower-privilege or unauthenticated identity gets a response matching a higher-privilege " +
                 "one. Scales auth_diff across many endpoints in one call. Provide 'identities' as " +
-                "[{name, header_name?, header_value?}] — a name of none/unauth strips auth headers. Scope-gated " +
-                "(mcp_scope_mode).",
+                "[{name, header_name?, header_value?, headers?, remove_headers?}] — an identity's headers replace the " +
+                "request's own, and a name of none/unauth/anonymous sends the request without any credential header. " +
+                "Uniform refusals (same 401/403/404, a redirect to a login page, a 200 login page or denial message) are " +
+                "informational, never high or critical. Scope-gated (mcp_scope_mode).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("requests") {
@@ -26,7 +28,11 @@ object AccessControlTools {
                     }
                     putJsonObject("identities") {
                         put("type", "array"); putJsonObject("items") { put("type", "object") }
-                        put("description", "Identities: each {name, header_name?, header_value?}; name none/unauth strips auth")
+                        put("description", "At least 2 identities: each {name, header_name?, header_value?, headers?, remove_headers?}; name none/unauth/anonymous strips every credential header")
+                    }
+                    putJsonObject("denied_regex") {
+                        put("type", "string")
+                        put("description", "Optional regex (case-insensitive): a response whose body matches is treated as denied whatever its status")
                     }
                 },
                 required = listOf("requests", "identities")
@@ -35,16 +41,14 @@ object AccessControlTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val requests = args["requests"].asJsonObjectList()
-                    ?: return@addTool err("Parameter 'requests' (array of objects) is required")
+                    ?: return@addTool toolError("Parameter 'requests' (array of objects) is required")
                 val identities = args["identities"].asJsonObjectList()
-                    ?: return@addTool err("Parameter 'identities' (array of objects) is required")
-                CallToolResult(content = listOf(TextContent(bridge.sweep(requests, identities).toString())))
+                    ?: return@addTool toolError("Parameter 'identities' (array of objects) is required")
+                val deniedRegex = (args["denied_regex"] as? JsonPrimitive)?.contentOrNull?.takeIf { it.isNotEmpty() }
+                toolJsonResult(bridge.sweep(requests, identities, deniedRegex))
             } catch (e: Exception) {
-                err(e.message)
+                toolError(e.message ?: "Unknown error")
             }
         }
     }
-
-    private fun err(msg: String?): CallToolResult =
-        CallToolResult(content = listOf(TextContent(buildJsonObject { put("error", msg ?: "Unknown error") }.toString())), isError = true)
 }

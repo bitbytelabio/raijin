@@ -1,6 +1,10 @@
 package io.bitbytelab.raijin.tools.analysis
 
+import io.bitbytelab.raijin.bridge.AnalysisBridge
 import io.bitbytelab.raijin.bridge.BridgeFactory
+import io.bitbytelab.raijin.core.EnumValidation
+import io.bitbytelab.raijin.core.asBooleanSafe
+import io.bitbytelab.raijin.core.asBoundedInt
 import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
@@ -10,32 +14,11 @@ import kotlinx.serialization.json.*
 
 object AnalysisTools {
 
-    /**
-     * Registers all analysis tools. Accepts the full [BridgeFactory.Bridges]
-     * container because analysis may use the AnalysisBridge (which is
-     * constructed on-the-fly from the MontoyaApi held by other bridges)
-     * or direct proxy history access via the BurpSuiteBridge.
-     *
-     * The AnalysisBridge is instantiated lazily from the bridges container.
-     */
-    fun register(server: Server, bridges: BridgeFactory.Bridges) {
-        // AnalysisBridge is not stored in the Bridges data class directly;
-        // we create it using the same MontoyaApi that powers other bridges.
-        // Since BridgeFactory already creates one, we access it through a
-        // helper. But actually the BridgeFactory does not expose the raw API.
-        // Instead, we use the proxy bridge's API transitively -- let's just
-        // accept the AnalysisBridge is created elsewhere and passed through
-        // the Bridges container or we create a lightweight wrapper here.
-        //
-        // For now, AnalysisTools creates a standalone AnalysisBridge using
-        // the Montoya API extracted from BurpSuiteBridge's config export.
-        //
-        // Actually the cleanest approach: AnalysisBridge is constructed in
-        // BridgeFactory and passed via Bridges. But since the Bridges data
-        // class doesn't include it, we'll use a package-level approach:
-        // we'll create the analysis bridge inside the tools and use the
-        // bridges container for proxy history access.
+    private val DIFF_TYPES = listOf("request", "response")
 
+    fun register(server: Server, bridges: BridgeFactory.Bridges) = register(server, bridges.analysis)
+
+    fun register(server: Server, analysis: AnalysisBridge) {
         // 1. analyze_request
         server.addTool(
             name = "analyze_request",
@@ -51,10 +34,9 @@ object AnalysisTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
+                val rawRequest = args.string("request")
                     ?: return@addTool toolError("Missing required parameter: request")
-                val bridge = bridges.analysis
-                toolJsonResult(bridge.analyzeRequest(rawRequest))
+                toolJsonResult(analysis.analyzeRequest(rawRequest))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -75,10 +57,9 @@ object AnalysisTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val rawResponse = args["response"]?.jsonPrimitive?.contentOrNull
+                val rawResponse = args.string("response")
                     ?: return@addTool toolError("Missing required parameter: response")
-                val bridge = bridges.analysis
-                toolJsonResult(bridge.analyzeResponse(rawResponse))
+                toolJsonResult(analysis.analyzeResponse(rawResponse))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -108,15 +89,13 @@ object AnalysisTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
+                val rawRequest = args.string("request")
                     ?: return@addTool toolError("Missing required parameter: request")
-                val rawResponse = args["response"]?.jsonPrimitive?.contentOrNull
+                val rawResponse = args.string("response")
                     ?: return@addTool toolError("Missing required parameter: response")
-
                 val additionalValues = args["additional_values"].asStringList() ?: emptyList()
 
-                val bridge = bridges.analysis
-                toolJsonResult(bridge.findReflected(rawRequest, rawResponse, additionalValues))
+                toolJsonResult(analysis.findReflected(rawRequest, rawResponse, additionalValues))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -137,10 +116,9 @@ object AnalysisTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
+                val rawRequest = args.string("request")
                     ?: return@addTool toolError("Missing required parameter: request")
-                val bridge = bridges.analysis
-                toolJsonResult(bridge.extractParams(rawRequest))
+                toolJsonResult(analysis.extractParams(rawRequest))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -150,32 +128,36 @@ object AnalysisTools {
         server.addTool(
             name = "analyze_insertion_points",
             description = "Identify all potential injection/insertion points in an HTTP request. " +
-                "Returns URL parameters, body parameters, cookies, injectable headers " +
+                "Returns URL parameters, body parameters, JSON body leaves, cookies, injectable headers " +
                 "(User-Agent, Referer, X-Forwarded-For, etc.), and URL path segments. " +
                 "Parameters: request (string, raw HTTP request), host (string, target hostname), " +
-                "port (number, target port), use_tls (boolean, whether to use HTTPS).",
+                "port (number, target port), use_tls (boolean, whether to use HTTPS; default: port==443).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("request") { put("type", "string"); put("description", "Raw HTTP request") }
                     putJsonObject("host") { put("type", "string"); put("description", "Target hostname") }
-                    putJsonObject("port") { put("type", "integer"); put("description", "Target port") }
-                    putJsonObject("use_tls") { put("type", "boolean"); put("description", "Whether to use HTTPS") }
+                    putJsonObject("port") {
+                        put("type", "integer"); put("minimum", 1); put("maximum", 65535)
+                        put("description", "Target port")
+                    }
+                    putJsonObject("use_tls") { put("type", "boolean"); put("description", "Whether to use HTTPS (default: port==443)") }
                 },
                 required = listOf("request", "host", "port")
             )
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val rawRequest = args["request"]?.jsonPrimitive?.contentOrNull
+                val rawRequest = args.string("request")
                     ?: return@addTool toolError("Missing required parameter: request")
-                val host = args["host"]?.jsonPrimitive?.contentOrNull
+                if (rawRequest.isBlank()) return@addTool toolError("Empty request: provide a raw HTTP request.")
+                val host = args.string("host")
                     ?: return@addTool toolError("Missing required parameter: host")
-                val port = args["port"]?.jsonPrimitive?.intOrNull
+                val port = args["port"].asBoundedInt("port", 1, 65535)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid port") }
                     ?: return@addTool toolError("Missing required parameter: port")
-                val useTls = args["use_tls"]?.jsonPrimitive?.booleanOrNull ?: false
+                val useTls = args["use_tls"].asBooleanSafe() ?: (port == 443)
 
-                val bridge = bridges.analysis
-                toolJsonResult(bridge.getInsertionPoints(rawRequest, host, port, useTls))
+                toolJsonResult(analysis.getInsertionPoints(rawRequest, host, port, useTls))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -194,22 +176,25 @@ object AnalysisTools {
                 properties = buildJsonObject {
                     putJsonObject("item1") { put("type", "string"); put("description", "First raw HTTP message") }
                     putJsonObject("item2") { put("type", "string"); put("description", "Second raw HTTP message") }
-                    putJsonObject("type") { put("type", "string"); put("description", "'request' or 'response'") }
+                    putJsonObject("type") {
+                        put("type", "string")
+                        putJsonArray("enum") { DIFF_TYPES.forEach { add(it) } }
+                        put("description", "What item1 and item2 are")
+                    }
                 },
                 required = listOf("item1", "item2", "type")
             )
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val item1 = args["item1"]?.jsonPrimitive?.contentOrNull
+                val item1 = args.string("item1")
                     ?: return@addTool toolError("Missing required parameter: item1")
-                val item2 = args["item2"]?.jsonPrimitive?.contentOrNull
+                val item2 = args.string("item2")
                     ?: return@addTool toolError("Missing required parameter: item2")
-                val type = args["type"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: type ('request' or 'response')")
+                val type = args.string("type")
+                EnumValidation.error(type, DIFF_TYPES.toSet(), "type", required = true)?.let { return@addTool toolJsonResult(it) }
 
-                val bridge = bridges.analysis
-                toolJsonResult(bridge.diff(item1, item2, type))
+                toolJsonResult(analysis.diff(item1, item2, type.orEmpty().trim()))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -220,14 +205,18 @@ object AnalysisTools {
             name = "analyze_response_body_search",
             description = "Search response bodies across the proxy history for a regex pattern. " +
                 "Useful for finding sensitive data leaks, specific tokens, error messages, " +
-                "or patterns across all captured traffic. " +
+                "or patterns across all captured traffic. Matching is case-insensitive and time-bounded: " +
+                "a search that runs out of time returns what it found with incomplete=true. " +
                 "Parameters: pattern (string, regex pattern to search for), " +
                 "max_results (number, maximum matches to return; defaults to 50), " +
                 "in_scope_only (boolean, restrict to in-scope URLs; defaults to false).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("pattern") { put("type", "string"); put("description", "Regex pattern to search for") }
-                    putJsonObject("max_results") { put("type", "integer"); put("description", "Maximum matches to return (default 50)") }
+                    putJsonObject("max_results") {
+                        put("type", "integer"); put("minimum", 1); put("maximum", AnalysisBridge.SEARCH_MAX_RESULTS)
+                        put("description", "Maximum matches to return (default 50, at most ${AnalysisBridge.SEARCH_MAX_RESULTS})")
+                    }
                     putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Restrict to in-scope URLs (default false)") }
                 },
                 required = listOf("pattern")
@@ -235,17 +224,19 @@ object AnalysisTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val pattern = args["pattern"]?.jsonPrimitive?.contentOrNull
+                val pattern = args.string("pattern")
                     ?: return@addTool toolError("Missing required parameter: pattern")
-                val maxResults = args["max_results"]?.jsonPrimitive?.intOrNull ?: 50
-                val inScopeOnly = args["in_scope_only"]?.jsonPrimitive?.booleanOrNull ?: false
+                if (pattern.isEmpty()) return@addTool toolError("Parameter 'pattern' must not be empty")
+                val maxResults = args["max_results"].asBoundedInt("max_results", 1, AnalysisBridge.SEARCH_MAX_RESULTS)
+                    .getOrElse { return@addTool toolError(it.message ?: "Invalid max_results") } ?: 50
+                val inScopeOnly = args["in_scope_only"].asBooleanSafe() ?: false
 
-                val bridge = bridges.analysis
-                toolJsonResult(bridge.searchResponseBodies(pattern, maxResults, inScopeOnly))
+                toolJsonResult(analysis.searchResponseBodies(pattern, maxResults, inScopeOnly))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
         }
     }
 
+    private fun Map<String, JsonElement>.string(name: String): String? = (this[name] as? JsonPrimitive)?.contentOrNull
 }
