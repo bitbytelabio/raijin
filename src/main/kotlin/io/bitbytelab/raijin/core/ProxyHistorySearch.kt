@@ -114,6 +114,72 @@ object StatusCodeRange {
 }
 
 /**
+ * Pure per-item decision for `proxy_history`'s host / method / status filters, extracted from
+ * [io.bitbytelab.raijin.bridge.ProxyBridge.getHistory] so it is unit-testable without Montoya.
+ *
+ * Every set criterion must hold. An item lacking the data a criterion needs (no response, a
+ * request Burp cannot parse) never satisfies it: a status filter must not return items that have
+ * no response at all.
+ */
+data class HistoryCriteria(
+    val host: String? = null,
+    val method: String? = null,
+    val statusCode: Int? = null,
+    val statusRange: StatusCodeRange.Range? = null,
+) {
+    /** True when [matches] needs the item's status code (so callers only read it then). */
+    val needsStatus: Boolean get() = statusCode != null || statusRange != null
+
+    /** [host], [method] and [status] are the item's values, null when absent or unparseable. */
+    fun matches(host: String?, method: String?, status: Int?): Boolean {
+        if (this.host != null && (host == null || !host.contains(this.host, ignoreCase = true))) return false
+        if (this.method != null && (method == null || !method.equals(this.method, ignoreCase = true))) return false
+        if (statusCode != null && status != statusCode) return false
+        if (statusRange != null && (status == null || !statusRange.contains(status))) return false
+        return true
+    }
+}
+
+/**
+ * Pure filter logic for the proxy WebSocket history tools, extracted from
+ * [io.bitbytelab.raijin.bridge.ProxyBridge.getWebSocketHistory]. An unknown direction is an
+ * error rather than a silently dropped filter, and a host filter never matches a message whose
+ * upgrade host is unknown.
+ */
+data class WebSocketHistoryCriteria(val host: String? = null, val direction: String? = null) {
+
+    /** [upgradeHost] is null when unknown; [direction] is a Montoya `Direction` constant name. */
+    fun matches(upgradeHost: String?, direction: String?): Boolean {
+        if (host != null && (upgradeHost == null || !upgradeHost.contains(host, ignoreCase = true))) return false
+        if (this.direction != null && direction != this.direction) return false
+        return true
+    }
+
+    /** Result of parsing a caller-supplied direction filter. */
+    sealed interface DirectionFilter {
+        /** No filter: null, blank or "both". */
+        object All : DirectionFilter
+        /** Only messages travelling in [name] (a Montoya `Direction` constant name). */
+        data class Only(val name: String) : DirectionFilter
+        data class Invalid(val message: String) : DirectionFilter
+    }
+
+    companion object {
+        private val DIRECTIONS = setOf("CLIENT_TO_SERVER", "SERVER_TO_CLIENT")
+
+        /** Parses `client_to_server` / `server_to_client` / `both`, case-insensitively. */
+        fun parseDirection(input: String?): DirectionFilter {
+            val normalized = input?.trim()?.uppercase()
+            if (normalized.isNullOrEmpty() || normalized == "BOTH") return DirectionFilter.All
+            if (normalized in DIRECTIONS) return DirectionFilter.Only(normalized)
+            return DirectionFilter.Invalid(
+                "Invalid direction: '$input'. Use 'client_to_server', 'server_to_client' or 'both'"
+            )
+        }
+    }
+}
+
+/**
  * Pure decision logic for `proxy_annotate`'s `highlight` argument. Extracted from
  * [io.bitbytelab.raijin.bridge.ProxyBridge.annotateHistoryItem] so it is unit-testable
  * without Montoya.

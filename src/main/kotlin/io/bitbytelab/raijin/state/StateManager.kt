@@ -124,13 +124,16 @@ data class SessionRule(
  * Tracks a live WebSocket connection created through Burp's proxy or
  * programmatically via the WebSocket bridge.
  *
+ * Messages live in a bounded buffer (the newest [MAX_MESSAGES]). [append] allocates the next index
+ * and stores the message under one lock, so retained indices are contiguous and in order and a
+ * `since_index` poller can never skip a frame that a concurrent writer is still recording.
+ *
  * @property connectionId Unique identifier (e.g. "ws-001").
  * @property url The WebSocket URL.
  * @property createdAt ISO-8601 timestamp of connection creation.
- * @property status Current status: "connected", "closed", or "error".
+ * @property status Current status: "connected" or "closed".
  * @property messagesSent Counter of messages sent through this connection.
  * @property messagesReceived Counter of messages received on this connection.
- * @property messages Ordered list of messages exchanged on this connection.
  */
 data class WebSocketConnection(
     val connectionId: String,
@@ -139,44 +142,89 @@ data class WebSocketConnection(
     @Volatile var status: String = "connected",
     val messagesSent: AtomicLong = AtomicLong(0),
     val messagesReceived: AtomicLong = AtomicLong(0),
-    val messages: java.util.ArrayDeque<WebSocketMessage> = java.util.ArrayDeque()
 ) {
-    /** Appends [message] under monitor lock, evicting the oldest beyond [MAX_MESSAGES]. */
-    fun record(message: WebSocketMessage) {
-        synchronized(this) {
-            messages.addLast(message)
-            while (messages.size > MAX_MESSAGES) {
-                messages.removeFirst()
-            }
-        }
+    /** Retained messages, oldest first. Guarded by `this`. */
+    private val messages = java.util.ArrayDeque<WebSocketMessage>()
+
+    /** Index the next appended message gets. Guarded by `this`. */
+    private var nextIndex = 0L
+
+    /** Records a message under the next index, evicting the oldest beyond [MAX_MESSAGES]. */
+    fun append(direction: String, type: String, payload: String, length: Int): WebSocketMessage = synchronized(this) {
+        val message = WebSocketMessage(nextIndex, direction, type, payload, length, Instant.now().toString())
+        nextIndex++
+        messages.addLast(message)
+        if (messages.size > MAX_MESSAGES) messages.removeFirst()
+        message
     }
 
-    /** Atomically allocates the next monotonic index and records the built message in index order. */
-    fun recordIndexed(counter: AtomicLong, buildMessage: (Long) -> WebSocketMessage): WebSocketMessage {
-        synchronized(this) {
-            val idx = counter.getAndIncrement()
-            val msg = buildMessage(idx)
-            messages.addLast(msg)
-            while (messages.size > MAX_MESSAGES) {
-                messages.removeFirst()
-            }
-            return msg
+    /**
+     * Up to [limit] retained messages with an index greater than [sinceIndex], optionally only those
+     * in [direction], read under the same lock as [append] so the page and its window agree. Only
+     * the returned messages are copied.
+     */
+    fun page(sinceIndex: Long, limit: Int, direction: String? = null): WebSocketMessagePage = synchronized(this) {
+        val oldest = nextIndex - messages.size
+        // Indices are contiguous from `oldest`, so already-seen messages are skipped by position.
+        val skip = when {
+            sinceIndex < oldest -> 0
+            sinceIndex >= nextIndex - 1 -> messages.size
+            else -> (sinceIndex - oldest + 1).toInt()
         }
+        val out = ArrayList<WebSocketMessage>()
+        var hasMore = false
+        val iterator = messages.iterator()
+        repeat(skip) { iterator.next() }
+        while (iterator.hasNext()) {
+            val message = iterator.next()
+            if (direction != null && message.direction != direction) continue
+            if (out.size >= limit) {
+                hasMore = true
+                break
+            }
+            out.add(message)
+        }
+        val missed = if (sinceIndex < oldest - 1) oldest - 1 - maxOf(sinceIndex, -1L) else 0L
+        WebSocketMessagePage(out, oldest, nextIndex, messages.size, missed, hasMore)
     }
-
-    fun snapshotMessages(): List<WebSocketMessage> = synchronized(this) { messages.toList() }
 
     fun messageCount(): Int = synchronized(this) { messages.size }
+
+    /** Sets [status] to "closed"; true only for the call that actually closed it. */
+    fun markClosed(): Boolean = synchronized(this) {
+        if (status == "closed") false else {
+            status = "closed"
+            true
+        }
+    }
 
     companion object { const val MAX_MESSAGES = 2000 }
 }
 
 /**
+ * One page read by [WebSocketConnection.page].
+ *
+ * @property oldestIndex Index of the oldest retained message (equals [nextIndex] when none is retained).
+ * @property nextIndex Index the next recorded message will get.
+ * @property retained Number of messages currently retained.
+ * @property missed Messages after the caller's `since_index` that were evicted before this read.
+ * @property hasMore True when more messages matching the filter follow the last one returned.
+ */
+data class WebSocketMessagePage(
+    val messages: List<WebSocketMessage>,
+    val oldestIndex: Long,
+    val nextIndex: Long,
+    val retained: Int,
+    val missed: Long,
+    val hasMore: Boolean,
+)
+
+/**
  * A single WebSocket message within a [WebSocketConnection].
  *
- * @property index Zero-based index within the connection's message list.
+ * @property index Monotonic index within the connection, assigned by [WebSocketConnection.append].
  * @property direction "client_to_server" or "server_to_client".
- * @property type "TEXT" or "BINARY".
+ * @property type "TEXT" or "BINARY"; "TEXT_DROPPED"/"BINARY_DROPPED" when an intercept rule dropped a proxied frame.
  * @property payload The message content (binary payloads are base64-encoded).
  * @property length Length of the payload in bytes.
  * @property timestamp ISO-8601 timestamp of when the message was observed.
@@ -282,7 +330,7 @@ data class AutorizeRule(
     val methods: Set<String>? = null,
     val ignoreStaticAssets: Boolean = true,
     val similarityThreshold: Double = 90.0,
-    var enabled: Boolean = true,
+    @Volatile var enabled: Boolean = true,
     val createdAt: String = Instant.now().toString(),
 )
 
@@ -469,7 +517,7 @@ class StateManager {
 
     /**
      * Dedup guard so a repeatedly-hit endpoint isn't replayed on every single proxied request.
-     * Keyed by "ruleId|method|path". A crude cap-and-clear (rather than an LRU) is enough here:
+     * Keyed by [autorizeSeenKey]. A crude cap-and-clear (rather than an LRU) is enough here:
      * a full reset just means some endpoints get retested, which is harmless.
      */
     private val autorizeSeen = ConcurrentHashMap<String, Long>()
@@ -602,9 +650,12 @@ class StateManager {
      * collisions with subsequent live entries.
      */
     fun restoreMcpActivity(entries: List<McpActivityEntry>) {
+        var room = maxMcpActivityEntries - mcpActivityCount.get()
         for (e in entries) {
-            if (mcpActivity.size >= maxMcpActivityEntries) break
+            if (room <= 0) break
             mcpActivity.addLast(e)
+            mcpActivityCount.incrementAndGet()
+            room--
         }
         val maxId = entries.maxOfOrNull { it.id } ?: 0L
         if (maxId > mcpActivityIdCounter.get()) mcpActivityIdCounter.set(maxId)
@@ -625,17 +676,7 @@ class StateManager {
      * and allow garbage collection.
      */
     fun cleanup() {
-        proxyRules.clear()
-        trafficRules.clear()
-        sessionRules.clear()
-        websocketConnections.clear()
-        scanTasks.clear()
-        collaboratorClients.clear()
-        findings.clear()
-        findingsListeners.clear()
-        findingsRemoveListeners.clear()
-        registeredScanChecks.clear()
-        // Deregister any live scan checks before dropping their handles so
+        // Deregister live Burp registrations before dropping their handles so
         // they don't keep running after the extension unloads.
         scanCheckRegistrations.values.forEach { reg ->
             try { reg.deregister() } catch (_: Exception) {}
@@ -645,11 +686,30 @@ class StateManager {
             try { reg.deregister() } catch (_: Exception) {}
         }
         intruderRegistrations.clear()
+        registeredScanChecks.clear()
         registeredPayloadProcessors.clear()
+        proxyRules.clear()
+        trafficRules.clear()
+        sessionRules.clear()
+        websocketConnections.clear()
         websocketInterceptRules.clear()
+        scanTasks.clear()
+        collaboratorClients.clear()
+        findings.clear()
+        findingsListeners.clear()
+        findingsRemoveListeners.clear()
         mcpActivity.clear()
+        mcpActivityCount.set(0)
         mcpActivityListeners.clear()
         autorizeRules.clear()
         autorizeMatches.clear()
+        autorizeMatchCount.set(0)
+        autorizeSeen.clear()
+    }
+
+    companion object {
+        /** Dedup key for one Autorize replay: rule, method and URL without its query string. */
+        fun autorizeSeenKey(ruleId: String, method: String, url: String): String =
+            "$ruleId|${method.uppercase()}|${url.substringBefore('?')}"
     }
 }

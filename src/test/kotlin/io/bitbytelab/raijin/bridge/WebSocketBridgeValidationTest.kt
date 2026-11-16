@@ -98,6 +98,12 @@ class WebSocketBridgeValidationTest {
     }
 
     @Test
+    fun `both and upper-case directions are accepted, as for the proxy history tools`() {
+        assertNull(WebSocketBridge.validateDirectionFilter("both"))
+        assertNull(WebSocketBridge.validateDirectionFilter("SERVER_TO_CLIENT"))
+    }
+
+    @Test
     fun `unknown direction is rejected with a clear message`() {
         val err = WebSocketBridge.validateDirectionFilter("sideways")
         assertNotNull(err)
@@ -118,6 +124,14 @@ class WebSocketBridgeValidationTest {
     fun `zero and positive max_results are accepted`() {
         assertNull(WebSocketBridge.validateMaxResults(0))
         assertNull(WebSocketBridge.validateMaxResults(100))
+    }
+
+    @Test
+    fun `since_index below -1 is rejected, -1 and above are accepted`() {
+        assertNotNull(WebSocketBridge.validateSinceIndex(-2))
+        assertNull(WebSocketBridge.validateSinceIndex(-1))
+        assertNull(WebSocketBridge.validateSinceIndex(0))
+        assertNull(WebSocketBridge.validateSinceIndex(Long.MAX_VALUE))
     }
 
     @Test

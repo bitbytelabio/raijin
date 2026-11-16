@@ -2,11 +2,14 @@ package io.bitbytelab.raijin.tools.proxy
 
 import io.bitbytelab.raijin.bridge.ProxyBridge
 import io.bitbytelab.raijin.core.EnumValidation
+import io.bitbytelab.raijin.core.asLongSafe
+import io.bitbytelab.raijin.core.asStringMap
 import io.bitbytelab.raijin.state.ProxyRule
 import io.bitbytelab.raijin.state.StateManager
+import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
@@ -19,6 +22,14 @@ import kotlinx.serialization.json.*
  */
 object ProxyTools {
 
+    private val HIGHLIGHT_COLORS = listOf("NONE", "RED", "ORANGE", "YELLOW", "GREEN", "CYAN", "BLUE", "PINK", "MAGENTA", "GRAY")
+    private val RULE_ACTIONS = listOf("modify", "drop", "tag")
+    private val WS_DIRECTIONS = listOf("client_to_server", "server_to_client", "both")
+    private val SEARCH_TARGETS = listOf("url", "request", "response", "both")
+
+    private const val MATCH_HOST_DESCRIPTION =
+        "Host to match: a glob such as '*.example.com' or a regex such as '.*\\.example\\.com' (whole host, case-insensitive)"
+
     fun register(server: Server, bridge: ProxyBridge, stateManager: StateManager) {
 
         // ---------------------------------------------------------------
@@ -29,47 +40,39 @@ object ProxyTools {
             description = "Get HTTP proxy history entries with optional filtering by host, method, status code, status code range, MIME type. Returns request/response metadata and optionally full request/response text.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("start_index") { put("type", "integer"); put("description", "Start index of history entries (default 0)") }
-                    putJsonObject("count") { put("type", "integer"); put("description", "Maximum number of entries to return (default 100)") }
-                    putJsonObject("host") { put("type", "string"); put("description", "Filter by host") }
+                    intProp("start_index", "Start index of history entries (default 0)", min = 0)
+                    intProp("count", "Maximum number of entries to return (default 100, max ${ProxyBridge.MAX_PAGE_SIZE}; 0 returns only total_filtered)", min = 0, max = ProxyBridge.MAX_PAGE_SIZE)
+                    putJsonObject("host") { put("type", "string"); put("description", "Filter by host (case-insensitive substring)") }
                     putJsonObject("method") { put("type", "string"); put("description", "Filter by HTTP method") }
-                    putJsonObject("status_code") { put("type", "integer"); put("description", "Filter by exact status code") }
-                    putJsonObject("status_code_range") { put("type", "string"); put("description", "Filter by status code range") }
+                    intProp("status_code", "Filter by exact status code; items without a response never match", min = 0, max = 999)
+                    putJsonObject("status_code_range") { put("type", "string"); put("description", "Filter by status code range: '200-299', '400-', '-399' or '404'; items without a response never match") }
                     putJsonObject("mime_type") { put("type", "string"); put("description", "Filter by MIME type") }
                     putJsonObject("include_request") { put("type", "boolean"); put("description", "Include full request text (default false). Also unmasks sensitive request header values (Cookie, Authorization, …) which are otherwise redacted in request_headers") }
                     putJsonObject("include_response") { put("type", "boolean"); put("description", "Include full response text (default false)") }
                     putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Restrict to in-scope items (default false)") }
-                    putJsonObject("max_response_length") { put("type", "integer"); put("description", "Truncate response text to this length") }
+                    intProp("max_response_length", "Truncate request/response text to this many characters (default 200000)", min = 1)
                 },
                 required = emptyList()
             )
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val startIndex = args["start_index"]?.jsonPrimitive?.intOrNull ?: 0
-                val count = args["count"]?.jsonPrimitive?.intOrNull ?: 100
-                val host = args["host"]?.jsonPrimitive?.contentOrNull
-                val method = args["method"]?.jsonPrimitive?.contentOrNull
-                val statusCode = args["status_code"]?.jsonPrimitive?.intOrNull
-                val statusCodeRange = args["status_code_range"]?.jsonPrimitive?.contentOrNull
-                val mimeType = args["mime_type"]?.jsonPrimitive?.contentOrNull
-                val includeRequest = args["include_request"]?.jsonPrimitive?.booleanOrNull ?: false
-                val includeResponse = args["include_response"]?.jsonPrimitive?.booleanOrNull ?: false
-                val inScopeOnly = args["in_scope_only"]?.jsonPrimitive?.booleanOrNull ?: false
-                val maxResponseLength = args["max_response_length"]?.jsonPrimitive?.intOrNull
-
                 val result = bridge.getHistory(
-                    startIndex, count, host, method, statusCode, mimeType,
-                    inScopeOnly, includeRequest, includeResponse, statusCodeRange, maxResponseLength
+                    startIndex = args.int("start_index", 0..Int.MAX_VALUE) ?: 0,
+                    count = args.int("count", 0..ProxyBridge.MAX_PAGE_SIZE) ?: 100,
+                    host = args.string("host"),
+                    method = args.string("method"),
+                    statusCode = args.int("status_code", 0..999),
+                    mimeType = args.string("mime_type"),
+                    inScopeOnly = args.bool("in_scope_only", false),
+                    includeRequest = args.bool("include_request", false),
+                    includeResponse = args.bool("include_response", false),
+                    statusCodeRange = args.string("status_code_range"),
+                    maxResponseLength = args.int("max_response_length", 1..Int.MAX_VALUE),
                 )
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(result)
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent(buildJsonObject {
-                        put("error", e.message ?: "Unknown error")
-                    }.toString())),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -82,13 +85,13 @@ object ProxyTools {
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("pattern") { put("type", "string"); put("description", "Regex pattern to search for") }
-                    putJsonObject("search_in") { put("type", "string"); put("description", "Where to search: 'url', 'request', 'response', or 'both' (default 'both' = url+request+response)") }
+                    enumProp("search_in", SEARCH_TARGETS, "Where to search: 'url', 'request', 'response', or 'both' (default 'both' = url+request+response)")
                     putJsonObject("case_sensitive") { put("type", "boolean"); put("description", "Case-sensitive matching (default false)") }
-                    putJsonObject("max_results") { put("type", "integer"); put("description", "Maximum number of results (default 100)") }
+                    intProp("max_results", "Maximum number of results (default 100, max ${ProxyBridge.MAX_PAGE_SIZE})", min = 0, max = ProxyBridge.MAX_PAGE_SIZE)
                     putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Restrict to in-scope items (default false)") }
                     putJsonObject("include_request") { put("type", "boolean"); put("description", "Include full request text (default false). Also unmasks sensitive request header values (Cookie, Authorization, …) which are otherwise redacted in request_headers") }
                     putJsonObject("include_response") { put("type", "boolean"); put("description", "Include full response text (default false)") }
-                    putJsonObject("max_response_length") { put("type", "integer"); put("description", "Truncate response text to this length") }
+                    intProp("max_response_length", "Truncate request/response text to this many characters (default 200000)", min = 1)
                 },
                 required = listOf("pattern")
             )
@@ -96,34 +99,27 @@ object ProxyTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
 
-                val pattern = args["pattern"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent(buildJsonObject {
-                            put("error", "Parameter 'pattern' is required")
-                        }.toString())),
-                        isError = true
-                    )
-
-                val searchIn = args["search_in"]?.jsonPrimitive?.contentOrNull ?: "both"
-                val caseSensitive = args["case_sensitive"]?.jsonPrimitive?.booleanOrNull ?: false
-                val maxResults = args["max_results"]?.jsonPrimitive?.intOrNull ?: 100
-                val inScopeOnly = args["in_scope_only"]?.jsonPrimitive?.booleanOrNull ?: false
-                val includeRequest = args["include_request"]?.jsonPrimitive?.booleanOrNull ?: false
-                val includeResponse = args["include_response"]?.jsonPrimitive?.booleanOrNull ?: false
-                val maxResponseLength = args["max_response_length"]?.jsonPrimitive?.intOrNull
+                val pattern = args.string("pattern")
+                    ?: return@addTool toolError("Parameter 'pattern' is required")
+                val searchIn = args.string("search_in") ?: "both"
+                // "all" is accepted as an alias of "both".
+                EnumValidation.error(searchIn, SEARCH_TARGETS.toSet() + "all", "search_in")?.let {
+                    return@addTool toolJsonResult(it)
+                }
 
                 val result = bridge.searchHistory(
-                    pattern, searchIn, caseSensitive, maxResults, inScopeOnly,
-                    includeRequest, includeResponse, maxResponseLength
+                    pattern = pattern,
+                    searchIn = searchIn,
+                    caseSensitive = args.bool("case_sensitive", false),
+                    maxResults = args.int("max_results", 0..ProxyBridge.MAX_PAGE_SIZE) ?: 100,
+                    inScopeOnly = args.bool("in_scope_only", false),
+                    includeRequest = args.bool("include_request", false),
+                    includeResponse = args.bool("include_response", false),
+                    maxResponseLength = args.int("max_response_length", 1..Int.MAX_VALUE),
                 )
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(result)
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent(buildJsonObject {
-                        put("error", e.message ?: "Unknown error")
-                    }.toString())),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -132,33 +128,28 @@ object ProxyTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "proxy_websocket_history",
-            description = "Get WebSocket proxy history entries with optional filtering by host and direction (CLIENT_TO_SERVER or SERVER_TO_CLIENT).",
+            description = "Get WebSocket proxy history entries with optional filtering by host and direction (client_to_server or server_to_client).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("start_index") { put("type", "integer"); put("description", "Start index of history entries (default 0)") }
-                    putJsonObject("count") { put("type", "integer"); put("description", "Maximum number of entries to return (default 100)") }
-                    putJsonObject("host") { put("type", "string"); put("description", "Filter by host") }
-                    putJsonObject("direction") { put("type", "string"); put("description", "Filter by direction (CLIENT_TO_SERVER or SERVER_TO_CLIENT)") }
+                    intProp("start_index", "Start index of history entries (default 0)", min = 0)
+                    intProp("count", "Maximum number of entries to return (default 100, max ${ProxyBridge.MAX_PAGE_SIZE})", min = 0, max = ProxyBridge.MAX_PAGE_SIZE)
+                    putJsonObject("host") { put("type", "string"); put("description", "Filter by upgrade host (case-insensitive substring)") }
+                    enumProp("direction", WS_DIRECTIONS, "Direction filter (case-insensitive): 'client_to_server', 'server_to_client', or 'both' (default, no filter)")
                 },
                 required = emptyList()
             )
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val startIndex = args["start_index"]?.jsonPrimitive?.intOrNull ?: 0
-                val count = args["count"]?.jsonPrimitive?.intOrNull ?: 100
-                val host = args["host"]?.jsonPrimitive?.contentOrNull
-                val direction = args["direction"]?.jsonPrimitive?.contentOrNull
-
-                val result = bridge.getWebSocketHistory(startIndex, count, host, direction)
-                CallToolResult(content = listOf(TextContent(result.toString())))
-            } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent(buildJsonObject {
-                        put("error", e.message ?: "Unknown error")
-                    }.toString())),
-                    isError = true
+                val result = bridge.getWebSocketHistory(
+                    startIndex = args.int("start_index", 0..Int.MAX_VALUE) ?: 0,
+                    count = args.int("count", 0..ProxyBridge.MAX_PAGE_SIZE) ?: 100,
+                    host = args.string("host"),
+                    direction = args.string("direction"),
                 )
+                toolJsonResult(result)
+            } catch (e: Exception) {
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -171,8 +162,8 @@ object ProxyTools {
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("pattern") { put("type", "string"); put("description", "Regex pattern to search message payloads") }
-                    putJsonObject("direction") { put("type", "string"); put("description", "Filter by direction (CLIENT_TO_SERVER or SERVER_TO_CLIENT)") }
-                    putJsonObject("max_results") { put("type", "integer"); put("description", "Maximum number of results (default 100)") }
+                    enumProp("direction", WS_DIRECTIONS, "Direction filter (case-insensitive): 'client_to_server', 'server_to_client', or 'both' (default, no filter)")
+                    intProp("max_results", "Maximum number of results (default 100, max ${ProxyBridge.MAX_PAGE_SIZE})", min = 0, max = ProxyBridge.MAX_PAGE_SIZE)
                 },
                 required = listOf("pattern")
             )
@@ -180,26 +171,17 @@ object ProxyTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
 
-                val pattern = args["pattern"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent(buildJsonObject {
-                            put("error", "Parameter 'pattern' is required")
-                        }.toString())),
-                        isError = true
-                    )
+                val pattern = args.string("pattern")
+                    ?: return@addTool toolError("Parameter 'pattern' is required")
 
-                val direction = args["direction"]?.jsonPrimitive?.contentOrNull
-                val maxResults = args["max_results"]?.jsonPrimitive?.intOrNull ?: 100
-
-                val result = bridge.searchWebSocketHistory(pattern, direction, maxResults)
-                CallToolResult(content = listOf(TextContent(result.toString())))
-            } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent(buildJsonObject {
-                        put("error", e.message ?: "Unknown error")
-                    }.toString())),
-                    isError = true
+                val result = bridge.searchWebSocketHistory(
+                    pattern = pattern,
+                    direction = args.string("direction"),
+                    maxResults = args.int("max_results", 0..ProxyBridge.MAX_PAGE_SIZE) ?: 100,
                 )
+                toolJsonResult(result)
+            } catch (e: Exception) {
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -212,15 +194,9 @@ object ProxyTools {
             inputSchema = ToolSchema(properties = buildJsonObject {}, required = emptyList())
         ) { _ ->
             try {
-                val result = bridge.enableIntercept()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.enableIntercept())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent(buildJsonObject {
-                        put("error", e.message ?: "Unknown error")
-                    }.toString())),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -233,15 +209,9 @@ object ProxyTools {
             inputSchema = ToolSchema(properties = buildJsonObject {}, required = emptyList())
         ) { _ ->
             try {
-                val result = bridge.disableIntercept()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.disableIntercept())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent(buildJsonObject {
-                        put("error", e.message ?: "Unknown error")
-                    }.toString())),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -254,15 +224,9 @@ object ProxyTools {
             inputSchema = ToolSchema(properties = buildJsonObject {}, required = emptyList())
         ) { _ ->
             try {
-                val result = bridge.isInterceptEnabled()
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.isInterceptEnabled())
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent(buildJsonObject {
-                        put("error", e.message ?: "Unknown error")
-                    }.toString())),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -274,9 +238,9 @@ object ProxyTools {
             description = "Annotate a proxy history item by setting a comment and/or highlight color. Highlight colors: NONE, RED, ORANGE, YELLOW, GREEN, CYAN, BLUE, PINK, MAGENTA, GRAY.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("index") { put("type", "integer"); put("description", "Proxy history item ID") }
+                    intProp("index", "Proxy history item ID", min = 0)
                     putJsonObject("comment") { put("type", "string"); put("description", "Comment to set on the item") }
-                    putJsonObject("highlight") { put("type", "string"); put("description", "Highlight color (NONE, RED, ORANGE, YELLOW, GREEN, CYAN, BLUE, PINK, MAGENTA, GRAY)") }
+                    enumProp("highlight", HIGHLIGHT_COLORS, "Highlight color (case-insensitive); NONE clears it")
                 },
                 required = listOf("index")
             )
@@ -284,26 +248,12 @@ object ProxyTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
 
-                val index = args["index"]?.jsonPrimitive?.intOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent(buildJsonObject {
-                            put("error", "Parameter 'index' is required (proxy history item ID)")
-                        }.toString())),
-                        isError = true
-                    )
+                val index = args.int("index", 0..Int.MAX_VALUE)
+                    ?: return@addTool toolError("Parameter 'index' is required (proxy history item ID)")
 
-                val comment = args["comment"]?.jsonPrimitive?.contentOrNull
-                val highlight = args["highlight"]?.jsonPrimitive?.contentOrNull
-
-                val result = bridge.annotateHistoryItem(index, comment, highlight)
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.annotateHistoryItem(index, args.string("comment"), args.string("highlight")))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent(buildJsonObject {
-                        put("error", e.message ?: "Unknown error")
-                    }.toString())),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -316,19 +266,19 @@ object ProxyTools {
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("rule_id") { put("type", "string"); put("description", "Rule ID; auto-generated if omitted") }
-                    putJsonObject("action") { put("type", "string"); put("description", "Action: 'modify', 'drop', or 'tag'") }
-                    putJsonObject("match_host") { put("type", "string"); put("description", "Regex to match against host") }
-                    putJsonObject("match_url") { put("type", "string"); put("description", "Regex to match against URL") }
-                    putJsonObject("match_method") { put("type", "string"); put("description", "Regex to match against HTTP method") }
-                    putJsonObject("match_header") { put("type", "string"); put("description", "Regex to match against headers") }
-                    putJsonObject("match_body") { put("type", "string"); put("description", "Regex to match against body") }
-                    putJsonObject("modify_add_header") { put("type", "string"); put("description", "Header to add when action is 'modify'") }
-                    putJsonObject("modify_remove_header") { put("type", "string"); put("description", "Header to remove when action is 'modify'") }
+                    enumProp("action", RULE_ACTIONS, "Action: 'modify', 'drop', or 'tag'")
+                    putJsonObject("match_host") { put("type", "string"); put("description", MATCH_HOST_DESCRIPTION) }
+                    putJsonObject("match_url") { put("type", "string"); put("description", "Regex (case-insensitive) searched in the full URL") }
+                    putJsonObject("match_method") { put("type", "string"); put("description", "HTTP method to match (exact, case-insensitive)") }
+                    putJsonObject("match_header") { put("type", "string"); put("description", "Regex (case-insensitive) searched in the 'Name: value' header lines") }
+                    putJsonObject("match_body") { put("type", "string"); put("description", "Regex (case-insensitive) searched in the body") }
+                    putJsonObject("modify_add_header") { put("type", "string"); put("description", "Header to add when action is 'modify', as one 'Name: Value' line") }
+                    putJsonObject("modify_remove_header") { put("type", "string"); put("description", "Header name to remove when action is 'modify'") }
                     putJsonObject("modify_replace_header") { put("type", "object"); put("description", "Map of header names to replacement values") }
-                    putJsonObject("modify_body_regex") { put("type", "string"); put("description", "Regex for body replacement") }
-                    putJsonObject("modify_body_replacement") { put("type", "string"); put("description", "Replacement for body regex matches") }
+                    putJsonObject("modify_body_regex") { put("type", "string"); put("description", "Regex for body replacement (requires modify_body_replacement)") }
+                    putJsonObject("modify_body_replacement") { put("type", "string"); put("description", "Replacement for body regex matches (\"\" deletes them)") }
                     putJsonObject("tag_comment") { put("type", "string"); put("description", "Comment to attach when action is 'tag'") }
-                    putJsonObject("tag_highlight") { put("type", "string"); put("description", "Highlight color when action is 'tag'") }
+                    enumProp("tag_highlight", HIGHLIGHT_COLORS, "Highlight color when action is 'tag'")
                     putJsonObject("enabled") { put("type", "boolean"); put("description", "Whether the rule is active (default true)") }
                 },
                 required = listOf("action")
@@ -336,64 +286,11 @@ object ProxyTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-
-                val ruleId = args["rule_id"]?.jsonPrimitive?.contentOrNull
-                    ?: stateManager.generateId("prule")
-
-                val action = args["action"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent(buildJsonObject {
-                            put("error", "Parameter 'action' is required ('modify', 'drop', or 'tag')")
-                        }.toString())),
-                        isError = true
-                    )
-
-                EnumValidation.error(action, setOf("modify", "drop", "tag"), "action")?.let {
-                    return@addTool CallToolResult(content = listOf(TextContent(it.toString())), isError = true)
-                }
-
-                val replaceHeader = args["modify_replace_header"]?.jsonObject?.let { obj ->
-                    obj.entries.associate { (k, v) -> k to v.jsonPrimitive.content }
-                }
-
-                val rule = ProxyRule(
-                    ruleId = ruleId,
-                    type = "request",
-                    matchHost = args["match_host"]?.jsonPrimitive?.contentOrNull,
-                    matchUrl = args["match_url"]?.jsonPrimitive?.contentOrNull,
-                    matchMethod = args["match_method"]?.jsonPrimitive?.contentOrNull,
-                    matchHeader = args["match_header"]?.jsonPrimitive?.contentOrNull,
-                    matchBody = args["match_body"]?.jsonPrimitive?.contentOrNull,
-                    matchStatus = null,
-                    action = action,
-                    modifyAddHeader = args["modify_add_header"]?.jsonPrimitive?.contentOrNull,
-                    modifyRemoveHeader = args["modify_remove_header"]?.jsonPrimitive?.contentOrNull,
-                    modifyReplaceHeader = replaceHeader,
-                    modifyBodyRegex = args["modify_body_regex"]?.jsonPrimitive?.contentOrNull,
-                    modifyBodyReplacement = args["modify_body_replacement"]?.jsonPrimitive?.contentOrNull,
-                    tagComment = args["tag_comment"]?.jsonPrimitive?.contentOrNull,
-                    tagHighlight = args["tag_highlight"]?.jsonPrimitive?.contentOrNull,
-                    enabled = args["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
-                )
-
-                // Remove existing rule with same ID, then add the new one
-                stateManager.proxyRules.removeIf { it.ruleId == ruleId }
-                stateManager.proxyRules.add(rule)
-
-                CallToolResult(content = listOf(TextContent(buildJsonObject {
-                    put("rule_set", true)
-                    put("rule_id", ruleId)
-                    put("type", "request")
-                    put("action", action)
-                    put("total_rules", stateManager.proxyRules.size)
-                }.toString())))
+                val rule = buildRule(args, "request", stateManager)
+                    ?: return@addTool toolError("A rule action is required: 'modify', 'drop', or 'tag'")
+                toolJsonResult(bridge.setRule(rule))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent(buildJsonObject {
-                        put("error", e.message ?: "Unknown error")
-                    }.toString())),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -406,19 +303,19 @@ object ProxyTools {
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("rule_id") { put("type", "string"); put("description", "Rule ID; auto-generated if omitted") }
-                    putJsonObject("action") { put("type", "string"); put("description", "Action: 'modify', 'drop', or 'tag'") }
-                    putJsonObject("match_host") { put("type", "string"); put("description", "Regex to match against host") }
-                    putJsonObject("match_url") { put("type", "string"); put("description", "Regex to match against URL") }
-                    putJsonObject("match_header") { put("type", "string"); put("description", "Regex to match against headers") }
-                    putJsonObject("match_body") { put("type", "string"); put("description", "Regex to match against body") }
-                    putJsonObject("match_status") { put("type", "integer"); put("description", "Status code to match") }
-                    putJsonObject("modify_add_header") { put("type", "string"); put("description", "Header to add when action is 'modify'") }
-                    putJsonObject("modify_remove_header") { put("type", "string"); put("description", "Header to remove when action is 'modify'") }
+                    enumProp("action", RULE_ACTIONS, "Action: 'modify', 'drop', or 'tag'")
+                    putJsonObject("match_host") { put("type", "string"); put("description", MATCH_HOST_DESCRIPTION) }
+                    putJsonObject("match_url") { put("type", "string"); put("description", "Regex (case-insensitive) searched in the full URL") }
+                    putJsonObject("match_header") { put("type", "string"); put("description", "Regex (case-insensitive) searched in the 'Name: value' header lines") }
+                    putJsonObject("match_body") { put("type", "string"); put("description", "Regex (case-insensitive) searched in the body") }
+                    intProp("match_status", "Status code to match", min = 0, max = 999)
+                    putJsonObject("modify_add_header") { put("type", "string"); put("description", "Header to add when action is 'modify', as one 'Name: Value' line") }
+                    putJsonObject("modify_remove_header") { put("type", "string"); put("description", "Header name to remove when action is 'modify'") }
                     putJsonObject("modify_replace_header") { put("type", "object"); put("description", "Map of header names to replacement values") }
-                    putJsonObject("modify_body_regex") { put("type", "string"); put("description", "Regex for body replacement") }
-                    putJsonObject("modify_body_replacement") { put("type", "string"); put("description", "Replacement for body regex matches") }
+                    putJsonObject("modify_body_regex") { put("type", "string"); put("description", "Regex for body replacement (requires modify_body_replacement)") }
+                    putJsonObject("modify_body_replacement") { put("type", "string"); put("description", "Replacement for body regex matches (\"\" deletes them)") }
                     putJsonObject("tag_comment") { put("type", "string"); put("description", "Comment to attach when action is 'tag'") }
-                    putJsonObject("tag_highlight") { put("type", "string"); put("description", "Highlight color when action is 'tag'") }
+                    enumProp("tag_highlight", HIGHLIGHT_COLORS, "Highlight color when action is 'tag'")
                     putJsonObject("enabled") { put("type", "boolean"); put("description", "Whether the rule is active (default true)") }
                 },
                 required = listOf("action")
@@ -426,64 +323,11 @@ object ProxyTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-
-                val ruleId = args["rule_id"]?.jsonPrimitive?.contentOrNull
-                    ?: stateManager.generateId("prule")
-
-                val action = args["action"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent(buildJsonObject {
-                            put("error", "Parameter 'action' is required ('modify', 'drop', or 'tag')")
-                        }.toString())),
-                        isError = true
-                    )
-
-                EnumValidation.error(action, setOf("modify", "drop", "tag"), "action")?.let {
-                    return@addTool CallToolResult(content = listOf(TextContent(it.toString())), isError = true)
-                }
-
-                val replaceHeader = args["modify_replace_header"]?.jsonObject?.let { obj ->
-                    obj.entries.associate { (k, v) -> k to v.jsonPrimitive.content }
-                }
-
-                val rule = ProxyRule(
-                    ruleId = ruleId,
-                    type = "response",
-                    matchHost = args["match_host"]?.jsonPrimitive?.contentOrNull,
-                    matchUrl = args["match_url"]?.jsonPrimitive?.contentOrNull,
-                    matchMethod = null,
-                    matchHeader = args["match_header"]?.jsonPrimitive?.contentOrNull,
-                    matchBody = args["match_body"]?.jsonPrimitive?.contentOrNull,
-                    matchStatus = args["match_status"]?.jsonPrimitive?.intOrNull,
-                    action = action,
-                    modifyAddHeader = args["modify_add_header"]?.jsonPrimitive?.contentOrNull,
-                    modifyRemoveHeader = args["modify_remove_header"]?.jsonPrimitive?.contentOrNull,
-                    modifyReplaceHeader = replaceHeader,
-                    modifyBodyRegex = args["modify_body_regex"]?.jsonPrimitive?.contentOrNull,
-                    modifyBodyReplacement = args["modify_body_replacement"]?.jsonPrimitive?.contentOrNull,
-                    tagComment = args["tag_comment"]?.jsonPrimitive?.contentOrNull,
-                    tagHighlight = args["tag_highlight"]?.jsonPrimitive?.contentOrNull,
-                    enabled = args["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
-                )
-
-                // Remove existing rule with same ID, then add the new one
-                stateManager.proxyRules.removeIf { it.ruleId == ruleId }
-                stateManager.proxyRules.add(rule)
-
-                CallToolResult(content = listOf(TextContent(buildJsonObject {
-                    put("rule_set", true)
-                    put("rule_id", ruleId)
-                    put("type", "response")
-                    put("action", action)
-                    put("total_rules", stateManager.proxyRules.size)
-                }.toString())))
+                val rule = buildRule(args, "response", stateManager)
+                    ?: return@addTool toolError("A rule action is required: 'modify', 'drop', or 'tag'")
+                toolJsonResult(bridge.setRule(rule))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent(buildJsonObject {
-                        put("error", e.message ?: "Unknown error")
-                    }.toString())),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -495,40 +339,16 @@ object ProxyTools {
             description = "List all proxy interception rules. Optionally filter by type ('request' or 'response').",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("type") { put("type", "string"); put("description", "Filter by rule type ('request' or 'response')") }
+                    enumProp("type", listOf("request", "response"), "Filter by rule type ('request' or 'response')")
                 },
                 required = emptyList()
             )
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val typeFilter = args["type"]?.jsonPrimitive?.contentOrNull
-
-                val rules = if (typeFilter != null) {
-                    stateManager.proxyRules.filter {
-                        it.type.equals(typeFilter, ignoreCase = true)
-                    }
-                } else {
-                    stateManager.proxyRules.toList()
-                }
-
-                val result = buildJsonObject {
-                    put("total", rules.size)
-                    put("rules", buildJsonArray {
-                        rules.forEach { rule ->
-                            add(serializeProxyRule(rule))
-                        }
-                    })
-                }
-
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                toolJsonResult(bridge.listRules(args.string("type")))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent(buildJsonObject {
-                        put("error", e.message ?: "Unknown error")
-                    }.toString())),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -548,28 +368,12 @@ object ProxyTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
 
-                val ruleId = args["rule_id"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent(buildJsonObject {
-                            put("error", "Parameter 'rule_id' is required")
-                        }.toString())),
-                        isError = true
-                    )
+                val ruleId = args.string("rule_id")
+                    ?: return@addTool toolError("Parameter 'rule_id' is required")
 
-                val removed = stateManager.proxyRules.removeIf { it.ruleId == ruleId }
-
-                CallToolResult(content = listOf(TextContent(buildJsonObject {
-                    put("rule_id", ruleId)
-                    put("removed", removed)
-                    put("remaining_rules", stateManager.proxyRules.size)
-                }.toString())))
+                toolJsonResult(bridge.removeRule(ruleId))
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent(buildJsonObject {
-                        put("error", e.message ?: "Unknown error")
-                    }.toString())),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -578,28 +382,25 @@ object ProxyTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "proxy_auto_auth",
-            description = "Convenience tool: auto-inject an authentication header into all proxy requests matching a host pattern. Creates a proxy request rule that adds the specified header. Use proxy_remove_rule with the returned rule_id to remove it later. Parameters: header_name (default 'Authorization'), header_value (required), host_pattern (regex, default '.*' for all hosts).",
+            description = "Convenience tool: auto-inject an authentication header into all proxy requests matching a host pattern. Creates a proxy request rule that adds the specified header. Use proxy_remove_rule with the returned rule_id to remove it later. Parameters: header_name (default 'Authorization'), header_value (required), host_pattern (glob or regex, default '.*' for all hosts).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("header_name") { put("type", "string"); put("description", "Header name to inject (default 'Authorization')") }
                     putJsonObject("header_value") { put("type", "string"); put("description", "Header value to inject") }
-                    putJsonObject("host_pattern") { put("type", "string"); put("description", "Regex host pattern to match (default '.*' for all hosts)") }
+                    putJsonObject("host_pattern") { put("type", "string"); put("description", "$MATCH_HOST_DESCRIPTION; default '.*' for all hosts") }
                 },
                 required = listOf("header_value")
             )
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val headerName = args["header_name"]?.jsonPrimitive?.contentOrNull ?: "Authorization"
-                val headerValue = args["header_value"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(
-                        content = listOf(TextContent("""{"error":"Parameter 'header_value' is required"}""")),
-                        isError = true
-                    )
-                val hostPattern = args["host_pattern"]?.jsonPrimitive?.contentOrNull ?: ".*"
+                val headerName = args.string("header_name") ?: "Authorization"
+                val headerValue = args.string("header_value")
+                    ?: return@addTool toolError("Parameter 'header_value' is required")
+                val hostPattern = args.string("host_pattern") ?: ".*"
 
                 val ruleId = stateManager.generateId("auto-auth")
-                stateManager.proxyRules.add(ProxyRule(
+                val stored = bridge.setRule(ProxyRule(
                     ruleId = ruleId,
                     type = "request",
                     matchHost = hostPattern,
@@ -607,52 +408,87 @@ object ProxyTools {
                     modifyAddHeader = "$headerName: $headerValue",
                     enabled = true
                 ))
+                if (stored["error"] != null) return@addTool toolJsonResult(stored)
 
-                CallToolResult(content = listOf(TextContent(buildJsonObject {
+                toolJsonResult(buildJsonObject {
                     put("rule_id", ruleId)
                     put("status", "active")
                     put("header", "$headerName: $headerValue")
                     put("host_pattern", hostPattern)
                     put("note", "Use proxy_remove_rule with rule_id to deactivate")
-                }.toString())))
+                })
             } catch (e: Exception) {
-                CallToolResult(
-                    content = listOf(TextContent(buildJsonObject {
-                        put("error", e.message ?: "Unknown error")
-                    }.toString())),
-                    isError = true
-                )
+                toolError(e.message ?: "Unknown error")
             }
         }
     }
 
+    /**
+     * Builds the request/response rule described by [args], or null when no action was given.
+     * Pattern, header and colour checks happen in [ProxyBridge.setRule].
+     */
+    private fun buildRule(args: Map<String, JsonElement>, type: String, stateManager: StateManager): ProxyRule? {
+        val action = args.string("action")?.trim()?.lowercase() ?: return null
+        val replaceHeader = args["modify_replace_header"]?.takeUnless { it is JsonNull }?.let { element ->
+            element.asStringMap()
+                ?: throw IllegalArgumentException("Parameter 'modify_replace_header' must be an object of header name to value")
+        }
+        return ProxyRule(
+            ruleId = args.string("rule_id") ?: stateManager.generateId("prule"),
+            type = type,
+            matchHost = args.string("match_host"),
+            matchUrl = args.string("match_url"),
+            matchMethod = if (type == "request") args.string("match_method") else null,
+            matchHeader = args.string("match_header"),
+            matchBody = args.string("match_body"),
+            matchStatus = if (type == "response") args.int("match_status", 0..999) else null,
+            action = action,
+            modifyAddHeader = args.string("modify_add_header"),
+            modifyRemoveHeader = args.string("modify_remove_header"),
+            modifyReplaceHeader = replaceHeader,
+            modifyBodyRegex = args.string("modify_body_regex"),
+            modifyBodyReplacement = args.string("modify_body_replacement"),
+            tagComment = args.string("tag_comment"),
+            tagHighlight = args.string("tag_highlight"),
+            enabled = args.bool("enabled", true)
+        )
+    }
+
     // ---------------------------------------------------------------
-    // Helper: serialize a ProxyRule to JSON
+    // Argument and schema helpers
     // ---------------------------------------------------------------
 
-    private fun serializeProxyRule(rule: ProxyRule): JsonObject {
-        return buildJsonObject {
-            put("rule_id", rule.ruleId)
-            put("type", rule.type)
-            put("action", rule.action)
-            put("enabled", rule.enabled)
-            if (rule.matchHost != null) put("match_host", rule.matchHost)
-            if (rule.matchUrl != null) put("match_url", rule.matchUrl)
-            if (rule.matchMethod != null) put("match_method", rule.matchMethod)
-            if (rule.matchHeader != null) put("match_header", rule.matchHeader)
-            if (rule.matchBody != null) put("match_body", rule.matchBody)
-            if (rule.matchStatus != null) put("match_status", rule.matchStatus)
-            if (rule.modifyAddHeader != null) put("modify_add_header", rule.modifyAddHeader)
-            if (rule.modifyRemoveHeader != null) put("modify_remove_header", rule.modifyRemoveHeader)
-            if (rule.modifyReplaceHeader != null) {
-                put("modify_replace_header", buildJsonObject {
-                    rule.modifyReplaceHeader.forEach { (k, v) -> put(k, v) }
-                })
-            }
-            if (rule.modifyBodyRegex != null) put("modify_body_regex", rule.modifyBodyRegex)
-            if (rule.modifyBodyReplacement != null) put("modify_body_replacement", rule.modifyBodyReplacement)
-            if (rule.tagComment != null) put("tag_comment", rule.tagComment)
-            if (rule.tagHighlight != null) put("tag_highlight", rule.tagHighlight)
+    private fun Map<String, JsonElement>.string(name: String): String? = (this[name] as? JsonPrimitive)?.contentOrNull
+
+    private fun Map<String, JsonElement>.bool(name: String, default: Boolean): Boolean =
+        (this[name] as? JsonPrimitive)?.booleanOrNull ?: default
+
+    /** Optional integer argument; a non-integer or a value outside [range] throws, reported as a tool error. */
+    private fun Map<String, JsonElement>.int(name: String, range: IntRange): Int? {
+        val element = this[name]
+        if (element == null || element is JsonNull) return null
+        val value = element.asLongSafe() ?: throw IllegalArgumentException("Parameter '$name' must be an integer")
+        require(value >= range.first && value <= range.last) {
+            if (range.last == Int.MAX_VALUE) "Parameter '$name' must be at least ${range.first} (got $value)"
+            else "Parameter '$name' must be between ${range.first} and ${range.last} (got $value)"
+        }
+        return value.toInt()
+    }
+
+    private fun JsonObjectBuilder.intProp(name: String, description: String, min: Int? = null, max: Int? = null) {
+        putJsonObject(name) {
+            put("type", "integer")
+            if (min != null) put("minimum", min)
+            if (max != null) put("maximum", max)
+            put("description", description)
+        }
+    }
+
+    private fun JsonObjectBuilder.enumProp(name: String, values: List<String>, description: String) {
+        putJsonObject(name) {
+            put("type", "string")
+            putJsonArray("enum") { values.forEach { add(it) } }
+            put("description", description)
         }
     }
 }

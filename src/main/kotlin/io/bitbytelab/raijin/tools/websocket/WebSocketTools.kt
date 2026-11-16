@@ -1,6 +1,8 @@
 package io.bitbytelab.raijin.tools.websocket
 
 import io.bitbytelab.raijin.bridge.WebSocketBridge
+import io.bitbytelab.raijin.core.asLongSafe
+import io.bitbytelab.raijin.core.asStringMap
 import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
@@ -9,6 +11,9 @@ import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
 object WebSocketTools {
+
+    /** Shared by every `direction` parameter in the websocket tool group, so the merged schema fits all of them. */
+    private val DIRECTIONS = listOf("client_to_server", "server_to_client", "both")
 
     fun register(server: Server, bridge: WebSocketBridge, stateManager: StateManager) {
 
@@ -31,13 +36,14 @@ object WebSocketTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val url = args["url"]?.jsonPrimitive?.contentOrNull
+                val url = args.string("url")
                     ?: return@addTool toolError("Missing required parameter: url")
 
-                val headers = args["headers"]?.jsonObject?.let { obj ->
-                    obj.entries.associate { (k, v) -> k to v.jsonPrimitive.content }
+                val headers = args["headers"]?.takeUnless { it is JsonNull }?.let { element ->
+                    element.asStringMap()
+                        ?: return@addTool toolError("Parameter 'headers' must be an object of header name to value")
                 }
-                val subprotocol = args["subprotocol"]?.jsonPrimitive?.contentOrNull
+                val subprotocol = args.string("subprotocol")
 
                 toolJsonResult(bridge.createConnection(url, headers, subprotocol))
             } catch (e: Exception) {
@@ -61,9 +67,9 @@ object WebSocketTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val connectionId = args["connection_id"]?.jsonPrimitive?.contentOrNull
+                val connectionId = args.string("connection_id")
                     ?: return@addTool toolError("Missing required parameter: connection_id")
-                val message = args["message"]?.jsonPrimitive?.contentOrNull
+                val message = args.string("message")
                     ?: return@addTool toolError("Missing required parameter: message")
 
                 toolJsonResult(bridge.sendText(connectionId, message))
@@ -88,9 +94,9 @@ object WebSocketTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val connectionId = args["connection_id"]?.jsonPrimitive?.contentOrNull
+                val connectionId = args.string("connection_id")
                     ?: return@addTool toolError("Missing required parameter: connection_id")
-                val data = args["data"]?.jsonPrimitive?.contentOrNull
+                val data = args.string("data")
                     ?: return@addTool toolError("Missing required parameter: data")
 
                 toolJsonResult(bridge.sendBinary(connectionId, data))
@@ -113,7 +119,7 @@ object WebSocketTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val connectionId = args["connection_id"]?.jsonPrimitive?.contentOrNull
+                val connectionId = args.string("connection_id")
                     ?: return@addTool toolError("Missing required parameter: connection_id")
 
                 toolJsonResult(bridge.close(connectionId))
@@ -139,30 +145,34 @@ object WebSocketTools {
         server.addTool(
             name = "websocket_get_messages",
             description = "Retrieve messages from a specific WebSocket connection with optional " +
-                "filtering and pagination. Supports cursor-based polling via since_index. " +
-                "Parameters: connection_id (string, required), direction (optional string, " +
-                "filter by 'client_to_server' or 'server_to_client'), since_index (optional " +
+                "filtering and pagination. Supports cursor-based polling via since_index: pass the " +
+                "index of the last message you read; no frame is ever skipped, and missed_messages " +
+                "counts frames evicted from the buffer (newest ${io.bitbytelab.raijin.state.WebSocketConnection.MAX_MESSAGES} " +
+                "kept) before you read them. Parameters: connection_id (string, required), direction " +
+                "(optional, 'client_to_server', 'server_to_client' or 'both'), since_index (optional " +
                 "integer, only return messages with index greater than this value, default -1 " +
                 "for all), max_results (optional integer, maximum messages to return, default 100).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("connection_id") { put("type", "string"); put("description", "The WebSocket connection ID") }
-                    putJsonObject("direction") { put("type", "string"); put("description", "Filter by 'client_to_server' or 'server_to_client'") }
-                    putJsonObject("since_index") { put("type", "integer"); put("description", "Only return messages with index greater than this (default -1 for all)") }
-                    putJsonObject("max_results") { put("type", "integer"); put("description", "Maximum messages to return (default 100)") }
+                    enumProp("direction", DIRECTIONS, "Direction filter (case-insensitive): 'client_to_server', 'server_to_client', or 'both' (default, no filter)")
+                    putJsonObject("since_index") { put("type", "integer"); put("minimum", -1); put("description", "Only return messages with index greater than this (default -1 for all)") }
+                    putJsonObject("max_results") { put("type", "integer"); put("minimum", 0); put("description", "Maximum messages to return (default 100)") }
                 },
                 required = listOf("connection_id")
             )
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val connectionId = args["connection_id"]?.jsonPrimitive?.contentOrNull
+                val connectionId = args.string("connection_id")
                     ?: return@addTool toolError("Missing required parameter: connection_id")
-                val direction = args["direction"]?.jsonPrimitive?.contentOrNull
-                val sinceIndex = args["since_index"]?.jsonPrimitive?.longOrNull ?: -1L
-                val maxResults = args["max_results"]?.jsonPrimitive?.intOrNull ?: 100
+                val sinceIndex = args.long("since_index") ?: -1L
+                val maxResults = args.long("max_results") ?: 100L
+                if (maxResults !in 0L..Int.MAX_VALUE.toLong()) {
+                    return@addTool toolError("Invalid max_results: $maxResults. Must be zero or a positive integer")
+                }
 
-                toolJsonResult(bridge.getMessages(connectionId, direction, sinceIndex, maxResults))
+                toolJsonResult(bridge.getMessages(connectionId, args.string("direction"), sinceIndex, maxResults.toInt()))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -187,10 +197,10 @@ object WebSocketTools {
                     putJsonObject("rule_id") { put("type", "string"); put("description", "Unique rule ID; auto-generated if not provided") }
                     putJsonObject("match_url") { put("type", "string"); put("description", "Regex to match against WebSocket URL") }
                     putJsonObject("match_message") { put("type", "string"); put("description", "Regex to match against message content") }
-                    putJsonObject("direction") { put("type", "string"); put("description", "'client_to_server', 'server_to_client', or 'both' (default 'both')") }
-                    putJsonObject("action") { put("type", "string"); put("description", "'modify', 'drop', or 'tag'") }
-                    putJsonObject("modify_regex") { put("type", "string"); put("description", "Regex for content replacement when action is 'modify'") }
-                    putJsonObject("modify_replacement") { put("type", "string"); put("description", "Replacement for regex matches") }
+                    enumProp("direction", DIRECTIONS, "Direction filter (case-insensitive): 'client_to_server', 'server_to_client', or 'both' (default, no filter)")
+                    enumProp("action", listOf("modify", "drop", "tag"), "'modify', 'drop', or 'tag'")
+                    putJsonObject("modify_regex") { put("type", "string"); put("description", "Regex for content replacement; required when action is 'modify'") }
+                    putJsonObject("modify_replacement") { put("type", "string"); put("description", "Replacement for regex matches (default \"\")") }
                     putJsonObject("tag_comment") { put("type", "string"); put("description", "Comment to attach when action is 'tag'") }
                     putJsonObject("enabled") { put("type", "boolean"); put("description", "Whether the rule is active (default true)") }
                 },
@@ -199,29 +209,40 @@ object WebSocketTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val ruleId = args["rule_id"]?.jsonPrimitive?.contentOrNull
-                val matchUrl = args["match_url"]?.jsonPrimitive?.contentOrNull
-                val matchMessage = args["match_message"]?.jsonPrimitive?.contentOrNull
-                val direction = args["direction"]?.jsonPrimitive?.contentOrNull ?: "both"
-                val action = args["action"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: action")
-
-                if (action !in listOf("modify", "drop", "tag")) {
-                    return@addTool toolError("Invalid action: $action. Must be 'modify', 'drop', or 'tag'")
-                }
-
-                val modifyRegex = args["modify_regex"]?.jsonPrimitive?.contentOrNull
-                val modifyReplacement = args["modify_replacement"]?.jsonPrimitive?.contentOrNull
-                val tagComment = args["tag_comment"]?.jsonPrimitive?.contentOrNull
-                val enabled = args["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
+                val action = args.string("action")
+                    ?: return@addTool toolError("Missing required parameter: action ('modify', 'drop', or 'tag')")
 
                 toolJsonResult(bridge.setInterceptRule(
-                    ruleId, matchUrl, matchMessage, direction, action,
-                    modifyRegex, modifyReplacement, tagComment, enabled
+                    ruleId = args.string("rule_id"),
+                    matchUrl = args.string("match_url"),
+                    matchMessage = args.string("match_message"),
+                    direction = args.string("direction") ?: "both",
+                    action = action,
+                    modifyRegex = args.string("modify_regex"),
+                    modifyReplacement = args.string("modify_replacement"),
+                    tagComment = args.string("tag_comment"),
+                    enabled = (args["enabled"] as? JsonPrimitive)?.booleanOrNull ?: true,
                 ))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
+        }
+    }
+
+    private fun Map<String, JsonElement>.string(name: String): String? = (this[name] as? JsonPrimitive)?.contentOrNull
+
+    /** Optional integer argument; a non-integer throws, reported as a tool error. */
+    private fun Map<String, JsonElement>.long(name: String): Long? {
+        val element = this[name]
+        if (element == null || element is JsonNull) return null
+        return element.asLongSafe() ?: throw IllegalArgumentException("Parameter '$name' must be an integer")
+    }
+
+    private fun JsonObjectBuilder.enumProp(name: String, values: List<String>, description: String) {
+        putJsonObject(name) {
+            put("type", "string")
+            putJsonArray("enum") { values.forEach { add(it) } }
+            put("description", description)
         }
     }
 }

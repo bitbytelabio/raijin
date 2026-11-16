@@ -9,13 +9,97 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class AutorizeBridgeTest {
 
     private fun identity(name: String): JsonObject = buildJsonObject { put("name", name) }
+
+    private val twoIdentities = listOf(identity("admin"), identity("none"))
+
+    private fun assertError(result: JsonObject, mentions: String) {
+        val error = result["error"]?.jsonPrimitive?.contentOrNull
+        assertNotNull(error, "expected an error mentioning '$mentions'")
+        assertTrue(mentions in error, error)
+    }
+
+    @Test
+    fun `setting a rule resets its dedup guard on create and on update`() {
+        val state = StateManager()
+        val b = AutorizeBridge(state)
+        val id = b.setRule(null, twoIdentities, true, null, null, null, true, 90.0, true)["rule_id"]!!.jsonPrimitive.content
+        val key = StateManager.autorizeSeenKey(id, "GET", "https://x/a")
+        assertTrue(state.autorizeSeenOnce(key))
+        assertFalse(state.autorizeSeenOnce(key))
+
+        b.setRule(id, null, null, null, null, null, null, 70.0, null)
+        assertTrue(state.autorizeSeenOnce(key), "an updated rule retests endpoints")
+
+        b.removeRule(id)
+        state.autorizeSeenOnce(key) // a replay still in flight for the removed rule marks the key
+        b.setRule(id, twoIdentities, true, null, null, null, true, 90.0, true)
+        assertTrue(state.autorizeSeenOnce(key), "a re-created rule with the same id starts fresh")
+    }
+
+    @Test
+    fun `invalid filters and identities are rejected instead of silently never matching`() {
+        val b = AutorizeBridge(StateManager())
+        assertError(b.setRule(null, twoIdentities, true, "[a-", null, null, true, 90.0, true), "include_host_pattern")
+        assertError(b.setRule(null, twoIdentities, true, null, "(", null, true, 90.0, true), "exclude_url_regex")
+        assertError(b.setRule(null, twoIdentities, true, null, null, listOf(" "), true, 90.0, true), "methods")
+        assertError(b.setRule(null, twoIdentities, true, null, null, null, true, 150.0, true), "similarity_threshold")
+        assertError(b.setRule(null, twoIdentities, true, null, null, null, true, Double.NaN, true), "similarity_threshold")
+
+        val headerWithoutValue = buildJsonObject { put("name", "low"); put("header_name", "Cookie") }
+        val crlfValue = buildJsonObject { put("name", "low"); put("header_name", "Cookie"); put("header_value", "a=1\r\nX-Injected: 1") }
+        val nameless = buildJsonObject { put("header_name", "Cookie"); put("header_value", "a=1") }
+        for (bad in listOf(headerWithoutValue, crlfValue, nameless)) {
+            assertError(b.setRule(null, listOf(identity("admin"), bad), true, null, null, null, true, 90.0, true), "identities[1]")
+        }
+        assertEquals(0, b.listRules()["count"]?.jsonPrimitive?.int)
+
+        val ok = b.setRule(null, twoIdentities, true, "*.example.com", "\\.(png|css)$", listOf("get", "post"), true, 0.0, true)
+        assertNull(ok["error"])
+        assertEquals(
+            listOf("GET", "POST"),
+            b.listRules()["rules"]!!.jsonArray[0].jsonObject["methods"]!!.jsonArray.map { it.jsonPrimitive.content },
+        )
+    }
+
+    @Test
+    fun `replay gate skips instead of blocking when full and bounds concurrent sends`() {
+        val gate = AutorizeReplayGate(maxQueued = 3, maxConcurrent = 2)
+        repeat(3) { assertTrue(gate.tryAdmit()) }
+        assertFalse(gate.tryAdmit(), "a full queue skips instead of blocking the proxy thread")
+        gate.release()
+        assertTrue(gate.tryAdmit())
+        repeat(3) { gate.release() }
+
+        val running = AtomicInteger()
+        val peak = AtomicInteger()
+        val pool = Executors.newFixedThreadPool(8)
+        val tasks = (1..16).map {
+            pool.submit {
+                gate.withSendSlot {
+                    val now = running.incrementAndGet()
+                    peak.accumulateAndGet(now) { a, b -> maxOf(a, b) }
+                    Thread.sleep(20)
+                    running.decrementAndGet()
+                }
+            }
+        }
+        tasks.forEach { it.get(10, TimeUnit.SECONDS) }
+        pool.shutdown()
+        assertTrue(peak.get() in 1..2, "at most 2 replays send at once (peak ${peak.get()})")
+    }
 
     @Test
     fun `setRule requires at least 2 identities`() {

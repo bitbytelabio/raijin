@@ -2,6 +2,7 @@ package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
 import burp.api.montoya.core.ByteArray as BurpByteArray
+import burp.api.montoya.core.Registration
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.HttpService
 import io.bitbytelab.raijin.safety.RequestHygiene
@@ -28,9 +29,11 @@ import java.time.Instant
 import java.util.Base64
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 class WebSocketBridge(
     private val api: MontoyaApi,
@@ -40,15 +43,44 @@ class WebSocketBridge(
     /** Maps connection IDs to the Montoya ExtensionWebSocket object for sending messages. */
     private val webSocketHandles = ConcurrentHashMap<String, ExtensionWebSocket>()
 
-    /** Per-connection message index counter for ordered message tracking. */
-    private val messageIndexCounters = ConcurrentHashMap<String, AtomicLong>()
+    /** Message-handler registrations on Burp-created sockets, by connection ID; deregistered on unload. */
+    private val handlerRegistrations = ConcurrentHashMap<String, Registration>()
+
+    /** Sockets opened by [createConnection], keyed by the Sec-WebSocket-Key of their upgrade request. */
+    private val ownSockets = ConcurrentHashMap<String, OwnSocket>()
+
+    /** Runs the blocking createWebSocket call so a stalled upgrade cannot wedge the tool call. */
+    private val createExecutor: ExecutorService = Executors.newCachedThreadPool { task ->
+        Thread(task, "raijin-ws-create").apply { isDaemon = true }
+    }
+
+    /** Serialises intercept-rule writes so concurrent sets of one id cannot both append. */
+    private val ruleLock = Any()
+
+    @Volatile
+    private var shutDown = false
+
+    /** Which handler records the server frames of an [OwnSocket]. */
+    private enum class Capture { PENDING, CREATED_HANDLER, EXTENSION_HANDLER }
+
+    /**
+     * A socket opened by [createConnection]. Its server frames are recorded by exactly one handler:
+     * the [WebSocketCreatedHandler] tap when Burp reports the socket there (attached before any frame
+     * flows), otherwise the [ExtensionWebSocketMessageHandler] registered as soon as createWebSocket
+     * returns. [capture] holds the winner, so a frame is never recorded twice.
+     */
+    private class OwnSocket(val key: String, val connection: WebSocketConnection) {
+        val capture = AtomicReference(Capture.PENDING)
+    }
 
     /**
      * Creates a new WebSocket connection by constructing an HTTP upgrade
      * request and using the Montoya WebSocket API.
      *
-     * The returned connection is stored in StateManager and a handler is
-     * registered to capture all incoming messages.
+     * The returned connection is stored in StateManager. Server frames are captured
+     * from the moment the socket exists: by the created-socket tap when Burp reports
+     * the socket there, otherwise by a handler attached on the creating thread before
+     * the socket is handed back (see [OwnSocket]).
      *
      * @param url The WebSocket URL (e.g. "wss://example.com/ws").
      * @param headers Optional map of additional HTTP headers for the upgrade request.
@@ -56,10 +88,12 @@ class WebSocketBridge(
      * @return JSON object with the connection ID and status.
      */
     fun createConnection(url: String, headers: Map<String, String>?, subprotocol: String?): JsonObject {
-        val connectionId = stateManager.generateId("ws")
-
         // Parse URL to extract host, port, and path
-        val parsedUrl = java.net.URI(url)
+        val parsedUrl = try {
+            java.net.URI(url)
+        } catch (e: Exception) {
+            return buildErrorJson("Invalid URL: ${e.message}")
+        }
         val scheme = parsedUrl.scheme ?: "wss"
 
         // Reject obviously non-WebSocket schemes before attempting an upgrade so
@@ -67,7 +101,7 @@ class WebSocketBridge(
         validateScheme(scheme)?.let { return buildErrorJson(it) }
 
         val host = parsedUrl.host ?: return buildErrorJson("Invalid URL: missing host")
-        val useTls = scheme == "wss" || scheme == "https"
+        val useTls = scheme.equals("wss", ignoreCase = true) || scheme.equals("https", ignoreCase = true)
         val defaultPort = if (useTls) 443 else 80
         val port = if (parsedUrl.port > 0) parsedUrl.port else defaultPort
         // Strip control chars so a stray newline in the path/query can't fold into the
@@ -75,15 +109,17 @@ class WebSocketBridge(
         val path = RequestHygiene.stripControl(if (parsedUrl.rawPath.isNullOrEmpty()) "/" else parsedUrl.rawPath)
         val query = RequestHygiene.stripControl(if (parsedUrl.rawQuery != null) "?${parsedUrl.rawQuery}" else "")
 
-        // Build the HTTP upgrade request
+        // Build the HTTP upgrade request. Its Sec-WebSocket-Key identifies the socket when Burp
+        // reports it to createWebSocketHandler.
+        val wsKey = generateWebSocketKey()
         val httpService = HttpService.httpService(host, port, useTls)
-        var requestBuilder = StringBuilder()
+        val requestBuilder = StringBuilder()
         requestBuilder.append("GET $path$query HTTP/1.1\r\n")
         requestBuilder.append("Host: $host${if (port != defaultPort) ":$port" else ""}\r\n")
         requestBuilder.append("Upgrade: websocket\r\n")
         requestBuilder.append("Connection: Upgrade\r\n")
         requestBuilder.append("Sec-WebSocket-Version: 13\r\n")
-        requestBuilder.append("Sec-WebSocket-Key: ${generateWebSocketKey()}\r\n")
+        requestBuilder.append("Sec-WebSocket-Key: $wsKey\r\n")
 
         if (subprotocol != null) {
             requestBuilder.append("Sec-WebSocket-Protocol: $subprotocol\r\n")
@@ -97,29 +133,46 @@ class WebSocketBridge(
 
         val httpRequest = HttpRequest.httpRequest(httpService, requestBuilder.toString())
 
+        val connection = WebSocketConnection(
+            connectionId = stateManager.generateId("ws"),
+            url = url,
+            createdAt = Instant.now().toString(),
+        )
+        val own = OwnSocket(wsKey, connection)
+        ownSockets[wsKey] = own
+
         // Create the WebSocket connection through the Montoya API. The call is
         // blocking and can hang indefinitely when a host accepts the TCP
         // connection but never completes the upgrade (common with plaintext
         // ws:// against a TLS port, or a silently-dropping middlebox). Bound it
-        // on a worker thread so the tool call always returns promptly; the
-        // underlying blocking read may still be leaked by Montoya, but the tool
-        // itself must not wedge.
+        // on a worker thread so the tool call always returns promptly.
+        val future = try {
+            CompletableFuture.supplyAsync({ openSocket(httpRequest, own) }, createExecutor)
+        } catch (e: Exception) {
+            ownSockets.remove(wsKey)
+            return buildErrorJson("WebSocket creation failed: ${e.message ?: e.javaClass.simpleName}")
+        }
         val creation: ExtensionWebSocketCreation = try {
-            CompletableFuture
-                .supplyAsync { api.websockets().createWebSocket(httpRequest) }
-                .get(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            future.get(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         } catch (e: TimeoutException) {
+            // The blocking create may still succeed later: close that socket instead of leaking it.
+            future.whenComplete { late, _ ->
+                late?.webSocket()?.ifPresent { ws -> runCatching { ws.close() } }
+                ownSockets.remove(wsKey)
+            }
             return buildErrorJson(
                 "WebSocket upgrade timed out after $CONNECT_TIMEOUT_MS ms " +
                     "(host accepted the connection but did not complete the upgrade)"
             )
         } catch (e: Exception) {
+            ownSockets.remove(wsKey)
             val cause = e.cause ?: e
             return buildErrorJson("WebSocket creation failed: ${cause.message ?: cause.javaClass.simpleName}")
         }
 
-        val webSocketOpt = creation.webSocket()
-        if (!webSocketOpt.isPresent) {
+        val webSocket = creation.webSocket().orElse(null)
+        if (webSocket == null) {
+            ownSockets.remove(wsKey)
             // Surface the real failure reason from the creation status rather
             // than a single generic message, so scheme/port mismatches are
             // distinguishable from DNS and connection failures.
@@ -133,20 +186,23 @@ class WebSocketBridge(
                 if (upgradeStatusCode != null) put("upgrade_status_code", upgradeStatusCode)
             }
         }
-        val webSocket = webSocketOpt.get()
+        if (shutDown) {
+            runCatching { webSocket.close() }
+            ownSockets.remove(wsKey)
+            return buildErrorJson("WebSocket bridge is shut down (extension unloading)")
+        }
 
-        // Initialize per-connection state and attach message handler immediately before emitting events
+        val connectionId = connection.connectionId
         evictClosedConnectionsIfNeeded()
-        messageIndexCounters[connectionId] = AtomicLong(0)
-        val connection = WebSocketConnection(
-            connectionId = connectionId,
-            url = url,
-            createdAt = Instant.now().toString(),
-            status = "connected"
-        )
         stateManager.websocketConnections[connectionId] = connection
         webSocketHandles[connectionId] = webSocket
-        registerExtensionMessageHandlers(webSocket, connectionId)
+        // Re-check after publishing the handle: an unload or an early server close may have run meanwhile.
+        if (shutDown) {
+            webSocketHandles.remove(connectionId)
+            runCatching { webSocket.close() }
+        } else if (connection.status == "closed") {
+            webSocketHandles.remove(connectionId)
+        }
 
         // Emit connection created event
         eventBus.emit("websocket.created", buildJsonObject {
@@ -164,8 +220,86 @@ class WebSocketBridge(
             put("host", host)
             put("port", port)
             put("use_tls", useTls)
-            put("status", "connected")
+            put("status", connection.status)
         }
+    }
+
+    /**
+     * Runs on [createExecutor]. Attaches the capture handler before handing the socket back, so
+     * frames the server pushes right after the 101 are recorded rather than arriving unobserved.
+     */
+    private fun openSocket(request: HttpRequest, own: OwnSocket): ExtensionWebSocketCreation {
+        val creation = api.websockets().createWebSocket(request)
+        creation.webSocket().ifPresent { ws -> attachExtensionHandler(ws, own) }
+        return creation
+    }
+
+    private fun attachExtensionHandler(webSocket: ExtensionWebSocket, own: OwnSocket) {
+        val recordFrames = own.capture.compareAndSet(Capture.PENDING, Capture.EXTENSION_HANDLER)
+        val connection = own.connection
+        webSocket.registerMessageHandler(object : ExtensionWebSocketMessageHandler {
+            override fun textMessageReceived(textMessage: TextMessage) {
+                if (recordFrames) recordServerText(connection, textMessage.payload())
+            }
+
+            override fun binaryMessageReceived(binaryMessage: BinaryMessage) {
+                if (recordFrames) recordServerBinary(connection, binaryMessage.payload().getBytes())
+            }
+
+            override fun onClose() = onOwnSocketClosed(own)
+        })
+    }
+
+    /** Tap for an [OwnSocket] attached from [createWebSocketHandler]; client frames are recorded by the send methods. */
+    private fun ownSocketTap(own: OwnSocket): MessageHandler = object : MessageHandler {
+        override fun handleTextMessage(textMessage: TextMessage): TextMessageAction {
+            if (textMessage.direction() == Direction.SERVER_TO_CLIENT) recordServerText(own.connection, textMessage.payload())
+            return TextMessageAction.continueWith(textMessage)
+        }
+
+        override fun handleBinaryMessage(binaryMessage: BinaryMessage): BinaryMessageAction {
+            if (binaryMessage.direction() == Direction.SERVER_TO_CLIENT) {
+                recordServerBinary(own.connection, binaryMessage.payload().getBytes())
+            }
+            return BinaryMessageAction.continueWith(binaryMessage)
+        }
+
+        override fun onClose() = onOwnSocketClosed(own)
+    }
+
+    /**
+     * Records a server text frame on a socket opened by [createConnection]. That socket's receive
+     * callback cannot drop or rewrite frames, so matching intercept rules are reported, not applied.
+     */
+    private fun recordServerText(connection: WebSocketConnection, payload: String) {
+        try {
+            connection.messagesReceived.incrementAndGet()
+            val message = connection.append("server_to_client", "TEXT", payload, payload.toByteArray().size)
+            emitMessageEvent(connection.connectionId, message)
+            applyIncomingRulesAdvisory(connection.url, "server_to_client", payload)
+        } catch (_: Exception) {
+            // Recording is best-effort; it must never break the socket's callback thread.
+        }
+    }
+
+    /** Binary counterpart of [recordServerText]; the payload is stored base64-encoded. */
+    private fun recordServerBinary(connection: WebSocketConnection, bytes: ByteArray) {
+        try {
+            connection.messagesReceived.incrementAndGet()
+            val message = connection.append("server_to_client", "BINARY", Base64.getEncoder().encodeToString(bytes), bytes.size)
+            emitMessageEvent(connection.connectionId, message)
+            applyIncomingBinaryRulesAdvisory(connection.url, "server_to_client")
+        } catch (_: Exception) {
+            // See recordServerText.
+        }
+    }
+
+    private fun onOwnSocketClosed(own: OwnSocket) {
+        val connectionId = own.connection.connectionId
+        ownSockets.remove(own.key)
+        webSocketHandles.remove(connectionId)
+        handlerRegistrations.remove(connectionId)
+        markClosed(own.connection)
     }
 
     /**
@@ -197,37 +331,16 @@ class WebSocketBridge(
 
         webSocket.sendTextMessage(message)
 
-        // Atomically assign index and append in order
-        val counter = messageIndexCounters.computeIfAbsent(connectionId) { AtomicLong(0) }
         connection.messagesSent.incrementAndGet()
-        val wsMessage = connection.recordIndexed(counter) { index ->
-            WebSocketMessage(
-                index = index,
-                direction = "client_to_server",
-                type = "TEXT",
-                payload = message,
-                length = message.toByteArray().size,
-                timestamp = Instant.now().toString()
-            )
-        }
-        val index = wsMessage.index
-
-        // Emit message event
-        eventBus.emit("websocket.message", buildJsonObject {
-            put("connection_id", connectionId)
-            put("direction", "client_to_server")
-            put("type", "TEXT")
-            put("index", index)
-            put("length", message.length)
-            put("timestamp", Instant.now().toString())
-        })
+        val wsMessage = connection.append("client_to_server", "TEXT", message, message.toByteArray().size)
+        emitMessageEvent(connectionId, wsMessage)
 
         return buildJsonObject {
             put("connection_id", connectionId)
             put("status", "sent")
             put("type", "TEXT")
-            put("message_index", index)
-            put("length", message.length)
+            put("message_index", wsMessage.index)
+            put("length", wsMessage.length)
         }
     }
 
@@ -254,39 +367,22 @@ class WebSocketBridge(
         val webSocket = webSocketHandles[connectionId]
             ?: return buildErrorJson("Connection handle unavailable (connection may be closed): $connectionId")
 
-        val decodedBytes = Base64.getDecoder().decode(data)
+        val decodedBytes = try {
+            Base64.getDecoder().decode(data)
+        } catch (e: IllegalArgumentException) {
+            return buildErrorJson("Invalid base64 in 'data': ${e.message}")
+        }
         webSocket.sendBinaryMessage(BurpByteArray.byteArray(*decodedBytes))
 
-        // Atomically assign index and append in order
-        val counter = messageIndexCounters.computeIfAbsent(connectionId) { AtomicLong(0) }
         connection.messagesSent.incrementAndGet()
-        val wsMessage = connection.recordIndexed(counter) { index ->
-            WebSocketMessage(
-                index = index,
-                direction = "client_to_server",
-                type = "BINARY",
-                payload = data,
-                length = decodedBytes.size,
-                timestamp = Instant.now().toString()
-            )
-        }
-        val index = wsMessage.index
-
-        // Emit message event
-        eventBus.emit("websocket.message", buildJsonObject {
-            put("connection_id", connectionId)
-            put("direction", "client_to_server")
-            put("type", "BINARY")
-            put("index", index)
-            put("length", decodedBytes.size)
-            put("timestamp", Instant.now().toString())
-        })
+        val wsMessage = connection.append("client_to_server", "BINARY", data, decodedBytes.size)
+        emitMessageEvent(connectionId, wsMessage)
 
         return buildJsonObject {
             put("connection_id", connectionId)
             put("status", "sent")
             put("type", "BINARY")
-            put("message_index", index)
+            put("message_index", wsMessage.index)
             put("length", decodedBytes.size)
         }
     }
@@ -317,18 +413,8 @@ class WebSocketBridge(
         // Only extension-created connections have a live handle we can drive.
         // Proxy-observed / shadow entries have none; that is not an error — we
         // simply mark the tracked state as closed.
-        webSocketHandles.remove(connectionId)?.close()
-        connection.status = "closed"
-        messageIndexCounters.remove(connectionId)
-
-        // Emit close event
-        eventBus.emit("websocket.closed", buildJsonObject {
-            put("connection_id", connectionId)
-            put("url", connection.url)
-            put("messages_sent", connection.messagesSent.get())
-            put("messages_received", connection.messagesReceived.get())
-            put("timestamp", Instant.now().toString())
-        })
+        webSocketHandles.remove(connectionId)?.let { runCatching { it.close() } }
+        markClosed(connection)
 
         return buildJsonObject {
             put("connection_id", connectionId)
@@ -367,9 +453,13 @@ class WebSocketBridge(
      * Retrieves messages from a specific WebSocket connection with optional
      * filtering by direction and pagination support.
      *
+     * Polling contract: pass the index of the last message you read as [sinceIndex]. Indices are
+     * allocated and stored atomically, so no frame is ever skipped; `missed_messages` reports frames
+     * that were evicted from the bounded buffer before this call could read them.
+     *
      * @param connectionId The connection to retrieve messages from.
-     * @param direction Optional direction filter: "client_to_server", "server_to_client", or null for all.
-     * @param sinceIndex Only return messages with index greater than this value.
+     * @param direction Optional direction filter: "client_to_server", "server_to_client", "both" or null for all.
+     * @param sinceIndex Only return messages with index greater than this value (-1 for all).
      * @param maxResults Maximum number of messages to return.
      * @return JSON object containing the matching messages.
      */
@@ -386,23 +476,25 @@ class WebSocketBridge(
         // Validate max_results: a negative value would make List.take() throw an
         // IllegalArgumentException that leaks as an opaque stdlib error.
         validateMaxResults(maxResults)?.let { return buildErrorJson(it) }
+        validateSinceIndex(sinceIndex)?.let { return buildErrorJson(it) }
 
         val connection = stateManager.websocketConnections[connectionId]
             ?: return buildErrorJson("Connection not found: $connectionId")
 
-        val messages = connection.snapshotMessages()
-
-        val filtered = messages
-            .filter { it.index > sinceIndex }
-            .filter { msg -> direction == null || msg.direction == direction }
-            .take(maxResults)
+        val directionFilter = direction?.trim()?.lowercase()?.takeUnless { it == "both" }
+        val page = connection.page(sinceIndex, maxResults, directionFilter)
 
         return buildJsonObject {
             put("connection_id", connectionId)
-            put("total_messages", messages.size)
-            put("returned_messages", filtered.size)
+            put("status", connection.status)
+            put("total_messages", page.retained)
+            put("returned_messages", page.messages.size)
+            put("oldest_index", page.oldestIndex)
+            put("next_index", page.nextIndex)
+            if (page.missed > 0) put("missed_messages", page.missed)
+            put("has_more", page.hasMore)
             putJsonArray("messages") {
-                for (msg in filtered) {
+                for (msg in page.messages) {
                     addJsonObject {
                         put("index", msg.index)
                         put("direction", msg.direction)
@@ -419,142 +511,157 @@ class WebSocketBridge(
     /**
      * Creates a WebSocketCreatedHandler that monitors all WebSocket connections
      * initiated through Burp's proxy (or any other Burp component). Each new
-     * connection is tracked in StateManager and emits lifecycle events.
+     * connection is tracked in StateManager and emits lifecycle events. Sockets
+     * opened by [createConnection] are recognised by their Sec-WebSocket-Key and
+     * tapped for that connection instead of being tracked a second time.
      *
      * @return A WebSocketCreatedHandler to register with the Montoya API.
      */
     fun createWebSocketHandler(): WebSocketCreatedHandler {
         return WebSocketCreatedHandler { webSocketCreated: WebSocketCreated ->
-            val connectionId = stateManager.generateId("ws")
-            val upgradeRequest = webSocketCreated.upgradeRequest()
-            val url = upgradeRequest.url()
-
-            // Initialize per-connection state
-            messageIndexCounters[connectionId] = AtomicLong(0)
-
-            val connection = WebSocketConnection(
-                connectionId = connectionId,
-                url = url,
-                createdAt = Instant.now().toString(),
-                status = "connected"
-            )
-            stateManager.websocketConnections[connectionId] = connection
-
-            // Emit creation event
-            eventBus.emit("websocket.created", buildJsonObject {
-                put("connection_id", connectionId)
-                put("url", url)
-                put("source", "proxy")
-                put("timestamp", Instant.now().toString())
-            })
-
-            // Register a unified MessageHandler on the proxy WebSocket
-            val proxyWs = webSocketCreated.webSocket()
-            proxyWs.registerMessageHandler(object : MessageHandler {
-                override fun handleTextMessage(textMessage: TextMessage): TextMessageAction {
-                    val direction = when (textMessage.direction()) {
-                        Direction.CLIENT_TO_SERVER -> "client_to_server"
-                        Direction.SERVER_TO_CLIENT -> "server_to_client"
-                        else -> "unknown"
-                    }
-
-                    val originalPayload = textMessage.payload()
-                    val outcome = evaluateTextRules(url, direction, originalPayload)
-                    val effectivePayload = when (outcome) {
-                        is TextRuleOutcome.Modify -> outcome.payload
-                        else -> originalPayload
-                    }
-                    val recordedType = if (outcome is TextRuleOutcome.Drop) "TEXT_DROPPED" else "TEXT"
-
-                    val counter = messageIndexCounters.computeIfAbsent(connectionId) { AtomicLong(0) }
-                    if (outcome !is TextRuleOutcome.Drop) {
-                        if (direction == "server_to_client") connection.messagesReceived.incrementAndGet()
-                        else connection.messagesSent.incrementAndGet()
-                    }
-                    val wsMessage = connection.recordIndexed(counter) { index ->
-                        WebSocketMessage(
-                            index = index,
-                            direction = direction,
-                            type = recordedType,
-                            payload = effectivePayload,
-                            length = effectivePayload.toByteArray().size,
-                            timestamp = Instant.now().toString()
-                        )
-                    }
-
-                    eventBus.emit("websocket.message", buildJsonObject {
-                        put("connection_id", connectionId)
-                        put("direction", direction)
-                        put("type", recordedType)
-                        put("index", wsMessage.index)
-                        put("length", effectivePayload.length)
-                        put("timestamp", wsMessage.timestamp)
-                    })
-
-                    return when (outcome) {
-                        is TextRuleOutcome.Drop -> TextMessageAction.drop()
-                        is TextRuleOutcome.Modify -> TextMessageAction.continueWith(outcome.payload)
-                        is TextRuleOutcome.Continue -> TextMessageAction.continueWith(textMessage)
-                    }
-                }
-
-                override fun handleBinaryMessage(binaryMessage: BinaryMessage): BinaryMessageAction {
-                    val direction = when (binaryMessage.direction()) {
-                        Direction.CLIENT_TO_SERVER -> "client_to_server"
-                        Direction.SERVER_TO_CLIENT -> "server_to_client"
-                        else -> "unknown"
-                    }
-
-                    val drop = shouldDropBinary(url, direction)
-                    val recordedType = if (drop) "BINARY_DROPPED" else "BINARY"
-                    val rawBytes = binaryMessage.payload().getBytes()
-                    val base64Payload = Base64.getEncoder().encodeToString(rawBytes)
-                    val counter = messageIndexCounters.computeIfAbsent(connectionId) { AtomicLong(0) }
-                    if (!drop) {
-                        if (direction == "server_to_client") connection.messagesReceived.incrementAndGet()
-                        else connection.messagesSent.incrementAndGet()
-                    }
-                    val wsMessage = connection.recordIndexed(counter) { index ->
-                        WebSocketMessage(
-                            index = index,
-                            direction = direction,
-                            type = recordedType,
-                            payload = base64Payload,
-                            length = rawBytes.size,
-                            timestamp = Instant.now().toString()
-                        )
-                    }
-
-                    eventBus.emit("websocket.message", buildJsonObject {
-                        put("connection_id", connectionId)
-                        put("direction", direction)
-                        put("type", recordedType)
-                        put("index", wsMessage.index)
-                        put("length", rawBytes.size)
-                        put("timestamp", wsMessage.timestamp)
-                    })
-
-                    return if (drop) {
-                        BinaryMessageAction.drop()
-                    } else {
-                        BinaryMessageAction.continueWith(binaryMessage)
-                    }
-                }
-
-                override fun onClose() {
-                    connection.status = "closed"
-                    messageIndexCounters.remove(connectionId)
-
-                    eventBus.emit("websocket.closed", buildJsonObject {
-                        put("connection_id", connectionId)
-                        put("url", url)
-                        put("messages_sent", connection.messagesSent.get())
-                        put("messages_received", connection.messagesReceived.get())
-                        put("timestamp", Instant.now().toString())
-                    })
-                }
-            })
+            try {
+                onWebSocketCreated(webSocketCreated)
+            } catch (_: Exception) {
+                // Tracking is best-effort; it must never interfere with the socket itself.
+            }
         }
+    }
+
+    private fun onWebSocketCreated(created: WebSocketCreated) {
+        if (shutDown) return
+        val upgradeRequest = created.upgradeRequest()
+        val key = try { upgradeRequest.headerValue("Sec-WebSocket-Key") } catch (_: Exception) { null }
+        val own = key?.let { ownSockets[it] }
+        if (own != null) {
+            // Burp reports the socket before any frame flows, so tapping here loses nothing.
+            if (own.capture.compareAndSet(Capture.PENDING, Capture.CREATED_HANDLER)) {
+                try {
+                    keepRegistration(own.connection.connectionId, created.webSocket().registerMessageHandler(ownSocketTap(own)))
+                } catch (_: Exception) {
+                    // Let the extension handler record the frames instead.
+                    own.capture.set(Capture.PENDING)
+                }
+            }
+            return
+        }
+
+        val url = try { upgradeRequest.url() } catch (_: Exception) { "" }
+        val source = try { created.toolSource().toolType().name.lowercase() } catch (_: Exception) { "proxy" }
+        val connection = WebSocketConnection(
+            connectionId = stateManager.generateId("ws"),
+            url = url,
+            createdAt = Instant.now().toString(),
+        )
+        evictClosedConnectionsIfNeeded()
+        stateManager.websocketConnections[connection.connectionId] = connection
+
+        // Emit creation event
+        eventBus.emit("websocket.created", buildJsonObject {
+            put("connection_id", connection.connectionId)
+            put("url", url)
+            put("source", source)
+            put("timestamp", Instant.now().toString())
+        })
+
+        keepRegistration(connection.connectionId, created.webSocket().registerMessageHandler(burpSocketTap(connection)))
+    }
+
+    /** Keeps [registration] for deregistration on unload, or deregisters it now if the unload has begun. */
+    private fun keepRegistration(connectionId: String, registration: Registration) {
+        handlerRegistrations[connectionId] = registration
+        if (shutDown) handlerRegistrations.remove(connectionId)?.let { runCatching { it.deregister() } }
+    }
+
+    /**
+     * Tap for a socket created by a Burp tool (Proxy, Repeater, ...): applies intercept rules and
+     * records each frame as it was actually forwarded — the rewritten payload for "modify", the
+     * original marked *_DROPPED for "drop". A failure here forwards the frame unchanged.
+     */
+    private fun burpSocketTap(connection: WebSocketConnection): MessageHandler = object : MessageHandler {
+        override fun handleTextMessage(textMessage: TextMessage): TextMessageAction = try {
+            tapText(connection, textMessage)
+        } catch (_: Exception) {
+            TextMessageAction.continueWith(textMessage)
+        }
+
+        override fun handleBinaryMessage(binaryMessage: BinaryMessage): BinaryMessageAction = try {
+            tapBinary(connection, binaryMessage)
+        } catch (_: Exception) {
+            BinaryMessageAction.continueWith(binaryMessage)
+        }
+
+        override fun onClose() {
+            handlerRegistrations.remove(connection.connectionId)
+            markClosed(connection)
+        }
+    }
+
+    private fun tapText(connection: WebSocketConnection, textMessage: TextMessage): TextMessageAction {
+        val direction = directionName(textMessage.direction())
+        val originalPayload = textMessage.payload()
+        val outcome = evaluateTextRules(connection.url, direction, originalPayload)
+        val dropped = outcome is TextRuleOutcome.Drop
+        val forwarded = (outcome as? TextRuleOutcome.Modify)?.payload ?: originalPayload
+
+        if (!dropped) countFrame(connection, direction)
+        val message = connection.append(
+            direction, if (dropped) "TEXT_DROPPED" else "TEXT", forwarded, forwarded.toByteArray().size
+        )
+        emitMessageEvent(connection.connectionId, message)
+
+        return when (outcome) {
+            is TextRuleOutcome.Drop -> TextMessageAction.drop()
+            is TextRuleOutcome.Modify -> TextMessageAction.continueWith(outcome.payload)
+            is TextRuleOutcome.Continue -> TextMessageAction.continueWith(textMessage)
+        }
+    }
+
+    private fun tapBinary(connection: WebSocketConnection, binaryMessage: BinaryMessage): BinaryMessageAction {
+        val direction = directionName(binaryMessage.direction())
+        val dropped = shouldDropBinary(connection.url, direction)
+        val rawBytes = binaryMessage.payload().getBytes()
+
+        if (!dropped) countFrame(connection, direction)
+        val message = connection.append(
+            direction, if (dropped) "BINARY_DROPPED" else "BINARY", Base64.getEncoder().encodeToString(rawBytes), rawBytes.size
+        )
+        emitMessageEvent(connection.connectionId, message)
+
+        return if (dropped) BinaryMessageAction.drop() else BinaryMessageAction.continueWith(binaryMessage)
+    }
+
+    private fun countFrame(connection: WebSocketConnection, direction: String) {
+        if (direction == "server_to_client") connection.messagesReceived.incrementAndGet()
+        else connection.messagesSent.incrementAndGet()
+    }
+
+    private fun directionName(direction: Direction?): String = when (direction) {
+        Direction.CLIENT_TO_SERVER -> "client_to_server"
+        Direction.SERVER_TO_CLIENT -> "server_to_client"
+        else -> "unknown"
+    }
+
+    private fun emitMessageEvent(connectionId: String, message: WebSocketMessage) {
+        eventBus.emit("websocket.message", buildJsonObject {
+            put("connection_id", connectionId)
+            put("direction", message.direction)
+            put("type", message.type)
+            put("index", message.index)
+            put("length", message.length)
+            put("timestamp", message.timestamp)
+        })
+    }
+
+    /** Marks [connection] closed and emits "websocket.closed" once, whichever close path gets there first. */
+    private fun markClosed(connection: WebSocketConnection) {
+        if (!connection.markClosed()) return
+        eventBus.emit("websocket.closed", buildJsonObject {
+            put("connection_id", connection.connectionId)
+            put("url", connection.url)
+            put("messages_sent", connection.messagesSent.get())
+            put("messages_received", connection.messagesReceived.get())
+            put("timestamp", Instant.now().toString())
+        })
     }
 
     /**
@@ -584,6 +691,17 @@ class WebSocketBridge(
         tagComment: String?,
         enabled: Boolean
     ): JsonObject {
+        val ruleDirection = direction.trim().lowercase()
+        if (ruleDirection !in RULE_DIRECTIONS) {
+            return buildErrorJson("Invalid direction: '$direction'. Must be 'client_to_server', 'server_to_client' or 'both'")
+        }
+        val ruleAction = action.trim().lowercase()
+        if (ruleAction !in RULE_ACTIONS) {
+            return buildErrorJson("Invalid action: '$action'. Must be 'modify', 'drop', or 'tag'")
+        }
+        if (ruleAction == "modify" && modifyRegex == null) {
+            return buildErrorJson("action 'modify' requires modify_regex")
+        }
         if (matchUrl != null) {
             SafeRegex.validate(matchUrl)?.let { err ->
                 return buildJsonObject { put("error", "Invalid match_url regex: $err") }
@@ -606,23 +724,33 @@ class WebSocketBridge(
             ruleId = actualRuleId,
             matchUrl = matchUrl,
             matchMessage = matchMessage,
-            direction = direction,
-            action = action,
+            direction = ruleDirection,
+            action = ruleAction,
             modifyRegex = modifyRegex,
             modifyReplacement = modifyReplacement,
             tagComment = tagComment,
             enabled = enabled
         )
 
-        // Replace existing rule with same ID, or add new
-        stateManager.websocketInterceptRules.removeIf { it.ruleId == actualRuleId }
-        stateManager.websocketInterceptRules.add(rule)
+        // Replace an existing rule with the same ID in place (keeping its evaluation order), or add.
+        synchronized(ruleLock) {
+            var replaced = false
+            stateManager.websocketInterceptRules.replaceAll { existing ->
+                if (existing.ruleId == actualRuleId) {
+                    replaced = true
+                    rule
+                } else {
+                    existing
+                }
+            }
+            if (!replaced) stateManager.websocketInterceptRules.add(rule)
+        }
 
         // Emit rule change event
         eventBus.emit("websocket.rule_set", buildJsonObject {
             put("rule_id", actualRuleId)
-            put("action", action)
-            put("direction", direction)
+            put("action", ruleAction)
+            put("direction", ruleDirection)
             put("enabled", enabled)
             put("timestamp", Instant.now().toString())
         })
@@ -630,105 +758,11 @@ class WebSocketBridge(
         return buildJsonObject {
             put("rule_id", actualRuleId)
             put("status", "rule_set")
-            put("action", action)
-            put("direction", direction)
+            put("action", ruleAction)
+            put("direction", ruleDirection)
             put("enabled", enabled)
             put("total_rules", stateManager.websocketInterceptRules.size)
         }
-    }
-
-    /**
-     * Registers message handlers on a programmatically created ExtensionWebSocket
-     * to capture incoming messages from the server.
-     */
-    private fun registerExtensionMessageHandlers(webSocket: ExtensionWebSocket, connectionId: String) {
-        val connection = stateManager.websocketConnections[connectionId] ?: return
-
-        webSocket.registerMessageHandler(object : ExtensionWebSocketMessageHandler {
-            override fun textMessageReceived(textMessage: TextMessage) {
-                val counter = messageIndexCounters.computeIfAbsent(connectionId) { AtomicLong(0) }
-                connection.messagesReceived.incrementAndGet()
-
-                val payload = textMessage.payload()
-                val wsMessage = connection.recordIndexed(counter) { index ->
-                    WebSocketMessage(
-                        index = index,
-                        direction = "server_to_client",
-                        type = "TEXT",
-                        payload = payload,
-                        length = payload.toByteArray().size,
-                        timestamp = Instant.now().toString()
-                    )
-                }
-                val index = wsMessage.index
-
-                eventBus.emit("websocket.message", buildJsonObject {
-                    put("connection_id", connectionId)
-                    put("direction", "server_to_client")
-                    put("type", "TEXT")
-                    put("index", index)
-                    put("length", payload.length)
-                    put("timestamp", Instant.now().toString())
-                })
-
-                // Evaluate intercept rules. This is a receive-only callback
-                // (ExtensionWebSocketMessageHandler.textMessageReceived returns
-                // void), so the Montoya API cannot drop or rewrite the frame
-                // here. "tag" rules are honoured via their emitted event; for
-                // "drop"/"modify" matches we surface an advisory event so the
-                // rule is observable even though it cannot be enforced on this
-                // path.
-                applyIncomingRulesAdvisory(connection.url, "server_to_client", payload)
-            }
-
-            override fun binaryMessageReceived(binaryMessage: BinaryMessage) {
-                val counter = messageIndexCounters.computeIfAbsent(connectionId) { AtomicLong(0) }
-                connection.messagesReceived.incrementAndGet()
-
-                val rawBytes = binaryMessage.payload().getBytes()
-                val base64Payload = Base64.getEncoder().encodeToString(rawBytes)
-                val wsMessage = connection.recordIndexed(counter) { index ->
-                    WebSocketMessage(
-                        index = index,
-                        direction = "server_to_client",
-                        type = "BINARY",
-                        payload = base64Payload,
-                        length = rawBytes.size,
-                        timestamp = Instant.now().toString()
-                    )
-                }
-                val index = wsMessage.index
-
-                eventBus.emit("websocket.message", buildJsonObject {
-                    put("connection_id", connectionId)
-                    put("direction", "server_to_client")
-                    put("type", "BINARY")
-                    put("index", index)
-                    put("length", rawBytes.size)
-                    put("timestamp", Instant.now().toString())
-                })
-
-                // Receive-only callback: honour "tag" rules and surface an
-                // advisory event for unenforceable drop matches (see the text
-                // handler above for rationale). Binary content is not matched
-                // against matchMessage.
-                applyIncomingBinaryRulesAdvisory(connection.url, "server_to_client")
-            }
-
-            override fun onClose() {
-                connection.status = "closed"
-                webSocketHandles.remove(connectionId)
-                messageIndexCounters.remove(connectionId)
-
-                eventBus.emit("websocket.closed", buildJsonObject {
-                    put("connection_id", connectionId)
-                    put("url", connection.url)
-                    put("messages_sent", connection.messagesSent.get())
-                    put("messages_received", connection.messagesReceived.get())
-                    put("timestamp", Instant.now().toString())
-                })
-            }
-        })
     }
 
     /**
@@ -796,7 +830,8 @@ class WebSocketBridge(
         var current = payload
         var modified = false
 
-        for (rule in stateManager.websocketInterceptRules.toList()) {
+        // Iterating the copy-on-write list directly walks its current snapshot without copying it.
+        for (rule in stateManager.websocketInterceptRules) {
             if (!rule.enabled) continue
             if (!ruleMatches(rule, url, direction, current)) continue
 
@@ -843,7 +878,7 @@ class WebSocketBridge(
      * @return true if the binary message should be dropped, false to continue.
      */
     private fun shouldDropBinary(url: String?, direction: String): Boolean {
-        for (rule in stateManager.websocketInterceptRules.toList()) {
+        for (rule in stateManager.websocketInterceptRules) {
             if (!rule.enabled) continue
             // Binary frames have no text content; matchMessage cannot apply.
             if (rule.matchMessage != null) continue
@@ -933,23 +968,34 @@ class WebSocketBridge(
         upgradeStatusCode: Int?
     ): String = describeCreationStatus(status?.name, upgradeStatusCode)
 
-    /** Closes all live extension WebSocket handles and clears counters on extension unload. */
+    /**
+     * Releases everything this bridge holds on extension unload: stops the creation worker,
+     * closes every socket opened by [createConnection], and deregisters the message handlers
+     * attached to Burp-created sockets so none of them keeps calling into unloaded code.
+     */
     fun shutdown() {
+        shutDown = true
+        createExecutor.shutdownNow()
         webSocketHandles.values.forEach { ws -> runCatching { ws.close() } }
         webSocketHandles.clear()
-        messageIndexCounters.clear()
+        handlerRegistrations.values.forEach { reg -> runCatching { reg.deregister() } }
+        handlerRegistrations.clear()
+        ownSockets.clear()
     }
 
+    /** Once [MAX_CONNECTIONS] are tracked, drops the oldest closed connections (and anything they still hold). */
     private fun evictClosedConnectionsIfNeeded() {
-        if (stateManager.websocketConnections.size < MAX_CONNECTIONS) return
-        val closedOldest = stateManager.websocketConnections.entries
-            .filter { it.value.status == "closed" }
-            .sortedBy { it.value.createdAt }
-        for ((id, _) in closedOldest) {
-            if (stateManager.websocketConnections.size < MAX_CONNECTIONS) break
-            stateManager.websocketConnections.remove(id)
+        val connections = stateManager.websocketConnections
+        if (connections.size < MAX_CONNECTIONS) return
+        val closedOldest = connections.values
+            .filter { it.status == "closed" }
+            .sortedBy { runCatching { Instant.parse(it.createdAt) }.getOrDefault(Instant.EPOCH) }
+        for (connection in closedOldest) {
+            if (connections.size < MAX_CONNECTIONS) break
+            val id = connection.connectionId
+            connections.remove(id)
             webSocketHandles.remove(id)?.let { runCatching { it.close() } }
-            messageIndexCounters.remove(id)
+            handlerRegistrations.remove(id)?.let { runCatching { it.deregister() } }
         }
     }
 
@@ -974,8 +1020,10 @@ class WebSocketBridge(
         /** Schemes accepted for a WebSocket upgrade attempt. */
         private val ALLOWED_SCHEMES = setOf("ws", "wss", "http", "https")
 
-        /** Recognised direction filters for [getMessages]. */
-        private val VALID_DIRECTIONS = setOf("client_to_server", "server_to_client")
+        /** Accepted direction values (case-insensitive); "both" means no direction filter. */
+        private val RULE_DIRECTIONS = setOf("client_to_server", "server_to_client", "both")
+
+        private val RULE_ACTIONS = setOf("modify", "drop", "tag")
 
         /**
          * Returns an error message if [scheme] is not a WebSocket-capable
@@ -992,11 +1040,11 @@ class WebSocketBridge(
         /**
          * Returns an error message if [direction] is a non-null value that is
          * not a recognised direction filter, or null if it is acceptable (null
-         * means "no filter").
+         * or "both" means "no filter"). Comparison is case-insensitive.
          */
         internal fun validateDirectionFilter(direction: String?): String? {
-            if (direction != null && direction !in VALID_DIRECTIONS) {
-                return "Invalid direction: '$direction'. Must be 'client_to_server' or 'server_to_client'"
+            if (direction != null && direction.trim().lowercase() !in RULE_DIRECTIONS) {
+                return "Invalid direction: '$direction'. Must be 'client_to_server', 'server_to_client' or 'both'"
             }
             return null
         }
@@ -1009,6 +1057,14 @@ class WebSocketBridge(
         internal fun validateMaxResults(maxResults: Int): String? {
             if (maxResults < 0) {
                 return "Invalid max_results: $maxResults. Must be zero or a positive integer"
+            }
+            return null
+        }
+
+        /** Returns an error message if [sinceIndex] is below -1 (-1 means "from the oldest retained message"). */
+        internal fun validateSinceIndex(sinceIndex: Long): String? {
+            if (sinceIndex < -1) {
+                return "Invalid since_index: $sinceIndex. Use -1 for all retained messages, or the index of the last message read"
             }
             return null
         }

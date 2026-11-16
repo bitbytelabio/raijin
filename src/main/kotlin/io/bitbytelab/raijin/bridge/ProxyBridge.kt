@@ -2,10 +2,12 @@ package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
 import io.bitbytelab.raijin.core.BodyText
+import io.bitbytelab.raijin.core.HistoryCriteria
 import io.bitbytelab.raijin.core.ProxyHistorySearch
 import io.bitbytelab.raijin.core.SensitiveHeaders
 import io.bitbytelab.raijin.core.StatusCodeRange
 import io.bitbytelab.raijin.core.HighlightColorName
+import io.bitbytelab.raijin.core.WebSocketHistoryCriteria
 import burp.api.montoya.core.Annotations
 import burp.api.montoya.core.HighlightColor
 import burp.api.montoya.http.message.MimeType
@@ -23,7 +25,6 @@ import burp.api.montoya.proxy.http.ProxyRequestToBeSentAction
 import burp.api.montoya.proxy.http.ProxyResponseHandler
 import burp.api.montoya.proxy.http.ProxyResponseReceivedAction
 import burp.api.montoya.proxy.http.ProxyResponseToBeSentAction
-import burp.api.montoya.websocket.Direction
 import io.bitbytelab.raijin.core.TextSimilarity
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.safety.BoundedHttp
@@ -60,8 +61,12 @@ class ProxyBridge(
      * Montoya callback dispatch; its futures are intentionally never awaited (see [maybeAutorize]).
      */
     private val autorizeExecutor: ExecutorService = Executors.newVirtualThreadPerTaskExecutor()
-    private val autorizeSemaphore = java.util.concurrent.Semaphore(10)
-    private val autorizePendingCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Admission and send-concurrency bounds for [autorizeExecutor]. */
+    private val autorizeGate = AutorizeReplayGate(AUTORIZE_MAX_QUEUED, AUTORIZE_MAX_CONCURRENT)
+
+    /** Serialises rule writes so concurrent sets of one id cannot both append. */
+    private val ruleLock = Any()
 
     /** Shuts down background executors on extension unload. */
     fun shutdown() {
@@ -124,37 +129,29 @@ class ProxyBridge(
             is StatusCodeRange.Result.Invalid -> return buildJsonObject { put("error", r.message) }
         }
 
+        val criteria = HistoryCriteria(host, method, statusCode, resolvedRange)
         val filter = ProxyHistoryFilter { item ->
             try {
                 if (inScopeOnly && !item.request().isInScope()) return@ProxyHistoryFilter false
-                val itemHost = try { item.host() } catch (_: Exception) { null }
-                if (host != null && (itemHost == null || !itemHost.contains(host, ignoreCase = true))) return@ProxyHistoryFilter false
-                val itemMethod = try { item.method() } catch (_: Exception) { null }
-                if (method != null && (itemMethod == null || !itemMethod.equals(method, ignoreCase = true))) return@ProxyHistoryFilter false
-                if (statusCode != null) {
-                    if (!item.hasResponse() || item.response().statusCode().toInt() != statusCode) return@ProxyHistoryFilter false
-                }
-                if (resolvedRange != null) {
-                    if (!item.hasResponse()) return@ProxyHistoryFilter false
-                    val sc = item.response().statusCode().toInt()
-                    if (!resolvedRange.contains(sc)) return@ProxyHistoryFilter false
-                }
-                if (resolvedMimeType != null && item.mimeType() != resolvedMimeType) {
-                    return@ProxyHistoryFilter false
-                }
-                true
+                if (resolvedMimeType != null && item.mimeType() != resolvedMimeType) return@ProxyHistoryFilter false
+                // Each value is read only when its criterion is set, and guarded: a malformed
+                // request throws from host()/method() and must not abort the whole read.
+                criteria.matches(
+                    host = if (criteria.host != null) safe { item.httpService().host() } else null,
+                    method = if (criteria.method != null) safe { item.finalRequest().method() } else null,
+                    status = if (criteria.needsStatus) responseStatus(item) else null,
+                )
             } catch (_: Exception) {
                 false
             }
         }
 
-        val safeStart = startIndex.coerceAtLeast(0)
         val allItems = api.proxy().history(filter)
-        val totalFiltered = allItems.size
-        val slice = allItems.drop(safeStart).take(count.coerceIn(0, 1000))
+        val safeStart = startIndex.coerceAtLeast(0)
+        val slice = page(allItems, safeStart, count)
 
         return buildJsonObject {
-            put("total_filtered", totalFiltered)
+            put("total_filtered", allItems.size)
             put("start_index", safeStart)
             put("returned", slice.size)
             put("items", buildJsonArray {
@@ -191,32 +188,35 @@ class ProxyBridge(
         SafeRegex.validate(pattern, ignoreCase = ignoreCase)?.let { err ->
             return buildJsonObject { put("error", "Invalid regex pattern: $err") }
         }
+        val t = ProxyHistorySearch.targets(searchIn)
 
         val filter = ProxyHistoryFilter { item ->
-            if (inScopeOnly && !runCatching { item.request().isInScope() }.getOrDefault(false)) return@ProxyHistoryFilter false
+            try {
+                if (inScopeOnly && !item.request().isInScope()) return@ProxyHistoryFilter false
 
-            val t = ProxyHistorySearch.targets(searchIn)
-
-            var found = false
-            if (t.url) {
-                // Match against the fully-reconstructed URL (scheme+host+path+query),
-                // which the request text does not expose as one contiguous string.
-                val url = try { item.request().url() } catch (_: Exception) { "" }
-                found = SafeRegex.containsMatchIn(pattern, url, ignoreCase = ignoreCase)
+                var found = false
+                if (t.url) {
+                    // Match against the fully-reconstructed URL (scheme+host+path+query),
+                    // which the request text does not expose as one contiguous string.
+                    val url = safe { item.request().url() } ?: ""
+                    found = SafeRegex.containsMatchIn(pattern, url, ignoreCase = ignoreCase)
+                }
+                if (!found && t.request) {
+                    val reqText = safe { item.request().toString() } ?: ""
+                    found = SafeRegex.containsMatchIn(pattern, reqText, ignoreCase = ignoreCase)
+                }
+                if (!found && t.response && item.hasResponse()) {
+                    val respText = safe { item.response().toString() } ?: ""
+                    found = SafeRegex.containsMatchIn(pattern, respText, ignoreCase = ignoreCase)
+                }
+                found
+            } catch (_: Exception) {
+                false
             }
-            if (!found && t.request) {
-                val reqText = try { item.request().toString() } catch (_: Exception) { "" }
-                found = SafeRegex.containsMatchIn(pattern, reqText, ignoreCase = ignoreCase)
-            }
-            if (!found && t.response && item.hasResponse()) {
-                val respText = try { item.response().toString() } catch (_: Exception) { "" }
-                found = SafeRegex.containsMatchIn(pattern, respText, ignoreCase = ignoreCase)
-            }
-            found
         }
 
         val matches = api.proxy().history(filter)
-        val limited = matches.take(maxResults.coerceIn(0, 1000))
+        val limited = page(matches, 0, maxResults)
 
         return buildJsonObject {
             put("total_matches", matches.size)
@@ -237,7 +237,7 @@ class ProxyBridge(
      * @param startIndex Zero-based offset.
      * @param count Maximum number of items.
      * @param host Optional hostname filter.
-     * @param direction Optional direction filter: "CLIENT_TO_SERVER" or "SERVER_TO_CLIENT".
+     * @param direction Optional direction filter: "client_to_server", "server_to_client" or "both" (any case).
      * @return JSON object with items array.
      */
     fun getWebSocketHistory(
@@ -246,30 +246,30 @@ class ProxyBridge(
         host: String?,
         direction: String?
     ): JsonObject {
-        val dirFilter = direction?.let {
-            try { Direction.valueOf(it.uppercase()) } catch (_: Exception) { null }
+        val dirName = when (val d = WebSocketHistoryCriteria.parseDirection(direction)) {
+            is WebSocketHistoryCriteria.DirectionFilter.All -> null
+            is WebSocketHistoryCriteria.DirectionFilter.Only -> d.name
+            is WebSocketHistoryCriteria.DirectionFilter.Invalid -> return buildJsonObject { put("error", d.message) }
         }
+        val criteria = WebSocketHistoryCriteria(host, dirName)
 
         val filter = ProxyWebSocketHistoryFilter { item ->
-            if (host != null) {
-                val upgradeHost = try { item.upgradeRequest()?.httpService()?.host() } catch (_: Exception) { null }
-                if (upgradeHost != null && !upgradeHost.contains(host, ignoreCase = true)) {
-                    return@ProxyWebSocketHistoryFilter false
-                }
+            try {
+                criteria.matches(
+                    upgradeHost = if (host != null) safe { item.upgradeRequest()?.httpService()?.host() } else null,
+                    direction = if (dirName != null) safe { item.direction().name } else null,
+                )
+            } catch (_: Exception) {
+                false
             }
-            if (dirFilter != null && item.direction() != dirFilter) {
-                return@ProxyWebSocketHistoryFilter false
-            }
-            true
         }
 
-        val safeStart = startIndex.coerceAtLeast(0)
         val allItems = api.proxy().webSocketHistory(filter)
-        val totalFiltered = allItems.size
-        val slice = allItems.drop(safeStart).take(count.coerceIn(0, 1000))
+        val safeStart = startIndex.coerceAtLeast(0)
+        val slice = page(allItems, safeStart, count)
 
         return buildJsonObject {
-            put("total_filtered", totalFiltered)
+            put("total_filtered", allItems.size)
             put("start_index", safeStart)
             put("returned", slice.size)
             put("items", buildJsonArray {
@@ -294,18 +294,24 @@ class ProxyBridge(
         SafeRegex.validate(pattern, ignoreCase = true)?.let { err ->
             return buildJsonObject { put("error", "Invalid regex pattern: $err") }
         }
-        val dirFilter = direction?.let {
-            try { Direction.valueOf(it.uppercase()) } catch (_: Exception) { null }
+        val dirName = when (val d = WebSocketHistoryCriteria.parseDirection(direction)) {
+            is WebSocketHistoryCriteria.DirectionFilter.All -> null
+            is WebSocketHistoryCriteria.DirectionFilter.Only -> d.name
+            is WebSocketHistoryCriteria.DirectionFilter.Invalid -> return buildJsonObject { put("error", d.message) }
         }
 
         val filter = ProxyWebSocketHistoryFilter { item ->
-            if (dirFilter != null && item.direction() != dirFilter) return@ProxyWebSocketHistoryFilter false
-            val payloadText = try { item.payload().toString() } catch (_: Exception) { "" }
-            SafeRegex.containsMatchIn(pattern, payloadText, ignoreCase = true)
+            try {
+                if (dirName != null && item.direction().name != dirName) return@ProxyWebSocketHistoryFilter false
+                val payloadText = safe { item.payload().toString() } ?: ""
+                SafeRegex.containsMatchIn(pattern, payloadText, ignoreCase = true)
+            } catch (_: Exception) {
+                false
+            }
         }
 
         val matches = api.proxy().webSocketHistory(filter)
-        val limited = matches.take(maxResults.coerceIn(0, 1000))
+        val limited = page(matches, 0, maxResults)
 
         return buildJsonObject {
             put("total_matches", matches.size)
@@ -361,8 +367,7 @@ class ProxyBridge(
      * @return JSON object confirming the annotation.
      */
     fun annotateHistoryItem(index: Int, comment: String?, highlight: String?): JsonObject {
-        val history = api.proxy().history()
-        val item = history.find { it.id() == index }
+        val item = api.proxy().history { it.id() == index }.firstOrNull()
             ?: return buildJsonObject {
                 put("error", "History item with id $index not found")
             }
@@ -401,6 +406,83 @@ class ProxyBridge(
     }
 
     // ---------------------------------------------------------------
+    // Proxy rules
+    // ---------------------------------------------------------------
+
+    /** Validates [rule] and stores it, replacing (in place) any rule with the same id. */
+    fun setRule(rule: ProxyRule): JsonObject {
+        validateRule(rule)?.let { return buildJsonObject { put("error", it) } }
+        synchronized(ruleLock) {
+            var replaced = false
+            stateManager.proxyRules.replaceAll { existing ->
+                if (existing.ruleId == rule.ruleId) {
+                    replaced = true
+                    rule
+                } else {
+                    existing
+                }
+            }
+            if (!replaced) stateManager.proxyRules.add(rule)
+        }
+        return buildJsonObject {
+            put("rule_set", true)
+            put("rule_id", rule.ruleId)
+            put("type", rule.type)
+            put("action", rule.action)
+            put("total_rules", stateManager.proxyRules.size)
+        }
+    }
+
+    /** Lists proxy rules, optionally only "request" or "response" ones. */
+    fun listRules(type: String?): JsonObject {
+        val wanted = type?.trim()?.lowercase()
+        if (wanted != null && wanted !in RULE_TYPES) {
+            return buildJsonObject { put("error", "Invalid type '$type'. Allowed: request, response") }
+        }
+        val rules = stateManager.proxyRules.filter { wanted == null || it.type.equals(wanted, ignoreCase = true) }
+        return buildJsonObject {
+            put("total", rules.size)
+            put("rules", buildJsonArray { rules.forEach { add(serializeProxyRule(it)) } })
+        }
+    }
+
+    /** Removes the rule with [ruleId]; `removed` is false when there was none. */
+    fun removeRule(ruleId: String): JsonObject {
+        val removed = synchronized(ruleLock) { stateManager.proxyRules.removeIf { it.ruleId == ruleId } }
+        return buildJsonObject {
+            put("rule_id", ruleId)
+            put("removed", removed)
+            put("remaining_rules", stateManager.proxyRules.size)
+        }
+    }
+
+    private fun serializeProxyRule(rule: ProxyRule): JsonObject {
+        return buildJsonObject {
+            put("rule_id", rule.ruleId)
+            put("type", rule.type)
+            put("action", rule.action)
+            put("enabled", rule.enabled)
+            if (rule.matchHost != null) put("match_host", rule.matchHost)
+            if (rule.matchUrl != null) put("match_url", rule.matchUrl)
+            if (rule.matchMethod != null) put("match_method", rule.matchMethod)
+            if (rule.matchHeader != null) put("match_header", rule.matchHeader)
+            if (rule.matchBody != null) put("match_body", rule.matchBody)
+            if (rule.matchStatus != null) put("match_status", rule.matchStatus)
+            if (rule.modifyAddHeader != null) put("modify_add_header", rule.modifyAddHeader)
+            if (rule.modifyRemoveHeader != null) put("modify_remove_header", rule.modifyRemoveHeader)
+            if (rule.modifyReplaceHeader != null) {
+                put("modify_replace_header", buildJsonObject {
+                    rule.modifyReplaceHeader.forEach { (k, v) -> put(k, v) }
+                })
+            }
+            if (rule.modifyBodyRegex != null) put("modify_body_regex", rule.modifyBodyRegex)
+            if (rule.modifyBodyReplacement != null) put("modify_body_replacement", rule.modifyBodyReplacement)
+            if (rule.tagComment != null) put("tag_comment", rule.tagComment)
+            if (rule.tagHighlight != null) put("tag_highlight", rule.tagHighlight)
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Proxy handlers (registered during extension init)
     // ---------------------------------------------------------------
 
@@ -415,66 +497,11 @@ class ProxyBridge(
             override fun handleRequestReceived(interceptedRequest: InterceptedRequest): ProxyRequestReceivedAction {
                 // Emit event for every request passing through the proxy
                 emitRequestEvent(interceptedRequest)
-
-                // Find matching request rules
-                val matchingRules = stateManager.proxyRules.filter { rule ->
-                    rule.enabled && rule.type.equals("request", ignoreCase = true) &&
-                        matchesRequestRule(rule, interceptedRequest)
-                }
-
-                if (matchingRules.isEmpty()) {
-                    return ProxyRequestReceivedAction.continueWith(interceptedRequest)
-                }
-
-                var currentRequest: HttpRequest = interceptedRequest
-                var currentAnnotations = interceptedRequest.annotations()
-                var shouldDrop = false
-
-                for (rule in matchingRules) {
-                    when (rule.action.lowercase()) {
-                        "drop" -> {
-                            shouldDrop = true
-                            eventBus.emit("proxy.rule.applied", buildJsonObject {
-                                put("rule_id", rule.ruleId)
-                                put("action", "drop")
-                                put("url", interceptedRequest.url())
-                                put("timestamp", Instant.now().toString())
-                            })
-                            break
-                        }
-                        "modify" -> {
-                            currentRequest = applyRequestModifications(rule, currentRequest)
-                            eventBus.emit("proxy.rule.applied", buildJsonObject {
-                                put("rule_id", rule.ruleId)
-                                put("action", "modify")
-                                put("url", interceptedRequest.url())
-                                put("timestamp", Instant.now().toString())
-                            })
-                        }
-                        "tag" -> {
-                            if (rule.tagComment != null) {
-                                currentAnnotations = currentAnnotations.withNotes(rule.tagComment)
-                            }
-                            if (rule.tagHighlight != null) {
-                                val color = resolveHighlightColor(rule.tagHighlight)
-                                if (color != null) {
-                                    currentAnnotations = currentAnnotations.withHighlightColor(color)
-                                }
-                            }
-                            eventBus.emit("proxy.rule.applied", buildJsonObject {
-                                put("rule_id", rule.ruleId)
-                                put("action", "tag")
-                                put("url", interceptedRequest.url())
-                                put("timestamp", Instant.now().toString())
-                            })
-                        }
-                    }
-                }
-
-                return if (shouldDrop) {
-                    ProxyRequestReceivedAction.drop()
-                } else {
-                    ProxyRequestReceivedAction.continueWith(currentRequest, currentAnnotations)
+                return try {
+                    applyRequestRules(interceptedRequest)
+                } catch (_: Exception) {
+                    // A failing rule must never break the proxy: forward the request unchanged.
+                    ProxyRequestReceivedAction.continueWith(interceptedRequest)
                 }
             }
 
@@ -499,65 +526,11 @@ class ProxyBridge(
                 // Live Autorize-style tap: fire-and-forget, never blocks this handler.
                 maybeAutorize(interceptedResponse)
 
-                // Find matching response rules
-                val matchingRules = stateManager.proxyRules.filter { rule ->
-                    rule.enabled && rule.type.equals("response", ignoreCase = true) &&
-                        matchesResponseRule(rule, interceptedResponse)
-                }
-
-                if (matchingRules.isEmpty()) {
-                    return ProxyResponseReceivedAction.continueWith(interceptedResponse)
-                }
-
-                var currentResponse: HttpResponse = interceptedResponse
-                var currentAnnotations = interceptedResponse.annotations()
-                var shouldDrop = false
-
-                for (rule in matchingRules) {
-                    when (rule.action.lowercase()) {
-                        "drop" -> {
-                            shouldDrop = true
-                            eventBus.emit("proxy.rule.applied", buildJsonObject {
-                                put("rule_id", rule.ruleId)
-                                put("action", "drop")
-                                put("url", interceptedResponse.request()?.url() ?: "")
-                                put("timestamp", Instant.now().toString())
-                            })
-                            break
-                        }
-                        "modify" -> {
-                            currentResponse = applyResponseModifications(rule, currentResponse)
-                            eventBus.emit("proxy.rule.applied", buildJsonObject {
-                                put("rule_id", rule.ruleId)
-                                put("action", "modify")
-                                put("url", interceptedResponse.request()?.url() ?: "")
-                                put("timestamp", Instant.now().toString())
-                            })
-                        }
-                        "tag" -> {
-                            if (rule.tagComment != null) {
-                                currentAnnotations = currentAnnotations.withNotes(rule.tagComment)
-                            }
-                            if (rule.tagHighlight != null) {
-                                val color = resolveHighlightColor(rule.tagHighlight)
-                                if (color != null) {
-                                    currentAnnotations = currentAnnotations.withHighlightColor(color)
-                                }
-                            }
-                            eventBus.emit("proxy.rule.applied", buildJsonObject {
-                                put("rule_id", rule.ruleId)
-                                put("action", "tag")
-                                put("url", interceptedResponse.request()?.url() ?: "")
-                                put("timestamp", Instant.now().toString())
-                            })
-                        }
-                    }
-                }
-
-                return if (shouldDrop) {
-                    ProxyResponseReceivedAction.drop()
-                } else {
-                    ProxyResponseReceivedAction.continueWith(currentResponse, currentAnnotations)
+                return try {
+                    applyResponseRules(interceptedResponse)
+                } catch (_: Exception) {
+                    // A failing rule must never break the proxy: forward the response unchanged.
+                    ProxyResponseReceivedAction.continueWith(interceptedResponse)
                 }
             }
 
@@ -567,6 +540,80 @@ class ProxyBridge(
         }
     }
 
+    private fun applyRequestRules(request: InterceptedRequest): ProxyRequestReceivedAction {
+        val matchingRules = stateManager.proxyRules.filter { rule ->
+            rule.enabled && rule.type.equals("request", ignoreCase = true) && matchesRequestRule(rule, request)
+        }
+        if (matchingRules.isEmpty()) return ProxyRequestReceivedAction.continueWith(request)
+
+        val url = safe { request.url() } ?: ""
+        var currentRequest: HttpRequest = request
+        var currentAnnotations = request.annotations()
+        for (rule in matchingRules) {
+            when (rule.action.lowercase()) {
+                "drop" -> {
+                    emitRuleApplied(rule, "drop", url)
+                    return ProxyRequestReceivedAction.drop()
+                }
+                "modify" -> {
+                    currentRequest = applyRequestModifications(rule, currentRequest)
+                    emitRuleApplied(rule, "modify", url)
+                }
+                "tag" -> {
+                    currentAnnotations = tagAnnotations(rule, currentAnnotations)
+                    emitRuleApplied(rule, "tag", url)
+                }
+            }
+        }
+        return ProxyRequestReceivedAction.continueWith(currentRequest, currentAnnotations)
+    }
+
+    private fun applyResponseRules(response: InterceptedResponse): ProxyResponseReceivedAction {
+        val matchingRules = stateManager.proxyRules.filter { rule ->
+            rule.enabled && rule.type.equals("response", ignoreCase = true) && matchesResponseRule(rule, response)
+        }
+        if (matchingRules.isEmpty()) return ProxyResponseReceivedAction.continueWith(response)
+
+        val url = safe { response.request()?.url() } ?: ""
+        var currentResponse: HttpResponse = response
+        var currentAnnotations = response.annotations()
+        for (rule in matchingRules) {
+            when (rule.action.lowercase()) {
+                "drop" -> {
+                    emitRuleApplied(rule, "drop", url)
+                    return ProxyResponseReceivedAction.drop()
+                }
+                "modify" -> {
+                    currentResponse = applyResponseModifications(rule, currentResponse)
+                    emitRuleApplied(rule, "modify", url)
+                }
+                "tag" -> {
+                    currentAnnotations = tagAnnotations(rule, currentAnnotations)
+                    emitRuleApplied(rule, "tag", url)
+                }
+            }
+        }
+        return ProxyResponseReceivedAction.continueWith(currentResponse, currentAnnotations)
+    }
+
+    private fun tagAnnotations(rule: ProxyRule, annotations: Annotations): Annotations {
+        var tagged = annotations
+        if (rule.tagComment != null) tagged = tagged.withNotes(rule.tagComment)
+        if (rule.tagHighlight != null) {
+            resolveHighlightColor(rule.tagHighlight)?.let { tagged = tagged.withHighlightColor(it) }
+        }
+        return tagged
+    }
+
+    private fun emitRuleApplied(rule: ProxyRule, action: String, url: String) {
+        eventBus.emit("proxy.rule.applied", buildJsonObject {
+            put("rule_id", rule.ruleId)
+            put("action", action)
+            put("url", url)
+            put("timestamp", Instant.now().toString())
+        })
+    }
+
     // ---------------------------------------------------------------
     // Live Autorize-style tap: clone matching traffic, replay under a second identity in the
     // background, diff against the already-captured response. See AutorizeBridge for rule CRUD.
@@ -574,58 +621,65 @@ class ProxyBridge(
 
     /**
      * Checks [response] against every enabled [io.bitbytelab.raijin.state.AutorizeRule], and for each
-     * match, submits a background replay+diff to [autorizeExecutor]. Never blocks or throws into the
-     * caller — this runs on Burp's proxy handler thread for every single response.
+     * match not yet tested, submits a background replay+diff to [autorizeExecutor]. Never blocks or
+     * throws into the caller — this runs on Burp's proxy handler thread for every single response.
      */
     private fun maybeAutorize(response: InterceptedResponse) {
         val rules = stateManager.autorizeRules
         if (rules.none { it.enabled }) return
+        // Admissions taken but not yet handed to a submitted task; released in `finally`.
+        var admitted = 0
         try {
             val request = response.request() ?: return
             val url = request.url()
             val method = request.method()
-            val originalContentType = try { response.headerValue("Content-Type") } catch (_: Exception) { null }
+            val contentType = safe { response.headerValue("Content-Type") }
 
-            val matching = rules.filter { rule ->
-                rule.enabled && autorizeRuleMatches(rule, request, method, url, originalContentType)
+            // Cheap per-rule filters and the dedup guard run first; the request and response are
+            // only stringified when at least one rule will actually replay.
+            val replays = ArrayList<AutorizeRule>(1)
+            for (rule in rules) {
+                if (!rule.enabled || !autorizeRuleMatches(rule, request, method, url, contentType)) continue
+                // Queue full: leave the endpoint unmarked so a later hit can still test it.
+                if (!autorizeGate.tryAdmit()) break
+                admitted++
+                if (stateManager.autorizeSeenOnce(StateManager.autorizeSeenKey(rule.ruleId, method, url))) {
+                    replays += rule
+                } else {
+                    autorizeGate.release()
+                    admitted--
+                }
             }
-            if (matching.isEmpty()) return
+            if (replays.isEmpty()) return
 
-            // Serialize heavy strings ONLY after confirming at least one rule matches.
-            val originalStatus = response.statusCode().toInt()
-            val originalBody = response.bodyToString()
-            val originalLocation = try { response.headerValue("Location") } catch (_: Exception) { null }
+            val captured = AuthDiffVerdict.LevelResult(
+                "captured",
+                response.statusCode().toInt(),
+                response.bodyToString(),
+                contentType,
+                safe { response.headerValue("Location") },
+            )
             val rawRequest = request.toString()
             val rawResponse = response.toString()
 
-            for (rule in matching) {
-                val seenKey = "${rule.ruleId}|$method|${url.substringBefore('?')}"
-                if (!stateManager.autorizeSeenOnce(seenKey)) continue
-                if (autorizePendingCount.incrementAndGet() > 100) {
-                    autorizePendingCount.decrementAndGet()
-                    continue
-                }
-
-                autorizeExecutor.submit {
+            for (rule in replays) {
+                autorizeExecutor.execute {
                     try {
-                        autorizeSemaphore.acquire()
-                        try {
-                            autorizeReplayAndAssess(
-                                rule, request, method, url, originalStatus, originalBody, originalContentType,
-                                originalLocation, rawRequest, rawResponse,
-                            )
-                        } finally {
-                            autorizeSemaphore.release()
+                        autorizeGate.withSendSlot {
+                            autorizeReplayAndAssess(rule, request, method, url, captured, rawRequest, rawResponse)
                         }
                     } catch (_: Exception) {
                         // Best-effort background check; a failure here must never surface as a proxy error.
                     } finally {
-                        autorizePendingCount.decrementAndGet()
+                        autorizeGate.release()
                     }
                 }
+                admitted--
             }
         } catch (_: Exception) {
             // Same: tapping must never disrupt the live proxy flow.
+        } finally {
+            repeat(admitted) { autorizeGate.release() }
         }
     }
 
@@ -634,11 +688,11 @@ class ProxyBridge(
         if (rule.methods != null && method.uppercase() !in rule.methods) return false
         if (rule.excludeUrlRegex != null && SafeRegex.containsMatchIn(rule.excludeUrlRegex, url, ignoreCase = true)) return false
         if (rule.includeHostPattern != null) {
-            val host = try { request.httpService().host() } catch (_: Exception) { "" }
+            val host = safe { request.httpService().host() } ?: ""
             if (!SafeRegex.matchesHostPattern(rule.includeHostPattern, host)) return false
         }
         if (rule.inScopeOnly) {
-            val inScope = try { api.scope().isInScope(url) } catch (_: Exception) { true }
+            val inScope = safe { api.scope().isInScope(url) } ?: true
             if (!inScope) return false
         }
         if (rule.ignoreStaticAssets && StaticAssetHeuristic.looksStatic(contentType, url)) return false
@@ -657,10 +711,7 @@ class ProxyBridge(
         originalRequest: HttpRequest,
         method: String,
         url: String,
-        originalStatus: Int,
-        originalBody: String,
-        originalContentType: String?,
-        originalLocation: String?,
+        captured: AuthDiffVerdict.LevelResult,
         rawRequest: String,
         rawResponse: String,
     ) {
@@ -668,13 +719,11 @@ class ProxyBridge(
         // replay send, independent of rule.inScopeOnly (which only filters which traffic is tapped).
         if (scopeGate.deny(url) != null) return
 
-        val levels = mutableListOf(
-            AuthDiffVerdict.LevelResult("captured", originalStatus, originalBody, originalContentType, originalLocation)
-        )
+        val levels = mutableListOf(captured)
         for (identity in rule.identities) {
-            val name = identity["name"]?.jsonPrimitive?.contentOrNull ?: "unknown"
-            val headerName = identity["header_name"]?.jsonPrimitive?.contentOrNull
-            val headerValue = identity["header_value"]?.jsonPrimitive?.contentOrNull
+            val name = (identity["name"] as? JsonPrimitive)?.contentOrNull ?: "unknown"
+            val headerName = (identity["header_name"] as? JsonPrimitive)?.contentOrNull
+            val headerValue = (identity["header_value"] as? JsonPrimitive)?.contentOrNull
 
             var mutated = originalRequest
             if (headerName != null && headerValue != null) {
@@ -693,10 +742,10 @@ class ProxyBridge(
             levels.add(
                 AuthDiffVerdict.LevelResult(
                     name,
-                    try { resp.statusCode().toInt() } catch (_: Exception) { 0 },
-                    try { resp.bodyToString() } catch (_: Exception) { "" },
-                    try { resp.headerValue("Content-Type") } catch (_: Exception) { null },
-                    try { resp.headerValue("Location") } catch (_: Exception) { null },
+                    safe { resp.statusCode().toInt() } ?: 0,
+                    safe { resp.bodyToString() } ?: "",
+                    safe { resp.headerValue("Content-Type") },
+                    safe { resp.headerValue("Location") },
                 )
             )
         }
@@ -713,7 +762,8 @@ class ProxyBridge(
         if (actionable.isEmpty()) return
 
         val findingsJson = actionable.map { f -> buildJsonObject { put("severity", f.severity); put("id", f.id); put("detail", f.detail) } }
-        stateManager.addAutorizeMatch(rule.ruleId, method, url, originalStatus, findingsJson, rawRequest, rawResponse)
+        stateManager.addAutorizeMatch(rule.ruleId, method, url, captured.status, findingsJson, rawRequest, rawResponse)
+        val evidence = BodyText.render(rawResponse, 2000, label = "response").text
         for (f in actionable) {
             findings.add(
                 type = f.id,
@@ -721,7 +771,7 @@ class ProxyBridge(
                 url = url,
                 location = "method:$method",
                 detail = f.detail,
-                evidence = rawResponse.take(2000),
+                evidence = evidence,
                 request = rawRequest,
                 response = rawResponse,
             )
@@ -734,9 +784,16 @@ class ProxyBridge(
 
     /**
      * Tests whether a request matches a proxy rule's conditions.
-     * All non-null conditions must match (logical AND).
+     * All non-null conditions must match (logical AND). A request Burp cannot
+     * parse never matches a rule that inspects it.
      */
-    private fun matchesRequestRule(rule: ProxyRule, request: InterceptedRequest): Boolean {
+    private fun matchesRequestRule(rule: ProxyRule, request: InterceptedRequest): Boolean = try {
+        matchesRequestConditions(rule, request)
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun matchesRequestConditions(rule: ProxyRule, request: InterceptedRequest): Boolean {
         if (rule.matchHost != null) {
             if (!SafeRegex.matchesHostPattern(rule.matchHost, request.httpService().host())) {
                 return false
@@ -769,17 +826,24 @@ class ProxyBridge(
 
     /**
      * Tests whether a response matches a proxy rule's conditions.
-     * All non-null conditions must match (logical AND).
+     * All non-null conditions must match (logical AND); host and URL conditions
+     * never match a response whose request is unavailable or unparseable.
      */
-    private fun matchesResponseRule(rule: ProxyRule, response: InterceptedResponse): Boolean {
+    private fun matchesResponseRule(rule: ProxyRule, response: InterceptedResponse): Boolean = try {
+        matchesResponseConditions(rule, response)
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun matchesResponseConditions(rule: ProxyRule, response: InterceptedResponse): Boolean {
         if (rule.matchHost != null) {
-            val host = try { response.request()?.httpService()?.host() } catch (_: Exception) { null } ?: return false
+            val host = safe { response.request()?.httpService()?.host() } ?: return false
             if (!SafeRegex.matchesHostPattern(rule.matchHost, host)) {
                 return false
             }
         }
         if (rule.matchUrl != null) {
-            val url = try { response.request()?.url() } catch (_: Exception) { null } ?: return false
+            val url = safe { response.request()?.url() } ?: return false
             if (!SafeRegex.containsMatchIn(rule.matchUrl, url, ignoreCase = true)) {
                 return false
             }
@@ -881,34 +945,39 @@ class ProxyBridge(
     // ---------------------------------------------------------------
 
     private fun emitRequestEvent(request: InterceptedRequest) {
-        eventBus.emit("proxy.request", buildJsonObject {
-            put("message_id", request.messageId())
-            put("method", request.method())
-            put("url", request.url())
-            put("host", request.httpService().host())
-            put("port", request.httpService().port())
-            put("secure", request.httpService().secure())
-            put("in_scope", request.isInScope())
-            put("timestamp", Instant.now().toString())
-        })
+        try {
+            eventBus.emit("proxy.request", buildJsonObject {
+                put("message_id", request.messageId())
+                put("method", safe { request.method() } ?: "")
+                put("url", safe { request.url() } ?: "")
+                safe { request.httpService() }?.let { service ->
+                    put("host", service.host())
+                    put("port", service.port())
+                    put("secure", service.secure())
+                }
+                put("in_scope", safe { request.isInScope() } ?: false)
+                put("timestamp", Instant.now().toString())
+            })
+        } catch (_: Exception) {
+            // Events are best-effort; a malformed request must not break the proxy flow.
+        }
     }
 
     private fun emitResponseEvent(response: InterceptedResponse) {
-        eventBus.emit("proxy.response", buildJsonObject {
-            put("message_id", response.messageId())
-            put("status_code", response.statusCode().toInt())
-            put("mime_type", response.mimeType().name)
-            try {
-                val req = response.request()
-                if (req != null) {
-                    put("url", req.url())
-                    put("host", req.httpService().host())
+        try {
+            eventBus.emit("proxy.response", buildJsonObject {
+                put("message_id", response.messageId())
+                put("status_code", safe { response.statusCode().toInt() } ?: 0)
+                put("mime_type", safe { response.mimeType().name } ?: "")
+                safe { response.request() }?.let { req ->
+                    put("url", safe { req.url() } ?: "")
+                    put("host", safe { req.httpService().host() } ?: "")
                 }
-            } catch (_: Exception) {
-                // request may not be available
-            }
-            put("timestamp", Instant.now().toString())
-        })
+                put("timestamp", Instant.now().toString())
+            })
+        } catch (_: Exception) {
+            // Events are best-effort; see emitRequestEvent.
+        }
     }
 
     // ---------------------------------------------------------------
@@ -916,7 +985,9 @@ class ProxyBridge(
     // ---------------------------------------------------------------
 
     /**
-     * Serializes a [ProxyHttpRequestResponse] to a [JsonObject].
+     * Serializes a [ProxyHttpRequestResponse] to a [JsonObject]. Every accessor is guarded: a
+     * request Burp cannot parse (MalformedRequestException from method()/url()/path()) is
+     * reported with `malformed_request` instead of failing the whole history read.
      */
     private fun serializeHistoryItem(
         item: ProxyHttpRequestResponse,
@@ -925,16 +996,23 @@ class ProxyBridge(
         maxResponseLength: Int? = null
     ): JsonObject {
         return buildJsonObject {
-            put("index", item.id())
-            put("host", item.host())
-            put("port", item.port())
-            put("secure", item.secure())
-            put("method", item.method())
-            put("url", item.url())
-            put("path", item.path())
-            put("edited", item.edited())
-            put("mime_type", item.mimeType().name)
-            put("has_response", item.hasResponse())
+            safe { item.id() }?.let { put("index", it) }
+            safe { item.httpService() }?.let { service ->
+                put("host", service.host())
+                put("port", service.port())
+                put("secure", service.secure())
+            }
+            val method = safe { item.finalRequest().method() }
+            val url = safe { item.finalRequest().url() }
+            val path = safe { item.finalRequest().path() }
+            method?.let { put("method", it) }
+            url?.let { put("url", it) }
+            path?.let { put("path", it) }
+            if (method == null || url == null || path == null) put("malformed_request", true)
+            safe { item.edited() }?.let { put("edited", it) }
+            safe { item.mimeType().name }?.let { put("mime_type", it) }
+            val hasResponse = safe { item.hasResponse() } ?: false
+            put("has_response", hasResponse)
 
             // Timing
             try {
@@ -954,7 +1032,7 @@ class ProxyBridge(
             } catch (_: Exception) { }
 
             // Response metadata
-            if (item.hasResponse()) {
+            if (hasResponse) {
                 try {
                     val resp = item.response()
                     put("status_code", resp.statusCode().toInt())
@@ -1000,9 +1078,9 @@ class ProxyBridge(
             // Full response text. A binary body (font/image/archive) is replaced by a placeholder
             // rather than string-converted: doing the latter corrupted the WHOLE batch's JSON for
             // the client, not just this item (issue #12).
-            if (includeResponse && item.hasResponse()) {
+            if (includeResponse && hasResponse) {
                 try {
-                    val mime = try { item.response().mimeType().name } catch (_: Exception) { null }
+                    val mime = safe { item.response().mimeType().name }
                     val r = BodyText.render(item.response().toString(), maxResponseLength, mime, "response body")
                     put("response", r.text)
                     if (r.binary) put("response_binary", true)
@@ -1019,10 +1097,10 @@ class ProxyBridge(
      */
     private fun serializeWebSocketItem(item: ProxyWebSocketMessage): JsonObject {
         return buildJsonObject {
-            put("id", item.id())
-            put("websocket_id", item.webSocketId())
-            put("direction", item.direction().name)
-            put("listener_port", item.listenerPort())
+            safe { item.id() }?.let { put("id", it) }
+            safe { item.webSocketId() }?.let { put("websocket_id", it) }
+            safe { item.direction().name }?.let { put("direction", it) }
+            safe { item.listenerPort() }?.let { put("listener_port", it) }
 
             try {
                 val time = item.time()
@@ -1063,6 +1141,24 @@ class ProxyBridge(
                 }
             } catch (_: Exception) { }
         }
+    }
+
+    /** Status code of [item]'s response, or null when it has none or it cannot be read. */
+    private fun responseStatus(item: ProxyHttpRequestResponse): Int? =
+        if (item.hasResponse()) safe { item.response().statusCode().toInt() } else null
+
+    /** Up to [count] (capped at [MAX_PAGE_SIZE]) items from [from], as a view (no copy of the list). */
+    private fun <T> page(items: List<T>, from: Int, count: Int): List<T> {
+        val start = from.coerceIn(0, items.size)
+        val end = (start.toLong() + count.coerceIn(0, MAX_PAGE_SIZE)).coerceAtMost(items.size.toLong()).toInt()
+        return items.subList(start, end)
+    }
+
+    /** Runs a Montoya accessor that may throw on malformed data (e.g. MalformedRequestException). */
+    private inline fun <T> safe(block: () -> T): T? = try {
+        block()
+    } catch (_: Exception) {
+        null
     }
 
     /**
@@ -1123,5 +1219,78 @@ class ProxyBridge(
         } catch (_: Exception) {
             try { HighlightColor.valueOf(name.uppercase()) } catch (_: Exception) { null }
         }
+    }
+
+    companion object {
+        /** Largest page any history read returns. */
+        const val MAX_PAGE_SIZE = 1000
+
+        /** Autorize replays admitted at once (queued or running); further matches wait for a later hit. */
+        private const val AUTORIZE_MAX_QUEUED = 100
+
+        /** Autorize replays sending at the same time. */
+        private const val AUTORIZE_MAX_CONCURRENT = 10
+
+        private val RULE_TYPES = setOf("request", "response")
+        private val RULE_ACTIONS = setOf("modify", "drop", "tag")
+
+        /**
+         * Error message when a host pattern for [SafeRegex.matchesHostPattern] (proxy `match_host`,
+         * Autorize `include_host_pattern`) could never match, else null. Such a pattern is either a
+         * glob (`*.example.com`) or a regex (`.*\.example\.com`); only a regex that fails to compile
+         * is unusable, and a glob always matches its own text with each `*` filled in.
+         */
+        internal fun hostPatternError(pattern: String): String? {
+            if (pattern.isBlank()) return "Host pattern is blank"
+            val regexError = SafeRegex.validate(pattern, ignoreCase = true) ?: return null
+            if (SafeRegex.matchesHostPattern(pattern, pattern.replace("*", "x"))) return null
+            return "Invalid host pattern '$pattern': $regexError. Use a glob such as *.example.com or a valid regex."
+        }
+
+        /**
+         * Checks a proxy rule before it reaches live traffic, where an invalid regex or header would
+         * otherwise make it silently never match or never apply. Returns an error message or null.
+         */
+        internal fun validateRule(rule: ProxyRule): String? {
+            if (rule.type.lowercase() !in RULE_TYPES) return "Invalid rule type '${rule.type}'. Allowed: request, response"
+            if (rule.action.lowercase() !in RULE_ACTIONS) return "Invalid rule action '${rule.action}'. Allowed: drop, modify, tag"
+            rule.matchHost?.let { pattern -> hostPatternError(pattern)?.let { return "match_host: $it" } }
+            regexError("match_url", rule.matchUrl)?.let { return it }
+            regexError("match_header", rule.matchHeader)?.let { return it }
+            regexError("match_body", rule.matchBody)?.let { return it }
+            regexError("modify_body_regex", rule.modifyBodyRegex)?.let { return it }
+            rule.matchStatus?.let { if (it !in 0..999) return "match_status must be between 0 and 999 (got $it)" }
+            rule.tagHighlight?.let {
+                if (!HighlightColorName.isValid(it)) {
+                    return "Invalid tag_highlight '$it'. Valid values: ${HighlightColorName.validValues()}"
+                }
+            }
+            rule.modifyAddHeader?.let {
+                if (HeaderSafety.parseHeaderLine(it) == null) {
+                    return "modify_add_header must be one 'Name: Value' line without CR/LF (got '$it')"
+                }
+            }
+            rule.modifyRemoveHeader?.let {
+                if (!HeaderSafety.isValidHeaderName(it)) return "modify_remove_header must be a header name without ':' or CR/LF (got '$it')"
+            }
+            rule.modifyReplaceHeader?.forEach { (name, value) ->
+                if (!HeaderSafety.isValidHeaderName(name) || !HeaderSafety.isValidHeaderValue(value)) {
+                    return "modify_replace_header entry '$name' needs a header name without ':' and a value without CR/LF"
+                }
+            }
+            if (rule.modifyBodyRegex != null && rule.modifyBodyReplacement == null) {
+                return "modify_body_replacement is required with modify_body_regex (use \"\" to delete matches)"
+            }
+            val modifies = rule.modifyAddHeader != null || rule.modifyRemoveHeader != null ||
+                !rule.modifyReplaceHeader.isNullOrEmpty() || rule.modifyBodyRegex != null
+            if (rule.action.equals("modify", ignoreCase = true) && !modifies) {
+                return "action 'modify' needs at least one of modify_add_header, modify_remove_header, " +
+                    "modify_replace_header, modify_body_regex"
+            }
+            return null
+        }
+
+        private fun regexError(param: String, pattern: String?): String? =
+            pattern?.let { p -> SafeRegex.validate(p, ignoreCase = true)?.let { "Invalid $param regex: $it" } }
     }
 }
