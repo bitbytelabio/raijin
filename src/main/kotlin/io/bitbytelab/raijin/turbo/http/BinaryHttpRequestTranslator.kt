@@ -19,6 +19,11 @@ object BinaryHttpRequestTranslator {
         "upgrade",
     )
 
+    /**
+     * Turns an HTTP/1-style request into binary HTTP field lines. With [kettled], [KettleEscapes]
+     * are decoded in the method, the path, every field name (where a backtick is a colon) and every
+     * value, and fields are otherwise kept exactly as written.
+     */
     fun translate(
         raw: String,
         scheme: String,
@@ -34,13 +39,13 @@ object BinaryHttpRequestTranslator {
 
         val requestLine = headLines[0].split(" ", limit = 3)
         require(requestLine.size >= 2) { "Invalid HTTP request line: ${headLines[0]}" }
-        val method = requestLine[0]
-        val path = requestLine[1]
+        val method = if (kettled) KettleEscapes.decode(requestLine[0]) else requestLine[0]
+        val path = if (kettled) KettleEscapes.decode(requestLine[1]) else requestLine[1]
         val authoredVersion = requestLine.getOrElse(2) { "HTTP/1.1" }
-        val parsedFields = headLines.drop(1).filter { it.isNotEmpty() }.map(::parseField)
+        val parsedFields = headLines.drop(1).filter { it.isNotEmpty() }.map { parseField(it, kettled) }
         val decodedFields = parsedFields.map { field ->
             if (kettled) {
-                FieldLine.of(KettleEscapes.decode(field.name), KettleEscapes.decode(field.value))
+                FieldLine.of(KettleEscapes.decodeName(field.name), KettleEscapes.decode(field.value))
             } else {
                 FieldLine.of(field.name.lowercase(Locale.ROOT), field.value)
             }
@@ -75,13 +80,22 @@ object BinaryHttpRequestTranslator {
         )
     }
 
-    private fun parseField(line: String): FieldLine {
-        val separator = line.indexOf(": ")
-        return if (separator >= 0) {
-            FieldLine.of(line.substring(0, separator), line.substring(separator + 2))
-        } else {
-            FieldLine.of(line, "")
+    /**
+     * Splits a header line at its first colon, as an HTTP/1 parser does, so `Name:value` needs no
+     * space; a pseudo-header's own leading colon belongs to its name. A kettled value loses only the
+     * single space after the colon, keeping any deliberate whitespace; an ordinary value is trimmed
+     * of optional whitespace.
+     */
+    private fun parseField(line: String, kettled: Boolean): FieldLine {
+        val separator = line.indexOf(':', if (line.startsWith(':')) 1 else 0)
+        if (separator < 0) {
+            return FieldLine.of(line, "")
         }
+        val value = line.substring(separator + 1)
+        return FieldLine.of(
+            line.substring(0, separator),
+            if (kettled) value.removePrefix(" ") else value.trim(' ', '\t'),
+        )
     }
 
     private fun addIfMissing(

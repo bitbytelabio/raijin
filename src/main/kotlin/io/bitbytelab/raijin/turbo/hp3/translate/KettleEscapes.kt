@@ -25,6 +25,7 @@ import java.util.HexFormat
  *   <tr><td>{@code ^s}</td><td>space, which the request line cannot otherwise hold</td></tr>
  *   <tr><td>{@code ^xNN}</td><td>any byte, exactly two hex digits</td></tr>
  *   <tr><td>{@code ^^}</td><td>a literal {@code ^}</td></tr>
+ *   <tr><td>a backtick</td><td>a colon, in a field name only (see {@link #NAME_COLON})</td></tr>
  * </table>
  *
  * <p>Anything else after a caret is a {@link KettleSyntaxException}, never a silent literal. That
@@ -51,6 +52,14 @@ object KettleEscapes {
     const val ESCAPE: Char = '^'
 
     /**
+     * Stands for a colon inside a field name. A header line splits at its first colon, so a name
+     * cannot carry a raw one; this is the convention {@code H2Connection} has always applied to
+     * names, and the one {@code DesyncTechniques} writes for {@code h2colon} and {@code h2name}.
+     * Values keep a backtick as written, and {@code ^x60} still spells a literal one in a name.
+     */
+    const val NAME_COLON: Char = '`'
+
+    /**
      * Resolves every escape in {@code text}.
      *
      * @throws KettleSyntaxException if a caret is followed by anything the table does not define, or
@@ -58,8 +67,21 @@ object KettleEscapes {
      */
     @JvmStatic
     @Throws(KettleSyntaxException::class)
-    fun decode(text: String): String {
-        if (text.indexOf(ESCAPE) < 0) {
+    fun decode(text: String): String = decode(text, name = false)
+
+    /**
+     * Resolves every escape in a field name: everything {@link #decode} does, plus a bare
+     * {@link #NAME_COLON} becoming a colon. One pass, so an escaped backtick stays a backtick.
+     *
+     * @throws KettleSyntaxException as {@link #decode} does
+     */
+    @JvmStatic
+    @Throws(KettleSyntaxException::class)
+    fun decodeName(text: String): String = decode(text, name = true)
+
+    @Throws(KettleSyntaxException::class)
+    private fun decode(text: String, name: Boolean): String {
+        if (text.indexOf(ESCAPE) < 0 && (!name || text.indexOf(NAME_COLON) < 0)) {
             return text    // the common case, and the one worth not allocating for
         }
 
@@ -68,7 +90,7 @@ object KettleEscapes {
         while (at < text.length) {
             val character = text[at]
             if (character != ESCAPE) {
-                decoded.append(character)
+                decoded.append(if (name && character == NAME_COLON) ':' else character)
                 at++
                 continue
             }

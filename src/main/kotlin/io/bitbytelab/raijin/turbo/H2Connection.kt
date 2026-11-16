@@ -1,21 +1,28 @@
 package io.bitbytelab.raijin.turbo
 import com.twitter.hpack.Decoder
+import java.io.EOFException
+import java.io.IOException
+import java.io.InputStream
 import java.io.OutputStream
 import java.lang.Exception
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.URL
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
 import java.security.cert.X509Certificate
 import java.util.*
-import java.util.concurrent.locks.ReentrantReadWriteLock
 import javax.net.ssl.*
-import kotlin.collections.HashMap
 
-class H2Connection(val target: URL, val seedQueue: Queue<Request>, private val requestQueue: LinkedBlockingQueue<Request>, var requestsPerConnection: Int, val engine: HTTP2RequestEngine) {
+/**
+ * One HTTP/2 connection. Its reader thread connects, then reads frames and completes streams; once
+ * the server's SETTINGS arrive a writer thread takes requests from the engine. The engine's manager
+ * thread owns the lifecycle and collects what a closed connection left in flight only after both
+ * threads have exited, so frame processing needs no lock and the in-flight set it sees is final.
+ */
+class H2Connection(val target: URL, val requestsPerConnection: Int, val engine: HTTP2RequestEngine) {
 
     companion object {
         const val CONNECTING = 1
@@ -24,6 +31,16 @@ class H2Connection(val target: URL, val seedQueue: Queue<Request>, private val r
         const val CLOSED = 4
 
         private const val DEBUG = false
+
+        /** How long the writer waits on an empty queue before it looks at the connection and run state again. */
+        private const val QUEUE_POLL_MILLIS = 100L
+        private const val SETTINGS_FRAME = 0x04
+        private val PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".toByteArray(Charsets.ISO_8859_1)
+        private val INITIAL_SETTINGS = byteArrayOf(0, 4, 0x7f, -1, -1, -1, // MAXINT window size (Burp match)
+                                                   0, 2, 0, 0, 0, 0,   // no PUSH (Burp match)
+                                                   0, 1, 0, 0, 0x10, 0, //  4096 header table size (Burp match)
+                                                   0, 3, 0, 0, 0x01, 0 // 256 max *concurrent* streams (Burp match)
+        )
 
         fun debug(message: String) {
             if (DEBUG) {
@@ -69,7 +86,8 @@ class H2Connection(val target: URL, val seedQueue: Queue<Request>, private val r
                     name = "Connection"
                 }
 
-                if (name == "Host" && host == "") {
+                // Any case: an HTTP/2-style template, or one DesyncTechniques lower-cased, says "host".
+                if (name.equals("Host", ignoreCase = true) && host == "") {
                     host = value
                 }
 
@@ -136,210 +154,306 @@ class H2Connection(val target: URL, val seedQueue: Queue<Request>, private val r
         }
     }
 
-    var done = false
-    val streams: HashMap<Int, Stream> = HashMap()
+    /** Streams this connection opened that still await their response; read by the reader, writer and manager threads. */
+    val streams: MutableMap<Int, Stream> = ConcurrentHashMap()
+    @Volatile
     var totalQueuedRequests = 0
-    private lateinit var socket: Socket
-    private lateinit var output: OutputStream
+        private set
     val decoder = Decoder(4096, 4096)
+    private val encoder = HeaderEncoder()
+    @Volatile
     var maxConcurrentStreams = 100
 
-    val stateLock = ReentrantReadWriteLock() // todo I have no idea if this is even necessary
+    @Volatile
     var state: Int = CONNECTING
+        private set
+    @Volatile
     var lastCreatedStreamID = -1
+        private set
+
+    /** Whether the server's SETTINGS arrived; a connection that closes without them never got past the handshake. */
+    @Volatile
+    var established = false
+        private set
+
+    /** What closed the connection, when an error did rather than the run or the connection's own work ending. */
+    @Volatile
+    var failure: Throwable? = null
+        private set
+
+    /** Guards the state transitions, the socket hand-over and stream registration. */
+    private val lifecycle = Any()
+    /** Serialises whole frames onto the socket: the reader writes ACKs while the writer writes requests. */
+    private val writeLock = Any()
+    @Volatile
+    private var socket: Socket? = null
+    @Volatile
+    private var output: OutputStream? = null
+    @Volatile
+    private var writer: Thread? = null
+    private val label = "${target.host}:${if (target.port == -1) target.defaultPort else target.port}"
+    private val reader: Thread
 
     init {
-        connect()
+        // Last, so the thread starts on a fully built connection. Connecting happens on it too: a
+        // slow or silent server then costs this connection its timeout, not the manager thread.
+        reader = thread(name = "turbo-h2-reader-$label", isDaemon = true) { readForever() }
     }
 
-    private fun connect() {
-        val port = if (target.port == -1) { target.defaultPort } else { target.port }
+    /** Closes the connection. Closing the socket is also what unblocks the reader. */
+    fun close() = shutDown(null)
+
+    /** Closes the connection because of [cause], which the engine reports as the reason requests failed. */
+    internal fun fail(cause: Throwable) = shutDown(cause)
+
+    private fun shutDown(cause: Throwable?) {
+        val open: Socket?
+        synchronized(lifecycle) {
+            if (state == CLOSED) {
+                return
+            }
+            debug("Closing connection...")
+            state = CLOSED
+            failure = cause
+            open = socket
+        }
+        try {
+            open?.close()
+        } catch (e: IOException) {
+            debug("Error closing socket: $e")
+        }
+    }
+
+    /** True once the connection is closed and neither of its threads can touch it again. */
+    internal fun isFinished(): Boolean = state == CLOSED && !reader.isAlive && writer?.isAlive != true
+
+    /** Waits, until [deadlineNanos] at the latest, for both threads to exit. */
+    internal fun awaitExit(deadlineNanos: Long) {
+        for (thread in listOfNotNull(reader, writer)) {
+            val remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000
+            if (remainingMillis <= 0) {
+                return
+            }
+            thread.join(remainingMillis)
+        }
+    }
+
+    private fun connect(): InputStream {
+        val port = if (target.port == -1) target.defaultPort else target.port
+        val timeout = engine.socketTimeoutMillis
+        val plain = Socket()
+        adopt(plain)
+        plain.connect(InetSocketAddress(target.host, port), timeout)
+        // Before the handshake, so a server that accepts and then says nothing cannot stall it.
+        plain.soTimeout = timeout
+        var connected: Socket = plain
         if (target.protocol == "https") {
-            val sslsf = createSSLSocketFactory()
-            target.port
-            socket = sslsf.createSocket(target.host, port) as SSLSocket
-            val sslp = (socket as SSLSocket).sslParameters
-            val clientAPs = arrayOf("h2") // don't offer "http/1.1"
-            sslp.applicationProtocols = clientAPs
-            (socket as SSLSocket).sslParameters = sslp
-            (socket as SSLSocket).startHandshake()
-            socket.soTimeout = 10000
-            //val ap = (socket as SSLSocket).applicationProtocol
-        } else {
-            socket = Socket(target.host, port)
-            socket.soTimeout = 10000
+            val ssl = createSSLSocketFactory().createSocket(plain, target.host, port, true) as SSLSocket
+            val sslp = ssl.sslParameters
+            sslp.applicationProtocols = arrayOf("h2") // don't offer "http/1.1"
+            ssl.sslParameters = sslp
+            adopt(ssl)
+            ssl.startHandshake()
+            connected = ssl
         }
 
-        output = socket.outputStream
-        val message = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-        output.write(message.toByteArray())
-        val settingsPayload = byteArrayOf(0, 4, 0x7f, -1, -1, -1, // MAXINT window size (Burp match)
-                                          0, 2, 0, 0, 0, 0,   // no PUSH (Burp match)
-                                          0, 1, 0, 0, 0x10, 0, //  4096 header table size (Burp match)
-                                          0, 3, 0, 0, 0x01, 0 // 256 max *concurrent* streams (Burp match)
-            )
-        val initialSettingsFrame = Frame(0x04, 0x00, 0, settingsPayload)
-        sendFrame(initialSettingsFrame)
-
-        val flowControlFrame = Frame(0x08, 0x00, 0, HTTP2Utils.intToFourBytes(2147418112)) // Burp match
-        sendFrame(flowControlFrame)
-
-        thread { readForever() }
-    }
-
-    fun startSendingRequests() {
-        if (state != CONNECTING) {
-            return
+        val out = connected.outputStream
+        output = out
+        synchronized(writeLock) {
+            out.write(PREFACE)
+            out.write(Frame(0x04, 0x00, 0, INITIAL_SETTINGS).asBytes())
+            out.write(Frame(0x08, 0x00, 0, HTTP2Utils.intToFourBytes(2147418112)).asBytes()) // Burp match
+            out.flush()
         }
-        state = ALIVE
-        thread { writeForever() }
+        return connected.inputStream
     }
 
+    /** Makes [candidate] the socket [close] closes, unless the connection already closed while connecting. */
+    private fun adopt(candidate: Socket) {
+        synchronized(lifecycle) {
+            if (state != CLOSED) {
+                socket = candidate
+                return
+            }
+        }
+        candidate.close()
+        throw SocketException("Connection closed while connecting")
+    }
 
-    private fun checkState(): Int {
-        if (engine.runState.get() >= 3) {
+    private fun startSendingRequests() {
+        synchronized(lifecycle) {
+            if (state != CONNECTING) {
+                return
+            }
+            state = ALIVE
+            established = true
+            writer = thread(name = "turbo-h2-writer-$label", isDaemon = true) { writeForever() }
+        }
+    }
+
+    private fun halfClose() {
+        synchronized(lifecycle) {
+            if (state != ALIVE) {
+                return
+            }
+            state = HALFCLOSED
+        }
+        if (streams.isEmpty()) {
             close()
         }
-        return state
     }
 
-    private fun req(req: Request) {
-
-        val parsedRequest = HTTP2Request(req.getRequest())
-        val built = buildReq(parsedRequest)
-        val encoder = HeaderEncoder()
-        for ((key, value) in built) {
-            encoder.addHeader(key, value)
-        }
-
-        val streamID = addStream(req)
-        if (parsedRequest.body == null || parsedRequest.body == "") {
-            // 5 = 4 + 1 (end headers & end stream)
-            req.time = System.nanoTime()
-            sendFrame(Frame(0x01, 0x05, streamID, encoder.headers.toByteArray()))
-        }
-        else {
-            //debug("Sending a data frame: '"+parsedRequest.body+"'")
-            sendFrame(Frame(0x01, 0x04, streamID, encoder.headers.toByteArray()))
-            req.time = System.nanoTime()
-            sendFrame(Frame(0x00, 0x01, streamID, parsedRequest.body!!.toByteArray()))
-        }
-        //Utils.out(request.asBytes().asList())
-    }
-
-
-    fun close() {
-        debug("Closing connection...")
-        val locked = stateLock.writeLock().tryLock(5, TimeUnit.SECONDS)
-        if (locked) {
-            state = CLOSED
-            stateLock.writeLock().unlock()
-            debug("Full close complete")
-        }
-        else {
-            throw Exception("Deadlock closing connection: ${stateLock.readLockCount}")
+    /** Called by a stream once its callback has run. */
+    internal fun streamCompleted(streamID: Int) {
+        streams.remove(streamID)
+        if (state == HALFCLOSED && streams.isEmpty()) {
+            debug("Transitioning halfclosed connection to closed")
+            close()
         }
     }
 
     private fun readForever() {
         try {
-            val input = socket.inputStream
-            while (checkState() != CLOSED) {
-                if (state == HALFCLOSED && !hasInflightRequests()) {
+            val input = connect()
+            val header = ByteArray(9)
+            while (state != CLOSED) {
+                if (engine.runState.get() >= 3) {
+                    close()
+                    return
+                }
+                if (state == HALFCLOSED && streams.isEmpty()) {
                     debug("Transitioning halfclosed connection to closed")
                     close()
                     return
                 }
 
                 debug("Reading...")
-
-                if (streams.size == 0 && state != CONNECTING) {
-                    Thread.sleep(100)
+                if (!readFrameHeader(input, header)) {
                     continue
                 }
-
-                val sizeBuffer = ByteArray(3)
-                try {
-                    val needToRead = 3
-                    var haveRead = 0
-                    while (haveRead < needToRead) {
-                        //debug("reading inital 3 bytes")
-                        if (checkState() == CLOSED) {
-                            return
-                        }
-                        val justRead = input.read(sizeBuffer, haveRead, needToRead - haveRead)
-                        if (justRead == -1) {
-                            Thread.sleep(10)
-                            continue
-                        }
-                        haveRead += justRead
-                    }
-                } catch (ex: SocketTimeoutException) {
-                    if (hasInflightRequests()) {
-                        Utils.out("Socket read timeout with ~" + streams.size + " inflight requests")
-                        Utils.out(streams.keys.toString())
-                    }
-                    close()
-                    return
-                } catch (ex: SSLProtocolException) {
-                    Utils.out("Invoking fullClose due to socket read error")
-                    close()
-                    return
+                if (state == CONNECTING && header[3].toInt() != SETTINGS_FRAME) {
+                    throw IOException("The server's first frame was not SETTINGS - is $label speaking HTTP/2?")
                 }
-
-                val size = HTTP2Utils.threeByteInt(sizeBuffer)
-
-
-                //debug("Received frame with payload size $size")
-                //debug("Raw payload size: " + sizeBuffer.asList())
-
-                // header size is 9 bytes but we already read 3
-                val needToRead = size + 6
-                val frameBuffer = ByteArray(needToRead)
-                var haveRead = 0
-                while (haveRead < needToRead) {
-                    //debug("reading needToRead")
-                    if (checkState() == CLOSED) {
-                        return
-                    }
-                    val justRead = input.read(frameBuffer, haveRead, needToRead - haveRead)
-                    if (justRead == -1) {
-                        Thread.sleep(10)
-                        continue
-                    }
-                    haveRead += justRead
-                }
-                passResponseToStream(sizeBuffer + frameBuffer)
+                val payload = ByteArray(HTTP2Utils.threeByteInt(header))
+                readFully(input, payload)
+                handleFrame(header + payload)
             }
         } catch (e: Exception) {
-            Utils.out("Stopping read thread")
-            close()
+            if (state != CLOSED) {
+                Utils.out("Stopping read thread: $e")
+            }
+            fail(e)
         }
         debug("Closing read thread...")
     }
 
-    private fun passResponseToStream(frameBytes: ByteArray) {
-        val streamID = HTTP2Utils.fourByteInt(frameBytes.sliceArray(5..8))
-        //debug("StreamID " + streamID)
-        //debug("Whole frame: " + frameBytes.asList())
+    /**
+     * Reads the next frame header. Returns false when the read timed out with nothing read and
+     * nothing to wait for, so an idle connection stays open; a timeout during the handshake, with
+     * requests in flight, or part-way through a header is the connection's end, and so is EOF.
+     */
+    private fun readFrameHeader(input: InputStream, header: ByteArray): Boolean {
+        var haveRead = 0
+        while (haveRead < header.size) {
+            val justRead = try {
+                input.read(header, haveRead, header.size - haveRead)
+            } catch (e: SocketTimeoutException) {
+                if (haveRead == 0 && state != CONNECTING && streams.isEmpty()) {
+                    return false
+                }
+                throw readTimeout(e)
+            }
+            if (justRead == -1) {
+                throw EOFException("The server closed the connection")
+            }
+            haveRead += justRead
+        }
+        return true
+    }
 
-        if (streamID != 0 && !streams.containsKey(streamID)) {
-            throw Exception("Received message on unrecognised or closed stream: $streamID | ${lastCreatedStreamID}")
+    private fun readFully(input: InputStream, buffer: ByteArray) {
+        var haveRead = 0
+        while (haveRead < buffer.size) {
+            val justRead = try {
+                input.read(buffer, haveRead, buffer.size - haveRead)
+            } catch (e: SocketTimeoutException) {
+                throw readTimeout(e)
+            }
+            if (justRead == -1) {
+                throw EOFException("The server closed the connection mid-frame")
+            }
+            haveRead += justRead
+        }
+    }
+
+    private fun readTimeout(cause: SocketTimeoutException): IOException {
+        val waitedFor = if (state == CONNECTING) "the server's SETTINGS" else "responses to ~${streams.size} in-flight requests"
+        return IOException("Socket read timeout after ${engine.socketTimeoutMillis}ms waiting for $waitedFor", cause)
+    }
+
+    private fun handleFrame(frameBytes: ByteArray) {
+        val streamID = HTTP2Utils.fourByteInt(frameBytes.sliceArray(5..8)) and 0x7fffffff
+        if (streamID == 0) {
+            handleConnectionFrame(frameBytes)
+            return
         }
 
-        streams.putIfAbsent(
-                streamID,
-                Stream(this, streamID, Request("dud"), true)
-        )
-        streams[streamID]!!.processFrame(frameBytes)
+        val stream = streams[streamID]
+        if (stream == null) {
+            // RFC 9113 section 5.1: WINDOW_UPDATE and RST_STREAM can still arrive for a stream that
+            // has finished. Now that idle connections keep reading, they must not kill the connection.
+            val type = frameBytes[3].toInt()
+            if (streamID <= lastCreatedStreamID && (type == 0x08 || type == 0x03)) {
+                debug("Ignoring frame of type $type on finished stream $streamID")
+                return
+            }
+            throw IOException("Received message on unrecognised or closed stream: $streamID | $lastCreatedStreamID")
+        }
+        stream.processFrame(frameBytes)
+    }
+
+    /** Frames on stream 0 belong to the connection, never to a request. */
+    private fun handleConnectionFrame(frameBytes: ByteArray) {
+        val type = frameBytes[3]
+        val flags = frameBytes[4]
+        val payload = frameBytes.sliceArray(9 until frameBytes.size)
+        when (type.toInt()) {
+            SETTINGS_FRAME -> {
+                val settings = SettingsFrame(type, flags, 0, payload)
+                if (settings.isAck) {
+                    return
+                }
+                if (settings.maxConcurrentStreams != 0) {
+                    debug("Change max concurrent streams from $maxConcurrentStreams to ${settings.maxConcurrentStreams}")
+                    maxConcurrentStreams = settings.maxConcurrentStreams
+                }
+                settings.headerTableSize?.let { encoder.peerTableSize(it) }
+                sendFrame(Frame(0x04, 0x01, 0, byteArrayOf()))
+                startSendingRequests()
+            }
+            0x07 -> {
+                GoAwayFrame(type, flags, 0, payload)
+                Utils.out("Server sent a GOAWAY, dumping the whole connection")
+                fail(IOException("The server sent GOAWAY"))
+            }
+            else -> debug("Ignoring connection frame of type $type")
+        }
     }
 
     private fun writeForever() {
         debug("Starting write thread")
         try {
-            var completedSeedQueue = false
-
-            while (state == ALIVE && engine.runState.get() < 3) {
+            while (state == ALIVE) {
+                val runState = engine.runState.get()
+                if (runState >= 3) {
+                    close()
+                    return
+                }
+                // 0 is "connecting": nothing goes out before start(), as on the other engines.
+                if (runState == 0) {
+                    Thread.sleep(10)
+                    continue
+                }
 
                 // todo use a lock instead, should be faster
                 if (streams.size >= maxConcurrentStreams) {
@@ -348,68 +462,67 @@ class H2Connection(val target: URL, val seedQueue: Queue<Request>, private val r
                 }
 
                 if (totalQueuedRequests >= requestsPerConnection) {
-                    //Utils.out("Reached max streams of "+requestsPerConnection)
-                    state = HALFCLOSED
+                    halfClose()
                     return
                 }
 
-                val req: Request?
-
-                if (completedSeedQueue) {
-                    req = requestQueue.poll(1000, TimeUnit.MILLISECONDS)
-                    if (req == null) {
-                        if (engine.runState.get() == 2 && !hasInflightRequests()) {
-                            close()
-                            done = true
-                            return
-                        }
-                        continue
+                val req = engine.nextRequest(QUEUE_POLL_MILLIS)
+                if (req == null) {
+                    // In flight first, then the queues: a callback queues its follow-ups before its
+                    // stream is removed, so this order cannot miss one.
+                    if (engine.runState.get() == 2 && streams.isEmpty() && engine.hasNoQueuedWork()) {
+                        close()
+                        return
                     }
-                } else {
-                    req = seedQueue.poll()
-                    if (req == null) {
-                        completedSeedQueue = true
-                        continue
-                    }
+                    continue
                 }
 
-
-                if (state == CLOSED) {
-                    requestQueue.put(req)
-                    close()
-                    return
-                }
-
-                try {
-                    req(req)
-                } catch (ex: SocketException) {
-                    requestQueue.put(req)
-                    close()
-                } catch (ex: SSLProtocolException) {
-                    requestQueue.put(req)
-                    close()
-                }
+                send(req)
             }
         } catch (e: Exception) {
-            Utils.out("Stopping write thread")
-            close()
-        } finally {
-            engine.completedLatch.countDown()
+            if (state != CLOSED) {
+                Utils.out("Stopping write thread: $e")
+            }
+            fail(e)
         }
         debug("Exiting write thread")
     }
 
-    fun hasInflightRequests(): Boolean {
-        if (streams.size == 0) {
-            return false
+    private fun send(req: Request) {
+        val parsedRequest: HTTP2Request
+        val built: List<Pair<String, String>>
+        try {
+            parsedRequest = HTTP2Request(req.getRequest())
+            built = buildReq(parsedRequest)
+        } catch (e: Exception) {
+            // The request itself cannot be expressed; no retry or other connection would change that.
+            Utils.out("Skipping a request that could not be built as HTTP/2: $e")
+            engine.permaFails.incrementAndGet()
+            return
         }
 
-        if (streams.size > 1) {
-            return true
+        val stream = addStream(req)
+        if (stream == null) {
+            engine.requeue(req) // never sent, so no retry is charged; the loop sees the closed state
+            return
         }
 
-        return !streams.containsKey(0)
+        val headerBlock = encoder.encode(built)
+        val body = parsedRequest.body
+        if (body.isNullOrEmpty()) {
+            // 5 = 4 + 1 (end headers & end stream)
+            stream.sentAt = System.nanoTime()
+            sendFrame(Frame(0x01, 0x05, stream.streamID, headerBlock))
+        }
+        else {
+            //debug("Sending a data frame: '"+parsedRequest.body+"'")
+            sendFrame(Frame(0x01, 0x04, stream.streamID, headerBlock))
+            stream.sentAt = System.nanoTime()
+            sendFrame(Frame(0x00, 0x01, stream.streamID, body.toByteArray(Charsets.ISO_8859_1)))
+        }
     }
+
+    fun hasInflightRequests(): Boolean = streams.isNotEmpty()
 
     fun getInflightRequests(): List<Request> {
         if (state != CLOSED) {
@@ -418,35 +531,30 @@ class H2Connection(val target: URL, val seedQueue: Queue<Request>, private val r
         return streams.values.map{it.req}
     }
 
-//    private fun ping() {
-//        // issue a ping
-//        val ping = Frame(0x06, 0x00, 0x00, byteArrayOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08))
-//        socket.outputStream.write(ping.asBytes())
-//        socket.outputStream.flush()
-//    }
-
     fun sendFrame(frame: Frame) {
-        socket.outputStream.write(frame.asBytes())
-        socket.outputStream.flush()
+        val out = output ?: throw SocketException("Not connected")
+        synchronized(writeLock) {
+            out.write(frame.asBytes())
+            out.flush()
+        }
     }
 
-    private fun addStream(req: Request): Int {
-
-        if (state == CLOSED || totalQueuedRequests > requestsPerConnection) {
-            throw SocketException("Attempt to create a stream on a dud connection")
+    /**
+     * Registers a stream for [req], or returns null once the connection has stopped taking work.
+     * Atomic with [shutDown], so no stream joins a connection after it has closed.
+     */
+    private fun addStream(req: Request): Stream? {
+        synchronized(lifecycle) {
+            if (state != ALIVE || totalQueuedRequests >= requestsPerConnection) {
+                return null
+            }
+            totalQueuedRequests += 1
+            lastCreatedStreamID += 2
+            val stream = Stream(this, lastCreatedStreamID, req, true)
+            streams[lastCreatedStreamID] = stream
+            debug("Sending on stream ${stream.streamID}")
+            return stream
         }
-
-        totalQueuedRequests += 1
-        lastCreatedStreamID += 2
-        val stream = Stream(this, lastCreatedStreamID, req,true)
-        streams[lastCreatedStreamID] = stream
-        debug("Sending on stream ${stream.streamID}")
-
-        if (stream.streamID % 2 == 0 && !streams.containsKey(stream.streamID)) {
-            throw Exception("Client-initiated frames must have an odd ID. Not ${stream.streamID}")
-        }
-
-        return stream.streamID
     }
 
     private fun createSSLSocketFactory(): SSLSocketFactory {

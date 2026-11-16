@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.turbo
 import java.io.ByteArrayInputStream
 import java.lang.StringBuilder
+import com.twitter.hpack.Decoder
 import com.twitter.hpack.HeaderListener
 
 
@@ -9,23 +10,11 @@ open class Frame(val type: Byte, val flags: Byte, val streamID: Int, val payload
 
     fun asBytes(): ByteArray {
         val length = HTTP2Utils.intToThreeBytes(payload.size)
-//        H2Connection.debug("Real size: "+payload.size)
-//        H2Connection.debug("Reversed size: "+threeByteInt(length))
-//        H2Connection.debug("Reversed raw size: "+length.asList())
-        //checkUnsigned(intToFourBytes(streamID))
         return length + type + flags + HTTP2Utils.intToFourBytes(streamID) + payload
-    }
-
-    fun checkUnsigned(bytes: ByteArray) {
-        for (byte in bytes) {
-            if (byte.toString() != byte.toUByte().toString()) {
-                throw Exception("sign problems!: $byte | ${byte.toUByte()}")
-            }
-        }
     }
 }
 
-class HeaderFrame(type: Byte, flags: Byte, streamID: Int, payload: ByteArray, stream: Stream): Frame(type, flags, streamID, payload) {
+class HeaderFrame(type: Byte, flags: Byte, streamID: Int, payload: ByteArray, decoder: Decoder): Frame(type, flags, streamID, payload) {
 
     val headerString: String
 
@@ -38,16 +27,14 @@ class HeaderFrame(type: Byte, flags: Byte, streamID: Int, payload: ByteArray, st
 
         val `in` = ByteArrayInputStream(payload)
         val headers = StringBuilder()
+        // ISO-8859-1 both ways, like the body: one char per byte, so the response text round-trips.
         val listener = HeaderListener { name, value, _ ->
-            headers.append(String(name))
+            headers.append(String(name, Charsets.ISO_8859_1))
             headers.append(": ")
-            headers.append(String(value))
+            headers.append(String(value, Charsets.ISO_8859_1))
             headers.append("\r\n")
-            //Connection.debug("Got header "+String(name) + "="+String(value))
         }
-        // decode header list from header block
-        //val decoder = Decoder(4096, 4096)
-        val decoder = stream.connection.decoder
+        // The connection's decoder: HPACK state spans every header block on the connection.
         decoder.decode(`in`, listener)
         decoder.endHeaderBlock()
         headerString = headers.toString()
@@ -73,14 +60,17 @@ class DataFrame(type: Byte, flags: Byte, streamID: Int, payload: ByteArray): Fra
 
 class SettingsFrame(type: Byte, flags: Byte, streamID: Int, payload: ByteArray): Frame(type, flags, streamID, payload) {
 
+    /** An acknowledgement of our SETTINGS rather than the server's own: the ACK flag, not an empty payload (an empty SETTINGS is legal). */
+    val isAck: Boolean = (flags.toInt() and 1) == 1
     var maxConcurrentStreams = 0
+    /** SETTINGS_HEADER_TABLE_SIZE, when the server sent it: the most our HPACK encoder may use. */
+    var headerTableSize: Int? = null
 
     init {
         H2Connection.debug("Parsing settings...")
-        // fixme is their double-settings response blowing things up
 
         if (payload.size == 0) {
-            H2Connection.debug("Just an ack")
+            H2Connection.debug("No settings")
         } else {
 
             var head = 0
@@ -88,13 +78,14 @@ class SettingsFrame(type: Byte, flags: Byte, streamID: Int, payload: ByteArray):
                 val key = HTTP2Utils.twoByteInt(payload.slice(head..head + 1).toByteArray())
                 val value = HTTP2Utils.fourByteInt(payload.slice(head + 2..head + 5).toByteArray())
                 when (key) {
-                    1 -> H2Connection.debug("HEADER_TABLE_SIZE = $value")
+                    1 -> {
+                        H2Connection.debug("HEADER_TABLE_SIZE = $value")
+                        headerTableSize = value
+                    }
                     2 -> H2Connection.debug("ENABLE_PUSH = $value")
                     3 -> {
-                        // todo this is actually maxConcurrentStreams
                         H2Connection.debug("MAX_CONCURRENT_STREAMS = $value")
                         maxConcurrentStreams = value
-
                     }
                     4 -> H2Connection.debug("INITIAL_WINDOW_SIZE = $value")
                     5 -> H2Connection.debug("MAX_FRAME_SIZE = $value")
