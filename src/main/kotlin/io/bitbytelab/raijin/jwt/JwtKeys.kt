@@ -5,6 +5,7 @@ import com.nimbusds.jose.jwk.ECKey
 import com.nimbusds.jose.jwk.JWK
 import com.nimbusds.jose.jwk.JWKSet
 import com.nimbusds.jose.jwk.OctetKeyPair
+import com.nimbusds.jose.jwk.OctetSequenceKey
 import com.nimbusds.jose.jwk.RSAKey
 import com.nimbusds.jose.jwk.gen.ECKeyGenerator
 import com.nimbusds.jose.jwk.gen.OctetSequenceKeyGenerator
@@ -13,13 +14,23 @@ import com.nimbusds.jose.util.Base64URL
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import org.bouncycastle.asn1.ASN1ObjectIdentifier
+import org.bouncycastle.asn1.DEROctetString
+import org.bouncycastle.asn1.DERUTF8String
+import org.bouncycastle.asn1.pkcs.PrivateKeyInfo
+import org.bouncycastle.asn1.x500.X500NameBuilder
+import org.bouncycastle.asn1.x500.style.BCStyle
+import org.bouncycastle.asn1.x509.AlgorithmIdentifier
+import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo
+import org.bouncycastle.cert.X509v3CertificateBuilder
 import org.bouncycastle.crypto.generators.Ed25519KeyPairGenerator
 import org.bouncycastle.crypto.generators.Ed448KeyPairGenerator
 import org.bouncycastle.crypto.generators.X25519KeyPairGenerator
@@ -38,90 +49,74 @@ import org.bouncycastle.crypto.params.X448PrivateKeyParameters
 import org.bouncycastle.crypto.params.X448PublicKeyParameters
 import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.bouncycastle.openssl.jcajce.JcaPEMWriter
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
+import java.io.StringWriter
+import java.math.BigInteger
+import java.security.KeyFactory
+import java.security.PrivateKey
 import java.security.SecureRandom
 import java.security.Security
 import java.security.interfaces.ECPrivateKey
 import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
+import java.security.spec.PKCS8EncodedKeySpec
 import java.util.Base64
+import java.util.Date
 import java.util.concurrent.ConcurrentHashMap
-import java.io.StringWriter
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
- * In-memory JWK ring. Private material stays in [snapshot] and in
- * [JwtKey.export] only when private export is requested.
+ * JWK ring. Private material stays in [snapshot] and in
+ * [JwtKey.Jose.exportJwk] only when private export is requested.
+ *
+ * Reads never wait. Writers take [writeLock] one at a time and hand the whole ring to [store]
+ * before they release it, so stores happen in the order the ring changed and each one holds a
+ * complete ring: two tools writing at once cannot leave the store without one of their keys.
+ *
+ * @param store receives [snapshot] after every change (the extension's persistent data), or null
+ *   for a ring that lives in memory only.
  */
-class JwtKeyRing {
+class JwtKeyRing(private val store: ((String) -> Unit)? = null) {
     private val keys = ConcurrentHashMap<String, JwtKey>()
+    private val writeLock = ReentrantLock()
+
+    /**
+     * Ids promised to a generation that is still running. Key material is generated outside
+     * [writeLock] (RSA can take seconds), and the id must stay taken meanwhile. Guarded by [writeLock].
+     */
+    private val reserved = HashSet<String>()
+
+    /** Why the last [persist] failed, or null when the store holds the ring as it is now. */
+    @Volatile
+    var storeError: String? = null
+        private set
 
     fun generate(kty: String, size: Int?, crv: String?, alg: String?, id: String?): JwtKey {
         val kind = kty.trim().lowercase()
-        val key = when (kind) {
-            "rsa" -> {
-                val bits = size ?: 2048
-                if (bits < 512 || bits % 8 != 0) {
-                    throw IllegalArgumentException("RSA size must be a multiple of 8 and at least 512")
-                }
-                val kid = freshId(id, "rsa")
-                val gen = RSAKeyGenerator(bits).keyID(kid)
-                if (alg != null) gen.algorithm(com.nimbusds.jose.JWSAlgorithm.parse(alg))
-                jose(kid, gen.generate())
-            }
-            "ec" -> {
-                val curve = curveOf(crv ?: "P-256")
-                if (curve == Curve.Ed25519 || curve == Curve.Ed448 || curve == Curve.X25519 || curve == Curve.X448) {
-                    throw IllegalArgumentException("Curve ${curve.name} is an OKP key, not EC")
-                }
-                val kid = freshId(id, "ec")
-                if (curve == Curve.SECP256K1) {
-                    jose(kid, secp256k1(kid, alg))
-                } else {
-                    val gen = ECKeyGenerator(curve).keyID(kid)
-                    if (alg != null) gen.algorithm(com.nimbusds.jose.JWSAlgorithm.parse(alg))
-                    jose(kid, gen.generate())
-                }
-            }
-            "okp" -> {
-                val curve = curveOf(crv ?: "Ed25519")
-                if (curve != Curve.Ed25519 && curve != Curve.Ed448 && curve != Curve.X25519 && curve != Curve.X448) {
-                    throw IllegalArgumentException("Curve ${curve.name} is not an OKP curve")
-                }
-                val kid = freshId(id, "okp")
-                jose(kid, okp(curve, kid, alg))
-            }
-            "oct" -> {
-                val bits = size ?: 256
-                if (bits < 128 || bits % 8 != 0) {
-                    throw IllegalArgumentException("oct size must be a multiple of 8 and at least 128")
-                }
-                val kid = freshId(id, "oct")
-                val gen = OctetSequenceKeyGenerator(bits).keyID(kid)
-                if (alg != null) gen.algorithm(com.nimbusds.jose.JWSAlgorithm.parse(alg))
-                jose(kid, gen.generate())
-            }
-            "password" -> {
-                val kid = freshId(id, "password")
-                val bytes = ByteArray(24).also { SecureRandom().nextBytes(it) }
-                val secret = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
-                JwtKey.Password(kid, secret, alg)
-            }
-            else -> throw IllegalArgumentException("Unknown kty '$kty'. Use RSA, EC, OKP, oct, or password")
+        val kid = reserve(id, kind)
+        try {
+            val key = create(kind, kid, size, crv, alg)
+            commit { keys[kid] = key }
+            return key
+        } finally {
+            writeLock.withLock { reserved.remove(kid) }
         }
-        keys[key.id] = key
-        return key
     }
 
-    /** Imports a PEM document, one JWK, or a JWK set. Returns the stored keys. */
+    /** Imports a PEM document, one JWK, or a JWK set. Returns the stored keys; stores all of them or none. */
     fun import(pem: String?, jwkJson: String?, password: String?): List<JwtKey> {
-        val stored = when {
-            !password.isNullOrBlank() && pem.isNullOrBlank() && jwkJson.isNullOrBlank() ->
-                listOf(JwtKey.Password(freshId(null, "password"), password, null))
-            !pem.isNullOrBlank() -> pemToJwks(pem).map { storeParsed(it) }
-            !jwkJson.isNullOrBlank() -> parseJwkText(jwkJson).map { storeParsed(it) }
+        val parsed = when {
+            !pem.isNullOrBlank() -> pemToJwks(pem)
+            !jwkJson.isNullOrBlank() -> parseJwkText(jwkJson)
+            !password.isNullOrBlank() -> return commit {
+                val key = JwtKey.Password(nextId("password"), password, null)
+                keys[key.id] = key
+                listOf(key)
+            }
             else -> throw IllegalArgumentException("import requires pem, jwk, or password")
         }
-        stored.forEach { keys[it.id] = it }
-        return stored
+        return commit { withIds(parsed).onEach { keys[it.id] = it } }
     }
 
     fun list(): List<JwtKey> = keys.values.sortedBy { it.id }
@@ -129,9 +124,13 @@ class JwtKeyRing {
     fun get(id: String): JwtKey =
         keys[id] ?: throw IllegalArgumentException("Unknown key_id '$id'")
 
-    fun delete(id: String): Boolean = keys.remove(id) != null
+    fun delete(id: String): Boolean = writeLock.withLock {
+        val removed = keys.remove(id) != null
+        if (removed) persist()
+        removed
+    }
 
-    fun snapshot(): String {
+    fun snapshot(): String = writeLock.withLock {
         val arr = buildJsonArray {
             keys.values.sortedBy { it.id }.forEach { key ->
                 add(buildJsonObject {
@@ -140,7 +139,7 @@ class JwtKeyRing {
                 })
             }
         }
-        return buildJsonObject {
+        buildJsonObject {
             put("v", 1)
             put("keys", arr)
         }.toString()
@@ -149,48 +148,146 @@ class JwtKeyRing {
     fun restore(json: String) {
         val root = Json.parseToJsonElement(json).jsonObject
         val arr = root["keys"] as? JsonArray ?: return
-        for (el in arr) {
-            val obj = el as? JsonObject ?: continue
-            val id = obj["id"]?.jsonPrimitive?.contentOrNull ?: continue
-            val material = obj["material"]?.jsonPrimitive?.contentOrNull ?: continue
-            val key = try {
-                decodeMaterial(id, material)
-            } catch (_: Exception) {
-                continue
+        writeLock.withLock {
+            for (el in arr) {
+                val obj = el as? JsonObject ?: continue
+                val id = obj["id"]?.jsonPrimitive?.contentOrNull ?: continue
+                val material = obj["material"]?.jsonPrimitive?.contentOrNull ?: continue
+                val key = try {
+                    decodeMaterial(id, material)
+                } catch (_: Exception) {
+                    continue
+                }
+                keys[key.id] = key
             }
-            keys[key.id] = key
         }
     }
 
-    private fun storeParsed(jwk: JWK): JwtKey {
-        val kid = jwk.keyID?.takeIf { it.isNotBlank() } ?: freshId(null, jwk.keyType?.value ?: "key")
-        val withKid = if (jwk.keyID == kid) jwk else {
-            JWK.parse(buildJsonObject {
-                val parsed = Json.parseToJsonElement(jwk.toJSONString()).jsonObject
-                parsed.forEach { (k, v) -> put(k, v) }
-                put("kid", kid)
-            }.toString())
+    /**
+     * Hands the whole ring to the store. Every change calls this before it lets go of the ring,
+     * which is what keeps the stored ring whole when two changes race. Returns false, and sets
+     * [storeError], when the store throws: the keys then stay usable in memory.
+     */
+    fun persist(): Boolean {
+        val sink = store ?: return true
+        return writeLock.withLock {
+            try {
+                sink(snapshot())
+                storeError = null
+                true
+            } catch (e: Exception) {
+                storeError = e.message ?: e.javaClass.simpleName
+                false
+            }
         }
-        if (keys.containsKey(kid)) throw IllegalArgumentException("key_id '$kid' already exists")
-        val stored = jose(kid, withKid)
-        keys[stored.id] = stored
-        return stored
     }
 
-    private fun freshId(requested: String?, prefix: String): String {
-        val base = requested?.trim()?.takeIf { it.isNotEmpty() }
-        if (base != null && !keys.containsKey(base)) return base
-        if (base != null) throw IllegalArgumentException("key_id '$base' already exists")
-        var n = keys.size + 1
-        var id = "$prefix-$n"
-        while (keys.containsKey(id)) {
-            n += 1
-            id = "$prefix-$n"
+    /** Applies [change] and stores the ring as one step. */
+    private inline fun <T> commit(change: () -> T): T = writeLock.withLock {
+        val result = change()
+        persist()
+        result
+    }
+
+    private fun reserve(requested: String?, prefix: String): String = writeLock.withLock {
+        val wanted = requested?.trim()?.takeIf { it.isNotEmpty() }
+        if (wanted != null && taken(wanted)) throw IllegalArgumentException("key_id '$wanted' already exists")
+        val id = wanted ?: nextId(prefix)
+        reserved.add(id)
+        id
+    }
+
+    private fun taken(id: String): Boolean = keys.containsKey(id) || id in reserved
+
+    /** The next free `prefix-N` id. Call under [writeLock]; [pending] holds ids of a batch not stored yet. */
+    private fun nextId(prefix: String, pending: Set<String> = emptySet()): String {
+        var n = keys.size + pending.size + 1
+        while (taken("$prefix-$n") || "$prefix-$n" in pending) n += 1
+        return "$prefix-$n"
+    }
+
+    /**
+     * Gives each imported JWK its ring id: its own `kid`, or a fresh one. Fails before anything is
+     * stored when an id is taken, so an import never lands half-way. Call under [writeLock].
+     */
+    private fun withIds(parsed: List<JWK>): List<JwtKey.Jose> {
+        val batch = LinkedHashMap<String, JwtKey.Jose>()
+        for (jwk in parsed) {
+            val own = jwk.keyID?.takeIf { it.isNotBlank() }
+            if (own != null && (taken(own) || own in batch)) throw IllegalArgumentException("key_id '$own' already exists")
+            val kid = own ?: nextId(jwk.keyType?.value ?: "key", batch.keys)
+            val withKid = if (own != null) jwk else {
+                JWK.parse(buildJsonObject {
+                    val json = Json.parseToJsonElement(jwk.toJSONString()).jsonObject
+                    json.forEach { (k, v) -> put(k, v) }
+                    put("kid", kid)
+                }.toString())
+            }
+            batch[kid] = jose(kid, withKid)
         }
-        return id
+        return batch.values.toList()
+    }
+
+    /** Builds the key material for [kid]. Runs outside [writeLock]. */
+    private fun create(kind: String, kid: String, size: Int?, crv: String?, alg: String?): JwtKey = when (kind) {
+        "rsa" -> {
+            val bits = size ?: 2048
+            if (bits < 512 || bits % 8 != 0) {
+                throw IllegalArgumentException("RSA size must be a multiple of 8 and at least 512")
+            }
+            // Nimbus refuses to generate under 2048 bits unless asked; a weak key is a test case here.
+            val gen = RSAKeyGenerator(bits, true).keyID(kid)
+            if (alg != null) gen.algorithm(com.nimbusds.jose.JWSAlgorithm.parse(alg))
+            jose(kid, gen.generate())
+        }
+        "ec" -> {
+            val curve = curveOf(crv ?: "P-256")
+            if (curve.isOkp()) {
+                throw IllegalArgumentException("Curve ${curve.name} is an OKP key, not EC")
+            }
+            if (curve == Curve.SECP256K1) {
+                jose(kid, secp256k1(kid, alg))
+            } else {
+                val gen = ECKeyGenerator(curve).keyID(kid)
+                if (alg != null) gen.algorithm(com.nimbusds.jose.JWSAlgorithm.parse(alg))
+                jose(kid, gen.generate())
+            }
+        }
+        "okp" -> {
+            val curve = curveOf(crv ?: "Ed25519")
+            if (!curve.isOkp()) {
+                throw IllegalArgumentException("Curve ${curve.name} is not an OKP curve")
+            }
+            jose(kid, okp(curve, kid, alg))
+        }
+        "oct" -> {
+            val bits = size ?: 256
+            if (bits < 128 || bits % 8 != 0) {
+                throw IllegalArgumentException("oct size must be a multiple of 8 and at least 128")
+            }
+            val gen = OctetSequenceKeyGenerator(bits).keyID(kid)
+            if (alg != null) gen.algorithm(com.nimbusds.jose.JWSAlgorithm.parse(alg))
+            jose(kid, gen.generate())
+        }
+        "password" -> {
+            val bytes = ByteArray(24).also { SecureRandom().nextBytes(it) }
+            val secret = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+            JwtKey.Password(kid, secret, alg)
+        }
+        else -> throw IllegalArgumentException("Unknown kty '$kind'. Use ${KTYS.joinToString(", ")}")
     }
 
     companion object {
+        /** `kty` values [generate] accepts (matched without regard to case). */
+        val KTYS: List<String> = listOf("RSA", "EC", "OKP", "oct", "password")
+
+        /** Curve names [curveOf] accepts, in their JWK spelling. */
+        val CURVES: List<String> = listOf("P-256", "P-384", "P-521", "secp256k1", "Ed25519", "Ed448", "X25519", "X448")
+
+        /** Smallest and largest `size` in bits [generate] can use (128-bit oct up to the JDK's RSA limit). */
+        const val MIN_SIZE_BITS = 128
+        const val MAX_SIZE_BITS = 16384
+
         /** Nimbus generates OKP keys via Tink. These curves come from BouncyCastle instead. */
         private fun okp(curve: Curve, kid: String, alg: String?): OctetKeyPair {
             val (x, d) = when (curve) {
@@ -254,7 +351,7 @@ class JwtKeyRing {
             "ED448" -> Curve.Ed448
             "X25519" -> Curve.X25519
             "X448" -> Curve.X448
-            else -> throw IllegalArgumentException("Unknown curve '$crv'")
+            else -> throw IllegalArgumentException("Unknown curve '$crv'. Use ${CURVES.joinToString(", ")}")
         }
     }
 }
@@ -265,6 +362,12 @@ sealed class JwtKey {
     abstract val alg: String?
     abstract val publicOnly: Boolean
     abstract val crv: String?
+
+    /**
+     * The `jwt_attack` modes this key can serve. Reported with every key, so nobody has to find out
+     * by trial that an X448 key encrypts but cannot sign.
+     */
+    abstract val modes: List<String>
 
     /** JSON stored in the extension key ring. Includes private material. */
     abstract fun persist(): String
@@ -277,6 +380,7 @@ sealed class JwtKey {
         put("public_only", publicOnly)
         alg?.let { put("alg", it) }
         crv?.let { put("crv", it) }
+        putJsonArray("modes") { modes.forEach { add(it) } }
     }
 
     data class Jose(override val id: String, val jwk: JWK) : JwtKey() {
@@ -288,6 +392,34 @@ sealed class JwtKey {
             is OctetKeyPair -> jwk.curve?.name
             else -> null
         }
+
+        override val modes: List<String>
+            get() {
+                val signs = when (jwk) {
+                    is RSAKey, is ECKey, is OctetSequenceKey -> true
+                    is OctetKeyPair -> jwk.curve == Curve.Ed25519 || jwk.curve == Curve.Ed448
+                    else -> false
+                }
+                val encrypts = when (jwk) {
+                    is RSAKey, is OctetSequenceKey -> true
+                    is ECKey -> jwk.curve != Curve.SECP256K1
+                    is OctetKeyPair -> jwk.curve == Curve.X25519 || jwk.curve == Curve.X448
+                    else -> false
+                }
+                val asymmetric = jwk !is OctetSequenceKey
+                val private = jwk.isPrivate
+                return buildList {
+                    if (signs && private) add("sign_key")
+                    if (signs) add("verify")
+                    if (signs && private && asymmetric) {
+                        add("embed_jwk")
+                        add("header_url")
+                    }
+                    if (asymmetric) add("alg_confusion")
+                    if (encrypts) add("encrypt")
+                    if (encrypts && private) add("decrypt")
+                }
+            }
 
         override fun persist(): String = jwk.toJSONString()
 
@@ -307,20 +439,13 @@ sealed class JwtKey {
                 includePrivate && jwk.isPrivate -> when (jwk) {
                     is RSAKey -> jwk.toPrivateKey()
                     is ECKey -> jwk.toECPrivateKey()
-                    is OctetKeyPair -> jwk.toPrivateKey()
+                    is OctetKeyPair -> okpPrivateInfo(jwk)
                     else -> throw IllegalArgumentException("Key '$id' cannot be exported as PEM")
                 }
-                else -> when (val pub = jwk.toPublicJWK()) {
-                    is RSAKey -> pub.toPublicKey()
-                    is ECKey -> pub.toECPublicKey()
-                    is OctetKeyPair -> pub.toPublicKey()
-                    null -> throw IllegalArgumentException("Key '$id' has no public PEM. Pass include_private=true")
-                    else -> throw IllegalArgumentException("Key '$id' cannot be exported as PEM")
-                }
+                else -> publicPemObject(jwk)
+                    ?: throw IllegalArgumentException("Key '$id' has no public PEM. Pass include_private=true")
             }
-            val sw = StringWriter()
-            JcaPEMWriter(sw).use { it.writeObject(obj) }
-            return sw.toString()
+            return pem(obj)
         }
     }
 
@@ -328,6 +453,7 @@ sealed class JwtKey {
         override val kty: String get() = "password"
         override val publicOnly: Boolean get() = false
         override val crv: String? get() = null
+        override val modes: List<String> get() = listOf("encrypt", "decrypt")
 
         override fun persist(): String = buildJsonObject {
             put("kty", "password")
@@ -346,6 +472,9 @@ sealed class JwtKey {
 }
 
 private fun jose(id: String, jwk: JWK): JwtKey.Jose = JwtKey.Jose(id, jwk)
+
+private fun Curve.isOkp(): Boolean =
+    this == Curve.Ed25519 || this == Curve.Ed448 || this == Curve.X25519 || this == Curve.X448
 
 private fun decodeMaterial(id: String, material: String): JwtKey {
     val el = Json.parseToJsonElement(material)
@@ -373,26 +502,109 @@ private fun parseJwkText(text: String): List<JWK> {
  * literal HMAC-secret bytes, so it needs byte-exact PEM text, not JSON). A JWK set uses its
  * first entry. This lets a caller pass a server's JWKS entry directly instead of first
  * importing it into the key ring and exporting it as PEM by hand.
- *
- * Same JWK -> PEM conversion as [JwtKey.Jose.exportPem]'s public-key path, kept as an
- * independent function here (rather than shared code) since that one also handles private-key
- * export with ring-specific, id-scoped error messages this standalone case has no use for.
  */
 fun jwkTextToPem(jwkJson: String): String {
     val jwk = parseJwkText(jwkJson).firstOrNull()
         ?: throw IllegalArgumentException("No JWK found in the supplied JSON")
-    val obj: Any = when (val pub = jwk.toPublicJWK() ?: jwk) {
-        is RSAKey -> pub.toPublicKey()
-        is ECKey -> pub.toECPublicKey()
-        is OctetKeyPair -> pub.toPublicKey()
-        else -> throw IllegalArgumentException("JWK has no exportable public key (kty=${jwk.keyType?.value})")
-    }
-    val sw = StringWriter()
-    JcaPEMWriter(sw).use { it.writeObject(obj) }
-    return sw.toString()
+    val obj = publicPemObject(jwk)
+        ?: throw IllegalArgumentException("JWK has no exportable public key (kty=${jwk.keyType?.value})")
+    return pem(obj)
 }
 
 private fun pemToJwks(pem: String): List<JWK> {
     val parsed = JWK.parseFromPEMEncodedObjects(pem.trim())
     return listOf(parsed)
+}
+
+/** PEM text with LF line ends on every platform: a PEM used as an HMAC secret has to match byte for byte. */
+private fun pem(obj: Any): String {
+    val sw = StringWriter()
+    JcaPEMWriter(sw).use { it.writeObject(obj) }
+    return sw.toString().replace("\r\n", "\n")
+}
+
+/** What [pem] writes as the public key of [jwk], or null when the key has no public half. */
+private fun publicPemObject(jwk: JWK): Any? = when (val public = jwk.toPublicJWK()) {
+    is RSAKey -> public.toPublicKey()
+    is ECKey -> public.toECPublicKey()
+    is OctetKeyPair -> okpPublicInfo(public)
+    else -> null
+}
+
+/** RFC 8410 algorithm identifier of an OKP curve. */
+private fun okpAlgorithm(curve: Curve): AlgorithmIdentifier = AlgorithmIdentifier(
+    ASN1ObjectIdentifier(
+        when (curve) {
+            Curve.X25519 -> "1.3.101.110"
+            Curve.X448 -> "1.3.101.111"
+            Curve.Ed25519 -> "1.3.101.112"
+            Curve.Ed448 -> "1.3.101.113"
+            else -> throw IllegalArgumentException("Curve ${curve.name} is not an OKP curve")
+        }
+    )
+)
+
+/**
+ * Nimbus 9.21 cannot turn an OKP key into a JCA key ("Export to java.security.PublicKey not
+ * supported"), so the PEM forms of Ed25519, Ed448, X25519 and X448 keys are built from the raw
+ * key bytes.
+ */
+private fun okpPublicInfo(jwk: OctetKeyPair): SubjectPublicKeyInfo =
+    SubjectPublicKeyInfo(okpAlgorithm(jwk.curve), jwk.decodedX)
+
+private fun okpPrivateInfo(jwk: OctetKeyPair): PrivateKeyInfo =
+    PrivateKeyInfo(okpAlgorithm(jwk.curve), DEROctetString(jwk.decodedD))
+
+private const val DAY_MILLIS = 24L * 60 * 60 * 1000
+
+/**
+ * A self-signed X.509 certificate for [jwk] as PEM: the one-certificate chain an `x5u` URL has to
+ * serve (RFC 7515 section 4.1.5). BouncyCastle signs it, so every ring key that can sign gets one
+ * the same way.
+ */
+internal fun selfSignedCertificatePem(jwk: JWK): String {
+    if (!jwk.isPrivate) throw IllegalArgumentException("Key cannot sign (public only)")
+    val provider = JwtKeyRing.bcProvider()
+    val publicInfo: SubjectPublicKeyInfo
+    val privateKey: PrivateKey
+    val signatureAlgorithm: String
+    when (jwk) {
+        is RSAKey -> {
+            publicInfo = SubjectPublicKeyInfo.getInstance(jwk.toRSAPublicKey().encoded)
+            privateKey = jwk.toPrivateKey()
+            signatureAlgorithm = "SHA256withRSA"
+        }
+        is ECKey -> {
+            publicInfo = SubjectPublicKeyInfo.getInstance(jwk.toECPublicKey().encoded)
+            privateKey = jwk.toECPrivateKey()
+            signatureAlgorithm = when (jwk.curve) {
+                Curve.P_384 -> "SHA384withECDSA"
+                Curve.P_521 -> "SHA512withECDSA"
+                else -> "SHA256withECDSA"
+            }
+        }
+        is OctetKeyPair -> {
+            if (jwk.curve != Curve.Ed25519 && jwk.curve != Curve.Ed448) {
+                throw IllegalArgumentException("Curve ${jwk.curve.name} cannot sign a certificate")
+            }
+            publicInfo = okpPublicInfo(jwk)
+            privateKey = KeyFactory.getInstance(jwk.curve.name, provider)
+                .generatePrivate(PKCS8EncodedKeySpec(okpPrivateInfo(jwk).encoded))
+            signatureAlgorithm = jwk.curve.name
+        }
+        else -> throw IllegalArgumentException("A certificate needs an RSA, EC, Ed25519 or Ed448 key")
+    }
+    val name = X500NameBuilder(BCStyle.INSTANCE)
+        .addRDN(BCStyle.CN, DERUTF8String(jwk.keyID?.takeIf { it.isNotEmpty() } ?: "jwt"))
+        .build()
+    val now = System.currentTimeMillis()
+    val certificate = X509v3CertificateBuilder(
+        name,
+        BigInteger(63, SecureRandom()).add(BigInteger.ONE),
+        Date(now - DAY_MILLIS),
+        Date(now + 365 * DAY_MILLIS),
+        name,
+        publicInfo,
+    ).build(JcaContentSignerBuilder(signatureAlgorithm).setProvider(provider).build(privateKey))
+    return pem(certificate)
 }
