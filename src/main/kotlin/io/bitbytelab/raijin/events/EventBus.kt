@@ -4,7 +4,6 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.time.Instant
 
@@ -27,12 +26,12 @@ data class BurpEvent(
 /**
  * Thread-safe event bus backed by a bounded ring buffer.
  *
- * Events are emitted by Burp handler callbacks and consumed by MCP clients
- * through cursor-based polling (getEvents / getEventsByType) or push-based
- * subscriptions (subscribe / unsubscribe).
+ * Events are emitted by Burp handler callbacks and consumed by MCP clients through cursor-based
+ * polling (getEvents / getEventsByType, or a [PollSubscription] that keeps its own cursor), and by
+ * in-process listeners through push callbacks (subscribe / subscribeInternal).
  *
- * When the buffer reaches [maxBufferSize], the oldest events are evicted to
- * keep memory usage bounded.
+ * When the buffer reaches [maxBufferSize], the oldest events are evicted to keep memory usage
+ * bounded. Events enter the buffer in id order, so a cursor never skips an event still buffered.
  *
  * All public methods are safe to call from any thread.
  *
@@ -40,11 +39,27 @@ data class BurpEvent(
  */
 class EventBus(private val maxBufferSize: Int = 10000) {
     private val buffer = ConcurrentLinkedDeque<BurpEvent>()
-    private val bufferSize = AtomicInteger(0)
-    private val idCounter = AtomicLong(0)
-    /** Separate from [idCounter] so subscribing never leaves gaps in event ids. */
+    /** Guards id assignment, insertion and eviction together; reads iterate [buffer] without it. */
+    private val emitLock = Any()
+    private var nextId = 0L // guarded by emitLock
+
+    @Volatile
+    private var count = 0
+
+    /** Every event with an id up to this one is already in [buffer] (or was evicted). */
+    @Volatile
+    private var lastCommittedId = 0L
+
+    /** Separate from event ids so subscribing never leaves gaps in event ids. */
     private val subscriptionCounter = AtomicLong(0)
     private val subscribers = CopyOnWriteArrayList<EventSubscriber>()
+    /** Access-ordered, so the least recently polled subscription is dropped first. Guarded by itself. */
+    private val pollSubscriptions = LinkedHashMap<String, PollSubscription>(16, 0.75f, true)
+
+    companion object {
+        /** Cap on open [PollSubscription]s; beyond it the least recently used one is dropped. */
+        const val MAX_POLL_SUBSCRIPTIONS = 64
+    }
 
     /**
      * Emits a new event, appending it to the ring buffer and notifying
@@ -54,19 +69,14 @@ class EventBus(private val maxBufferSize: Int = 10000) {
      * @param data JSON payload for the event.
      */
     fun emit(type: String, data: JsonObject) {
-        val event = BurpEvent(
-            id = idCounter.incrementAndGet(),
-            type = type,
-            timestamp = Instant.now().toString(),
-            data = data
-        )
-
-        buffer.addLast(event)
-        bufferSize.incrementAndGet()
-
-        // Evict oldest events when the buffer exceeds capacity (O(1) size check)
-        while (bufferSize.get() > maxBufferSize) {
-            if (buffer.pollFirst() != null) bufferSize.decrementAndGet() else break
+        val event = synchronized(emitLock) {
+            val e = BurpEvent(id = ++nextId, type = type, timestamp = Instant.now().toString(), data = data)
+            buffer.addLast(e)
+            var n = count + 1
+            while (n > maxBufferSize && buffer.pollFirst() != null) n--
+            count = n
+            lastCommittedId = e.id
+            e
         }
 
         // Notify matching subscribers (type filter is empty == wildcard)
@@ -124,6 +134,7 @@ class EventBus(private val maxBufferSize: Int = 10000) {
     /**
      * Registers a push-based subscriber. When [types] is empty the subscriber
      * receives all events; otherwise only events whose type is in the list.
+     * Removed by [clear]; use [subscribeInternal] for listeners that must outlive it.
      *
      * @return A subscription id that can be passed to [unsubscribe].
      */
@@ -144,22 +155,77 @@ class EventBus(private val maxBufferSize: Int = 10000) {
     }
 
     /**
-     * Removes a previously registered subscriber by its [subscriptionId].
+     * Opens a client poll subscription for [types] (empty = all) starting after the latest event.
+     * It holds no events and runs no callback: [poll] reads the ring buffer from its cursor. At most
+     * [MAX_POLL_SUBSCRIPTIONS] stay open; the least recently used one is dropped beyond that.
      */
-    fun unsubscribe(subscriptionId: String) {
-        subscribers.removeIf { it.id == subscriptionId }
+    fun openPollSubscription(types: List<String>): PollSubscription {
+        val subscription = PollSubscription("sub-${subscriptionCounter.incrementAndGet()}", types.distinct(), lastCommittedId)
+        synchronized(pollSubscriptions) {
+            pollSubscriptions[subscription.id] = subscription
+            val eldest = pollSubscriptions.keys.iterator()
+            while (pollSubscriptions.size > MAX_POLL_SUBSCRIPTIONS && eldest.hasNext()) {
+                eldest.next()
+                eldest.remove()
+            }
+        }
+        return subscription
     }
 
     /**
-     * Clears the buffered events and removes non-internal (client-created) subscribers.
-     * Internal Dashboard SSE and Burp UI subscribers are preserved.
+     * Returns up to [maxEvents] events matching subscription [subscriptionId] since its cursor and
+     * advances the cursor past everything read or skipped. Null when no such subscription is open.
+     */
+    fun poll(subscriptionId: String, maxEvents: Int = 200): PollResult? {
+        val subscription = synchronized(pollSubscriptions) { pollSubscriptions[subscriptionId] } ?: return null
+        val limit = maxEvents.coerceIn(0, maxBufferSize)
+        return synchronized(subscription) {
+            val from = subscription.cursor
+            val head = lastCommittedId
+            val oldest = buffer.peekFirst()?.id
+            val missed = head > from && (oldest == null || oldest > from + 1)
+            val page = ArrayList<BurpEvent>()
+            var lastRead = from
+            var full = false
+            for (event in buffer) {
+                if (event.id <= from) continue
+                if (event.id > head) break
+                if (subscription.types.isEmpty() || event.type in subscription.types) {
+                    if (page.size >= limit) {
+                        full = true
+                        break
+                    }
+                    page.add(event)
+                }
+                lastRead = event.id
+            }
+            subscription.cursor = if (full) lastRead else maxOf(head, from)
+            PollResult(subscription, page, subscription.cursor, missed)
+        }
+    }
+
+    /**
+     * Removes a push subscriber or a poll subscription by its [subscriptionId].
+     *
+     * @return whether anything was removed.
+     */
+    fun unsubscribe(subscriptionId: String): Boolean {
+        val callback = subscribers.removeIf { it.id == subscriptionId }
+        val poll = synchronized(pollSubscriptions) { pollSubscriptions.remove(subscriptionId) } != null
+        return callback || poll
+    }
+
+    /**
+     * Clears the buffered events and removes client subscriptions (non-internal push subscribers
+     * and poll subscriptions). Internal Dashboard SSE and Burp UI subscribers are preserved.
      */
     fun clear() {
-        while (buffer.pollFirst() != null) {
-            bufferSize.decrementAndGet()
+        synchronized(emitLock) {
+            buffer.clear()
+            count = 0
         }
-        if (bufferSize.get() != 0) bufferSize.set(buffer.size)
         subscribers.removeIf { !it.internal }
+        synchronized(pollSubscriptions) { pollSubscriptions.clear() }
     }
 
     /**
@@ -167,17 +233,54 @@ class EventBus(private val maxBufferSize: Int = 10000) {
      * Called only during extension unload.
      */
     fun clearAll() {
-        buffer.clear()
-        bufferSize.set(0)
+        synchronized(emitLock) {
+            buffer.clear()
+            count = 0
+        }
         subscribers.clear()
+        synchronized(pollSubscriptions) { pollSubscriptions.clear() }
     }
 
     /** Number of events currently in the buffer. */
-    fun size(): Int = bufferSize.get().coerceAtLeast(0)
+    fun size(): Int = count
 
     /** The id of the most recently emitted event (0 if none). */
-    fun lastId(): Long = idCounter.get()
+    fun lastId(): Long = lastCommittedId
+
+    /** Open push subscribers (internal ones included); for diagnostics and tests. */
+    internal fun pushSubscriberCount(): Int = subscribers.size
+
+    /** Open poll subscriptions; for diagnostics and tests. */
+    internal fun pollSubscriptionCount(): Int = synchronized(pollSubscriptions) { pollSubscriptions.size }
 }
+
+/**
+ * A client poll subscription ([EventBus.openPollSubscription]): a type filter and a read cursor.
+ * It holds no events; they stay in the ring buffer until read or evicted.
+ *
+ * @property id Subscription id, accepted by [EventBus.poll] and [EventBus.unsubscribe].
+ * @property types Event types read by [EventBus.poll] (empty = all).
+ */
+class PollSubscription internal constructor(val id: String, val types: List<String>, startCursor: Long) {
+    /** Id of the last event this subscription has read or skipped. */
+    @Volatile
+    var cursor: Long = startCursor
+        internal set
+}
+
+/**
+ * One page read by [EventBus.poll].
+ *
+ * @property cursor The subscription cursor after this read.
+ * @property missed Events after the previous cursor were evicted before this read, so some
+ *   matching events may be gone.
+ */
+data class PollResult(
+    val subscription: PollSubscription,
+    val events: List<BurpEvent>,
+    val cursor: Long,
+    val missed: Boolean
+)
 
 /**
  * Internal holder for a push-based event subscription.

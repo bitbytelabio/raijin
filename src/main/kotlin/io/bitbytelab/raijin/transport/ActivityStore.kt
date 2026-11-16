@@ -3,11 +3,18 @@ package io.bitbytelab.raijin.transport
 import io.bitbytelab.raijin.state.McpActivityEntry
 import kotlinx.serialization.json.*
 import java.io.File
-import java.util.concurrent.locks.ReentrantLock
+import java.nio.file.Files
 import kotlin.concurrent.withLock
 
-class ActivityFileStore(private val file: File) {
-    private val lock = ReentrantLock()
+/**
+ * File-backed activity store. All operations on one file share [JsonlStoreSupport.lockFor]; the file
+ * is trimmed back to [maxLines] once it grows a quarter past it, so a long session cannot grow it
+ * without bound between restarts.
+ */
+class ActivityFileStore(private val file: File, private val maxLines: Int = ActivityStore.MAX_LINES) {
+    private val lock = JsonlStoreSupport.lockFor(file)
+    private var appendsSinceCheck = 0 // guarded by lock
+    private var knownLines = -1 // guarded by lock; -1 until counted
 
     @Volatile
     var lastError: String? = null
@@ -20,40 +27,46 @@ class ActivityFileStore(private val file: File) {
         lock.withLock {
             try {
                 JsonlStoreSupport.appendLine(file, ActivityStore.buildEntry(e, project))
-                lastError = null
+                if (knownLines >= 0) knownLines++
+                if (++appendsSinceCheck >= COMPACT_CHECK_INTERVAL) {
+                    appendsSinceCheck = 0
+                    if (knownLines < 0) knownLines = file.useLines { it.count() }
+                    if (maxLines > 0 && knownLines > maxLines + maxLines / 4) compactLocked(maxLines)
+                }
+                succeeded()
             } catch (ex: Exception) {
-                recordError("append", ex)
+                failed("append", ex)
             }
         }
     }
 
-    fun rewriteProject(project: String, replacement: List<McpActivityEntry>) {
+    fun rewriteProject(project: String, replacement: List<McpActivityEntry>) = rewriteProject(project) { replacement }
+
+    /**
+     * Replaces [project]'s saved entries with [snapshot] (oldest-first), evaluated while the file
+     * lock is held. An entry recorded meanwhile is in the snapshot, appended after the rewrite, or
+     * both (the duplicate is dropped on load), so a caller on any thread loses nothing.
+     */
+    fun rewriteProject(project: String, snapshot: () -> List<McpActivityEntry>) {
         lock.withLock {
             try {
-                val existing = if (file.exists()) file.readLines().mapNotNull { ActivityStore.parseEntry(it) } else emptyList()
-                val lines = ActivityStore.rebuildLines(existing, project, replacement)
-                if (lines.isEmpty()) {
-                    if (file.exists()) file.delete()
-                } else {
-                    JsonlStoreSupport.atomicWriteLines(file, lines)
-                }
-                lastError = null
+                val lines = ActivityStore.rebuildLines(ActivityStore.dedupe(readParsed()), project, snapshot())
+                if (lines.isEmpty()) Files.deleteIfExists(file.toPath()) else JsonlStoreSupport.atomicWriteLines(file, lines)
+                knownLines = lines.size
+                succeeded()
             } catch (ex: Exception) {
-                recordError("rewriteProject", ex)
+                failed("rewriteProject", ex)
             }
         }
     }
 
     fun load(project: String, max: Int): List<McpActivityEntry> = lock.withLock {
         try {
-            if (!file.exists()) emptyList()
-            else {
-                val res = ActivityStore.selectForProject(file.readLines().mapNotNull { ActivityStore.parseEntry(it) }, project, max)
-                lastError = null
-                res
-            }
+            val res = ActivityStore.selectForProject(ActivityStore.dedupe(readParsed()), project, max)
+            succeeded()
+            res
         } catch (ex: Exception) {
-            recordError("load", ex)
+            failed("load", ex)
             emptyList()
         }
     }
@@ -61,20 +74,40 @@ class ActivityFileStore(private val file: File) {
     fun compact(maxLines: Int) {
         lock.withLock {
             try {
-                if (!file.exists()) return
-                val lines = file.readLines()
-                if (lines.size <= maxLines) return
-                JsonlStoreSupport.atomicWriteLines(file, lines.takeLast(maxLines))
-                lastError = null
+                compactLocked(maxLines)
+                succeeded()
             } catch (ex: Exception) {
-                recordError("compact", ex)
+                failed("compact", ex)
             }
         }
     }
 
-    private fun recordError(op: String, ex: Exception) {
-        lastError = ex.message ?: ex::class.simpleName
-        System.err.println("Raijin: ActivityStore.$op failed (${file.absolutePath}): $lastError")
+    private fun compactLocked(maxLines: Int) {
+        if (!file.exists()) {
+            knownLines = 0
+            return
+        }
+        val lines = file.readLines()
+        knownLines = lines.size
+        if (maxLines <= 0 || lines.size <= maxLines) return
+        JsonlStoreSupport.atomicWriteLines(file, lines.takeLast(maxLines))
+        knownLines = maxLines
+    }
+
+    private fun readParsed(): List<Pair<McpActivityEntry, String>> =
+        if (file.exists()) file.readLines().mapNotNull { ActivityStore.parseEntry(it) } else emptyList()
+
+    private fun succeeded() {
+        lastError = null
+        JsonlStoreSupport.recovered(file)
+    }
+
+    private fun failed(op: String, ex: Exception) {
+        lastError = JsonlStoreSupport.reportFailure("ActivityStore", op, file, ex)
+    }
+
+    private companion object {
+        const val COMPACT_CHECK_INTERVAL = 500
     }
 }
 
@@ -96,7 +129,7 @@ class ActivityFileStore(private val file: File) {
 object ActivityStore {
     private const val MAX_SUMMARY = 4000
 
-    /** Upper bound on retained file lines; older lines are dropped on startup [compact]. */
+    /** Upper bound on retained file lines: trimmed on startup [compact] and while running. */
     const val MAX_LINES = 20000
 
     private val defaultStore = ActivityFileStore(File(System.getProperty("user.home") ?: ".", ".raijin-activity.jsonl"))
@@ -158,6 +191,13 @@ object ActivityStore {
     fun selectForProject(parsed: List<Pair<McpActivityEntry, String>>, project: String, max: Int): List<McpActivityEntry> =
         parsed.filter { it.second == project }.map { it.first }.takeLast(max.coerceAtLeast(0)).asReversed()
 
+    /**
+     * Pure: drops repeated records of one entry (same project, id and timestamp), keeping the first.
+     * They come from an append racing with a rewrite that already included the entry.
+     */
+    fun dedupe(parsed: List<Pair<McpActivityEntry, String>>): List<Pair<McpActivityEntry, String>> =
+        parsed.distinctBy { (entry, project) -> Triple(project, entry.id, entry.timestamp) }
+
     /** The web-dashboard `tool.called` event payload for a restored entry (pure; mirrors ToolCallTracker). */
     fun toEventData(e: McpActivityEntry): JsonObject = buildJsonObject {
         put("tool_name", e.toolName)
@@ -201,6 +241,13 @@ object ActivityStore {
      */
     fun flushProject(entries: List<McpActivityEntry>, project: String) =
         defaultStore.rewriteProject(project, entries.asReversed())
+
+    /**
+     * Like [flushProject], but [snapshot] (newest-first, as the live deque) is taken while the file
+     * lock is held, so entries recorded while a background flush waits for the lock are not lost.
+     */
+    fun flushProject(project: String, snapshot: () -> List<McpActivityEntry>) =
+        defaultStore.rewriteProject(project) { snapshot().asReversed() }
 
     /** Loads up to [max] most-recent entries for [project], newest-first. Empty on any error. */
     fun load(project: String, max: Int): List<McpActivityEntry> = defaultStore.load(project, max)

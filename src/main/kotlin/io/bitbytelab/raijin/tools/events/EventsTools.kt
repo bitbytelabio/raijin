@@ -1,15 +1,19 @@
 package io.bitbytelab.raijin.tools.events
 
+import io.bitbytelab.raijin.core.asLongSafe
+import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.events.BurpEvent
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.tools.toolError
+import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
 
 object EventsTools {
+
+    private const val DEFAULT_MAX_EVENTS = 200
 
     fun register(server: Server, eventBus: EventBus) {
 
@@ -18,32 +22,60 @@ object EventsTools {
             name = "events_get",
             description = "Retrieve events from the event bus using cursor-based polling. Returns events " +
                 "whose ID is strictly greater than since_id. Use the last event's ID as the cursor " +
-                "for subsequent polls. Parameters: since_id (number, return events after this ID; " +
-                "defaults to 0 for all events), max_events (number, maximum events to return; " +
-                "defaults to 200).",
+                "for subsequent polls. With subscription_id (from events_subscribe) it returns the " +
+                "subscription's matching events since its previous poll instead, and advances that " +
+                "cursor; since_id is then ignored. Parameters: since_id (number, return events after " +
+                "this ID; defaults to 0 for all events), max_events (number, maximum events to return; " +
+                "defaults to 200), subscription_id (string, optional).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("since_id") { put("type", "integer"); put("description", "Return events after this ID (default 0)") }
-                    putJsonObject("max_events") { put("type", "integer"); put("description", "Maximum events to return (default 200)") }
+                    putJsonObject("max_events") {
+                        put("type", "integer")
+                        put("minimum", 0)
+                        put("description", "Maximum events to return (default $DEFAULT_MAX_EVENTS)")
+                    }
+                    putJsonObject("subscription_id") {
+                        put("type", "string")
+                        put("description", "Poll this subscription (from events_subscribe) from its own cursor")
+                    }
                 },
                 required = emptyList()
             )
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val sinceId = args["since_id"]?.jsonPrimitive?.longOrNull ?: 0L
-                val maxEvents = args["max_events"]?.jsonPrimitive?.intOrNull ?: 200
+                val maxEvents = maxEventsArg(args)
                 validateMaxEvents(maxEvents)?.let { return@addTool it }
 
+                val subscriptionId = (args["subscription_id"] as? JsonPrimitive)?.contentOrNull
+                if (subscriptionId != null) {
+                    val page = eventBus.poll(subscriptionId, maxEvents)
+                        ?: return@addTool toolError(
+                            "Unknown subscription_id '$subscriptionId': it was unsubscribed, cleared by events_clear, " +
+                                "or dropped as the least recently used beyond ${EventBus.MAX_POLL_SUBSCRIPTIONS} subscriptions. " +
+                                "Call events_subscribe again."
+                        )
+                    return@addTool toolJsonResult(buildJsonObject {
+                        put("subscription_id", subscriptionId)
+                        putJsonArray("types") { page.subscription.types.forEach { add(it) } }
+                        put("returned", page.events.size)
+                        put("cursor", page.cursor)
+                        put("last_id", eventBus.lastId())
+                        put("missed_events", page.missed)
+                        put("events", serializeEvents(page.events))
+                    })
+                }
+
+                val sinceId = args["since_id"].asLongSafe() ?: 0L
                 val events = eventBus.getEvents(sinceId, maxEvents)
-                val result = buildJsonObject {
+                toolJsonResult(buildJsonObject {
                     put("since_id", sinceId)
                     put("returned", events.size)
                     put("last_id", eventBus.lastId())
                     put("buffer_size", eventBus.size())
                     put("events", serializeEvents(events))
-                }
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                })
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -64,7 +96,11 @@ object EventsTools {
                         putJsonObject("items") { put("type", "string") }
                     }
                     putJsonObject("since_id") { put("type", "integer"); put("description", "Return events after this ID (default 0)") }
-                    putJsonObject("max_events") { put("type", "integer"); put("description", "Maximum events to return (default 200)") }
+                    putJsonObject("max_events") {
+                        put("type", "integer")
+                        put("minimum", 0)
+                        put("description", "Maximum events to return (default $DEFAULT_MAX_EVENTS)")
+                    }
                 },
                 required = listOf("types")
             )
@@ -72,22 +108,21 @@ object EventsTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
 
-                val types = args["types"]?.jsonArray?.map { it.jsonPrimitive.content }
+                val types = args["types"].asStringList()
                     ?: return@addTool toolError("Missing required parameter: types (array of strings)")
 
-                val sinceId = args["since_id"]?.jsonPrimitive?.longOrNull ?: 0L
-                val maxEvents = args["max_events"]?.jsonPrimitive?.intOrNull ?: 200
+                val sinceId = args["since_id"].asLongSafe() ?: 0L
+                val maxEvents = maxEventsArg(args)
                 validateMaxEvents(maxEvents)?.let { return@addTool it }
 
                 val events = eventBus.getEventsByType(types, sinceId, maxEvents)
-                val result = buildJsonObject {
+                toolJsonResult(buildJsonObject {
                     put("since_id", sinceId)
                     putJsonArray("types") { types.forEach { add(it) } }
                     put("returned", events.size)
                     put("last_id", eventBus.lastId())
                     put("events", serializeEvents(events))
-                }
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                })
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -96,10 +131,13 @@ object EventsTools {
         // 3. events_subscribe
         server.addTool(
             name = "events_subscribe",
-            description = "Subscribe to real-time event notifications from the event bus. When " +
-                "subscribed, matching events are buffered for retrieval. Returns a subscription " +
-                "ID for later unsubscription. Parameters: types (array of strings, event types " +
-                "to subscribe to; empty array subscribes to all events).",
+            description = "Open a poll subscription: a type filter plus a cursor starting after the latest " +
+                "event. Read it with events_get(subscription_id=...), which returns the matching events " +
+                "since the previous poll and advances the cursor. The subscription holds no events (they " +
+                "stay in the event ring buffer until evicted), so poll regularly. At most " +
+                "${EventBus.MAX_POLL_SUBSCRIPTIONS} stay open; the least recently used is dropped beyond that. " +
+                "Parameters: types (array of strings, event types to subscribe to; empty array subscribes " +
+                "to all events).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("types") {
@@ -113,24 +151,20 @@ object EventsTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
+                val types = args["types"].asStringList().orEmpty()
 
-                val types = (args["types"] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull } ?: emptyList()
-
-                val sinceId = eventBus.lastId()
-                val subscriptionId = eventBus.subscribe(types) { _ -> }
-
-                val result = buildJsonObject {
-                    put("subscription_id", subscriptionId)
+                val subscription = eventBus.openPollSubscription(types)
+                toolJsonResult(buildJsonObject {
+                    put("subscription_id", subscription.id)
                     put("status", "subscribed")
-                    put("cursor_since_id", sinceId)
-                    putJsonArray("types") { types.forEach { add(it) } }
+                    put("cursor_since_id", subscription.cursor)
+                    putJsonArray("types") { subscription.types.forEach { add(it) } }
                     put(
                         "note",
-                        "Recorded cursor since_id=$sinceId. Poll events using events(action='get', since_id=$sinceId) " +
-                            "or events(action='get_by_type', types=..., since_id=$sinceId)."
+                        "Poll with events(action='get', subscription_id='${subscription.id}'); each poll returns " +
+                            "the matching events since the previous one."
                     )
-                }
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                })
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -151,16 +185,14 @@ object EventsTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val subscriptionId = args["subscription_id"]?.jsonPrimitive?.contentOrNull
+                val subscriptionId = (args["subscription_id"] as? JsonPrimitive)?.contentOrNull
                     ?: return@addTool toolError("Missing required parameter: subscription_id")
 
-                eventBus.unsubscribe(subscriptionId)
-
-                val result = buildJsonObject {
+                val removed = eventBus.unsubscribe(subscriptionId)
+                toolJsonResult(buildJsonObject {
                     put("subscription_id", subscriptionId)
-                    put("status", "unsubscribed")
-                }
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                    put("status", if (removed) "unsubscribed" else "not_found")
+                })
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -169,24 +201,28 @@ object EventsTools {
         // 5. events_clear
         server.addTool(
             name = "events_clear",
-            description = "Clear all events from the event bus buffer and remove all subscriptions. " +
-                "Use with caution as this is irreversible. No parameters required.",
+            description = "Clear all buffered events and drop every subscription opened with " +
+                "events_subscribe. Burp-side listeners (the dashboard live feed, the Raijin tab) keep " +
+                "running. Irreversible. No parameters required.",
             inputSchema = ToolSchema(properties = buildJsonObject {}, required = emptyList())
         ) { _ ->
             try {
                 val sizeBefore = eventBus.size()
                 eventBus.clear()
-
-                val result = buildJsonObject {
+                toolJsonResult(buildJsonObject {
                     put("status", "cleared")
                     put("events_removed", sizeBefore)
-                }
-                CallToolResult(content = listOf(TextContent(result.toString())))
+                })
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
         }
     }
+
+    /** `max_events`, defaulting when absent; out-of-Int-range values clamp so [validateMaxEvents] sees the sign. */
+    private fun maxEventsArg(args: Map<String, JsonElement>): Int =
+        args["max_events"].asLongSafe()?.coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong())?.toInt()
+            ?: DEFAULT_MAX_EVENTS
 
     /**
      * Validates the max_events argument at the tool boundary. Returns a clean,
@@ -195,16 +231,8 @@ object EventsTools {
      * actionable message instead of leaking Kotlin's internal
      * `IllegalArgumentException` from [Iterable.take].
      */
-    internal fun validateMaxEvents(maxEvents: Int): CallToolResult? {
-        if (maxEvents < 0) {
-            val body = buildJsonObject { put("error", "max_events must be >= 0") }
-            return CallToolResult(
-                content = listOf(TextContent(body.toString())),
-                isError = true
-            )
-        }
-        return null
-    }
+    internal fun validateMaxEvents(maxEvents: Int): CallToolResult? =
+        if (maxEvents < 0) toolError("max_events must be >= 0") else null
 
     /**
      * Serializes a list of BurpEvent objects to a JsonArray.

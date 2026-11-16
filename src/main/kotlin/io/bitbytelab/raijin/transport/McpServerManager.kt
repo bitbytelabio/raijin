@@ -23,6 +23,7 @@ import io.ktor.server.routing.*
 import io.ktor.sse.ServerSentEvent
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
+import io.modelcontextprotocol.kotlin.sdk.server.ServerSession
 import io.modelcontextprotocol.kotlin.sdk.server.SseServerTransport
 import io.modelcontextprotocol.kotlin.sdk.server.mcpStreamableHttp
 import io.modelcontextprotocol.kotlin.sdk.shared.Transport
@@ -32,6 +33,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.JSONRPCMessage
 import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
 import kotlinx.coroutines.*
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Manages the lifecycle of MCP server instances and their underlying
@@ -39,7 +41,8 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * Two listeners are exposed on separate ports so that multiple MCP clients can connect
  * independently: **primary** on [ssePort] (default 9876) and **secondary** on [httpPort]
- * (default 9877). Each serves the same two transports:
+ * (default 9877). Both serve one shared MCP [Server] (each client gets its own session) over the
+ * same two transports:
  * - **Streamable HTTP** at [STREAMABLE_HTTP_PATH] (`/mcp`): what clients should use
  *   (`"type": "http"` in Claude Code and omp).
  * - **Legacy HTTP+SSE** (deprecated by the MCP spec, kept for old client configs): the SSE
@@ -77,8 +80,9 @@ class McpServerManager(
      */
     private val sendTimeoutMs: Long = 45_000L
 
+    /** The [Server] both listeners serve; built on first use and replaced after [stop] / [rebind]. */
     @Volatile
-    private var lastRegisteredCounts: Triple<Int, Int, Int>? = null
+    private var servedServer: Server? = null
 
     companion object {
         /** Path of the Streamable HTTP endpoint on both listeners. */
@@ -87,6 +91,9 @@ class McpServerManager(
         /** Cap on concurrent legacy SSE connections per listener to bound memory/file descriptors. */
         private const val MAX_SSE_SESSIONS = 64
         private const val SSE_HEARTBEAT_INTERVAL_MS = 15_000L
+
+        /** Bound on closing a session or the server; a wedged send can hold a session's lock. */
+        private const val SESSION_CLOSE_TIMEOUT_MS = 3_000L
 
         /**
          * Sent to every client on initialize. Keep it short (omp keeps only the first 4000
@@ -121,8 +128,8 @@ class McpServerManager(
 
     /**
      * Creates a fresh MCP [Server] instance with all tools, resources and prompts registered.
-     * Each listener builds one and serves every client session from it ([Server.createSession]
-     * keeps per-client state).
+     * Both listeners serve every client session from one ([Server.createSession] keeps
+     * per-client state).
      */
     fun createMcpServer(): Server {
         val options = ServerOptions(capabilities = serverCapabilities()).apply {
@@ -145,27 +152,29 @@ class McpServerManager(
         // Wrap all tools to emit tool.called events for dashboard + native UI visibility
         ToolCallTracker.wrapAll(server, eventBus, stateManager)
 
-        lastRegisteredCounts = Triple(server.tools.size, server.resources.size, server.prompts.size)
         return server
     }
 
+    /** The server both listeners serve, built on first use. */
+    private fun sharedServer(): Server = servedServer ?: synchronized(this) {
+        servedServer ?: createMcpServer().also { servedServer = it }
+    }
+
     /**
-     * Returns the REAL number of (tools, resources, prompts) actually registered, reusing the
-     * counts recorded during server creation when already started (instead of allocating an extra
-     * throwaway [Server]).
+     * Returns the REAL number of (tools, resources, prompts) registered on the server the listeners
+     * serve. Asked before [start], it builds that server once and [start] then reuses it.
      */
     fun registeredCounts(): Triple<Int, Int, Int> {
-        return lastRegisteredCounts ?: createMcpServer().let {
-            Triple(it.tools.size, it.resources.size, it.prompts.size)
-        }
+        val server = sharedServer()
+        return Triple(server.tools.size, server.resources.size, server.prompts.size)
     }
 
     /**
      * Starts both transport servers asynchronously. Failures on one
      * transport do not prevent the other from starting.
      *
-     * Each server is hardened via [installLocalhostSecurity] (Host-header allowlist + locked
-     * CORS), then mounts the MCP SSE transport with our OWN wiring —
+     * Each server is hardened via [installLocalhostSecurity] (Host-header allowlist, locked
+     * CORS, and the remote-access checks), then mounts the MCP SSE transport with our OWN wiring —
      * equivalent to the SDK's `mcp()` helper, but giving us a handle to each per-session
      * [SseServerTransport] and the SSE GET coroutine's [Job], so [TimeoutSseTransport] can
      * bound `send()` and recover a back-pressured client instead of wedging forever. The SSE
@@ -173,10 +182,9 @@ class McpServerManager(
      * param — NOT '/sse'.
      */
     fun start() {
-        val primaryServer = createMcpServer()
-        val secondaryServer = createMcpServer()
-        startTransport("Primary SSE", ssePort, primaryServer) { sseServer = it }
-        startTransport("Secondary SSE", httpPort, secondaryServer) { httpServer = it }
+        val server = sharedServer()
+        startTransport("Primary SSE", ssePort, server) { sseServer = it }
+        startTransport("Secondary SSE", httpPort, server) { httpServer = it }
     }
 
     /**
@@ -214,6 +222,7 @@ class McpServerManager(
                     installLocalhostSecurity(listOf(port), allowedSecurityHosts())
                     install(HttpRequestLifecycle) { cancelCallOnClose = true }
                     val sessions = ConcurrentHashMap<String, SseServerTransport>()
+                    val openSseSessions = AtomicInteger(0)
                     // Hand-rolled equivalent of the SDK's `mcp(serverFactory())` so we OWN each
                     // per-session SseServerTransport AND the SSE GET coroutine's Job — the SDK's
                     // mcp() builds the transport internally and hands us no handle. Route shape is
@@ -231,7 +240,7 @@ class McpServerManager(
                         // OPTIONS-skips-everything rule let an unauthenticated request open a
                         // stream and harvest a session id. Never drop the `method(Get)` wrapper.
 
-                        method(HttpMethod.Get) { sse { serveMcpSse(mcpServer, sessions) } }
+                        method(HttpMethod.Get) { sse { serveMcpSse(mcpServer, sessions, openSseSessions) } }
                         post { handleMcpPost(sessions) }
                     }
                 }
@@ -257,6 +266,8 @@ class McpServerManager(
                             "(Kotlin/Ktor/MCP-SDK incompatibility). Rebuild with a JDK 17-21 (NOT Burp's bundled Java 25)."
                     )
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 logging.logToError("Raijin: Failed to start $label transport on $bindHost:$port: ${e.message}")
                 logging.logToError("Raijin: Stack trace: ${e.stackTraceToString()}")
@@ -279,25 +290,44 @@ class McpServerManager(
     }
 
     /**
-     * Serves one MCP SSE session. The advertised POST endpoint is deliberately the relative
-     * reference `?sessionId=...`: the client resolves it against the URL it connected to.
+     * Serves one MCP SSE session, refusing it once [MAX_SSE_SESSIONS] streams are open on this
+     * listener. The slot is reserved atomically, so a burst of connections cannot overshoot the cap.
      */
     private suspend fun ServerSSESession.serveMcpSse(
         mcpServer: Server,
-        sessions: ConcurrentHashMap<String, SseServerTransport>
+        sessions: ConcurrentHashMap<String, SseServerTransport>,
+        openSessions: AtomicInteger
     ) {
-        if (sessions.size >= MAX_SSE_SESSIONS) {
-            runCatching {
+        if (openSessions.incrementAndGet() > MAX_SSE_SESSIONS) {
+            openSessions.decrementAndGet()
+            try {
                 send(ServerSentEvent(event = "error", data = "Maximum concurrent SSE sessions ($MAX_SSE_SESSIONS) reached"))
+                close()
+            } catch (_: Exception) {
             }
-            runCatching { close() }
             return
         }
+        try {
+            serveOpenMcpSse(mcpServer, sessions)
+        } finally {
+            openSessions.decrementAndGet()
+        }
+    }
+
+    /**
+     * Runs one MCP SSE session until the client goes away (the call is cancelled on close) or the
+     * session closes. The advertised POST endpoint is deliberately the relative reference
+     * `?sessionId=...`: the client resolves it against the URL it connected to.
+     */
+    private suspend fun ServerSSESession.serveOpenMcpSse(
+        mcpServer: Server,
+        sessions: ConcurrentHashMap<String, SseServerTransport>
+    ) {
         val sessionJob = coroutineContext.job
         val raw = SseServerTransport("", this)
         val tx = TimeoutSseTransport(raw, sessionJob, sendTimeoutMs, logging)
         sessions[raw.sessionId] = raw
-        var mcpSession: io.modelcontextprotocol.kotlin.sdk.server.ServerSession? = null
+        var mcpSession: ServerSession? = null
         val heartbeatJob = launch {
             while (isActive) {
                 delay(SSE_HEARTBEAT_INTERVAL_MS)
@@ -319,8 +349,18 @@ class McpServerManager(
         } finally {
             heartbeatJob.cancel()
             sessions.remove(raw.sessionId)
-            runCatching { mcpSession?.close() }
-            runCatching { tx.close() }
+            // The call is usually cancelled by now, and a cancelled close() could stop before the
+            // transport's close callbacks run, leaving the session registered on the Server. Close
+            // without cancellation, bounded in case a wedged send still holds the session lock.
+            withContext(NonCancellable) {
+                withTimeoutOrNull(SESSION_CLOSE_TIMEOUT_MS) {
+                    try {
+                        val session = mcpSession
+                        if (session != null) session.close() else tx.close()
+                    } catch (_: Exception) {
+                    }
+                }
+            }
         }
     }
 
@@ -352,22 +392,24 @@ class McpServerManager(
     }
 
     /**
-     * Hosts accepted by the Host-header + CORS allowlist. Always loopback; when bound to a
-     * network interface (operator opted in) this machine's own addresses are added so real LAN
-     * clients — whose `Host` header is the concrete IP, not the wildcard — pass the check.
+     * Hosts accepted by the Host-header + CORS allowlist besides the loopback names
+     * [installLocalhostSecurity] always accepts. When bound to a network interface (operator opted
+     * in) this machine's own addresses are added so real LAN clients — whose `Host` header is the
+     * concrete IP, not the wildcard — pass the check.
      */
     private fun allowedSecurityHosts(): List<String> {
         val extra = if (BindHostPolicy.classify(bindHost) != BindHostPolicy.Kind.LOOPBACK) NetworkHosts.local() else emptyList()
-        return (listOf(bindHost, "127.0.0.1", "localhost") + extra).distinct()
+        return (listOf(bindHost) + extra).distinct()
     }
 
     /**
-     * Gracefully stops both transport servers and cancels the coroutine scope.
-     * Called from the extension unload handler.
+     * Gracefully stops both transport servers, closes the MCP server's remaining sessions and
+     * cancels the coroutine scope. Called from the extension unload handler.
      */
     fun stop() {
         sseServer?.stop(gracePeriodMillis = 1000, timeoutMillis = 2000)
         httpServer?.stop(gracePeriodMillis = 1000, timeoutMillis = 2000)
+        closeMcpServer()
         scope.cancel()
         logging.logToOutput("Raijin: MCP servers stopped")
     }
@@ -383,11 +425,25 @@ class McpServerManager(
     fun rebind(newHost: String): Boolean {
         sseServer?.stop(gracePeriodMillis = 500, timeoutMillis = 1500); sseServer = null
         httpServer?.stop(gracePeriodMillis = 500, timeoutMillis = 1500); httpServer = null
+        closeMcpServer()
         scope.cancel()
         scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         bindHost = newHost
         start()
         return blockingWaitListening(ssePort)
+    }
+
+    /**
+     * Closes the shared server once its listeners are down: its sessions (whose clients are gone)
+     * and notification jobs would otherwise outlive it. The next [start] builds a fresh one.
+     */
+    private fun closeMcpServer() {
+        val server = synchronized(this) { servedServer.also { servedServer = null } } ?: return
+        try {
+            runBlocking { withTimeoutOrNull(SESSION_CLOSE_TIMEOUT_MS) { server.close() } }
+        } catch (e: Exception) {
+            logging.logToError("Raijin: closing the MCP server failed: ${e.message}")
+        }
     }
 
     /** Blocking sibling of [verifyListening] for the rebind path (already off the EDT). */

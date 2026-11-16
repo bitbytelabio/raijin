@@ -14,7 +14,8 @@ object ExtensionTools {
         server.addTool(
             name = "extension_info",
             description = "Get comprehensive information about the Raijin extension including " +
-                "its version, filename, Burp Suite version/edition, MCP server transport ports, " +
+                "its version, filename, Burp Suite version/edition, MCP server bind host and ports, " +
+                "remote-access state (auth_required, source IP and host allowlists; never the token), " +
                 "active runtime state (proxy rules, traffic rules, session rules, scan tasks, " +
                 "WebSocket connections, Collaborator clients), and registered handlers " +
                 "(scan checks, payload processors). No parameters required.",

@@ -59,6 +59,44 @@ object PortPolicy {
     }
 
     /**
+     * The three ports a session actually uses, plus one message per listener that had to move.
+     *
+     * @property messages operator-facing explanations; empty when the configuration had no clash.
+     */
+    data class Assignment(val ssePort: Int, val httpPort: Int, val dashboardPort: Int, val messages: List<String>)
+
+    /**
+     * Makes the three ports distinct so no listener is doomed to a bind failure against another
+     * Raijin listener. Ports are claimed in the order primary, secondary, dashboard; a listener whose
+     * port is already claimed moves to its own default when that is free, otherwise to the next free
+     * port above its configured one. Every move is reported, naming the preference to fix.
+     */
+    fun resolveDistinct(ssePort: Int, httpPort: Int, dashboardPort: Int): Assignment {
+        val claimed = mutableSetOf<Int>()
+        val messages = mutableListOf<String>()
+        fun claim(label: String, prefKey: String, configured: Int, default: Int): Int {
+            if (claimed.add(configured)) return configured
+            val moved = if (default !in claimed) default else nextFree(configured, claimed)
+            claimed += moved
+            messages += "Raijin: port $configured is configured for more than one listener; the $label " +
+                "listener uses $moved for this session. Set distinct ports ('$prefKey') to silence this."
+            return moved
+        }
+        val sse = claim("primary MCP", PREF_SSE_PORT, ssePort, DEFAULT_SSE)
+        val http = claim("secondary MCP", PREF_HTTP_PORT, httpPort, DEFAULT_HTTP)
+        val dashboard = claim("dashboard", PREF_DASHBOARD_PORT, dashboardPort, DEFAULT_DASHBOARD)
+        return Assignment(sse, http, dashboard, messages)
+    }
+
+    private fun nextFree(from: Int, claimed: Set<Int>): Int {
+        var p = from
+        do {
+            p = if (p >= 65535) 1024 else p + 1
+        } while (p in claimed)
+        return p
+    }
+
+    /**
      * The message logged when [port] is already taken, naming the causes an operator can actually
      * act on. [prefKey] is the preference that changes this particular port.
      */

@@ -1,5 +1,6 @@
 package io.bitbytelab.raijin.transport
 
+import burp.api.montoya.persistence.Preferences
 import java.security.SecureRandom
 import java.util.Base64
 
@@ -46,8 +47,60 @@ object RemoteAccess {
     var current: Config = Config()
         private set
 
+    /** Whether the listeners bind a non-loopback address; recorded by [applyFromPreferences]. */
+    @Volatile
+    var exposed: Boolean = false
+        private set
+
     fun install(config: Config) {
         current = config
+    }
+
+    /**
+     * Resolves the settings from Burp [prefs] and `-D` properties, saves a freshly generated token
+     * to [PREF_AUTH_TOKEN] (so it survives a reload) and installs the result for the next request.
+     * Safe to call from any thread.
+     */
+    fun applyFromPreferences(
+        prefs: Preferences,
+        exposed: Boolean,
+        sysProp: (String) -> String? = System::getProperty,
+    ): Resolved {
+        val resolved = resolve(
+            exposed = exposed,
+            requireAuthPref = runCatching { prefs.getBoolean(PREF_REQUIRE_AUTH) }.getOrNull(),
+            tokenPref = runCatching { prefs.getString(PREF_AUTH_TOKEN) }.getOrNull(),
+            allowedIpsPref = runCatching { prefs.getString(PREF_ALLOWED_IPS) }.getOrNull(),
+            allowedHostsPref = runCatching { prefs.getString(PREF_ALLOWED_HOSTS) }.getOrNull(),
+            sysProp = sysProp,
+        )
+        val token = resolved.config.token
+        if (resolved.generatedToken && token != null) runCatching { prefs.setString(PREF_AUTH_TOKEN, token) }
+        this.exposed = exposed
+        install(resolved.config)
+        return resolved
+    }
+
+    /** Re-applies the saved settings for the current exposure, e.g. after the Server tab changed them. */
+    fun reapply(prefs: Preferences): Resolved = applyFromPreferences(prefs, exposed)
+
+    /**
+     * Operator-facing warnings about [config]: an exposed listener without a source allowlist, and
+     * allowlist entries that cannot be used. Never mentions the token.
+     */
+    fun warnings(config: Config, exposed: Boolean): List<String> = buildList {
+        if (exposed && config.allowedIps.isEmpty()) {
+            add(
+                "no source IP allowlist ($PREF_ALLOWED_IPS / -D$PROP_ALLOWED_IPS): any host that can reach the " +
+                    "listeners may present the token. Restrict it to your client, e.g. 192.168.56.1 or 100.64.0.0/10."
+            )
+        }
+        SourceAddressPolicy.invalidEntries(config.allowedIps).forEach {
+            add("ignoring '$it' in $PREF_ALLOWED_IPS: not an IP address or CIDR range")
+        }
+        SecurityConfig.invalidHostEntries(config.allowedHosts).forEach {
+            add("ignoring '$it' in $PREF_ALLOWED_HOSTS: not a host name, IP or host:port")
+        }
     }
 
     /** A fresh URL-safe token with 256 bits of entropy. */

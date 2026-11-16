@@ -1,43 +1,92 @@
-# Raijin Caddy Reverse Proxy Configuration
+# Raijin behind Caddy
 #
-# Caddy acts as a stable proxy between MCP clients and the Burp extension,
-# preventing SSE timeout disconnections and providing reliable buffering.
+# Raijin keeps listening on loopback: its default, where no token is needed and nothing is
+# exposed to the network. Caddy is the only listener clients reach. Two profiles; Profile B is
+# commented out until you fill it in.
 #
-# Usage:
-#   sudo cp configs/Caddyfile /etc/caddy/Caddyfile
-#   sudo systemctl restart caddy
+#   Profile A, local proxy on the Burp machine (plain HTTP on loopback):
+#     http://127.0.0.1:9900/mcp (primary MCP), :9901/mcp (secondary MCP), :9902 (dashboard)
+#   Profile B, Burp in a VM: HTTPS on the VM address with Caddy's internal CA, a bearer token
+#     checked by Caddy for MCP and basic auth for the dashboard:
+#     https://<VM-IP>:9443/mcp (MCP), https://<VM-IP>:9444 (dashboard)
 #
-# Then configure your MCP client to connect to :9900 instead of :9876
+# Raijin answers "403 invalid Host header" to any Host it does not know (its anti DNS-rebinding
+# check), so every upstream rewrites Host to the loopback address Raijin listens on. Raijin's
+# ports default to 9876 (MCP primary), 9877 (MCP secondary) and 9878 (dashboard); change the
+# numbers below if you changed mcp_sse_port / mcp_http_port / mcp_dashboard_port.
+#
+# Install (Linux): sudo cp configs/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
+# Or run it in the foreground: caddy run --config configs/Caddyfile
 
-# MCP SSE Proxy (primary)
-:9900 {
-    reverse_proxy 127.0.0.1:9876 {
-        transport http {
-            read_timeout 0
-            write_timeout 0
-            response_header_timeout 0
-        }
-        flush_interval -1
-        header_up Connection {>Connection}
-        header_up Upgrade {>Upgrade}
-    }
+# One Raijin listener on loopback. Responses stream (Streamable HTTP, SSE), so nothing is
+# buffered and no timeout cuts a long-lived stream.
+(raijin) {
+	reverse_proxy 127.0.0.1:{args[0]} {
+		header_up Host 127.0.0.1:{args[0]}
+		flush_interval -1
+		transport http {
+			read_timeout 0
+			write_timeout 0
+		}
+	}
 }
 
-# MCP SSE Proxy (secondary)
-:9901 {
-    reverse_proxy 127.0.0.1:9877 {
-        transport http {
-            read_timeout 0
-            write_timeout 0
-            response_header_timeout 0
-        }
-        flush_interval -1
-        header_up Connection {>Connection}
-        header_up Upgrade {>Upgrade}
-    }
+# Refuses every request unless it carries "Authorization: Bearer $RAIJIN_TOKEN". Without the
+# variable Caddy refuses everything rather than accepting an empty token.
+(raijin_bearer) {
+	@no_token expression `{env.RAIJIN_TOKEN} == ""`
+	respond @no_token "RAIJIN_TOKEN is not set in Caddy's environment" 500
+	@unauthorized not header Authorization "Bearer {$RAIJIN_TOKEN}"
+	header @unauthorized WWW-Authenticate "Bearer realm=\"raijin\""
+	respond @unauthorized "unauthorized" 401
 }
 
-# Dashboard Proxy (optional — dashboard already on :9878)
-:9902 {
-    reverse_proxy 127.0.0.1:9878
+# ---- Profile A: local proxy ------------------------------------------------------------------
+
+http://:9900 {
+	bind 127.0.0.1
+	import raijin 9876
 }
+
+http://:9901 {
+	bind 127.0.0.1
+	import raijin 9877
+}
+
+http://:9902 {
+	bind 127.0.0.1
+	import raijin 9878
+}
+
+# ---- Profile B: Burp in a VM, MCP clients on the host machine ---------------------------------
+#
+# 1. Replace 192.168.56.10 with the VM address the host reaches (VirtualBox / VMware host-only,
+#    LAN, or the Tailscale / WireGuard IP). Raijin itself stays on 127.0.0.1.
+# 2. Give Caddy the token in its environment, e.g. with `sudo systemctl edit caddy`:
+#        [Service]
+#        Environment=RAIJIN_TOKEN=<long random string, e.g. from: openssl rand -hex 32>
+#    Using the token from Raijin's Server tab lets you also tick "Require Auth Token" in Raijin,
+#    so both layers check the same header.
+# 3. Create the dashboard password hash: caddy hash-password --plaintext '<password>'
+#    (Caddy older than 2.8 spells the directive `basicauth`).
+# 4. On the host machine, trust Caddy's local CA: copy root.crt from Caddy's data directory
+#    (caddy/pki/authorities/local/root.crt) and point the client at it, for example
+#    NODE_EXTRA_CA_CERTS=/path/to/root.crt for Node-based MCP clients.
+# 5. Client config: {"type": "http", "url": "https://192.168.56.10:9443/mcp",
+#                    "headers": {"Authorization": "Bearer <RAIJIN_TOKEN>"}}
+#
+# https://192.168.56.10:9443 {
+# 	bind 192.168.56.10
+# 	tls internal
+# 	import raijin_bearer
+# 	import raijin 9876
+# }
+#
+# https://192.168.56.10:9444 {
+# 	bind 192.168.56.10
+# 	tls internal
+# 	basic_auth {
+# 		raijin <bcrypt hash from step 3>
+# 	}
+# 	import raijin 9878
+# }

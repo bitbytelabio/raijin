@@ -23,17 +23,18 @@ import kotlin.test.assertTrue
  *
  * They pin the Host-header allowlist (anti DNS-rebinding) and Origin lockdown: a rebound Host or a
  * foreign Origin is refused on every verb *before* any handler runs, so no SSE stream (and no
- * session id) can be opened by a web page. There is no token — local clients just connect.
+ * session id) can be opened by a web page. On loopback there is no token — local clients just
+ * connect; once remote access requires one, nothing opens without it.
  */
 class SecurityInterceptorTest {
 
     private fun freePort(): Int = ServerSocket(0).use { it.localPort }
 
     /** Stands up the real interceptor + the real route shape, then runs [block] against it. */
-    private fun withServer(block: (Int) -> Unit) {
+    private fun withServer(remote: RemoteAccess.Config = RemoteAccess.Config(), block: (Int) -> Unit) {
         val port = freePort()
         val server = embeddedServer(CIO, port = port, host = "127.0.0.1") {
-            installLocalhostSecurity(listOf(port), listOf("127.0.0.1", "localhost"))
+            installLocalhostSecurity(listOf(port), listOf("127.0.0.1", "localhost"), remoteAccess = { remote })
             install(SSE)
             install(IgnoreTrailingSlash)
             routing {
@@ -150,6 +151,48 @@ class SecurityInterceptorTest {
     @Test fun `POST back-channel from a loopback client is accepted`() {
         withServer { port ->
             val r = raw(port, "POST /?sessionId=test-sid HTTP/1.1\r\nHost: 127.0.0.1:$port\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            assertEquals(200, status(r), r)
+        }
+    }
+
+    @Test fun `the IPv6 loopback Host is accepted`() {
+        withServer { port ->
+            val r = raw(port, "POST /?sessionId=test-sid HTTP/1.1\r\nHost: [::1]:$port\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            assertEquals(200, status(r), r)
+        }
+    }
+
+    // ---- remote access ---------------------------------------------------------
+
+    private val token = "raw-socket-token"
+
+    @Test fun `with a token required no stream opens without it`() {
+        withServer(RemoteAccess.Config(authRequired = true, token = token)) { port ->
+            for (verb in listOf("GET", "POST", "OPTIONS")) {
+                val r = raw(port, "$verb / HTTP/1.1\r\nHost: 127.0.0.1:$port\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                assertEquals(401, status(r), "$verb: $r")
+                assertTrue(r.contains("WWW-Authenticate: Bearer", ignoreCase = true), r)
+                assertFalse(r.contains("text/event-stream"), r)
+                assertFalse(r.contains("sessionId"), r)
+            }
+        }
+    }
+
+    @Test fun `with a token required the bearer opens the stream`() {
+        withServer(RemoteAccess.Config(authRequired = true, token = token)) { port ->
+            val r = raw(port, "GET / HTTP/1.1\r\nHost: 127.0.0.1:$port\r\nAuthorization: Bearer $token\r\n\r\n")
+            assertEquals(200, status(r), r)
+            assertTrue(r.contains("text/event-stream"), r)
+        }
+    }
+
+    @Test fun `the socket peer decides the source check and loopback always passes`() {
+        withServer(RemoteAccess.Config(allowedIps = listOf("192.0.2.10"))) { port ->
+            val r = raw(
+                port,
+                "POST /?sessionId=test-sid HTTP/1.1\r\nHost: 127.0.0.1:$port\r\nX-Forwarded-For: 198.51.100.1\r\n" +
+                    "Content-Length: 2\r\nConnection: close\r\n\r\n{}"
+            )
             assertEquals(200, status(r), r)
         }
     }

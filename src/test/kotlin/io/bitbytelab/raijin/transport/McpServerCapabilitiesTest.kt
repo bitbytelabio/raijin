@@ -2,6 +2,7 @@ package io.bitbytelab.raijin.transport
 
 import io.bitbytelab.raijin.skills.SkillCatalog
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -17,6 +18,13 @@ class McpServerCapabilitiesTest {
         assertNotNull(caps.tools, "tools capability")
         assertNotNull(caps.resources, "resources capability")
         assertNotNull(caps.prompts, "prompts capability: clients skip prompts/list without it, so no skill is listed")
+    }
+
+    @Test fun `server declares no resource subscriptions or list notifications it does not send`() {
+        val caps = McpServerManager.serverCapabilities()
+        assertEquals(false, caps.resources?.subscribe, "resources are read on demand; no updates are pushed")
+        assertEquals(false, caps.resources?.listChanged, "the resource list never changes while a session is open")
+        assertEquals(false, caps.prompts?.listChanged, "skills are static")
     }
 
     @Test

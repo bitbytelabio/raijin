@@ -8,7 +8,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.io.File
-import java.util.concurrent.locks.ReentrantLock
+import java.nio.file.Files
 import kotlin.concurrent.withLock
 
 /**
@@ -21,11 +21,10 @@ import kotlin.concurrent.withLock
  * Mirrors [ActivityStore]: JSON Lines under the user home, appended per entry
  * (crash-safe), project-tagged so each engagement restores its own findings.
  * Deletes and clears rewrite the file atomically with the project's section replaced,
- * preserving other projects' lines.
+ * preserving other projects' lines. All operations on one file share [JsonlStoreSupport.lockFor].
  */
 class FindingsFileStore(private val file: File) {
-    private val lock = ReentrantLock()
-    private val json = Json { ignoreUnknownKeys = true }
+    private val lock = JsonlStoreSupport.lockFor(file)
 
     @Volatile
     var lastError: String? = null
@@ -37,49 +36,53 @@ class FindingsFileStore(private val file: File) {
         lock.withLock {
             try {
                 JsonlStoreSupport.appendLine(file, FindingsStore.buildEntry(f, project))
-                lastError = null
+                succeeded()
             } catch (ex: Exception) {
-                recordError("append", ex)
+                failed("append", ex)
             }
         }
     }
 
     fun load(project: String): List<StoredFinding> = lock.withLock {
         try {
-            if (!file.exists()) emptyList()
-            else file.readLines().mapNotNull { FindingsStore.parseEntry(it) }
-                .filter { it.second == project }
-                .map { it.first }
+            val res = FindingsStore.dedupe(readParsed()).filter { it.second == project }.map { it.first }
+            succeeded()
+            res
         } catch (ex: Exception) {
-            recordError("load", ex)
+            failed("load", ex)
             emptyList()
         }
     }
 
-    fun replaceProject(project: String, findings: List<StoredFinding>) {
+    fun replaceProject(project: String, findings: List<StoredFinding>) = replaceProject(project) { findings }
+
+    /**
+     * Replaces [project]'s saved findings with [snapshot], evaluated while the file lock is held. A
+     * finding added meanwhile is in the snapshot, appended after the rewrite, or both (the duplicate
+     * is dropped on load), so a caller on any thread loses nothing.
+     */
+    fun replaceProject(project: String, snapshot: () -> List<StoredFinding>) {
         lock.withLock {
             try {
-                val existing = if (file.exists()) {
-                    file.readLines().mapNotNull { FindingsStore.parseEntry(it) }
-                } else {
-                    emptyList()
-                }
-                val lines = FindingsStore.rebuildLines(existing, project, findings)
-                if (lines.isEmpty()) {
-                    if (file.exists()) file.delete()
-                } else {
-                    JsonlStoreSupport.atomicWriteLines(file, lines)
-                }
-                lastError = null
+                val lines = FindingsStore.rebuildLines(FindingsStore.dedupe(readParsed()), project, snapshot())
+                if (lines.isEmpty()) Files.deleteIfExists(file.toPath()) else JsonlStoreSupport.atomicWriteLines(file, lines)
+                succeeded()
             } catch (ex: Exception) {
-                recordError("replaceProject", ex)
+                failed("replaceProject", ex)
             }
         }
     }
 
-    private fun recordError(op: String, ex: Exception) {
-        lastError = ex.message ?: ex::class.simpleName
-        System.err.println("Raijin: FindingsStore.$op failed (${file.absolutePath}): $lastError")
+    private fun readParsed(): List<Pair<StoredFinding, String>> =
+        if (file.exists()) file.readLines().mapNotNull { FindingsStore.parseEntry(it) } else emptyList()
+
+    private fun succeeded() {
+        lastError = null
+        JsonlStoreSupport.recovered(file)
+    }
+
+    private fun failed(op: String, ex: Exception) {
+        lastError = JsonlStoreSupport.reportFailure("FindingsStore", op, file, ex)
     }
 }
 
@@ -155,6 +158,16 @@ object FindingsStore {
         return others + mine
     }
 
+    /**
+     * Pure: drops repeated records of one finding (same project, id and creation time), keeping the
+     * first. They come from an append racing with a rewrite that already included the finding.
+     */
+    fun dedupe(parsed: List<Pair<StoredFinding, String>>): List<Pair<StoredFinding, String>> =
+        parsed.distinctBy { (finding, project) -> Triple(project, finding.id, finding.createdAt) }
+
     /** Reads the store, replaces [project]'s findings with [findings], and rewrites (deletes file if empty). */
     fun replaceProject(project: String, findings: List<StoredFinding>) = defaultStore.replaceProject(project, findings)
+
+    /** Like [replaceProject], but [snapshot] is taken under the file lock: safe from any thread. */
+    fun replaceProject(project: String, snapshot: () -> List<StoredFinding>) = defaultStore.replaceProject(project, snapshot)
 }

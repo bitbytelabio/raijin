@@ -4,20 +4,23 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.io.File
-import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 /**
- * File-backed JSONL audit log with thread-safe locking, automatic line-cap rotation, and
- * atomic compaction. Extracted so unit tests can verify concurrency and rotation on temp files.
+ * File-backed JSONL audit log with a per-file lock shared with every other writer of the file
+ * ([JsonlStoreSupport.lockFor]), and rotation by atomic compaction: once the file holds more than
+ * [maxLines] lines or [maxBytes] bytes, only the newest [retainLines] lines (within three quarters
+ * of [maxBytes]) are kept. Extracted so unit tests can verify concurrency and rotation on temp files.
  */
 class AuditFileStore(
     private val file: File,
     private val maxLines: Int = DEFAULT_MAX_LINES,
-    private val retainLines: Int = (maxLines * 3) / 4
+    private val retainLines: Int = (maxLines * 3) / 4,
+    private val maxBytes: Long = DEFAULT_MAX_BYTES
 ) {
-    private val lock = ReentrantLock()
-    private var linesSinceCheck = 0
+    private val lock = JsonlStoreSupport.lockFor(file)
+    private var appendsSinceCheck = 0 // guarded by lock
+    private var knownLines = -1 // guarded by lock; -1 until counted
 
     @Volatile
     var lastError: String? = null
@@ -40,15 +43,14 @@ class AuditFileStore(
         lock.withLock {
             try {
                 JsonlStoreSupport.appendLine(file, line)
-                linesSinceCheck++
-                if (linesSinceCheck >= COMPACT_CHECK_INTERVAL) {
-                    linesSinceCheck = 0
+                if (knownLines >= 0) knownLines++
+                if (++appendsSinceCheck >= COMPACT_CHECK_INTERVAL) {
+                    appendsSinceCheck = 0
                     compactIfNeededLocked()
                 }
-                lastError = null
+                succeeded()
             } catch (e: Exception) {
-                lastError = e.message ?: e::class.simpleName
-                System.err.println("Raijin: AuditLog.record failed (${file.absolutePath}): $lastError")
+                failed("record", e)
             }
         }
     }
@@ -57,24 +59,53 @@ class AuditFileStore(
         lock.withLock {
             try {
                 compactIfNeededLocked()
-                lastError = null
+                succeeded()
             } catch (e: Exception) {
-                lastError = e.message ?: e::class.simpleName
-                System.err.println("Raijin: AuditLog.compact failed (${file.absolutePath}): $lastError")
+                failed("compact", e)
             }
         }
     }
 
     private fun compactIfNeededLocked() {
-        if (maxLines <= 0 || !file.exists()) return
-        val lines = file.readLines()
-        if (lines.size <= maxLines) return
-        val kept = lines.takeLast(retainLines.coerceAtLeast(1))
+        if (!file.exists()) {
+            knownLines = 0
+            return
+        }
+        if (knownLines < 0) knownLines = file.useLines { it.count() }
+        val tooLong = maxLines > 0 && knownLines > maxLines
+        val tooBig = maxBytes > 0 && file.length() > maxBytes
+        if (!tooLong && !tooBig) return
+        val kept = retainedTail(file.readLines())
         JsonlStoreSupport.atomicWriteLines(file, kept)
+        knownLines = kept.size
+    }
+
+    /** The newest lines that fit both the line and the byte budget (always at least one line). */
+    private fun retainedTail(lines: List<String>): List<String> {
+        val byCount = if (maxLines > 0) lines.takeLast(retainLines.coerceAtLeast(1)) else lines
+        if (maxBytes <= 0) return byCount
+        val budget = maxBytes * 3 / 4
+        var size = byCount.sumOf { it.toByteArray(Charsets.UTF_8).size + 1L }
+        var start = 0
+        while (start < byCount.size - 1 && size > budget) {
+            size -= byCount[start].toByteArray(Charsets.UTF_8).size + 1L
+            start++
+        }
+        return byCount.subList(start, byCount.size)
+    }
+
+    private fun succeeded() {
+        lastError = null
+        JsonlStoreSupport.recovered(file)
+    }
+
+    private fun failed(op: String, e: Exception) {
+        lastError = JsonlStoreSupport.reportFailure("AuditLog", op, file, e)
     }
 
     companion object {
         const val DEFAULT_MAX_LINES = 20_000
+        const val DEFAULT_MAX_BYTES = 16L * 1024 * 1024
         private const val COMPACT_CHECK_INTERVAL = 250
     }
 }
@@ -85,17 +116,19 @@ class AuditFileStore(
  * activity log this survives a Burp restart and keeps near-full arguments, so an
  * operator can reconstruct what an agent did.
  *
- * Writes JSON Lines to `~/.raijin-audit.jsonl` with automatic line-cap rotation.
- * Write failures are recorded in [lastError] and printed to stderr.
+ * Writes JSON Lines to `~/.raijin-audit.jsonl`, rotated by line count and size. Write failures
+ * are recorded in [lastError], printed to stderr and reported to the Burp error log.
  */
 object AuditLog {
     private const val MAX_VALUE = 8000
 
-    private val defaultStore = AuditFileStore(File(System.getProperty("user.home") ?: ".", ".raijin-audit.jsonl"))
+    /** The file behind the log; tests point it at a temp file instead of the user's home. */
+    @Volatile
+    internal var store = AuditFileStore(File(System.getProperty("user.home") ?: ".", ".raijin-audit.jsonl"))
 
-    val lastError: String? get() = defaultStore.lastError
+    val lastError: String? get() = store.lastError
 
-    fun path(): String = defaultStore.path()
+    fun path(): String = store.path()
 
     /** Builds one JSONL audit record (pure; no I/O). Optional fields are omitted when blank. */
     fun buildEntry(
@@ -136,5 +169,5 @@ object AuditLog {
         host: String,
         method: String,
         statusCode: Int
-    ) = defaultStore.record(toolName, timestampIso, durationMs, isError, args, url, host, method, statusCode)
+    ) = store.record(toolName, timestampIso, durationMs, isError, args, url, host, method, statusCode)
 }

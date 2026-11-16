@@ -68,4 +68,32 @@ class PortPolicyTest {
         assertTrue(m.contains("9878"), m)
         assertTrue(m.contains("ss -ltnp"), m)
     }
+
+    // ---- clashes between Raijin's own listeners -----------------------------
+
+    @Test fun `distinct ports are kept as configured`() {
+        val a = PortPolicy.resolveDistinct(19876, 19877, 19878)
+        assertEquals(PortPolicy.Assignment(19876, 19877, 19878, emptyList()), a)
+    }
+
+    @Test fun `a clashing listener moves to its default and the move names its preference`() {
+        val a = PortPolicy.resolveDistinct(19876, 19876, 9878)
+        assertEquals(19876, a.ssePort)
+        assertEquals(PortPolicy.DEFAULT_HTTP, a.httpPort)
+        assertEquals(9878, a.dashboardPort)
+        assertEquals(1, a.messages.size)
+        assertTrue(a.messages.single().contains(PortPolicy.PREF_HTTP_PORT), a.messages.single())
+    }
+
+    @Test fun `when the default is taken too the listener moves to the next free port`() {
+        val a = PortPolicy.resolveDistinct(9877, 9877, 9877)
+        assertEquals(listOf(9877, 9878, 9879), listOf(a.ssePort, a.httpPort, a.dashboardPort))
+        assertEquals(2, a.messages.size)
+    }
+
+    @Test fun `all three on one port still yields three distinct ports`() {
+        val a = PortPolicy.resolveDistinct(65535, 65535, 65535)
+        assertEquals(3, setOf(a.ssePort, a.httpPort, a.dashboardPort).size, a.toString())
+        assertTrue(listOf(a.ssePort, a.httpPort, a.dashboardPort).all { it in 1..65535 })
+    }
 }

@@ -1,5 +1,11 @@
 package io.bitbytelab.raijin.core
 
+import io.bitbytelab.raijin.transport.SecurityConfig
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
+import java.net.URLEncoder
+
 /**
  * Single source of truth for how MCP clients connect to Raijin. Used by the dashboard, the
  * Server UI tab (and mirrored in the README/configs) so the connection details can never drift.
@@ -7,7 +13,8 @@ package io.bitbytelab.raijin.core
  * Invariants:
  *  1. Clients connect over Streamable HTTP at [MCP_PATH] (`/mcp`). The legacy SSE transport
  *     still answers at the root path `/` (never `/sse`) for old configs.
- *  2. There is **no token**: clients connect with the URL alone.
+ *  2. On loopback there is **no token**: clients connect with the URL alone. Once remote access
+ *     requires one, the client sends `Authorization: Bearer <token>` (pass `token` below).
  */
 object ConnectionInfo {
     const val PRIMARY_PORT = 9876
@@ -20,26 +27,71 @@ object ConnectionInfo {
     /** Path of the Streamable HTTP endpoint. */
     const val MCP_PATH = "/mcp"
 
+    /**
+     * Where the listeners actually run: the effective bind host and the resolved ports. The
+     * defaults hold until the extension publishes the real values at startup and on rebind.
+     */
+    data class Endpoints(
+        val host: String = "127.0.0.1",
+        val primaryPort: Int = PRIMARY_PORT,
+        val secondaryPort: Int = SECONDARY_PORT,
+        val dashboardPort: Int = DASHBOARD_PORT
+    )
+
+    @Volatile
+    var endpoints: Endpoints = Endpoints()
+        private set
+
+    fun publish(endpoints: Endpoints) {
+        this.endpoints = endpoints
+    }
+
     /** The Streamable HTTP endpoint URL for [port] on [host]. */
-    fun mcpUrl(port: Int, host: String = "127.0.0.1"): String = "http://$host:$port$MCP_PATH"
+    fun mcpUrl(port: Int, host: String = "127.0.0.1"): String = "http://${authority(host)}:$port$MCP_PATH"
 
     /** The legacy SSE endpoint URL for [port] on [host]: the ROOT path `/`, never `/sse`. */
-    fun legacySseUrl(port: Int, host: String = "127.0.0.1"): String = "http://$host:$port/"
+    fun legacySseUrl(port: Int, host: String = "127.0.0.1"): String = "http://${authority(host)}:$port/"
 
-    val primaryMcpUrl: String get() = mcpUrl(PRIMARY_PORT)
-    val secondaryMcpUrl: String get() = mcpUrl(SECONDARY_PORT)
+    val primaryMcpUrl: String get() = mcpUrl(endpoints.primaryPort)
+    val secondaryMcpUrl: String get() = mcpUrl(endpoints.secondaryPort)
     val dashboardUrl: String get() = dashboardUrlForHost()
 
     // Host-aware variants — every displayed endpoint reflects the interface the servers bound to.
-    fun primaryMcpUrlForHost(host: String): String = mcpUrl(PRIMARY_PORT, host)
-    fun secondaryMcpUrlForHost(host: String): String = mcpUrl(SECONDARY_PORT, host)
-    fun dashboardUrlForHost(host: String = "127.0.0.1"): String = "http://$host:$DASHBOARD_PORT"
+    fun primaryMcpUrlForHost(host: String): String = mcpUrl(endpoints.primaryPort, host)
+    fun secondaryMcpUrlForHost(host: String): String = mcpUrl(endpoints.secondaryPort, host)
 
-    /** A ready-to-paste MCP client config (Claude Code / omp / Cursor style). */
-    fun clientConfigJson(port: Int = PRIMARY_PORT, host: String = "127.0.0.1"): String =
-        """{"mcpServers":{"$SERVER_NAME":{"type":"http","url":"${mcpUrl(port, host)}"}}}"""
+    /**
+     * The dashboard URL on [host]. A non-null [token] makes it the one-time browser link: Raijin
+     * swaps the `?token=` for an HttpOnly cookie and redirects to the clean URL.
+     */
+    fun dashboardUrlForHost(host: String = "127.0.0.1", token: String? = null): String {
+        val base = "http://${authority(host)}:${endpoints.dashboardPort}"
+        return if (token == null) base else "$base/?${SecurityConfig.TOKEN_QUERY_PARAM}=${URLEncoder.encode(token, Charsets.UTF_8)}"
+    }
 
-    /** The equivalent one-liner for Claude Code. */
-    fun claudeCodeCommand(port: Int = PRIMARY_PORT, host: String = "127.0.0.1"): String =
-        "claude mcp add --transport http $SERVER_NAME ${mcpUrl(port, host)}"
+    /**
+     * A ready-to-paste MCP client config (Claude Code / omp / Cursor style). A non-null [token]
+     * adds the `Authorization: Bearer` header remote access requires.
+     */
+    fun clientConfigJson(port: Int = endpoints.primaryPort, host: String = "127.0.0.1", token: String? = null): String =
+        buildJsonObject {
+            putJsonObject("mcpServers") {
+                putJsonObject(SERVER_NAME) {
+                    put("type", "http")
+                    put("url", mcpUrl(port, host))
+                    if (token != null) putJsonObject("headers") { put("Authorization", "Bearer $token") }
+                }
+            }
+        }.toString()
+
+    /** The equivalent one-liner for Claude Code; a non-null [token] adds the bearer header. */
+    fun claudeCodeCommand(port: Int = endpoints.primaryPort, host: String = "127.0.0.1", token: String? = null): String {
+        val base = "claude mcp add --transport http $SERVER_NAME ${mcpUrl(port, host)}"
+        return if (token == null) base else "$base --header ${shellQuote("Authorization: Bearer $token")}"
+    }
+
+    /** IPv6 literals bracketed, so a URL built from any bind host stays valid. */
+    private fun authority(host: String): String = SecurityConfig.formatHostForAuthority(host)
+
+    private fun shellQuote(s: String): String = "'" + s.replace("'", "'\\''") + "'"
 }

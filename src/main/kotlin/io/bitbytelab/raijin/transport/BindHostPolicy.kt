@@ -6,14 +6,14 @@ import java.net.InetAddress
  * Security policy for the configurable server bind host (GitHub issue #4, contributed as PR #6
  * by @Spark0618 and re-implemented here with an operator gate).
  *
- * Raijin's entire threat model is **loopback-only**: the embedded servers expose 149
- * tools that drive the operator's Burp (SSRF-capable request engine, proxy history containing
- * captured credentials/cookies, scanner, collaborator) plus a dashboard API. Binding to a
- * network-reachable interface collapses that to "nothing but the network protects it (Raijin has no authentication)". So a
- * non-loopback bind is treated as a privileged action and **requires an explicit operator
- * opt-in** (Burp pref `mcp_allow_remote_bind` / `-Draijin.allowRemoteBind`); absent that, any
- * non-loopback request is refused and downgraded back to `127.0.0.1`. This mirrors the existing
- * `mcp_allow_destructive` gate pattern.
+ * The embedded servers expose Burp-driving tools (SSRF-capable request engine, proxy history
+ * containing captured credentials/cookies, scanner, collaborator) plus a dashboard API. On loopback
+ * they need no token. Binding to a network-reachable interface is therefore a privileged action
+ * that **requires an explicit operator opt-in** (Burp pref `mcp_allow_remote_bind` /
+ * `-Draijin.allowRemoteBind`); absent that, any non-loopback request is refused and downgraded back
+ * to `127.0.0.1`. An honored exposure ([Decision.exposed]) switches on the remote-access controls
+ * ([RemoteAccess]: mandatory bearer token, optional source and host allowlists). This mirrors the
+ * existing `mcp_allow_destructive` gate pattern.
  *
  * Kept pure (no Ktor, no I/O beyond a local `InetAddress` classification) so the gate is
  * deterministically unit-tested.

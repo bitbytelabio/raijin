@@ -1,8 +1,12 @@
 package io.bitbytelab.raijin.transport
 
+import burp.api.montoya.http.message.HttpRequestResponse
 import io.bitbytelab.raijin.core.truncateJsonForSummary
 import io.bitbytelab.raijin.events.EventBus
+import io.bitbytelab.raijin.safety.ActionPolicy
 import io.bitbytelab.raijin.state.StateManager
+import io.bitbytelab.raijin.tools.ToolConsolidation
+import io.bitbytelab.raijin.tools.toolError
 import io.modelcontextprotocol.kotlin.sdk.server.RegisteredTool
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
@@ -13,19 +17,22 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import java.time.Instant
 import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.cancellation.CancellationException
 
 /**
  * Wraps all registered MCP tools on a [Server] so that every tool invocation
  * emits a `tool.called` event on the [EventBus] and records an activity entry
- * in the [StateManager] for the native Burp UI tab.
+ * in the [StateManager] for the native Burp UI tab, plus an [AuditLog] entry for
+ * security-relevant and mutating calls. A call that throws or is cancelled is
+ * recorded too, as an error.
  *
  * Call [wrapAll] **after** all tools have been registered via [ToolRegistry].
  */
 object ToolCallTracker {
 
+    /** Tool families that change Burp or target state; their read-only members are excluded by [READ_ONLY_WORDS]. */
     private val MUTATING_TOOL_PREFIXES = listOf(
-        "turbo_run",
-        "turbo_start",
+        "turbo_",
         "config_",
         "websocket_",
         "persistence_",
@@ -44,6 +51,12 @@ object ToolCallTracker {
         "http_remove_"
     )
 
+    /** A word after the family prefix that marks a read-only tool (turbo_run_status, websocket_list, ...). */
+    private val READ_ONLY_WORDS = setOf(
+        "get", "list", "status", "result", "results", "script", "search", "templates", "issues",
+        "docs", "example", "examples", "messages", "history", "info"
+    )
+
     private val MUTATING_TOOL_NAMES = setOf(
         "http_send_requests_parallel",
         "http_race",
@@ -60,8 +73,7 @@ object ToolCallTracker {
 
     fun wrapAll(server: Server, eventBus: EventBus, stateManager: StateManager) {
         val toolsCopy = server.tools.values.toList()
-        val toolNames = toolsCopy.map { it.tool.name }
-        server.removeTools(toolNames)
+        server.removeTools(toolsCopy.map { it.tool.name })
 
         val wrappedTools = toolsCopy.map { registeredTool ->
             val originalHandler = registeredTool.handler
@@ -70,27 +82,91 @@ object ToolCallTracker {
             RegisteredTool(
                 tool = registeredTool.tool,
                 handler = { request: CallToolRequest ->
-                    val startTime = System.nanoTime()
+                    val startNanos = System.nanoTime()
                     val startInstant = Instant.now()
                     val holder = HttpCaptureHolder()
-
-                    val result: CallToolResult = withContext(ToolCallCaptureContext(holder)) {
-                        originalHandler(this@RegisteredTool, request)
-                    }
-
-                    val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
-
+                    var result: CallToolResult? = null
+                    var failure: Throwable? = null
                     try {
-                        recordToolCall(eventBus, stateManager, toolName, request, result, elapsedMs, startInstant, holder.value)
-                    } catch (_: Exception) {}
-
-                    result
+                        val r = withContext(ToolCallCaptureContext(holder)) {
+                            originalHandler(this@RegisteredTool, request)
+                        }
+                        result = r
+                        r
+                    } catch (t: Throwable) {
+                        failure = t
+                        throw t
+                    } finally {
+                        val elapsedMs = (System.nanoTime() - startNanos) / 1_000_000
+                        try {
+                            recordToolCall(
+                                eventBus, stateManager, toolName, request,
+                                result ?: failureResult(failure), elapsedMs, startInstant, holder.value
+                            )
+                        } catch (_: Exception) {
+                        }
+                    }
                 }
             )
         }
 
         server.addTools(wrappedTools)
     }
+
+    /**
+     * What an activity / audit record says about one call. Every value is read defensively: an
+     * argument or result field may be an array, an object or missing.
+     */
+    internal data class CallSummary(
+        val toolName: String,
+        val arguments: JsonObject,
+        val resultSummary: String,
+        val url: String,
+        val method: String,
+        val host: String,
+        val statusCode: Int,
+        val isError: Boolean
+    )
+
+    /**
+     * Builds the [CallSummary] of a call to [mergedToolName]. Grouped tools are reported under the
+     * member's original name (e.g. scope_include) so the Activity tab, audit log and destructive-action
+     * policy keep their granularity.
+     */
+    internal fun summarize(mergedToolName: String, args: Map<String, JsonElement>?, result: CallToolResult): CallSummary {
+        val action = (args?.get("action") as? JsonPrimitive)?.contentOrNull
+        val toolName = ToolConsolidation.legacyName(mergedToolName, action) ?: mergedToolName
+        val arguments = buildJsonObject {
+            args?.forEach { (key, value) -> put(key, truncateJsonForSummary(value, 200)) }
+        }
+
+        val resultText = result.content.filterIsInstance<TextContent>().firstOrNull()?.text
+        val resultSummary = resultText?.let { if (it.length > 500) it.take(500) + "..." else it } ?: ""
+
+        val resultJson = resultText?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() as? JsonObject }
+        val requestJson = resultJson?.get("request") as? JsonObject
+        val responseJson = resultJson?.get("response") as? JsonObject
+        fun JsonObject?.text(key: String): String = ((this?.get(key)) as? JsonPrimitive)?.contentOrNull.orEmpty()
+        fun JsonObject?.int(key: String): Int = ((this?.get(key)) as? JsonPrimitive)?.intOrNull ?: 0
+        val argsJson = args?.let(::JsonObject)
+
+        val url = resultJson.text("url").ifEmpty { requestJson.text("url") }.ifEmpty { argsJson.text("url") }
+        val method = resultJson.text("method").ifEmpty { requestJson.text("method") }.ifEmpty { argsJson.text("method") }
+        var host = resultJson.text("host").ifEmpty { argsJson.text("host") }
+        if (host.isEmpty() && url.isNotEmpty()) host = runCatching { java.net.URI(url).host }.getOrNull().orEmpty()
+        val statusCode = resultJson.int("status_code").takeIf { it != 0 } ?: responseJson.int("status_code")
+
+        return CallSummary(toolName, arguments, resultSummary, url, method, host, statusCode, result.isError ?: false)
+    }
+
+    /** The result recorded for a call that threw or was cancelled instead of returning. */
+    internal fun failureResult(failure: Throwable?): CallToolResult = toolError(
+        when (failure) {
+            null -> "tool call failed"
+            is CancellationException -> "cancelled before completion (client disconnected or the call was cancelled)"
+            else -> "${failure::class.simpleName}: ${failure.message ?: "no message"}"
+        }
+    )
 
     private fun recordToolCall(
         eventBus: EventBus,
@@ -100,91 +176,45 @@ object ToolCallTracker {
         result: CallToolResult,
         elapsedMs: Long,
         timestamp: Instant,
-        httpReqResp: burp.api.montoya.http.message.HttpRequestResponse?
+        httpReqResp: HttpRequestResponse?
     ) {
-        // Grouped tools are reported under the member's original name (e.g. scope_include) so the
-        // Activity tab, audit log and destructive-action policy keep their granularity.
         val args = request.params.arguments
-        val action = (args?.get("action") as? JsonPrimitive)?.contentOrNull
-        val toolName = io.bitbytelab.raijin.tools.ToolConsolidation.legacyName(mergedToolName, action) ?: mergedToolName
-        val argsJson = buildJsonObject {
-            args?.forEach { (key, value) -> put(key, truncateJsonForSummary(value, 200)) }
-        }
-
-        val resultSummary = result.content
-            .filterIsInstance<TextContent>()
-            .firstOrNull()
-            ?.text
-            ?.let { if (it.length > 500) it.take(500) + "..." else it }
-            ?: ""
-
-        // Extract HTTP info from result JSON without crashing on non-primitive JSON values
-        var url = ""
-        var method = ""
-        var host = ""
-        var statusCode = 0
-        try {
-            val resultJson = result.content
-                .filterIsInstance<TextContent>()
-                .firstOrNull()
-                ?.text
-                ?.let { Json.parseToJsonElement(it) as? JsonObject }
-            url = (resultJson?.get("url") as? JsonPrimitive)?.contentOrNull ?: ""
-            method = (resultJson?.get("method") as? JsonPrimitive)?.contentOrNull ?: ""
-            host = (resultJson?.get("host") as? JsonPrimitive)?.contentOrNull ?: ""
-            statusCode = (resultJson?.get("status_code") as? JsonPrimitive)?.intOrNull ?: 0
-
-            val reqObj = resultJson?.get("request") as? JsonObject
-            val respObj = resultJson?.get("response") as? JsonObject
-            if (url.isEmpty()) url = (reqObj?.get("url") as? JsonPrimitive)?.contentOrNull ?: ""
-            if (method.isEmpty()) method = (reqObj?.get("method") as? JsonPrimitive)?.contentOrNull ?: ""
-            if (statusCode == 0) statusCode = (respObj?.get("status_code") as? JsonPrimitive)?.intOrNull ?: 0
-        } catch (_: Exception) {}
-
-        // Safe fallback from arguments (never invoke .jsonPrimitive on arrays/objects)
-        if (url.isEmpty()) url = (args?.get("url") as? JsonPrimitive)?.contentOrNull ?: ""
-        if (host.isEmpty()) host = (args?.get("host") as? JsonPrimitive)?.contentOrNull ?: ""
-        if (method.isEmpty()) method = (args?.get("method") as? JsonPrimitive)?.contentOrNull ?: ""
-        if (host.isEmpty() && url.isNotEmpty()) {
-            try { host = java.net.URI(url).host ?: "" } catch (_: Exception) {}
-        }
-
-        val isError = result.isError ?: false
+        val s = summarize(mergedToolName, args, result)
 
         // Record in StateManager for native Burp UI tab
         stateManager.addMcpActivity(
-            toolName = toolName,
+            toolName = s.toolName,
             timestamp = timestamp.toString(),
             durationMs = elapsedMs,
-            method = method,
-            url = url,
-            host = host,
-            statusCode = statusCode,
-            isError = isError,
-            argsSummary = argsJson.toString(),
-            resultSummary = resultSummary,
+            method = s.method,
+            url = s.url,
+            host = s.host,
+            statusCode = s.statusCode,
+            isError = s.isError,
+            argsSummary = s.arguments.toString(),
+            resultSummary = s.resultSummary,
             requestResponse = httpReqResp
         )
 
         // Emit event for web dashboard
         eventBus.emit("tool.called", buildJsonObject {
-            put("tool_name", toolName)
+            put("tool_name", s.toolName)
             put("timestamp", timestamp.toString())
             put("duration_ms", elapsedMs)
-            put("is_error", isError)
-            put("arguments", argsJson)
-            put("result_summary", resultSummary)
-            put("url", url)
-            put("method", method)
-            put("host", host)
-            put("status_code", statusCode)
+            put("is_error", s.isError)
+            put("arguments", s.arguments)
+            put("result_summary", s.resultSummary)
+            put("url", s.url)
+            put("method", s.method)
+            put("host", s.host)
+            put("status_code", s.statusCode)
         })
 
         // Durable, append-only audit trail for security-relevant and mutating calls
-        if (shouldAudit(toolName, url, host, isError)) {
+        if (shouldAudit(s.toolName, s.url, s.host, s.isError)) {
             AuditLog.record(
-                toolName, timestamp.toString(), elapsedMs, isError,
-                args, url, host, method, statusCode
+                s.toolName, timestamp.toString(), elapsedMs, s.isError,
+                args, s.url, s.host, s.method, s.statusCode
             )
         }
     }
@@ -193,20 +223,27 @@ object ToolCallTracker {
         url.isNotEmpty() ||
             host.isNotEmpty() ||
             isError ||
-            io.bitbytelab.raijin.safety.ActionPolicy.isDestructive(toolName) ||
+            ActionPolicy.isDestructive(toolName) ||
             toolName in MUTATING_TOOL_NAMES ||
-            MUTATING_TOOL_PREFIXES.any { toolName.startsWith(it) }
+            isMutatingFamilyMember(toolName)
 
-    /** Coroutine-bound holder for the most recent Montoya [HttpRequestResponse] sent during a tool call. */
-    internal class HttpCaptureHolder(@Volatile var value: burp.api.montoya.http.message.HttpRequestResponse? = null)
+    private fun isMutatingFamilyMember(toolName: String): Boolean {
+        val prefix = MUTATING_TOOL_PREFIXES.firstOrNull { toolName.startsWith(it) } ?: return false
+        return toolName.removePrefix(prefix).split('_').none { it in READ_ONLY_WORDS }
+    }
+
+    /** Holds the most recent Montoya [HttpRequestResponse] sent during one tool call. */
+    internal class HttpCaptureHolder(@Volatile var value: HttpRequestResponse? = null)
 
     private val captureThreadLocal = ThreadLocal<HttpCaptureHolder?>()
 
     /**
-     * Propagates [HttpCaptureHolder] across coroutine dispatcher hops / suspension points without
-     * leaking thread-locals when a handler suspends, throws, or migrates across `Dispatchers.IO`.
+     * Coroutine-context element carrying a call's [HttpCaptureHolder]. It installs the holder in a
+     * thread-local only while the call's coroutine runs on a thread and restores the previous value
+     * whenever it suspends, finishes or throws, so blocking bridge code can reach it through
+     * [recordSentResult] across `Dispatchers.IO` hops without anything leaking to the next call.
      */
-    private class ToolCallCaptureContext(
+    internal class ToolCallCaptureContext(
         private val holder: HttpCaptureHolder
     ) : ThreadContextElement<HttpCaptureHolder?> {
         companion object Key : CoroutineContext.Key<ToolCallCaptureContext>
@@ -224,7 +261,7 @@ object ToolCallTracker {
     }
 
     /** Records the latest [HttpRequestResponse] sent during the currently active tool invocation. */
-    fun recordSentResult(result: burp.api.montoya.http.message.HttpRequestResponse?) {
+    fun recordSentResult(result: HttpRequestResponse?) {
         captureThreadLocal.get()?.value = result
     }
 }
