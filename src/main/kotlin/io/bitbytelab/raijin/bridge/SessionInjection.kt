@@ -233,7 +233,7 @@ internal object SessionInjection {
     }
 
     private fun parseTarget(body: String, path: String): Pair<List<JsonPathLite.Step>, JsonElement>? {
-        if (body.isBlank() || body.length > JsonPathLite.MAX_DOCUMENT_CHARS) return null
+        if (body.isBlank() || body.length > JsonPathLite.MAX_DOCUMENT_CHARS || JsonPathLite.exceedsMaxDepth(body)) return null
         if (validateJsonTarget(path) != null) return null
         val root = try { Json.parseToJsonElement(body) } catch (_: Exception) { return null }
         return JsonPathLite.parse(path) to root

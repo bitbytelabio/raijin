@@ -125,6 +125,7 @@ internal class HttpFuzzRunner(private val send: (HttpFuzzPlan.AttackRequest) -> 
             while (!Thread.currentThread().isInterrupted) {
                 val (index, request) = take() ?: return
                 pacer.await()
+                if (stop.get()) return
                 val sent = try {
                     send(request)
                 } catch (e: Exception) {

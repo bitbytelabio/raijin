@@ -267,7 +267,10 @@ internal class SessionMacroEngine(
         val entry = active.firstOrNull {
             SessionMacroTrigger.decide(it.macro, it.state.suspended, exchange) == SessionMacroTrigger.Verdict.TRIGGER
         } ?: return null
-
+        // Running the login steps and then being refused by the scope policy at `retry()` would
+        // waste a login attempt and still count as a macro failure toward the suspend-after circuit
+        // breaker; check first, so an out-of-scope URL is simply left alone, as it always was.
+        if (scopeGate.deny(url) != null) return null
         val owner = when (val ticket = entry.state.begin(clock(), sentEpoch)) {
             is MacroRunState.Ticket.Run -> {
                 if (!execute(entry, ticket, manual = false, triggerUrl = url).success) return null

@@ -2,8 +2,6 @@ package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
 import burp.api.montoya.core.ByteArray as BurpByteArray
-import burp.api.montoya.utilities.CompressionType
-import burp.api.montoya.utilities.Utilities
 import io.bitbytelab.raijin.bridge.HttpPipelineFraming.Outcome
 import io.bitbytelab.raijin.core.BodyText
 import io.bitbytelab.raijin.safety.ScopeGate
@@ -110,20 +108,16 @@ class HttpPipelineBridge(private val api: MontoyaApi) {
 
     private val scopeGate = ScopeGate(api)
 
-    /** Burp's brotli decoder for `decode_content`: the JDK has none. */
-    private val brotli: (ByteArray) -> ByteArray = { data ->
-        val utilities: Utilities = runCatching<Utilities?> { api.utilities() }.getOrNull()
-            ?: throw IllegalStateException("Burp's brotli decoder is not available")
-        val decoded = try {
-            utilities.compressionUtils().decompress(BurpByteArray.byteArray(*data), CompressionType.BROTLI).getBytes()
-        } catch (_: NullPointerException) {
-            // Montoya's factories are only wired up inside Burp.
-            throw IllegalStateException("Burp's brotli decoder is not available")
-        }
-        // Burp hands input it cannot decode back unchanged instead of failing.
-        if (UtilitiesBridge.isEchoedDecompression(data, decoded)) throw IllegalStateException("not a valid br stream")
-        decoded
-    }
+    /**
+     * `decode_content`'s `br` coding is refused for now: Burp's `compressionUtils().decompress()` is
+     * the only brotli decoder available here, and unlike the gzip/deflate paths (streamed through
+     * [HttpContentDecoding.inflate], which stop at `maxBytes`) it builds the whole decompressed
+     * output before anything can check its size. A small, deliberately crafted brotli body can
+     * decompress to gigabytes and exhaust the heap before the cap is ever applied. Re-enable once a
+     * streaming brotli decoder backs this, so [HttpContentDecoding.decode] reports the same clear
+     * "not available" result it already gives outside Burp.
+     */
+    private val brotli: ((ByteArray) -> ByteArray)? = null
 
     /**
      * Writes [requests] on one connection and reads up to [maxResponses] responses (default: one
@@ -390,7 +384,7 @@ class HttpPipelineBridge(private val api: MontoyaApi) {
         if (!stopNow) writing.join((deadlineAtMs - System.currentTimeMillis()).coerceAtLeast(1))
         if (!writing.isAlive) return true
         control.stop()
-        runCatching { socket.close() }
+        socket.closeAbortively()
         writing.join(WRITER_STOP_MS)
         return false
     }
@@ -400,7 +394,7 @@ class HttpPipelineBridge(private val api: MontoyaApi) {
         if (connectionId != null && entry != null) {
             HttpPipelineConnectionRegistry.remove(connectionId, entry)
         } else {
-            runCatching { socket.close() }
+            socket.closeAbortively()
         }
     }
 

@@ -54,8 +54,8 @@ internal object HttpAttackTools {
             description = """Fuzz an HTTP request like Burp Intruder: payloads placed at injection points, sent through Burp, every response clustered.
 
 Injection points (first that applies):
-1. FUZZ keyword: every FUZZ is an injection point. Example: GET /api?id=FUZZ HTTP/1.1\r\nHost: target.com\r\n\r\n
-2. Marker pairs: wrap values with § (or a custom marker): GET /api?id=§1§&name=§test§ HTTP/1.1\r\n... Each §value§ pair is a position; a position not being fuzzed keeps its value without the markers. An odd number of markers is rejected.
+1. Marker pairs: wrap values with § (or a custom marker): GET /api?id=§1§&name=§test§ HTTP/1.1\r\n... Each §value§ pair is a position; a position not being fuzzed keeps its value without the markers. An odd number of markers is rejected. Takes precedence over the FUZZ keyword when both appear.
+2. FUZZ keyword: used only when there are no § marker pairs. Every FUZZ is an injection point. Example: GET /api?id=FUZZ HTTP/1.1\r\nHost: target.com\r\n\r\n
 3. positions: non-overlapping [start, end) offsets into the request string as given.
 
 attack_mode (Intruder's attack types):

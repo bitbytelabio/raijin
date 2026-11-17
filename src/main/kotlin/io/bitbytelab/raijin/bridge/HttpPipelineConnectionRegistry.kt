@@ -7,6 +7,18 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 
 /**
+ * Closes [socket] without the graceful shutdown handshake. The JDK's `SSLSocketImpl.close()` waits,
+ * with no timeout, on the same lock a blocked write holds for as long as that write blocks — so a
+ * server that stops reading mid-body can make `close()` hang forever on a reused TLS socket. Setting
+ * `SO_LINGER(0)` first makes the close abortive (an RST instead of a graceful shutdown), which does
+ * not take that lock. Harmless, and the only safe option, when the socket is already being discarded.
+ */
+internal fun Socket.closeAbortively() {
+    runCatching { setSoLinger(true, 0) }
+    runCatching { close() }
+}
+
+/**
  * Process-lifetime registry letting [HttpPipelineBridge] reuse one TCP connection across SEPARATE
  * `http_send_pipeline` MCP calls (`keep_open` / `connection_id`). This is deliberately independent
  * of Montoya's own `connection_id` parameter on [HttpBridge.sendRequest] and of Turbo's
@@ -80,7 +92,7 @@ object HttpPipelineConnectionRegistry {
             if (!entry.lock.tryLock()) return@forEach
             try {
                 if (now - entry.lastUsedAtMs > IDLE_EVICTION_MS && entries.remove(id, entry)) {
-                    runCatching { entry.socket.close() }
+                    entry.socket.closeAbortively()
                 }
             } finally {
                 entry.lock.unlock()
@@ -91,14 +103,14 @@ object HttpPipelineConnectionRegistry {
     /** Replaces and closes any prior entry under [id]. */
     fun put(id: String, entry: Entry) {
         entries.put(id, entry)?.let { previous ->
-            if (previous !== entry) runCatching { previous.socket.close() }
+            if (previous !== entry) previous.socket.closeAbortively()
         }
     }
 
     fun get(id: String): Entry? = entries[id]
 
     fun remove(id: String) {
-        entries.remove(id)?.let { runCatching { it.socket.close() } }
+        entries.remove(id)?.let { it.socket.closeAbortively() }
     }
 
     /**
@@ -107,7 +119,7 @@ object HttpPipelineConnectionRegistry {
      */
     fun remove(id: String, entry: Entry) {
         entries.remove(id, entry)
-        runCatching { entry.socket.close() }
+        entry.socket.closeAbortively()
     }
 
     /** The kept connections, oldest first. */
@@ -128,7 +140,7 @@ object HttpPipelineConnectionRegistry {
         }
         try {
             if (!entries.remove(id, entry)) return CloseResult.UNKNOWN
-            runCatching { entry.socket.close() }
+            entry.socket.closeAbortively()
             return CloseResult.CLOSED
         } finally {
             entry.lock.unlock()

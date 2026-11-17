@@ -43,6 +43,35 @@ internal object JsonPathLite {
     /** Largest body parsed for a path: a session rule runs on Burp's HTTP threads. */
     const val MAX_DOCUMENT_CHARS = 2_000_000
 
+    /** Largest object/array nesting depth: kotlinx's tree reader recurses with no depth guard of
+     *  its own, so a document whose depth alone (regardless of [MAX_DOCUMENT_CHARS]) is enough to
+     *  overflow the stack must be rejected before it ever reaches `Json.parseToJsonElement`. Matches
+     *  [io.bitbytelab.raijin.bridge.JsonLeafSpans]'s bound. */
+    private const val MAX_DEPTH = 256
+
+    /** True once [json]'s object/array nesting would exceed [MAX_DEPTH], scanned without building a tree. */
+    fun exceedsMaxDepth(json: String): Boolean {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for (ch in json) {
+            if (inString) {
+                when {
+                    escaped -> escaped = false
+                    ch == '\\' -> escaped = true
+                    ch == '"' -> inString = false
+                }
+                continue
+            }
+            when (ch) {
+                '"' -> inString = true
+                '{', '[' -> { depth++; if (depth > MAX_DEPTH) return true }
+                '}', ']' -> depth--
+            }
+        }
+        return false
+    }
+
     /**
      * Parses [path].
      * @throws IllegalArgumentException saying where it stops being a supported path.
@@ -176,7 +205,7 @@ internal object JsonPathLite {
      * JSON, the path selects nothing, or it selects JSON `null`.
      */
     fun first(json: String, path: String): String? {
-        if (json.length > MAX_DOCUMENT_CHARS) return null
+        if (json.length > MAX_DOCUMENT_CHARS || exceedsMaxDepth(json)) return null
         val steps = try { parse(path) } catch (_: IllegalArgumentException) { return null }
         val root = try { Json.parseToJsonElement(json) } catch (_: Exception) { return null }
         return select(root, steps).firstNotNullOfOrNull(::text)

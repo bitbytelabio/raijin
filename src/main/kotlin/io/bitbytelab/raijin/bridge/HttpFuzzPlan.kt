@@ -278,7 +278,7 @@ internal object HttpFuzzPlan {
             // Legacy [start, end) offsets.
             !positions.isNullOrEmpty() -> {
                 validatePositions(positions, baseRequest.length)?.let { return Resolved.Error(it) }
-                val inTextOrder = positions.withIndex().sortedBy { it.value.first }
+                val inTextOrder = positions.withIndex().sortedWith(compareBy({ it.value.first }, { it.value.second }))
                 val literals = ArrayList<String>(positions.size + 1)
                 val values = MutableList(positions.size) { "" }
                 var cursor = 0
