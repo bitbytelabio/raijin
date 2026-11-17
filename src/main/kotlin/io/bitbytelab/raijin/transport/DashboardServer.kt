@@ -26,6 +26,7 @@ import java.time.Duration
 import java.time.Instant
 import java.time.ZonedDateTime
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * The web dashboard. The page itself is static (`resources/dashboard/`); every dynamic value
@@ -48,6 +49,7 @@ class DashboardServer(
     private var server: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
     private var scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val startTime = Instant.now()
+    private val openSseSubscribers = AtomicInteger(0)
 
     fun start() {
         scope.launch {
@@ -67,6 +69,15 @@ class DashboardServer(
                         // client), a heartbeat so a closed tab is noticed even when Burp is idle,
                         // and the EventBus subscriber is always released when the stream ends.
                         sse("/events") {
+                            if (openSseSubscribers.incrementAndGet() > MAX_SSE_SUBSCRIBERS) {
+                                openSseSubscribers.decrementAndGet()
+                                try {
+                                    send(ServerSentEvent(event = "error", data = "Maximum concurrent dashboard SSE streams ($MAX_SSE_SUBSCRIBERS) reached"))
+                                    close()
+                                } catch (_: Exception) {
+                                }
+                                return@sse
+                            }
                             val queue = Channel<BurpEvent>(capacity = SSE_QUEUE_CAPACITY, onBufferOverflow = BufferOverflow.DROP_OLDEST)
                             val subId = eventBus.subscribeInternal(emptyList()) { event ->
                                 queue.trySend(event)
@@ -87,6 +98,7 @@ class DashboardServer(
                             } finally {
                                 eventBus.unsubscribe(subId)
                                 queue.close()
+                                openSseSubscribers.decrementAndGet()
                             }
                         }
 
@@ -269,6 +281,7 @@ class DashboardServer(
     }
 
     private companion object {
+        const val MAX_SSE_SUBSCRIBERS = 64
         const val SSE_QUEUE_CAPACITY = 256
         const val SSE_HEARTBEAT_MS = 15_000L
     }

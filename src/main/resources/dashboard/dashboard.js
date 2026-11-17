@@ -133,10 +133,10 @@ function addEvent(type, data, timestamp) {
         method = data.method || '';
         host = data.host || '';
         statusCode = data.status_code || (type === 'autorize.match' ? data.original_status : 0) || 0;
-        contentType = data.content_type || data.mime_type || mimeType || '';
+        mimeType = data.mime_type || '';
+        contentType = data.content_type || mimeType || '';
         inScope = data.in_scope || false;
         messageId = data.message_id || 0;
-        mimeType = data.mime_type || '';
 
         // For tool.called events, extract tool name as method-like display
         if (type === 'tool.called') {

@@ -64,13 +64,29 @@ object ToolCallTracker {
         "http_send_request_chain",
         "http_send_pipeline",
         "http_pipeline_connections",
+        "http_cookie_jar_set",
+        "http_cookie_jar_delete",
+        "burp_task_engine_set",
+        "intruder_register_payload_processor",
         "proxy_rule",
+        "proxy_auto_auth",
+        "proxy_annotate",
+        "organizer_annotate",
+        "sitemap_annotate",
         "http_rule",
         "scope",
         "scope_include",
         "scope_exclude",
-        "scope_remove"
+        "scope_remove",
+        "findings_add",
+        "findings_remove",
+        "events_clear",
+        "collaborator_create_client",
+        "collaborator_restore_client",
+        "collaborator_remove_client"
     )
+
+    private val JWT_KEY_MUTATING_ACTIONS = setOf("generate", "import", "delete")
 
     fun wrapAll(server: Server, eventBus: EventBus, stateManager: StateManager) {
         val toolsCopy = server.tools.values.toList()
@@ -212,7 +228,8 @@ object ToolCallTracker {
         })
 
         // Durable, append-only audit trail for security-relevant and mutating calls
-        if (shouldAudit(s.toolName, s.url, s.host, s.isError)) {
+        val action = (args?.get("action") as? JsonPrimitive)?.contentOrNull
+        if (shouldAudit(s.toolName, s.url, s.host, s.isError, action)) {
             AuditLog.record(
                 s.toolName, timestamp.toString(), elapsedMs, s.isError,
                 args, s.url, s.host, s.method, s.statusCode
@@ -220,12 +237,19 @@ object ToolCallTracker {
         }
     }
 
-    internal fun shouldAudit(toolName: String, url: String, host: String, isError: Boolean): Boolean =
+    internal fun shouldAudit(
+        toolName: String,
+        url: String,
+        host: String,
+        isError: Boolean,
+        action: String? = null
+    ): Boolean =
         url.isNotEmpty() ||
             host.isNotEmpty() ||
             isError ||
             ActionPolicy.isDestructive(toolName) ||
             toolName in MUTATING_TOOL_NAMES ||
+            (toolName == "jwt_keys" && action?.trim()?.lowercase() in JWT_KEY_MUTATING_ACTIONS) ||
             isMutatingFamilyMember(toolName)
 
     private fun isMutatingFamilyMember(toolName: String): Boolean {

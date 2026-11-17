@@ -351,4 +351,11 @@ class AutorizeBridgeTest {
         assertEquals(1, remaining["total"]?.jsonPrimitive?.int)
         assertEquals("arule-2", remaining["matches"]!!.jsonArray[0].jsonObject["rule_id"]?.jsonPrimitive?.contentOrNull)
     }
+
+    @Test
+    fun `setRule rejects an empty or blank exclude_url_regex`() {
+        val b = AutorizeBridge(StateManager())
+        assertError(b.setRule(null, twoIdentities, true, null, "", null, true, 90.0, true), "exclude_url_regex")
+        assertError(b.setRule(null, twoIdentities, true, null, "   ", null, true, 90.0, true), "exclude_url_regex")
+    }
 }

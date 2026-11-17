@@ -279,4 +279,13 @@ class HttpFuzzPlanTest {
         assertNull(AttackMode.of("intruder"))
         assertEquals(listOf("sniper", "battering_ram", "pitchfork", "cluster_bomb"), AttackMode.ids)
     }
+
+    @Test
+    fun `explicit positions succeed even when the request contains a stray section marker`() {
+        val raw = "POST / HTTP/1.1\r\nHost: h\r\n\r\nnote=§only_one&val=XYZ"
+        val start = raw.indexOf("XYZ")
+        val p = plan(raw, listOf("P"), positions = listOf(start to start + 3))
+        assertEquals(HttpFuzzPlan.OFFSET_POSITIONS, p.positionMode)
+        assertEquals(listOf("POST / HTTP/1.1\r\nHost: h\r\n\r\nnote=§only_one&val=P"), texts(p))
+    }
 }

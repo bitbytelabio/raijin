@@ -256,14 +256,18 @@ class RaijinExtension : BurpExtension {
         // A listener answers until it has stopped. The stricter settings hold while the three move: the new
         // ones before an exposed bind opens, the old ones until an exposed bind has closed.
         RemoteAccess.install(RemoteAccess.duringRebind(RemoteAccess.current, access.config, d.exposed))
-        ConnectionInfo.publish(ConnectionInfo.endpoints.copy(host = d.effectiveHost))
+        val previousEndpoints = ConnectionInfo.endpoints
         val boundOk = try {
             val ok = serverManager.rebind(d.effectiveHost)
             dashboardServer.rebind(d.effectiveHost)
+            if (ok) {
+                ConnectionInfo.publish(previousEndpoints.copy(host = d.effectiveHost))
+            }
             // Every old listener has stopped: the settings for the new bind apply from here on.
             RemoteAccess.install(access.config, d.exposed)
             ok
         } catch (e: Exception) {
+            ConnectionInfo.publish(previousEndpoints)
             api.logging().logToError(
                 "Raijin: live rebind to ${d.effectiveHost} failed: ${e.message}; the stricter access settings stay in force"
             )

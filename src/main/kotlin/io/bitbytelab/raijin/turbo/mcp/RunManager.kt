@@ -61,6 +61,14 @@ class RunManager(
         return "deleted"
     }
 
+    /** Stops every known run (GUI and MCP) and drops them on extension unload. */
+    fun abortAndClearAll() {
+        val active = runs.values.toList()
+        runs.clear()
+        evictedIds.clear()
+        active.forEach { run -> runCatching { run.handler.abort() } }
+    }
+
     /**
      * Frees what finished runs hold: strips the response bodies of every finished run that still
      * has them or, once all are stripped, evicts the oldest finished run. Returns false when no

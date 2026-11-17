@@ -12,7 +12,7 @@ class Stream(val connection: H2Connection, val streamID: Int, val req: Request, 
 
     var state = Stream.CLEAN
     var headers: String = ""
-    var body: String = ""
+    private val body = StringBuilder()
 
     /** System.nanoTime() when the request's last frame went out; the response timings count from here. */
     @Volatile
@@ -43,21 +43,35 @@ class Stream(val connection: H2Connection, val streamID: Int, val req: Request, 
 
         if (state == CLEAN) {
             if (frame is HeaderFrame) {
-                firstFrameAt = System.nanoTime()
+                if (firstFrameAt == 0L) firstFrameAt = System.nanoTime()
                 headers = frame.headerString
-                state = if (frame.die) DONE else WANTBODY
+                state = when {
+                    frame.die -> DONE
+                    // Interim 1xx (100 Continue, 103 Early Hints): keep waiting for the final HEADERS.
+                    isInterimStatus(frame.headerString) -> CLEAN
+                    else -> WANTBODY
+                }
             } else if (frame is DataFrame) {
                 throw IOException("Expected headers, got data")
             }
         }
 
         if (state == WANTBODY && frame is DataFrame) {
-            body += frame.body
+            body.append(frame.body)
         }
 
         if (frame.die) {
             complete()
         }
+    }
+
+    private fun isInterimStatus(headerString: String): Boolean {
+        val statusLine = headerString.lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.startsWith(":status:", ignoreCase = true) }
+            ?: return false
+        val status = statusLine.substring(8).trim()
+        return status.length == 3 && status[0] == '1' && status.all { it.isDigit() }
     }
 
     private fun complete() {
@@ -68,7 +82,7 @@ class Stream(val connection: H2Connection, val streamID: Int, val req: Request, 
         req.time = req.ttlb
         connection.engine.successfulRequests.getAndIncrement()
 
-        val response = headers + "\r\n" + body
+        val response = headers + "\r\n" + body.toString()
         req.response = response
         val interesting = connection.engine.processResponse(req, response.toByteArray(Charsets.ISO_8859_1))
         connection.engine.invokeCallback(req, interesting)

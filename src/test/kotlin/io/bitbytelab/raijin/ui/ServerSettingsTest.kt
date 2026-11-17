@@ -109,6 +109,10 @@ class ServerSettingsTest {
             ServerSettings.clientHosts("0.0.0.0", Kind.WILDCARD, local, extra),
         )
         assertEquals(listOf("fd7a::1"), ServerSettings.clientHosts("[fd7a::1]", null, local, extra))
+        assertEquals(
+            listOf("192.168.56.101", "burp-vm.tailnet.ts.net", "127.0.0.1"),
+            ServerSettings.clientHosts("192.168.56.101", Kind.OTHER, local, listOf("burp-vm.tailnet.ts.net", "127.0.0.1:19877")),
+        )
     }
 
     @Test
@@ -120,10 +124,13 @@ class ServerSettingsTest {
     }
 
     @Test
-    fun `allowed hosts reject URLs, paths, credentials and ports`() {
-        val entries = listOf("burp-vm.tailnet.ts.net", "burp.internal", "[::1]", "http://burp.internal", "burp/x", "user@burp", "burp.internal:9876")
+    fun `allowed hosts accept names and host-port pairs, and reject URLs, paths, credentials or bad ports`() {
+        val entries = listOf(
+            "burp-vm.tailnet.ts.net", "burp.internal", "[::1]", "127.0.0.1:19877", "burp.internal:9876",
+            "http://burp.internal", "burp/x", "user@burp", "burp.internal:0", "*.ts.net",
+        )
         assertEquals(
-            listOf("http://burp.internal", "burp/x", "user@burp", "burp.internal:9876"),
+            listOf("http://burp.internal", "burp/x", "user@burp", "burp.internal:0", "*.ts.net"),
             ServerSettings.invalidHostEntries(entries),
         )
     }

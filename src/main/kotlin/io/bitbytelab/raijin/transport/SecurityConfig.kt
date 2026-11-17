@@ -256,7 +256,9 @@ fun Application.installLocalhostSecurity(
         allowOrigins { originAllowed(it) }
     }
 
-    intercept(ApplicationCallPipeline.Plugins) {
+    // Run security checks in Setup (before CORS and any plugin/route in Plugins), so a preflight
+    // OPTIONS from an allowed Origin cannot bypass source-IP or Host checks.
+    intercept(ApplicationCallPipeline.Setup) {
         val policy = policy()
 
         // 1. Source-address allowlist (remote access): the socket peer, never X-Forwarded-For.
@@ -272,9 +274,9 @@ fun Application.installLocalhostSecurity(
             return@intercept finish()
         }
 
-        // 3. Origin lockdown — reject cross-origin browser requests outright.
-        val origin = call.request.headers[HttpHeaders.Origin]
-        if (origin != null && !originAllowed(origin)) {
+        // 3. Origin lockdown — reject cross-origin browser requests outright (check every Origin header).
+        val origins = call.request.headers.getAll(HttpHeaders.Origin)
+        if (origins != null && origins.any { !originAllowed(it) }) {
             call.rejectJson(HttpStatusCode.Forbidden, "forbidden: cross-origin request rejected")
             return@intercept finish()
         }

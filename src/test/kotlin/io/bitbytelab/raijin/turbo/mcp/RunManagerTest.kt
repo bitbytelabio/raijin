@@ -67,6 +67,19 @@ class RunManagerTest {
     }
 
     @Test
+    fun `abortAndClearAll stops every run and clears the registry`() {
+        val run1 = manager.startRun()
+        val run2 = manager.startRun()
+        run2.handler.markScriptCompleted()
+
+        manager.abortAndClearAll()
+
+        assertNull(manager.getRun(run1.id))
+        assertNull(manager.getRun(run2.id))
+        assertEquals("exited-early", run1.handler.status())
+    }
+
+    @Test
     fun `evicts oldest completed run when cap is exceeded`() {
         val manager = RunManager(maxCompletedRuns = 2)
         val run1 = manager.startRun()

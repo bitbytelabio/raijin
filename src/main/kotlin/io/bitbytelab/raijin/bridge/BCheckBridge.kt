@@ -166,7 +166,7 @@ class BCheckBridge(
      */
     fun importRaw(script: String): JsonObject {
         // Extract name from the script metadata
-        val nameMatch = Regex("""name:\s*"([^"]+)"""").find(script)
+        val nameMatch = BCHECK_NAME.find(script.take(4096))
         val name = nameMatch?.groupValues?.get(1) ?: "unnamed-bcheck"
         val typeGuess = when {
             script.contains("given insertion point") -> "insertion_point"
@@ -1083,5 +1083,6 @@ given request then
         }
 
         private val STATUS_200 = CheckCondition("status_code", "200", "equals", ignoreCase = false)
+        private val BCHECK_NAME = Regex("""name:\s*"([^"]+)"""")
     }
 }

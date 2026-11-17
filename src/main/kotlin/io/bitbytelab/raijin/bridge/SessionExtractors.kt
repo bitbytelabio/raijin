@@ -9,12 +9,16 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import org.w3c.dom.Node
 import org.w3c.dom.NodeList
+import org.xml.sax.Attributes
 import org.xml.sax.ErrorHandler
 import org.xml.sax.InputSource
+import org.xml.sax.SAXException
 import org.xml.sax.SAXParseException
+import org.xml.sax.helpers.DefaultHandler
 import java.io.StringReader
 import javax.xml.XMLConstants
 import javax.xml.parsers.DocumentBuilderFactory
+import javax.xml.parsers.SAXParserFactory
 import javax.xml.xpath.XPathConstants
 import javax.xml.xpath.XPathFactory
 
@@ -230,6 +234,9 @@ internal object JsonPathLite {
 internal object XmlXPath {
 
     const val MAX_DOCUMENT_CHARS = JsonPathLite.MAX_DOCUMENT_CHARS
+    const val MAX_DEPTH = 256
+
+    private class DepthExceededException : SAXException("XML element depth exceeds $MAX_DEPTH")
 
     private val quietErrors = object : ErrorHandler {
         override fun warning(exception: SAXParseException) = Unit
@@ -253,6 +260,7 @@ internal object XmlXPath {
     fun first(xml: String, expression: String): String? {
         if (xml.isBlank() || xml.length > MAX_DOCUMENT_CHARS) return null
         return try {
+            if (exceedsMaxDepth(xml)) return null
             val document = builderFactory().newDocumentBuilder().apply {
                 setEntityResolver { _, _ -> InputSource(StringReader("")) }
                 setErrorHandler(quietErrors)
@@ -296,6 +304,45 @@ internal object XmlXPath {
         runCatching { factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false) }
         runCatching { factory.setAttribute("http://javax.xml.XMLConstants/property/accessExternalDTD", "") }
         runCatching { factory.setAttribute("http://javax.xml.XMLConstants/property/accessExternalSchema", "") }
+        return factory
+    }
+
+    private fun exceedsMaxDepth(xml: String): Boolean {
+        val sax = saxParserFactory().newSAXParser()
+        runCatching { sax.setProperty("http://javax.xml.XMLConstants/property/accessExternalDTD", "") }
+        runCatching { sax.setProperty("http://javax.xml.XMLConstants/property/accessExternalSchema", "") }
+        val reader = sax.xmlReader
+        reader.setEntityResolver { _, _ -> InputSource(StringReader("")) }
+        reader.errorHandler = quietErrors
+        var depth = 0
+        reader.contentHandler = object : DefaultHandler() {
+            override fun startElement(uri: String?, localName: String?, qName: String?, attributes: Attributes?) {
+                depth += 1
+                if (depth > MAX_DEPTH) throw DepthExceededException()
+            }
+
+            override fun endElement(uri: String?, localName: String?, qName: String?) {
+                if (depth > 0) depth -= 1
+            }
+        }
+        return try {
+            reader.parse(InputSource(StringReader(xml)))
+            false
+        } catch (_: DepthExceededException) {
+            true
+        }
+    }
+
+    private fun saxParserFactory(): SAXParserFactory {
+        val factory = runCatching {
+            SAXParserFactory::class.java.getMethod("newDefaultInstance").invoke(null) as SAXParserFactory
+        }.getOrElse { SAXParserFactory.newInstance() }
+        factory.isNamespaceAware = false
+        factory.isXIncludeAware = false
+        runCatching { factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true) }
+        runCatching { factory.setFeature("http://xml.org/sax/features/external-general-entities", false) }
+        runCatching { factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false) }
+        runCatching { factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false) }
         return factory
     }
 }

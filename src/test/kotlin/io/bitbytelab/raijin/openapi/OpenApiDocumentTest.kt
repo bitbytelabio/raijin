@@ -278,4 +278,13 @@ class OpenApiDocumentTest {
         assertNull(doc.deref(json($$"""{"$ref": "#/components/parameters/Missing"}""")))
         assertNull(doc.deref(json("\"not an object\"")))
     }
+
+    @Test
+    fun `source size check rejects oversized documents before parsing`() {
+        OpenApiDocument.validateSourceSize(1024, maxChars = 1024)
+        val err = assertFailsWith<IllegalArgumentException> {
+            OpenApiDocument.validateSourceSize(1025, maxChars = 1024)
+        }
+        assertTrue("exceeds" in err.message.orEmpty(), err.message)
+    }
 }

@@ -212,11 +212,7 @@ class SitemapBridge(private val api: MontoyaApi) {
         }
 
         if (severity != null) {
-            val targetSeverity = try {
-                AuditIssueSeverity.valueOf(severity.uppercase())
-            } catch (_: IllegalArgumentException) {
-                throw IllegalArgumentException("Invalid severity '$severity'. Allowed: high, medium, low, information")
-            }
+            val targetSeverity = parseSeverity(severity)
             issues = issues.filter { it.severity() == targetSeverity }
         }
 
@@ -288,11 +284,7 @@ class SitemapBridge(private val api: MontoyaApi) {
         request: String?,
         response: String?
     ): JsonObject {
-        val issueSeverity = try {
-            AuditIssueSeverity.valueOf(severity.uppercase())
-        } catch (_: IllegalArgumentException) {
-            throw IllegalArgumentException("Invalid severity '$severity'. Allowed: high, medium, low, information")
-        }
+        val issueSeverity = parseSeverity(severity)
 
         val issueConfidence = try {
             AuditIssueConfidence.valueOf(confidence.uppercase())
@@ -362,5 +354,16 @@ class SitemapBridge(private val api: MontoyaApi) {
          */
         fun requestToByteArray(request: String): BurpByteArray =
             BurpByteArray.byteArray(*encodeRequestBytes(request))
+
+        internal fun parseSeverity(severity: String): AuditIssueSeverity {
+            val normalized = severity.trim().uppercase().let { if (it == "INFO") "INFORMATION" else it }
+            return try {
+                AuditIssueSeverity.valueOf(normalized)
+            } catch (_: IllegalArgumentException) {
+                throw IllegalArgumentException(
+                    "Invalid severity '$severity'. Allowed: high, medium, low, info, information"
+                )
+            }
+        }
     }
 }

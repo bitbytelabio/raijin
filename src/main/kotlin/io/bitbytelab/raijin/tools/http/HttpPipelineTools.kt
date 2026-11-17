@@ -111,7 +111,7 @@ All *_ms are milliseconds with microsecond precision, counted from the first req
                     property("keep_open", "boolean", "Keep the socket open for a later call to reuse via connection_id (default false)")
                     property("connection_id", "string", "Reuse a socket kept open by a prior keep_open=true call (same host, port, TLS and sni only)")
                     property("max_response_length", "integer", "Truncate each response body in the result")
-                    property("decode_content", "boolean", "Show bodies with their Content-Encoding (gzip, deflate, br) undone (default false)")
+                    property("decode_content", "boolean", "Show bodies with their Content-Encoding (gzip, deflate) undone (default false)")
                     property("raw_hex_max_bytes", "integer", "Cap on each raw hex dump (0-10000000, default 65536; 0 leaves them out)")
                 },
                 required = listOf("host", "requests")

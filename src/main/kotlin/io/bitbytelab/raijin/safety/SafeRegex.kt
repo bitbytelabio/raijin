@@ -87,6 +87,58 @@ object SafeRegex {
     }
 
     /**
+     * Collects all matches of a precompiled [regex] in [input], stopping cleanly on timeout.
+     * Returns an empty list on oversize input.
+     */
+    fun findAll(
+        regex: Regex,
+        input: CharSequence,
+        maxInputLen: Int = DEFAULT_MAX_INPUT_LEN,
+        timeoutMs: Long = DEFAULT_TIMEOUT_MS
+    ): List<MatchResult> {
+        if (input.length > maxInputLen) return emptyList()
+        val guarded = guard(input, timeoutMs)
+        val matches = ArrayList<MatchResult>()
+        try {
+            val iter = regex.findAll(guarded).iterator()
+            while (iter.hasNext()) {
+                matches.add(iter.next())
+            }
+        } catch (_: RegexTimeoutException) {
+            // Keep matches collected before the deadline.
+        } finally {
+            guarded.disarm()
+        }
+        return matches
+    }
+
+    /**
+     * Replaces all matches of [pattern] in [input] using [transform], returning null on oversize
+     * input, invalid pattern, or timeout.
+     */
+    fun replaceOrNull(
+        pattern: String,
+        input: CharSequence,
+        ignoreCase: Boolean = false,
+        maxInputLen: Int = DEFAULT_MAX_INPUT_LEN,
+        timeoutMs: Long = DEFAULT_TIMEOUT_MS,
+        transform: (MatchResult) -> CharSequence
+    ): String? {
+        if (input.length > maxInputLen) return null
+        val regex = try { compile(pattern, ignoreCase) } catch (_: Exception) { return null }
+        val guarded = guard(input, timeoutMs)
+        return try {
+            regex.replace(guarded, transform)
+        } catch (_: RegexTimeoutException) {
+            null
+        } catch (_: Exception) {
+            null
+        } finally {
+            guarded.disarm()
+        }
+    }
+
+    /**
      * Replaces all matches of [pattern] in [input] with [replacement]. On oversize
      * input, an invalid pattern, an invalid replacement reference (`$10`, `$foo`),
      * or a timeout, returns the input unchanged (so a bad rule never crashes or
@@ -125,7 +177,8 @@ object SafeRegex {
     private fun looksLikeRegex(pattern: String): Boolean =
         pattern.contains(".*") || pattern.contains(".+") || pattern.contains("\\") ||
             pattern.contains('[') || pattern.contains('(') || pattern.contains('^') ||
-            pattern.contains('$') || pattern.contains('+') || pattern.contains('?')
+            pattern.contains('$') || pattern.contains('+') || pattern.contains('?') ||
+            pattern.contains('|') || pattern.contains('{')
 
     private fun guard(input: CharSequence, timeoutMs: Long): InterruptibleCharSequence {
         val deadlineNs = System.nanoTime() + timeoutMs * 1_000_000

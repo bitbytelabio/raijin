@@ -169,4 +169,15 @@ class HttpFuzzRunnerTest {
         assertFalse(FuzzResponseFilter(grepRegex = "secret").keeps(0, 0) { "" })
         assertEquals(2, built.get())
     }
+
+    @Test
+    fun `stopOnBodyRegex caps huge bodies before matching`() {
+        val tailPadding = "x".repeat(io.bitbytelab.raijin.safety.SafeRegex.DEFAULT_MAX_INPUT_LEN + 64)
+        val headBody = "MATCH_HERE" + tailPadding
+        val runner = HttpFuzzRunner {
+            HttpFuzzRunner.Sent.Answered(200, headBody.length, "HTTP/1.1 200 OK", headBody, 1) { buildJsonObject {} }
+        }
+        val out = runner.run(sniper("1", "2", "3"), HttpFuzzRunner.Options(stopOnBodyRegex = "MATCH_HERE", concurrency = 1))
+        assertEquals(1, out.results().size)
+    }
 }

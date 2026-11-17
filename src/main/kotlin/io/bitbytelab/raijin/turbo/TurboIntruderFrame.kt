@@ -342,10 +342,14 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
                             title = "Raijin Turbo - $inputHost - running"
 
                             thread(name = "raijin-turbo-run") {
-                                Utils.setPreference("turbo.defaultScript", editedScript)
-                                val baseRequest = Utils.bytesToString(messageBytes)
-                                val target = turboEndpoint(inputProtocol, inputHost, inputPort)
-                                evalJython(normalizeScriptNewlines(editedScript), baseRequest, messageBytes, target, inputHost, runInput, localStore, runHandler, reqs, localTable)
+                                try {
+                                    Utils.setPreference("turbo.defaultScript", editedScript)
+                                    val baseRequest = Utils.bytesToString(messageBytes)
+                                    val target = turboEndpoint(inputProtocol, inputHost, inputPort)
+                                    evalJython(normalizeScriptNewlines(editedScript), baseRequest, messageBytes, target, inputHost, runInput, localStore, runHandler, reqs, localTable)
+                                } finally {
+                                    runHandler.markScriptCompleted()
+                                }
                             }
                         }
                     }

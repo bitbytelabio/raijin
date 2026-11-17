@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.tools.skills
 
 import io.bitbytelab.raijin.skills.SkillCatalog
+import io.bitbytelab.raijin.tools.toolError
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
@@ -62,7 +63,7 @@ object SkillTools {
                 }
                 CallToolResult(content = listOf(TextContent(result.toString())))
             } catch (e: Exception) {
-                CallToolResult(content = listOf(TextContent(buildJsonObject { put("error", e.message ?: "Unknown error") }.toString())), isError = true)
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -81,7 +82,7 @@ object SkillTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val uri = args["uri"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Parameter 'uri' is required"}""")), isError = true)
+                    ?: return@addTool toolError("Parameter 'uri' is required")
 
                 val name = SkillCatalog.nameFromUri(uri)
                     ?: return@addTool CallToolResult(
@@ -107,7 +108,7 @@ object SkillTools {
                 }
                 CallToolResult(content = listOf(TextContent(result.toString())))
             } catch (e: Exception) {
-                CallToolResult(content = listOf(TextContent(buildJsonObject { put("error", e.message ?: "Unknown error") }.toString())), isError = true)
+                toolError(e.message ?: "Unknown error")
             }
         }
 
@@ -127,7 +128,7 @@ object SkillTools {
             try {
                 val args = request.params.arguments ?: emptyMap()
                 val uri = args["uri"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool CallToolResult(content = listOf(TextContent("""{"error":"Parameter 'uri' is required"}""")), isError = true)
+                    ?: return@addTool toolError("Parameter 'uri' is required")
 
                 val name = SkillCatalog.nameFromUri(uri)
                     ?: return@addTool CallToolResult(
@@ -151,7 +152,7 @@ object SkillTools {
                 }
                 CallToolResult(content = listOf(TextContent(result.toString())))
             } catch (e: Exception) {
-                CallToolResult(content = listOf(TextContent(buildJsonObject { put("error", e.message ?: "Unknown error") }.toString())), isError = true)
+                toolError(e.message ?: "Unknown error")
             }
         }
     }

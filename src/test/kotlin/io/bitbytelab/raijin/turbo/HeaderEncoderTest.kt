@@ -65,4 +65,13 @@ class HeaderEncoderTest {
         assertTrue((block[0].toInt() and 0xE0) != 0x20, "no size update is needed when the table does not change")
         assertEquals(listOf("x-a" to "1"), text(decode(Decoder(8192, 4096), block)))
     }
+
+    @Test
+    fun `unsigned 32-bit table sizes above 2G keep the protocol default instead of shrinking to zero`() {
+        val encoder = HeaderEncoder()
+        encoder.peerTableSize(0xFFFF_FFFFL)
+        val block = encoder.encode(listOf("x-a" to "1"))
+        assertTrue((block[0].toInt() and 0xE0) != 0x20)
+        assertEquals(listOf("x-a" to "1"), text(decode(Decoder(8192, 4096), block)))
+    }
 }

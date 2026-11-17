@@ -28,8 +28,11 @@ class HeaderEncoder {
      * block, the smallest size first when it changed more than once in between.
      */
     @Synchronized
-    fun peerTableSize(size: Int) {
-        val limit = size.coerceIn(0, DEFAULT_TABLE_SIZE)
+    fun peerTableSize(size: Int) = peerTableSize(size.toLong())
+
+    @Synchronized
+    fun peerTableSize(size: Long) {
+        val limit = size.coerceIn(0L, DEFAULT_TABLE_SIZE.toLong()).toInt()
         smallestPendingSize = if (pendingSize == null) limit else minOf(smallestPendingSize, limit)
         pendingSize = limit
     }

@@ -325,4 +325,28 @@ class AuthDiffVerdictTest {
         val f = AuthDiffVerdict.assess(listOf(css("admin", 200, "a{}"), css("user", 403, "no"), css("none", 200, "a{}")), sim)
         assertTrue(f.any { it.id == "unauth_reads_protected" && it.severity == "critical" }, f.toString())
     }
+
+    @Test
+    fun `304 not modified and redirects to generic error pages are treated as non-success`() {
+        val errorRedirects = listOf(
+            "/error", "/error.html", "/error/500", "/errors?code=403",
+            "https://app.example.com/404", "/404.html", "/500", "/maintenance", "/oops", "/not-found"
+        )
+        errorRedirects.forEach { assertTrue(AuthDiffVerdict.isErrorRedirect(it), it) }
+        assertFalse(AuthDiffVerdict.isErrorRedirect("/orders/403"))
+        assertFalse(AuthDiffVerdict.isErrorRedirect("/orders/404"))
+        assertFalse(AuthDiffVerdict.isErrorRedirect("/dashboard"))
+
+        val fErrorRedirect = AuthDiffVerdict.assess(
+            listOf(lr("admin", 200, """{"secret":1}"""), redirect("none", "/error")),
+            sim
+        )
+        assertTrue(fErrorRedirect.none(::isActionable), fErrorRedirect.toString())
+
+        val fNotModified = AuthDiffVerdict.assess(
+            listOf(lr("admin", 200, """{"secret":1}"""), AuthDiffVerdict.LevelResult("none", 304, "")),
+            sim
+        )
+        assertTrue(fNotModified.none(::isActionable), fNotModified.toString())
+    }
 }

@@ -248,7 +248,8 @@ class H2Connection(val target: URL, val requestsPerConnection: Int, val engine: 
         plain.soTimeout = timeout
         var connected: Socket = plain
         if (target.protocol == "https") {
-            val ssl = createSSLSocketFactory().createSocket(plain, target.host, port, true) as SSLSocket
+            val sslHost = target.host.removePrefix("[").removeSuffix("]")
+            val ssl = createSSLSocketFactory().createSocket(plain, sslHost, port, true) as SSLSocket
             val sslp = ssl.sslParameters
             sslp.applicationProtocols = arrayOf("h2") // don't offer "http/1.1"
             ssl.sslParameters = sslp
@@ -423,9 +424,10 @@ class H2Connection(val target: URL, val requestsPerConnection: Int, val engine: 
                 if (settings.isAck) {
                     return
                 }
-                if (settings.maxConcurrentStreams != 0) {
-                    debug("Change max concurrent streams from $maxConcurrentStreams to ${settings.maxConcurrentStreams}")
-                    maxConcurrentStreams = settings.maxConcurrentStreams
+                settings.maxConcurrentStreams?.takeIf { it > 0L }?.let { limit ->
+                    val capped = limit.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                    debug("Change max concurrent streams from $maxConcurrentStreams to $capped")
+                    maxConcurrentStreams = capped
                 }
                 settings.headerTableSize?.let { encoder.peerTableSize(it) }
                 sendFrame(Frame(0x04, 0x01, 0, byteArrayOf()))

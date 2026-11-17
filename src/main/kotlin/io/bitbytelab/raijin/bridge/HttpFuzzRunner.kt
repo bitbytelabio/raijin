@@ -219,7 +219,12 @@ internal class HttpFuzzRunner(private val send: (HttpFuzzPlan.AttackRequest) -> 
 
     private fun stopMatches(sent: Sent.Answered, options: Options): Boolean {
         val statusMatch = options.stopOnStatusCodes != null && sent.status in options.stopOnStatusCodes
-        val bodyMatch = options.stopOnBodyRegex != null && SafeRegex.find(options.stopOnBodyRegex, sent.body) != null
+        val boundedBody = if (sent.body.length > SafeRegex.DEFAULT_MAX_INPUT_LEN) {
+            sent.body.substring(0, SafeRegex.DEFAULT_MAX_INPUT_LEN)
+        } else {
+            sent.body
+        }
+        val bodyMatch = options.stopOnBodyRegex != null && SafeRegex.find(options.stopOnBodyRegex, boundedBody) != null
         return statusMatch || bodyMatch
     }
 

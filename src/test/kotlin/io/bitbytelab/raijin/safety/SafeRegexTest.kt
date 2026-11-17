@@ -68,4 +68,32 @@ class SafeRegexTest {
         val input = "a".repeat(40) + "!"
         assertFalse(SafeRegex.containsMatchIn(evil, input, timeoutMs = 50))
     }
+
+    @Test
+    fun `matchesHostPattern treats alternation and braced quantifiers as regex`() {
+        assertTrue(SafeRegex.matchesHostPattern("api|staging", "staging"))
+        assertTrue(SafeRegex.matchesHostPattern("api|staging", "API"))
+        assertFalse(SafeRegex.matchesHostPattern("api|staging", "prod"))
+        assertTrue(SafeRegex.matchesHostPattern("node[0-9]{2}", "node07"))
+        assertFalse(SafeRegex.matchesHostPattern("node[0-9]{2}", "node7"))
+    }
+
+    @Test
+    fun `findAll and replaceOrNull bound oversize and timing-out inputs`() {
+        assertEquals(emptyList(), SafeRegex.findAll(Regex("a"), "a".repeat(20), maxInputLen = 10))
+        assertEquals(listOf("1", "2"), SafeRegex.findAll(Regex("\\d"), "a1b2").map { it.value })
+        val slow = object : CharSequence {
+            private val backing = "ababababab"
+            override val length: Int get() = backing.length
+            override fun get(index: Int): Char {
+                if (index == 0) Thread.sleep(20)
+                return backing[index]
+            }
+            override fun subSequence(startIndex: Int, endIndex: Int): CharSequence = backing.subSequence(startIndex, endIndex)
+        }
+        assertEquals(emptyList(), SafeRegex.findAll(Regex("[ab]{2}"), slow, timeoutMs = 5))
+        assertNull(SafeRegex.replaceOrNull("[ab]{2}", slow, timeoutMs = 5) { "x" })
+        assertNull(SafeRegex.replaceOrNull("a", "aaa", maxInputLen = 2) { "b" })
+        assertEquals("b1b2", SafeRegex.replaceOrNull("a", "a1a2") { "b" })
+    }
 }

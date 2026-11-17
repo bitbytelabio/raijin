@@ -179,7 +179,7 @@ open class Request(val template: String, val words: List<String?>, val learnBori
         // No blank line after the headers means no body to measure; such a request is usually
         // deliberately unfinished, so it goes out as written.
         val bodyStart = Utils.findBodyStart(request)
-        if (bodyStart < 0 || Utils.indexOf(request, CONTENT_LENGTH_FIELD, 0, bodyStart) == -1) {
+        if (bodyStart < 0) {
             return request
         }
         return try {
@@ -231,7 +231,6 @@ open class Request(val template: String, val words: List<String?>, val learnBori
     }
 
     private companion object {
-        val CONTENT_LENGTH_FIELD = Utils.stringToBytes("Content-Length: ")
         const val LF = '\n'.code.toByte()
         const val CR = '\r'.code.toByte()
         const val COLON = ':'.code.toByte()

@@ -430,7 +430,7 @@ class McpServerManager(
         scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         bindHost = newHost
         start()
-        return blockingWaitListening(ssePort)
+        return blockingWaitListening(ssePort) && (httpPort == ssePort || blockingWaitListening(httpPort))
     }
 
     /**

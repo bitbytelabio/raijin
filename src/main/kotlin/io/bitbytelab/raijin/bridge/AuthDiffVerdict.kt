@@ -28,6 +28,25 @@ object AuthDiffVerdict {
             "unauthori[sz]ed|unauthenticated|forbidden|access[-_]?denied|denied)(?:[/.;]|$)"
     )
 
+    private val ERROR_REDIRECT_PATH = Regex(
+        "(?i)^/(?:errors?|oops|maintenance|not[-_]?found)(?:[/.?#;]|$)|" +
+            "^/(?:401|403|404|500|502|503)(?:\\.[a-z0-9]+)?(?:[?#;]|$)"
+    )
+
+    internal fun isErrorRedirect(location: String?): Boolean {
+        val raw = location?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+        val pathAndQuery = if (raw.startsWith("//") || raw.contains("://")) {
+            val withoutScheme = raw.substringAfter("://", raw.removePrefix("//"))
+            val slash = withoutScheme.indexOf('/')
+            if (slash < 0) "/" else withoutScheme.substring(slash)
+        } else if (raw.startsWith("/")) {
+            raw
+        } else {
+            "/$raw"
+        }
+        return ERROR_REDIRECT_PATH.containsMatchIn(pathAndQuery)
+    }
+
     // Identity-provider hosts: a login-ish first label, or a hosted IdP domain.
     private val AUTH_HOST = Regex(
         "(?i)^(?:login|logon|signin|auth|sso|idp|identity)\\.|" +
@@ -115,7 +134,8 @@ object AuthDiffVerdict {
         /** [isSuccess] for a request known to have gone to [requestHost] (see [isAuthRedirect]). */
         fun isSuccessOn(requestHost: String?): Boolean = when (status) {
             in 200..299 -> true
-            in 300..399 -> !isAuthRedirect(location, requestHost)
+            304 -> false
+            in 300..399 -> !isAuthRedirect(location, requestHost) && !isErrorRedirect(location)
             else -> false
         }
     }

@@ -108,6 +108,7 @@ class AutorizeStoreTest {
     @Test
     fun `trimming keeps the newest lines that fit, and always the newest one`() {
         assertEquals(listOf("bbbbbbbbbb", "cccccccccc"), AutorizeStore.newestWithin(listOf("aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc"), 25))
+        assertEquals(listOf("é".repeat(10)), AutorizeStore.newestWithin(listOf("aaaaaaaaaa", "é".repeat(10)), 25))
         assertEquals(listOf("xxxxx"), AutorizeStore.newestWithin(listOf("xxxxx"), 1))
         assertEquals(emptyList(), AutorizeStore.newestWithin(emptyList(), 100))
     }

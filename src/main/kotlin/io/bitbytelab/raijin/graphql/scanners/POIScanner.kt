@@ -114,10 +114,10 @@ class POIScanner(
         scanOperation(schema.subscriptions, "Subscription", depth, results)
 
         val finalResults = linkedMapOf<String, MutableList<FieldResult>>()
-        val seenPaths = mutableMapOf<String, MutableSet<String>>()
+        val seenPaths = mutableMapOf<Pair<String, String>, MutableSet<String>>()
         for (r in results.distinct()) {
             val bucket = finalResults.getOrPut(r.type) { mutableListOf() }
-            val seen = seenPaths.getOrPut(r.type) { mutableSetOf() }
+            val seen = seenPaths.getOrPut(r.type to r.queryType) { mutableSetOf() }
             if (seen.add(r.path)) bucket.add(r)
         }
         return finalResults

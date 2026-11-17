@@ -4,6 +4,7 @@ import io.bitbytelab.raijin.core.RebindOutcome
 import io.bitbytelab.raijin.safety.ScopeMode
 import io.bitbytelab.raijin.transport.BindHostPolicy
 import io.bitbytelab.raijin.transport.RemoteAccess
+import io.bitbytelab.raijin.transport.SecurityConfig
 import java.net.InetAddress
 
 /**
@@ -106,9 +107,12 @@ internal object ServerSettings {
      */
     fun clientHosts(bindHost: String, kind: BindHostPolicy.Kind?, local: List<String>, extraHosts: List<String>): List<String> {
         val bound = bindHost.trim().removePrefix("[").removeSuffix("]")
+        val resolvedExtras = extraHosts.map {
+            SecurityConfig.parseHostEntry(it)?.first?.removePrefix("[")?.removeSuffix("]") ?: it.trim()
+        }
         val hosts = when (kind) {
-            BindHostPolicy.Kind.WILDCARD -> reachableAddresses(local) + extraHosts + BindHostPolicy.LOOPBACK
-            BindHostPolicy.Kind.OTHER -> listOf(bound) + extraHosts
+            BindHostPolicy.Kind.WILDCARD -> reachableAddresses(local) + resolvedExtras + BindHostPolicy.LOOPBACK
+            BindHostPolicy.Kind.OTHER -> listOf(bound) + resolvedExtras
             BindHostPolicy.Kind.LOOPBACK, BindHostPolicy.Kind.INVALID, null -> listOf(bound)
         }
         return hosts.map { it.trim() }.filter { it.isNotEmpty() }.distinct().ifEmpty { listOf(BindHostPolicy.LOOPBACK) }
@@ -129,9 +133,12 @@ internal object ServerSettings {
         return prefix in 0..bits
     }
 
-    /** Allowed Hosts entries that are not a bare host name: a URL, a path, credentials or a `host:port`. */
+    /**
+     * Allowed Hosts entries that are invalid in the Server tab: a URL scheme, a path, credentials,
+     * or something [SecurityConfig.parseHostEntry] rejects (`name`, `name:port`, `ip`, `[v6]:port`).
+     */
     fun invalidHostEntries(entries: List<String>): List<String> = entries.filter { entry ->
-        "://" in entry || '/' in entry || '@' in entry || (entry.count { it == ':' } == 1 && !entry.startsWith("["))
+        "://" in entry || '/' in entry || '@' in entry || SecurityConfig.parseHostEntry(entry) == null
     }
 
     /** [token] with all but its last four characters hidden, for on-screen display. */

@@ -483,4 +483,21 @@ class OpenApiSchemaTest {
         val failure = assertFailsWith<IllegalArgumentException> { OpenApiImport.plan(doc) }
         assertTrue("base_url" in failure.message.orEmpty(), failure.message)
     }
+
+    @Test
+    fun `anyOf nullable branch referenced via ref is deprioritized behind non-null branches`() {
+        val doc = OpenApiDocument.parse(
+            $$"""
+            {"openapi": "3.1.0", "components": {"schemas": {
+              "NullValue": {"type": "null"},
+              "NullCycle": {"$ref": "#/components/schemas/NullCycle"},
+              "NullableName": {"anyOf": [
+                {"$ref": "#/components/schemas/NullValue"},
+                {"$ref": "#/components/schemas/NullCycle"},
+                {"type": "string", "example": "alice"}]}
+            }}}
+            """
+        )
+        assertEquals("alice", OpenApiSchema.example(json($$"""{"$ref": "#/components/schemas/NullableName"}"""), doc).jsonPrimitive.content)
+    }
 }

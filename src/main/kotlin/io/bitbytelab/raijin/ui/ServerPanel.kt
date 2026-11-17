@@ -264,7 +264,7 @@ internal class ServerPanel(
         line(null, hint("Comma-separated, e.g. 192.168.56.1, 10.0.2.2, 100.64.0.0/10. Empty: any source. Loopback is always allowed."))
         allowedHostsField.toolTipText = "Preference ${RemoteAccess.PREF_ALLOWED_HOSTS}"
         line("Allowed Hosts:", allowedHostsField)
-        line(null, hint("Extra names clients may use in the URL (Host/Origin), e.g. burp-vm.tailnet.ts.net, burp.internal"))
+        line(null, hint("Extra names clients may use in the URL (Host/Origin), e.g. burp-vm.tailnet.ts.net, burp.internal, 127.0.0.1:19877"))
         line("Effective now:", effectiveLabel)
         return group
     }
@@ -407,7 +407,7 @@ internal class ServerPanel(
         if (RemoteAccess.PREF_ALLOWED_HOSTS !in overridden) {
             val bad = ServerSettings.invalidHostEntries(form.allowedHosts)
             if (bad.isNotEmpty()) {
-                return showError("Allowed Hosts takes bare host names, without scheme, path or port: ${bad.joinToString(", ")}", "Invalid Allowed Hosts")
+                return showError("Allowed Hosts takes host names or host:port entries, without scheme, path or credentials: ${bad.joinToString(", ")}", "Invalid Allowed Hosts")
             }
         }
         val host = form.bindHost.ifEmpty { BindHostPolicy.LOOPBACK }

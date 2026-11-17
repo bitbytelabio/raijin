@@ -5,6 +5,7 @@ import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
 import io.bitbytelab.raijin.bridge.AnalysisBridge.Companion.describeException
 import io.bitbytelab.raijin.bridge.AnalysisBridge.Companion.normalizeCrlfMessage
+import io.bitbytelab.raijin.safety.SafeRegex
 import kotlinx.serialization.json.*
 
 /**
@@ -12,6 +13,9 @@ import kotlinx.serialization.json.*
  * response reflects, the parameters of a request and its insertion points. Nothing is sent.
  */
 internal object AnalysisMessages {
+
+    private val XML_ATTR_REGEX = Regex("""(\w+)\s*=\s*"([^"]*?)"""")
+    private val XML_ELEMENT_REGEX = Regex("""<(\w+)[^>]*>([^<]+)</\1>""")
 
     /**
      * Parses a raw HTTP request and extracts its components: method, URL,
@@ -534,9 +538,13 @@ internal object AnalysisMessages {
      * attribute values.
      */
     private fun extractXmlValues(xml: String, builder: JsonArrayBuilder) {
+        val boundedXml = if (xml.length > SafeRegex.DEFAULT_MAX_INPUT_LEN) {
+            xml.substring(0, SafeRegex.DEFAULT_MAX_INPUT_LEN)
+        } else {
+            xml
+        }
         // Extract attribute values: name="value"
-        val attrRegex = Regex("""(\w+)\s*=\s*"([^"]*?)"""")
-        for (match in attrRegex.findAll(xml)) {
+        for (match in SafeRegex.findAll(XML_ATTR_REGEX, boundedXml)) {
             builder.addJsonObject {
                 put("name", "attr:${match.groupValues[1]}")
                 put("value", match.groupValues[2])
@@ -545,8 +553,7 @@ internal object AnalysisMessages {
         }
 
         // Extract element text content: <tag>value</tag>
-        val elementRegex = Regex("""<(\w+)[^>]*>([^<]+)</\1>""")
-        for (match in elementRegex.findAll(xml)) {
+        for (match in SafeRegex.findAll(XML_ELEMENT_REGEX, boundedXml)) {
             val text = match.groupValues[2].trim()
             if (text.isNotEmpty()) {
                 builder.addJsonObject {

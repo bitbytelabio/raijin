@@ -233,7 +233,7 @@ internal object HttpFuzzPlan {
         val effectiveMarker = effectiveMarker(marker)
         val hasFuzzKeyword = baseRequest.contains(FUZZ_KEYWORD)
         val markerCount = countOccurrences(baseRequest, effectiveMarker)
-        if (!hasFuzzKeyword && markerCount > 0 && markerCount % 2 != 0) {
+        if (positions.isNullOrEmpty() && !hasFuzzKeyword && markerCount > 0 && markerCount % 2 != 0) {
             return Resolved.Error(
                 "Odd number ($markerCount) of '$effectiveMarker' markers; every injection point needs a closing marker " +
                     "(e.g. ${effectiveMarker}value${effectiveMarker})."

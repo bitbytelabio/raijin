@@ -107,7 +107,7 @@ object OpenApiSchema {
         for (keyword in ALTERNATIVES) {
             val branches = (schema[keyword] as? JsonArray)?.filterIsInstance<JsonObject>() ?: continue
             // `anyOf: [{type: "null"}, {...}]` is how 3.1 spells nullable: the null branch is the last resort.
-            for (branch in branches.filterNot(::isNullType) + branches.filter(::isNullType)) {
+            for (branch in branches.filterNot { isNullType(it, gen.doc) } + branches.filter { isNullType(it, gen.doc) }) {
                 if (resolvable(branch, gen.doc) && collect(branch, gen, entered, parts, depth + 1)) break
             }
         }
@@ -119,7 +119,13 @@ object OpenApiSchema {
         return false
     }
 
-    private fun isNullType(schema: JsonObject): Boolean = schema["type"].asText() == "null"
+    private fun isNullType(schema: JsonObject, doc: OpenApiDocument, visited: MutableSet<String> = HashSet()): Boolean {
+        if (schema["type"].asText() == "null") return true
+        val ref = schema[REF].asText() ?: return false
+        if (!visited.add(ref)) return false
+        val target = doc.resolve(ref) as? JsonObject ?: return false
+        return isNullType(target, doc, visited)
+    }
 
     private fun resolvable(schema: JsonObject, doc: OpenApiDocument): Boolean {
         val ref = schema[REF].asText() ?: return true

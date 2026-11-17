@@ -105,4 +105,14 @@ class SessionExtractorsTest {
         assertTrue(validate(null, "//a[", null)!!.startsWith("extract_xpath is not valid XPath"))
         assertTrue(validate("$.a", null, "(")!!.startsWith("extract_regex is not a valid regex"))
     }
+
+    @Test
+    fun `xml xpath refuses deeply nested XML beyond the depth limit`() {
+        val overLimit = XmlXPath.MAX_DEPTH + 10
+        val xml = "<a>".repeat(overLimit) + "ok" + "</a>".repeat(overLimit)
+        assertNull(XmlXPath.first(xml, "//a[last()]/text()"))
+
+        val atLimit = "<a>".repeat(XmlXPath.MAX_DEPTH) + "ok" + "</a>".repeat(XmlXPath.MAX_DEPTH)
+        assertEquals("ok", XmlXPath.first(atLimit, "//a[not(a)]/text()"))
+    }
 }

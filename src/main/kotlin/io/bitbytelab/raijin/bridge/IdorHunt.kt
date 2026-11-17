@@ -1,5 +1,7 @@
 package io.bitbytelab.raijin.bridge
 
+import io.bitbytelab.raijin.safety.SafeRegex
+
 /**
  * Pure, Burp-independent IDOR-hunting logic, distilled from the combined
  * IDOR/BOLA/BFLA methodology (the lossless union of the system's idor-agent
@@ -48,6 +50,7 @@ object IdorHunt {
     private val BASE64URL_RE = Regex("^[A-Za-z0-9_-]{4,}={0,2}$")
     private val GID_RE = Regex("^gid://[A-Za-z][A-Za-z0-9_]*/.+$")
     private val SLUG_RE = Regex("^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
+    private val TRAILING_DIGITS = Regex("(\\d+)\\s*$")
 
     /** Classify a single reference string into its most likely object-id format. */
     fun classify(raw: String): IdClassification {
@@ -165,7 +168,7 @@ object IdorHunt {
             IdFormat.GID, IdFormat.BASE64 -> {
                 cls.decoded?.let { dec ->
                     // decode → mutate the numeric tail → re-encode
-                    val tail = Regex("(\\d+)\\s*$").find(dec)
+                    val tail = TRAILING_DIGITS.find(dec)
                     if (tail != null) {
                         val num = tail.groupValues[1].toLongOrNull()
                         if (num != null) {
@@ -692,15 +695,15 @@ object IdorHunt {
     /** For a body that is JSON-like but does not parse: the field `"name": value`, at value boundaries. */
     private fun swapJsonText(request: RawRequest, ref: ObjectRef, newValue: String): Boolean {
         val key = ref.name.substringAfterLast('.')
-        if (key.isEmpty()) return false
+        if (key.isEmpty() || request.body.length > SafeRegex.DEFAULT_MAX_INPUT_LEN) return false
         val old = Regex.escape(ref.value)
-        val field = Regex("(\"${Regex.escape(key)}\"\\s*:\\s*)(\"$old\"|$old(?![\\w.-]))")
+        val fieldPattern = "(\"${Regex.escape(key)}\"\\s*:\\s*)(\"$old\"|$old(?![\\w.-]))"
         var changed = false
-        val body = field.replace(request.body) { m ->
+        val body = SafeRegex.replaceOrNull(fieldPattern, request.body) { m ->
             changed = true
             val bare = !m.groupValues[2].startsWith("\"") && JsonLeafSpans.isNumber(newValue)
             m.groupValues[1] + if (bare) newValue else JsonLeafSpans.quote(newValue)
-        }
+        } ?: return false
         if (changed) request.body = body
         return changed
     }
@@ -965,7 +968,7 @@ object IdorHunt {
             IdFormat.HASH_MD5, IdFormat.HASH_SHA1, IdFormat.HASH_SHA256 -> hex(v.length)
             IdFormat.GID, IdFormat.BASE64 -> {
                 val decoded = cls.decoded
-                val tail = decoded?.let { Regex("(\\d+)\\s*$").find(it) }
+                val tail = decoded?.let { TRAILING_DIGITS.find(it) }
                 when {
                     GID_RE.matches(v) -> v.substringBeforeLast('/') + "/" + missProbeValue(v.substringAfterLast('/'), random = random)
                     decoded != null && tail != null ->

@@ -118,6 +118,7 @@ class OpenApiDocument(val root: JsonObject) {
          */
         fun parse(text: String): OpenApiDocument {
             val source = text.removePrefix("\uFEFF")
+            validateSourceSize(source.length)
             val start = source.trimStart()
             require(start.isNotEmpty()) { "The document is empty" }
             require(!start.startsWith("<")) {
@@ -154,9 +155,15 @@ class OpenApiDocument(val root: JsonObject) {
             )
         }
 
+        internal fun validateSourceSize(length: Int, maxChars: Long = MAX_YAML_CHARS) {
+            require(length <= maxChars) {
+                "The document exceeds ${maxChars shr 20} MiB ($length chars)"
+            }
+        }
+
         private fun composeYaml(source: String): Node? {
             val options = LoaderOptions().apply {
-                codePointLimit = Int.MAX_VALUE // the text is already in memory
+                codePointLimit = MAX_YAML_CHARS.toInt()
                 nestingDepthLimit = MAX_DEPTH
                 maxAliasesForCollections = Int.MAX_VALUE // YamlToJson bounds what aliases expand to instead
             }

@@ -62,9 +62,9 @@ class SettingsFrame(type: Byte, flags: Byte, streamID: Int, payload: ByteArray):
 
     /** An acknowledgement of our SETTINGS rather than the server's own: the ACK flag, not an empty payload (an empty SETTINGS is legal). */
     val isAck: Boolean = (flags.toInt() and 1) == 1
-    var maxConcurrentStreams = 0
+    var maxConcurrentStreams: Long? = null
     /** SETTINGS_HEADER_TABLE_SIZE, when the server sent it: the most our HPACK encoder may use. */
-    var headerTableSize: Int? = null
+    var headerTableSize: Long? = null
 
     init {
         H2Connection.debug("Parsing settings...")
@@ -74,9 +74,9 @@ class SettingsFrame(type: Byte, flags: Byte, streamID: Int, payload: ByteArray):
         } else {
 
             var head = 0
-            while (head < payload.size) {
+            while (head + 6 <= payload.size) {
                 val key = HTTP2Utils.twoByteInt(payload.slice(head..head + 1).toByteArray())
-                val value = HTTP2Utils.fourByteInt(payload.slice(head + 2..head + 5).toByteArray())
+                val value = HTTP2Utils.fourByteUnsignedInt(payload.slice(head + 2..head + 5).toByteArray())
                 when (key) {
                     1 -> {
                         H2Connection.debug("HEADER_TABLE_SIZE = $value")
@@ -171,6 +171,8 @@ class HTTP2Utils {
             val b4 = raw[3].toInt()
             return (b1 and 0xFF shl 24) or (b2 and 0xFF shl 16) or (b3 and 0xFF shl 8) or (b4 and 0xFF)
         }
+
+        fun fourByteUnsignedInt(raw: ByteArray): Long = fourByteInt(raw).toLong() and 0xFFFF_FFFFL
 
         fun intToThreeBytes(num: Int): ByteArray {
             val s1 = num

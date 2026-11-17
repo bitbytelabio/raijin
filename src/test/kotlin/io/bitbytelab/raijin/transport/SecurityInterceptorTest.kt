@@ -138,6 +138,17 @@ class SecurityInterceptorTest {
         }
     }
 
+    @Test fun `a preflight with an allowed origin still fails Host check when Host is rebound`() {
+        withServer { port ->
+            val r = raw(
+                port,
+                "OPTIONS / HTTP/1.1\r\nHost: evil.attacker.com\r\n" +
+                    "Origin: http://127.0.0.1:$port\r\nAccess-Control-Request-Method: POST\r\nConnection: close\r\n\r\n"
+            )
+            assertEquals(403, status(r), "a rebound Host must still be refused even with an allowed-origin preflight: $r")
+        }
+    }
+
     // ---- no token needed from a local client ---------------------------------
 
     @Test fun `GET from a loopback client opens the SSE stream without any credentials`() {

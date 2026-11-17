@@ -198,4 +198,20 @@ class POIScannerTest {
         val auth = POIScanner(schema, categories = setOf("auth")).scan()["auth"].orEmpty().map { it.path }
         assertEquals(listOf("-> apikey", "-> api_key", "-> apiXkey"), auth)
     }
+
+    @Test
+    fun `identical paths on Query and Mutation are both preserved`() {
+        val schema = GQLSchema(
+            """
+            type Query { users: User }
+            type Mutation { users: User }
+            type User { email: String }
+            """.trimIndent()
+        )
+        val pii = POIScanner(schema, categories = setOf("pii")).scan()["pii"].orEmpty()
+        assertEquals(
+            setOf("Query" to "-> users -> email", "Mutation" to "-> users -> email"),
+            pii.map { it.queryType to it.path }.toSet(),
+        )
+    }
 }

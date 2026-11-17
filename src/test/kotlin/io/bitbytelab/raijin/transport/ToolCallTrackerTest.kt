@@ -182,4 +182,21 @@ class ToolCallTrackerTest {
             tempAudit.delete()
         }
     }
+
+    @Test fun `state-mutating tools and jwt_keys write actions are audited even without a URL`() {
+        listOf(
+            "http_cookie_jar_set", "http_cookie_jar_delete", "burp_task_engine_set",
+            "intruder_register_payload_processor", "proxy_auto_auth", "proxy_annotate",
+            "organizer_annotate", "sitemap_annotate", "findings_add", "findings_remove",
+            "events_clear", "collaborator_create_client", "collaborator_restore_client",
+            "collaborator_remove_client"
+        ).forEach { tool ->
+            assertTrue(ToolCallTracker.shouldAudit(tool, "", "", isError = false), "$tool must be audited")
+        }
+        assertFalse(ToolCallTracker.shouldAudit("findings_list", "", "", isError = false))
+        assertTrue(ToolCallTracker.shouldAudit("jwt_keys", "", "", isError = false, action = "generate"))
+        assertTrue(ToolCallTracker.shouldAudit("jwt_keys", "", "", isError = false, action = "import"))
+        assertTrue(ToolCallTracker.shouldAudit("jwt_keys", "", "", isError = false, action = "delete"))
+        assertFalse(ToolCallTracker.shouldAudit("jwt_keys", "", "", isError = false, action = "list"))
+    }
 }

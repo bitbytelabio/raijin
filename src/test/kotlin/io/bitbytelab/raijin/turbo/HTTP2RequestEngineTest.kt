@@ -17,6 +17,7 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
@@ -47,7 +48,9 @@ class HTTP2RequestEngineTest {
         respondWithDataFirst: Boolean = false,
         connectionFrames: Boolean = false,
         closeAfterResponses: Int = Int.MAX_VALUE,
-    ) = FakeH2Server(sendSettings, respond, responseDelayMillis, respondWithDataFirst, connectionFrames, closeAfterResponses)
+        settingsPayload: ByteArray = ByteArray(0),
+        sendInterim103: Boolean = false,
+    ) = FakeH2Server(sendSettings, respond, responseDelayMillis, respondWithDataFirst, connectionFrames, closeAfterResponses, settingsPayload, sendInterim103)
         .also { servers += it }
 
     private fun engine(
@@ -208,6 +211,40 @@ class HTTP2RequestEngineTest {
         assertEquals(3, engine.runState.get())
     }
 
+    @Test
+    fun `high-bit unsigned SETTINGS values do not overflow negative and stall the writer`() {
+        val settingsPayload = byteArrayOf(
+            0, 1, -1, -1, -1, -1, // HEADER_TABLE_SIZE = 0xFFFFFFFF
+            0, 3, -1, -1, -1, -1, // MAX_CONCURRENT_STREAMS = 0xFFFFFFFF
+        )
+        val answered = ConcurrentLinkedQueue<Request>()
+        val engine = engine(server(settingsPayload = settingsPayload), socketTimeoutMillis = 1500) { answered += it }
+        engine.start(5)
+        engine.queue(TEMPLATE, "u32")
+
+        engine.showStats(30)
+
+        assertEquals(4, engine.runState.get())
+        assertEquals(listOf("u32"), answeredWords(answered))
+    }
+
+    @Test
+    fun `interim 1xx header blocks do not swallow the final response headers and body`() {
+        val answered = ConcurrentLinkedQueue<Request>()
+        val engine = engine(server(sendInterim103 = true)) { answered += it }
+        engine.start(5)
+        engine.queue(TEMPLATE, "early")
+
+        engine.showStats(30)
+
+        assertEquals(4, engine.runState.get())
+        val req = answered.single()
+        val response = req.response.orEmpty()
+        assertFalse(response.contains(":status: 103"), response)
+        assertTrue(response.contains(":status: 200"), response)
+        assertTrue(response.endsWith("\r\n\r\nhello-103"), response)
+    }
+
     private fun elapsedMillis(startedNanos: Long) = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos)
 
     private fun liveThreads(prefix: String) = Thread.getAllStackTraces().keys.count { it.isAlive && it.name.startsWith(prefix) }
@@ -233,6 +270,8 @@ private class FakeH2Server(
     private val respondWithDataFirst: Boolean,
     private val connectionFrames: Boolean,
     private val closeAfterResponses: Int,
+    private val settingsPayload: ByteArray,
+    private val sendInterim103: Boolean,
 ) : AutoCloseable {
     private val server = ServerSocket(0, 50, InetAddress.getLoopbackAddress())
     private val sockets = CopyOnWriteArrayList<Socket>()
@@ -268,8 +307,8 @@ private class FakeH2Server(
                     drain(input)
                     return
                 }
-                // Empty, which is legal and is not an ACK.
-                frame(out, 0x04, 0x00, 0, ByteArray(0))
+                // Empty by default, which is legal and is not an ACK.
+                frame(out, 0x04, 0x00, 0, settingsPayload)
                 if (connectionFrames) {
                     frame(out, 0x08, 0x00, 0, byteArrayOf(0, 0, 0x10, 0)) // WINDOW_UPDATE
                     frame(out, 0x06, 0x00, 0, ByteArray(8)) // PING
@@ -297,6 +336,11 @@ private class FakeH2Server(
                     }
                     if (respondWithDataFirst) {
                         frame(out, 0x00, 0x01, stream, "oops".toByteArray())
+                    } else if (sendInterim103) {
+                        // :status: 103 (literal name index 8 = :status, value "103"), END_HEADERS only
+                        frame(out, 0x01, 0x04, stream, byteArrayOf(0x08, 0x03, '1'.code.toByte(), '0'.code.toByte(), '3'.code.toByte()))
+                        frame(out, 0x01, 0x04, stream, byteArrayOf(0x88.toByte())) // :status: 200, END_HEADERS
+                        frame(out, 0x00, 0x01, stream, "hello-103".toByteArray())  // DATA, END_STREAM
                     } else {
                         frame(out, 0x01, 0x05, stream, byteArrayOf(0x88.toByte())) // :status: 200, END_STREAM | END_HEADERS
                     }

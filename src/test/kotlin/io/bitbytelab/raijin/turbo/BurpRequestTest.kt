@@ -146,6 +146,13 @@ class BurpRequestTest {
     }
 
     @Test
+    fun `fixContentLength updates Content-Length written without a space`() {
+        val req = Request("POST / HTTP/1.1\r\nHost: x\r\nContent-Length:99\r\n\r\nhello")
+
+        assertEquals("POST / HTTP/1.1\r\nHost: x\r\nContent-Length:5\r\n\r\nhello", req.getRequest())
+    }
+
+    @Test
     fun `deliberately odd Content-Length headers go out as written`() {
         val leadingSpace = "POST / HTTP/1.1\r\nHost: x\r\n Content-Length: 99\r\n\r\nhello"
         val lowerCase = "POST / HTTP/1.1\r\nHost: x\r\ncontent-length: 99\r\n\r\nhello"

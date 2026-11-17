@@ -125,4 +125,24 @@ class SitemapBridgeQueryTest {
         )
         assertTrue(badExclude["error"]?.jsonPrimitive?.content?.startsWith("Invalid exclude_pattern regex") == true)
     }
+
+    @Test
+    fun `parseSeverity accepts info alias and rejects unknown severities`() {
+        assertEquals(
+            burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.INFORMATION,
+            SitemapBridge.parseSeverity("info"),
+        )
+        assertEquals(
+            burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.INFORMATION,
+            SitemapBridge.parseSeverity(" INFO "),
+        )
+        assertEquals(
+            burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.HIGH,
+            SitemapBridge.parseSeverity("high"),
+        )
+        val err = kotlin.test.assertFailsWith<IllegalArgumentException> {
+            SitemapBridge.parseSeverity("critical")
+        }
+        assertTrue("info" in err.message.orEmpty(), err.message)
+    }
 }

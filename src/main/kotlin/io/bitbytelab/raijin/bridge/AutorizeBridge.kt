@@ -279,6 +279,7 @@ class AutorizeBridge(private val stateManager: StateManager) {
             }
             includeHostPattern?.let { p -> ProxyBridge.hostPatternError(p)?.let { return "include_host_pattern: $it" } }
             excludeUrlRegex?.let { p ->
+                if (p.isBlank()) return "Invalid exclude_url_regex: pattern must not be blank"
                 SafeRegex.validate(p, ignoreCase = true)?.let { return "Invalid exclude_url_regex: $it" }
             }
             methods?.let { ms ->

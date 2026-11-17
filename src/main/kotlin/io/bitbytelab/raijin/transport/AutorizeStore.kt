@@ -191,14 +191,15 @@ object AutorizeStore {
     }
 
     /**
-     * Pure: the newest of [lines] (file order, oldest first) whose text fits in [budget] characters,
-     * in file order. The newest line is kept whatever its size.
+     * Pure: the newest of [lines] (file order, oldest first) whose UTF-8 byte length fits in
+     * [budget] bytes (including one newline byte per line), in file order. The newest line is kept
+     * whatever its size.
      */
     fun newestWithin(lines: List<String>, budget: Long): List<String> {
         var used = 0L
         var first = lines.size
         while (first > 0) {
-            val size = lines[first - 1].length + 1L
+            val size = lines[first - 1].toByteArray(Charsets.UTF_8).size + 1L
             if (first < lines.size && used + size > budget) break
             used += size
             first--
