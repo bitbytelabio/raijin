@@ -208,9 +208,9 @@ expand without bound:
   bodies, metadata) is capped at 64 MiB of text: going over fails the import with an error before
   anything reaches Burp.
 - `probe(action=jwt, mode=decrypt)` refuses a password-based JWE whose `p2c` iteration count is
-  above 1,000,000, before deriving any key. Nimbus runs PBKDF2 over the count the token's header
-  names before checking anything else (CVE-2023-52428), so a hostile token could otherwise hold a
-  thread for hours.
+  above 1,000,000, before deriving any key. Nimbus 9.x ran PBKDF2 over the count the token's header
+  named before checking anything else (CVE-2023-52428); Nimbus 10 caps the count itself, but this
+  check still refuses a hostile token before any key derivation.
 
 ## Files on disk
 

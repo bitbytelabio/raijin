@@ -22,6 +22,11 @@ class AtomicStreamFrameBundle private constructor(inputFrames: List<StreamFrame>
         if (inputFrames.isEmpty()) {
             throw IllegalArgumentException("an atomic stream bundle must contain at least one frame")
         }
+        inputFrames.firstOrNull { it.getFrameLength() < it.getLength() }?.let {
+            throw IllegalArgumentException(
+                "a stream frame of ${it.getLength()} data bytes is larger than one QUIC datagram can carry",
+            )
+        }
         this.frames = java.util.List.copyOf(inputFrames)
         this.frameLengthBytes = inputFrames.sumOf { it.getFrameLength() }
     }

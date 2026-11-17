@@ -1,7 +1,6 @@
 package io.bitbytelab.raijin.turbo
 
 import io.bitbytelab.raijin.turbo.hp3.quic.ControlledKwikQuicTransport
-import io.bitbytelab.raijin.turbo.hp3.quic.KwikThreads
 import io.bitbytelab.raijin.turbo.hp3.quic.QuicConfig
 import io.bitbytelab.raijin.turbo.http3.FirstByteTimingInputStream
 import io.bitbytelab.raijin.turbo.http3.GateMode
@@ -69,12 +68,9 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
 
     /**
      * Requests actually allowed in flight, which is [targetConcurrency] capped at
-     * [maxRequestsInFlight]. On a JDK that still pins, each in-flight request holds an OS thread, so an unbounded
-     * product would ask the OS for more threads than it will give: concurrentConnections defaults
-     * to 50 in the Python API and multiplies by 100 streams, so raising it to 800 asks for 80,000.
+     * [MAX_REQUESTS_IN_FLIGHT]. The cap stops a runaway connections × streams product from
+     * exhausting heap with virtual threads.
      */
-    private val useVirtualThreads = prefersVirtualThreads(Runtime.version().feature())
-
     private val initialRequestsInFlightLimit = dispatchCapacity(threads)
 
     val requestsInFlightLimit: Int
@@ -180,12 +176,7 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
                 gateMode,
                 options,
             )
-            // Adaptive execution is sized once for its immutable safety ceiling. Live work is
-            // controlled by the adaptive dispatch slots rather than replacing this executor.
-            requestExecutor = newHttp3RequestExecutor(
-                useVirtualThreads,
-                if (adaptive) maxRequestsInFlight(useVirtualThreads) else initialRequestsInFlightLimit,
-            )
+            requestExecutor = newHttp3RequestExecutor()
             gateExecutor = newHttp3GateExecutor()
             // Started here rather than in start() so that a run cancelled before it ever started
             // still has something to count the completion latch down.
@@ -297,7 +288,7 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
 
     private fun dispatchCapacity(connections: Int): Int =
         (connections.toLong() * maxConcurrentStreams)
-            .coerceAtMost(maxRequestsInFlight(useVirtualThreads).toLong())
+            .coerceAtMost(MAX_REQUESTS_IN_FLIGHT.toLong())
             .toInt()
 
     /**
@@ -982,31 +973,12 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
         const val DEFAULT_ADAPTIVE_CONNECTIONS = 10
 
         /**
-         * Ceiling on requests in flight when each one holds an OS thread. Without it the configured
-         * connections x streams product goes straight to the OS: an 800-connection run asks for
-         * 80,000 threads, and a Burp with other work in flight died with "OutOfMemoryError: unable
-         * to create native thread" before the engine could start its dispatcher.
+         * Ceiling on requests in flight. Each costs a virtual thread (heap, not an OS thread), so
+         * the bound only stops a runaway configuration exhausting memory. It sits this high
+         * because a lower one throttled real runs: measured in Burp on Java 26, a 4096 bound had
+         * 41 to 96 connections all flatlining at ~90k rps because each clamped to 4096 in flight.
          */
-        const val MAX_REQUESTS_IN_FLIGHT_PLATFORM = 4096
-
-        /**
-         * Ceiling on requests in flight when the threads are virtual. Those cost heap rather than
-         * OS threads, so the bound is only there to stop a runaway configuration exhausting memory,
-         * and it can sit far higher. Measured in Burp on Java 26: the platform bound was throttling
-         * the run, with 41 to 96 connections all flatlining at ~90k rps because each clamped to
-         * 4096 in flight.
-         */
-        const val MAX_REQUESTS_IN_FLIGHT_VIRTUAL = 65536
-
-        /** The in-flight ceiling appropriate to the kind of thread carrying each request. */
-        @JvmStatic
-        fun maxRequestsInFlight(virtualThreads: Boolean): Int =
-            if (virtualThreads) MAX_REQUESTS_IN_FLIGHT_VIRTUAL else MAX_REQUESTS_IN_FLIGHT_PLATFORM
-
-        /** Whether [jdkFeatureVersion] carries blocked virtual threads without pinning a carrier. */
-        @JvmStatic
-        fun prefersVirtualThreads(jdkFeatureVersion: Int): Boolean =
-            KwikThreads.prefersVirtualThreads(jdkFeatureVersion)
+        const val MAX_REQUESTS_IN_FLIGHT = 65536
 
         private fun authority(target: URL): String {
             val port = getEffectivePort(target)

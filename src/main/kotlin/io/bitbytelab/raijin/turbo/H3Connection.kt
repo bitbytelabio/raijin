@@ -244,10 +244,9 @@ class H3Connection private constructor(
         val response = CompletableFuture<H3Exchange>()
         val pending = PendingRead(stream, UNARMED_RESPONSE_DEADLINE)
         pendingReads.add(pending)
-        // This reader blocks in Kwik's stream input stream, which reads inside a synchronized
-        // block. A gate stages every request before releasing, so all of a batch's readers are
-        // blocked at once, and on a JDK that pins them a batch larger than the carrier pool would
-        // leave most of its responses unread.
+        // This reader blocks in Kwik's stream input stream, inside a synchronized block. A gate
+        // stages every request before releasing, so all of a batch's readers are blocked at once:
+        // a virtual thread each, which no longer pins a carrier there (JEP 491).
         kwikBlockingThread("h3-response-$streamId").start {
             try {
                 response.complete(readExchange(stream.input(), streamId, request.authoredVersion))

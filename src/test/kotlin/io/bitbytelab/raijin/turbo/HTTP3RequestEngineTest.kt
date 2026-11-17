@@ -108,7 +108,7 @@ class HTTP3RequestEngineTest {
         val opened = ConcurrentLinkedQueue<AnsweringSession>()
         // More streams than any JVM lets one engine carry, so start() logs the cap: the last thing
         // it does before the run goes live, and so a point a stop can be made to land on.
-        val engine = engine(answering(opened), streams = HTTP3RequestEngine.MAX_REQUESTS_IN_FLIGHT_VIRTUAL + 1)
+        val engine = engine(answering(opened), streams = HTTP3RequestEngine.MAX_REQUESTS_IN_FLIGHT + 1)
         onLog = { line -> if ("Capping at" in line) engine.finish(3) }
 
         engine.start(1)

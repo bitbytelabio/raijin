@@ -6,6 +6,8 @@ import io.bitbytelab.raijin.turbo.hp3.h3.qpack.HuffmanCodec
 import io.bitbytelab.raijin.turbo.hp3.h3.qpack.PrefixInteger
 import io.bitbytelab.raijin.turbo.hp3.h3.qpack.QpackDecoder
 import io.bitbytelab.raijin.turbo.hp3.h3.qpack.QpackEncoder
+import io.bitbytelab.raijin.turbo.hp3.quic.AtomicStreamFrameBundle
+import io.bitbytelab.raijin.turbo.hp3.quic.StreamFragment
 import io.bitbytelab.raijin.turbo.hp3.translate.KettleEscapes
 import io.bitbytelab.raijin.turbo.hp3.translate.KettleSyntaxException
 import java.nio.ByteBuffer
@@ -13,6 +15,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 class Hp3LogicTest {
 
@@ -106,5 +109,15 @@ class Hp3LogicTest {
         assertFailsWith<KettleSyntaxException> { KettleEscapes.decode("^q") }
         assertFailsWith<KettleSyntaxException> { KettleEscapes.decode("trailing^") }
         assertFailsWith<KettleSyntaxException> { KettleEscapes.decode("^x4") }
+    }
+
+    // Kwik 0.12 keeps a stream frame's length in a short, so a frame this large reports a wrapped
+    // length that would slip past the one-datagram checks.
+    @Test
+    fun frameLengthRefusesAFrameNoDatagramCanCarry() {
+        assertFailsWith<IllegalArgumentException> {
+            AtomicStreamFrameBundle.frameLengthOf(StreamFragment(0, 0L, ByteArray(40_000), true))
+        }
+        assertTrue(AtomicStreamFrameBundle.frameLengthOf(StreamFragment(0, 0L, ByteArray(100), true)) > 100)
     }
 }

@@ -59,6 +59,15 @@ class JwtJoseTest {
         assertEquals("hello x", JwtJose.decrypt(encrypted, key.jwk))
     }
 
+    // XC20P runs on Tink's XChaCha20Poly1305, bundled without protobuf: proves that path loads.
+    @Test
+    fun `X25519 with XC20P encrypt then decrypt`() {
+        val ring = JwtKeyRing()
+        val key = ring.generate("OKP", null, "X25519", null, null) as JwtKey.Jose
+        val encrypted = JwtJose.encrypt("hello xc20p", key.jwk, "ECDH-ES", "XC20P")
+        assertEquals("hello xc20p", JwtJose.decrypt(encrypted, key.jwk))
+    }
+
     @Test
     fun `RSA-OAEP-256 and A256GCM round-trip`() {
         val ring = JwtKeyRing()
@@ -153,7 +162,7 @@ class JwtJoseTest {
         val sealed = JwtJose.encryptPassword("for the password holder", "hunter2", null, null)
         assertEquals("for the password holder", JwtJose.decryptPassword(sealed, "hunter2"))
 
-        // The target writes the header. Nimbus 9.21 would run PBKDF2 p2c times before it checks the tag.
+        // The target writes the header. Nimbus 9.x would run PBKDF2 p2c times before it checks the tag.
         val parts = sealed.split('.')
         val header = Json.parseToJsonElement(Jwt.b64UrlDecode(parts[0]).decodeToString()).jsonObject
         val hostile = JsonObject(header + ("p2c" to JsonPrimitive(1_000_001)))

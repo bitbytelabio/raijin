@@ -196,7 +196,7 @@ class McpServerManager(
      * port never opens. That is the GitHub issue #2/#3 symptom: the UI shows
      * "running", 9876/9877 never listen, and there is no error. We therefore
      * actively probe the port and log a loud, actionable error if it didn't come
-     * up (the usual cause is a JAR built with Java 22+).
+     * up.
      */
     private fun startTransport(
         label: String,
@@ -261,9 +261,9 @@ class McpServerManager(
                                 if (port == ssePort) PortPolicy.PREF_SSE_PORT else PortPolicy.PREF_HTTP_PORT
                             )
                         else
-                        "Raijin: $label transport reported start() but $displayHost:$port is NOT listening. " +
-                            "This is the GitHub issue #2/#3 symptom — almost always a JAR built with Java 22+ " +
-                            "(Kotlin/Ktor/MCP-SDK incompatibility). Rebuild with a JDK 17-21 (NOT Burp's bundled Java 25)."
+                        "Raijin: $label transport reported start() but $displayHost:$port is NOT listening, " +
+                            "and no other process holds the port. Look for a Ktor/CIO error earlier in this " +
+                            "extension's error output."
                     )
                 }
             } catch (e: CancellationException) {

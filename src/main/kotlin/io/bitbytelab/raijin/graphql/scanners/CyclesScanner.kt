@@ -154,7 +154,7 @@ class CyclesScanner(
                 }
             }
             val selectable: List<GraphQLNamedType> = when (type) {
-                is GraphQLInterfaceType -> gql.getImplementations(type)
+                is GraphQLInterfaceType -> gql.getImplementations(type).orEmpty()
                 is GraphQLUnionType -> type.types
                 else -> emptyList()
             }

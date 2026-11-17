@@ -11,7 +11,6 @@ import io.bitbytelab.raijin.turbo.hp3.h3.qpack.FieldLine
 import io.bitbytelab.raijin.turbo.hp3.h3.qpack.QpackDecoder
 import io.bitbytelab.raijin.turbo.hp3.h3.qpack.QpackEncoder
 import io.bitbytelab.raijin.turbo.hp3.h3.qpack.QpackEncoderStream
-import io.bitbytelab.raijin.turbo.hp3.quic.KwikThreads
 import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.util.concurrent.CompletableFuture
@@ -127,10 +126,7 @@ class Http3ClientConnectionTest {
         transport.openPeerStream(MemoryStream(3, true, input))
 
         val reader = readBy.get(5, TimeUnit.SECONDS)
-        assertEquals(KwikThreads.prefersVirtualThreads(Runtime.version().feature()), reader.isVirtual)
-        if (!reader.isVirtual) {
-            assertTrue(reader.isDaemon, "a platform reader must not hold the JVM open")
-        }
+        assertTrue(reader.isVirtual)
     }
 
     @Test

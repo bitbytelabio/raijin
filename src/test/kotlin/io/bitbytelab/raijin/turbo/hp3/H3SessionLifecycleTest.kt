@@ -95,15 +95,7 @@ class H3SessionLifecycleTest {
     }
 
     @Test
-    fun kwikReadersAreVirtualOnlyWhereBlockingInAMonitorDoesNotPin() {
-        assertFalse(KwikThreads.prefersVirtualThreads(21))
-        assertFalse(KwikThreads.prefersVirtualThreads(23))
-        assertTrue(KwikThreads.prefersVirtualThreads(24))
-
-        val thread = KwikThreads.blockingThread("kwik-reader").unstarted {}
-        assertEquals(KwikThreads.prefersVirtualThreads(Runtime.version().feature()), thread.isVirtual)
-        if (!thread.isVirtual) {
-            assertTrue(thread.isDaemon, "a platform reader must not hold the JVM open")
-        }
+    fun kwikReadersAreVirtualThreads() {
+        assertTrue(KwikThreads.blockingThread("kwik-reader").unstarted {}.isVirtual)
     }
 }

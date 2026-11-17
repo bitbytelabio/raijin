@@ -8,55 +8,25 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
-/**
- * A thread for work that blocks inside Kwik: a handshake, or a response read. Virtual where the JVM
- * carries a blocked virtual thread without pinning a carrier, platform daemon where it does not; see
- * [KwikThreads].
- */
+/** A virtual thread for work that blocks inside Kwik: a handshake, or a response read; see [KwikThreads]. */
 internal fun kwikBlockingThread(name: String): Thread.Builder = KwikThreads.blockingThread(name)
 
 /**
- * Carries an HTTP/3 run's ungated requests, one thread per request in flight.
- *
- * Which kind of thread depends on the JVM. Kwik reads a response inside
- * `synchronized (addMonitor)` (`tech.kwik.core.stream.StreamInputStreamImpl`). Before JDK 24 a
- * virtual thread that blocks inside a synchronized block pins its carrier without the scheduler
- * compensating, so an in-flight request cost a whole carrier anyway and the run was capped at a
- * pool size only a JVM option can raise — measured on 18 cores, a run configured for 800
- * requests in flight carried 18. There, pooled platform threads are strictly better.
- *
- * JEP 491 removed that pinning in JDK 24, and Burp ships a JRE well past it, so in the case
- * that matters most the threads can be virtual: a run holding 1200 requests costs 1200 cheap
- * virtual threads instead of 1200 OS threads for the scheduler to move around.
- *
- * The platform pool is fixed rather than one thread per request because starting an OS thread
- * costs tens of microseconds and the single dispatcher pays it per request. Either way the
- * engine's dispatch slots bound submissions to its requests-in-flight limit, so neither executor
- * queues work behind a busy thread.
- *
- * @param platformThreads the size of the fixed pool, where the threads are platform threads
+ * Carries an HTTP/3 run's ungated requests, one virtual thread per request in flight. Kwik reads a
+ * response inside `synchronized (addMonitor)`, which no longer pins a carrier (JEP 491). The
+ * engine's dispatch slots bound submissions to its requests-in-flight limit.
  */
-internal fun newHttp3RequestExecutor(virtualThreads: Boolean, platformThreads: Int): ExecutorService {
-    if (virtualThreads) {
-        // Unnamed on purpose. A named virtual thread factory formats a fresh name string
-        // for every request on the hot path.
-        return Executors.newThreadPerTaskExecutor(Thread.ofVirtual().factory())
-    }
-    // Names request threads in creation order, so a stack dump is readable.
-    val requestThreads = AtomicInteger()
-    return Executors.newFixedThreadPool(platformThreads) { runnable ->
-        Thread.ofPlatform()
-            .daemon()
-            .name("http3-request-${requestThreads.incrementAndGet()}")
-            .unstarted(runnable)
-    }
+internal fun newHttp3RequestExecutor(): ExecutorService {
+    // Unnamed on purpose. A named virtual thread factory formats a fresh name string
+    // for every request on the hot path.
+    return Executors.newThreadPerTaskExecutor(Thread.ofVirtual().factory())
 }
 
 /**
- * Carries an HTTP/3 run's gate collectors. They must not queue behind ordinary requests: on
- * platform-thread JVMs every request-pool thread can be parked waiting for a connection held by a
- * gate. A separately managed executor preserves that independent capacity while still giving
- * teardown one owner that can interrupt and account for every collector.
+ * Carries an HTTP/3 run's gate collectors. They must not queue behind ordinary requests: a
+ * request can be parked waiting for a connection held by a gate. A separately managed executor
+ * preserves that independent capacity while still giving teardown one owner that can interrupt
+ * and account for every collector.
  */
 internal fun newHttp3GateExecutor(): ExecutorService {
     // Names managed gate collectors and keeps them independent of the ordinary request pool.

@@ -160,7 +160,7 @@ class POIScanner(
                         expandFields(type, step, queryType, queue, results)
                         // The interface's own fields were just reported; an implementation adds the rest.
                         val declared = type.fieldDefinitions.mapTo(mutableSetOf()) { it.name }
-                        for (implementation in schema.schema.getImplementations(type)) {
+                        for (implementation in schema.schema.getImplementations(type).orEmpty()) {
                             queue.add(Step(implementation, "${step.path} -> ... on ${implementation.name}", step.depth, declared))
                         }
                     }

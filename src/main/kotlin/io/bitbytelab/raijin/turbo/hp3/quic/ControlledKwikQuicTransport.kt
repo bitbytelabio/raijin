@@ -259,7 +259,18 @@ class ControlledKwikQuicTransport private constructor(
                 builder.noServerCertificateCheck()
             }
 
-            val connection = builder.build()
+            // Agent15 4.0 (Kwik 0.12) finds its key exchanges through ServiceLoader on the thread context
+            // class loader while build() creates the TLS engine. Burp's threads carry a loader that cannot
+            // see this extension's jar, so the lookup would come back empty and every handshake fail with
+            // "Unsupported named group(s)". Kwik's own loader sees agent15's service file.
+            val thread = Thread.currentThread()
+            val callerClassLoader = thread.contextClassLoader
+            thread.contextClassLoader = QuicClientConnection::class.java.classLoader
+            val connection = try {
+                builder.build()
+            } finally {
+                thread.contextClassLoader = callerClassLoader
+            }
             connection.connect()
             val implementation = connection as QuicConnectionImpl
             return ControlledKwikQuicTransport(
@@ -270,7 +281,10 @@ class ControlledKwikQuicTransport private constructor(
                     }
 
                     override fun maxShortHeaderPacketOverhead(): Int {
-                        return implementation.getMaxShortHeaderPacketOverhead()
+                        // Kwik 0.12 made QuicConnectionImpl.getMaxShortHeaderPacketOverhead() package-private. Same
+                        // formula over public accessors: flag byte, the peer's connection ID, the largest packet
+                        // number, and the AEAD tag.
+                        return 1 + implementation.getConnectionIdManager().getCurrentPeerConnectionIdLength() + 4 + 16
                     }
 
                     override fun submit(

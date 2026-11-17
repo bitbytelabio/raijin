@@ -138,9 +138,8 @@ internal class Http3ConnectionPool(
     fun openInitialConnections(desiredConnections: Int, timeout: Int) {
         val ready = CountDownLatch(desiredConnections)
         repeat(desiredConnections) { index ->
-            // A QUIC handshake blocks inside Kwik just as a response read does, so it needs the
-            // same thread choice: on a JDK that still pins, a pool larger than the carrier count
-            // would open in batches instead of at once.
+            // A QUIC handshake blocks inside Kwik just as a response read does, so it runs on the
+            // same kind of thread and the whole pool opens at once.
             kwikBlockingThread("http3-connect-$index").start {
                 var reservedSlot = false
                 try {

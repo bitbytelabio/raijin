@@ -545,7 +545,7 @@ private fun okpAlgorithm(curve: Curve): AlgorithmIdentifier = AlgorithmIdentifie
 )
 
 /**
- * Nimbus 9.21 cannot turn an OKP key into a JCA key ("Export to java.security.PublicKey not
+ * Nimbus (10.10 included) cannot turn an OKP key into a JCA key ("Export to java.security.PublicKey not
  * supported"), so the PEM forms of Ed25519, Ed448, X25519 and X448 keys are built from the raw
  * key bytes.
  */

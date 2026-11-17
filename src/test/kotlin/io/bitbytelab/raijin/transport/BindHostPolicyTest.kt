@@ -57,7 +57,7 @@ class BindHostPolicyTest {
 
     @Test fun `probeHost redirects a wildcard bind to loopback but keeps concrete addresses`() {
         // A server bound to 0.0.0.0 is not directly connectable at 0.0.0.0 — probe loopback,
-        // otherwise the liveness check false-negatives and logs the misleading "Java 22+" error.
+        // otherwise the liveness check false-negatives and logs a false "NOT listening" error.
         assertEquals("127.0.0.1", BindHostPolicy.probeHost("0.0.0.0"))
         assertEquals("192.168.1.50", BindHostPolicy.probeHost("192.168.1.50"))
         assertEquals("127.0.0.1", BindHostPolicy.probeHost("127.0.0.1"))

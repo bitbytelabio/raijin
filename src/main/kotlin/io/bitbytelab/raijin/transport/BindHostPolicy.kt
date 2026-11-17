@@ -88,7 +88,7 @@ object BindHostPolicy {
     /**
      * The address to PROBE for liveness. A server bound to a wildcard (`0.0.0.0`/`::`) is not
      * directly connectable at that address, so probe loopback instead — otherwise the bind
-     * verification false-negatives and logs the misleading "Java 22+" error. Concrete addresses
+     * verification false-negatives and logs a false "NOT listening" error. Concrete addresses
      * are probed as-is (unbracketed for [java.net.InetSocketAddress]).
      */
     fun probeHost(bindHost: String): String {

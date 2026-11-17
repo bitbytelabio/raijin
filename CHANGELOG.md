@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Build and dependencies
+- Java 25 bytecode: the jar needs Burp running on Java 25 or newer. Built with Gradle 9.9.1 (Shadow 9) on a JDK 25 toolchain and daemon; CI on JDK 25.
+- Ktor 3.6.1, kotlinx-serialization 1.13.0, graphql-java 26.2, Jython 2.7.4, RSyntaxTextArea 4.0.1 / RSTAUI 4.0.0, Kwik 0.12.3, Nimbus JOSE+JWT 10.10, BouncyCastle 1.87, Tink 1.24.0, SnakeYAML 2.7; tests on JUnit 6.1.3.
+- Turbo HTTP/3 always carries requests and Kwik reads on virtual threads; the platform-thread fallback for JDKs before 24 and its 4,096-request cap are gone.
+- Turbo HTTP/3 refuses a stream frame too large for one QUIC datagram instead of letting Kwik 0.12's 16-bit frame length wrap.
+- XPath value extraction parses XML up to its documented depth of 256 on Java 25; JDK 24 lowered the parser's own limit to 100.
+
 ## 2.0.0
 
 ### Remote access and transport

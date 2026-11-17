@@ -11,7 +11,7 @@ echo "=========================================="
 echo " Raijin Setup"
 echo "=========================================="
 
-# Step 1: Build (needs a JDK 21 toolchain; also runs the tests)
+# Step 1: Build (needs a JDK 25 toolchain; also runs the tests)
 echo ""
 echo "[1/4] Building extension (./gradlew build)..."
 cd "$PROJECT_DIR"

@@ -28,6 +28,7 @@ import com.nimbusds.jose.crypto.RSASSASigner
 import com.nimbusds.jose.crypto.RSASSAVerifier
 import com.nimbusds.jose.crypto.X25519Decrypter
 import com.nimbusds.jose.crypto.X25519Encrypter
+import com.nimbusds.jose.crypto.impl.AAD
 import com.nimbusds.jose.crypto.impl.CriticalHeaderParamsDeferral
 import com.nimbusds.jose.crypto.impl.ECDHCryptoProvider
 import com.nimbusds.jose.crypto.opts.AllowWeakRSAKey
@@ -73,8 +74,9 @@ object JwtJose {
     private const val PBES_ITERATIONS = 1000
 
     /**
-     * Highest PBES2 iteration count (`p2c`) [decryptPassword] accepts. Nimbus 9.21 runs PBKDF2 over
-     * whatever count the token's header names before it checks anything (CVE-2023-52428).
+     * Highest PBES2 iteration count (`p2c`) [decryptPassword] accepts. Nimbus 9.x ran PBKDF2 over
+     * whatever count the header named before checking anything (CVE-2023-52428); Nimbus 10 caps it
+     * too, but with a JOSEException, and this check keeps the refusal ahead of any key derivation.
      */
     private const val MAX_PBES2_COUNT = 1_000_000
 
@@ -515,7 +517,7 @@ object JwtJose {
     }
 
     private class X448Encrypter(private val publicKey: OctetKeyPair) :
-        ECDHCryptoProvider(publicKey.curve), JWEEncrypter {
+        ECDHCryptoProvider(publicKey.curve, null), JWEEncrypter {
         init {
             if (publicKey.curve != Curve.X448) throw JOSEException("X448Encrypter requires crv=X448")
             if (publicKey.isPrivate) throw JOSEException("X448Encrypter requires a public key")
@@ -523,7 +525,7 @@ object JwtJose {
 
         override fun supportedEllipticCurves(): Set<Curve> = setOf(Curve.X448)
 
-        override fun encrypt(header: JWEHeader, clearText: ByteArray): JWECryptoParts {
+        override fun encrypt(header: JWEHeader, clearText: ByteArray, aad: ByteArray): JWECryptoParts {
             val gen = X448KeyPairGenerator()
             gen.init(X448KeyGenerationParameters(SecureRandom()))
             val pair = gen.generateKeyPair()
@@ -532,12 +534,15 @@ object JwtJose {
             val ephPublicKey = OctetKeyPair.Builder(Curve.X448, Base64URL.encode(ephPubBytes)).build()
             val updatedHeader = JWEHeader.Builder(header).ephemeralPublicKey(ephPublicKey).build()
             val z = x448SharedSecret(publicKey.decodedX, ephPrivBytes)
-            return encryptWithZ(updatedHeader, z, clearText)
+            // JWEObject computed aad over the header before epk was added; authenticate the header that
+            // goes on the wire, as Nimbus's own ECDH and X25519 encrypters do.
+            val updatedAad = if (aad.contentEquals(AAD.compute(header))) AAD.compute(updatedHeader) else aad
+            return encryptWithZ(updatedHeader, z, clearText, updatedAad)
         }
     }
 
     private class X448Decrypter(private val privateKey: OctetKeyPair) :
-        ECDHCryptoProvider(privateKey.curve), JWEDecrypter {
+        ECDHCryptoProvider(privateKey.curve, null), JWEDecrypter {
         private val critPolicy = CriticalHeaderParamsDeferral()
 
         init {
@@ -553,6 +558,7 @@ object JwtJose {
             iv: Base64URL?,
             cipherText: Base64URL?,
             authTag: Base64URL?,
+            aad: ByteArray,
         ): ByteArray {
             critPolicy.ensureHeaderPasses(header)
             val epk = header.ephemeralPublicKey as? OctetKeyPair
@@ -561,7 +567,9 @@ object JwtJose {
                 throw JOSEException("Curve of ephemeral public key does not match curve of private key")
             }
             val z = x448SharedSecret(epk.decodedX, privateKey.decodedD)
-            return decryptWithZ(header, z, encryptedKey, iv, cipherText, authTag)
+            return decryptWithZ(
+                header, aad, z, encryptedKey, iv, cipherText, authTag, JWEObject.MAX_DECOMPRESSED_PLAIN_TEXT_LENGTH,
+            )
         }
     }
 }

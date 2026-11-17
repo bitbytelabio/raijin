@@ -9,7 +9,7 @@ for high-speed work: single-packet race conditions, HTTP/2 and HTTP/3 gates, req
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 ![Burp Suite 2026.2+](https://img.shields.io/badge/Burp%20Suite-2026.2%2B-orange.svg)
-![Java 21](https://img.shields.io/badge/Java-21-red.svg)
+![Java 25](https://img.shields.io/badge/Java-25-red.svg)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.4-7F52FF.svg)
 ![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-black.svg)
 
@@ -54,7 +54,7 @@ for high-speed work: single-packet race conditions, HTTP/2 and HTTP/3 gates, req
 
 - **Burp Suite 2026.2 or newer** (Montoya API), Community or Professional.
   The Turbo HTTP/3 engine and the `AUTO` engine need **Professional**.
-- **JDK 21** to build. A newer JDK on `PATH` is fine: `gradle/gradle-daemon-jvm.properties` pins Gradle to 21.
+- **JDK 25** to build. Another default JDK on `PATH` is fine: `gradle/gradle-daemon-jvm.properties` pins Gradle to 25. The jar needs Burp running on **Java 25 or newer**.
 
 ### 2. Build and load
 

@@ -1,32 +1,25 @@
 plugins {
     kotlin("jvm") version "2.4.21"
     kotlin("plugin.serialization") version "2.4.21"
-    id("com.github.johnrengelman.shadow") version "8.1.1"
+    id("com.gradleup.shadow") version "9.6.1"
 }
 
 group = "io.bitbytelab"
 version = "2.0.0"
 
-// Build JDK: gradle/gradle-daemon-jvm.properties pins the Gradle daemon to JDK 21, so
-// `./gradlew` relaunches the build under JDK 21 even when started from a newer JVM (e.g.
-// Burp's bundled Java 25). The build is only tested on JDK 21.
-//
-// Bytecode target is 21: the Turbo engines use virtual threads
-// (Thread.ofVirtual / Executors.newThreadPerTaskExecutor). Burp ships Java 21+.
+// Build JDK: gradle/gradle-daemon-jvm.properties pins the Gradle daemon to JDK 25. The
+// toolchain compiles and tests on JDK 25 and emits Java 25 bytecode, so the jar needs a Burp
+// running Java 25 or newer. Turbo relies on virtual threads that do not pin their carrier
+// inside `synchronized` (JEP 491, JDK 24+).
 kotlin {
-    jvmToolchain(21)
-}
-
-java {
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+    jvmToolchain(25)
 }
 
 repositories {
     mavenCentral()
 }
 
-val ktorVersion = "3.5.2"
+val ktorVersion = "3.6.1"
 val montoyaVersion = "2026.7"
 
 dependencies {
@@ -36,8 +29,9 @@ dependencies {
     // --- MCP server (Kotlin SDK on Ktor CIO) ---
     implementation("io.modelcontextprotocol:kotlin-sdk-server:0.16.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
-    // Ktor, coroutines and serialization versions must match what kotlin-sdk-server 0.16.0 was compiled against
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.13.0")
+    // kotlin-sdk-server 0.16.0 was built against Ktor 3.5.2 / serialization 1.11.0; newer minor
+    // releases are binary compatible. Re-check when bumping the SDK.
     implementation("io.ktor:ktor-server-cio:$ktorVersion")
     implementation("io.ktor:ktor-server-sse:$ktorVersion")
     implementation("io.ktor:ktor-server-cors:$ktorVersion")
@@ -45,31 +39,34 @@ dependencies {
     implementation("io.ktor:ktor-serialization-kotlinx-json:$ktorVersion")
 
     // --- Turbo engine ---
-    implementation("org.python:jython-standalone:2.7.0")
-    implementation("com.fifesoft:rsyntaxtextarea:3.1.1")
-    implementation("com.fifesoft:rstaui:3.1.1")
+    implementation("org.python:jython-standalone:2.7.4")
+    implementation("com.fifesoft:rsyntaxtextarea:4.0.1")
+    implementation("com.fifesoft:rstaui:4.0.0")
     implementation("com.twitter:hpack:1.0.2")
-    implementation("tech.kwik:kwik:0.10.3")
+    implementation("tech.kwik:kwik:0.12.3")
 
-    // JOSE key ring, JWS, and JWE. Versions match the jwt-editor 2.6.2 reference.
-    // BouncyCastle is required for secp256k1 (ES256K) and PEM encode/decode.
-    implementation("com.nimbusds:nimbus-jose-jwt:9.21")
-    implementation("org.bouncycastle:bcprov-jdk18on:1.83")
-    implementation("org.bouncycastle:bcpkix-jdk18on:1.83")
-    // Nimbus X25519 JWE calls Tink. 1.6.1 is the version nimbus-jose-jwt 9.21 was built against.
-    implementation("com.google.crypto.tink:tink:1.6.1")
+    // JOSE key ring, JWS, and JWE.
+    // BouncyCastle is required for secp256k1 (ES256K), X448/Ed448 and PEM encode/decode.
+    implementation("com.nimbusds:nimbus-jose-jwt:10.10")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.87")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.87")
+    // Nimbus X25519 JWE calls Tink's subtle X25519/XChaCha20Poly1305, which need no protobuf;
+    // Nimbus 10.10 excludes it from its own (optional) Tink dependency too.
+    implementation("com.google.crypto.tink:tink:1.24.0") {
+        exclude(group = "com.google.protobuf", module = "protobuf-java")
+    }
 
     // GraphQL schema modeling (introspection JSON/SDL -> GraphQLSchema, query generation, SDL
-    // printing). Plain JVM library, not sensitive to the Kotlin/Ktor pins above. Version matches
-    // what InQL (the reference extension this ports from) uses.
-    implementation("com.graphql-java:graphql-java:21.5")
+    // printing). Plain JVM library, not sensitive to the Kotlin/Ktor pins above.
+    implementation("com.graphql-java:graphql-java:26.2")
 
     // YAML OpenAPI/Swagger documents (api_import_openapi). Parsed with SafeConstructor only.
-    implementation("org.yaml:snakeyaml:2.4")
+    implementation("org.yaml:snakeyaml:2.7")
 
     // --- Tests ---
     testImplementation(kotlin("test-junit5"))
-    testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
+    testImplementation(platform("org.junit:junit-bom:6.1.3"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
     // Montoya is compileOnly for main; tests construct Montoya-typed values directly.
     testImplementation("net.portswigger.burp.extensions:montoya-api:$montoyaVersion")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
@@ -81,23 +78,11 @@ tasks.test {
     useJUnitPlatform()
 }
 
-tasks.compileKotlin {
-    compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
-    }
-}
-
-tasks.compileTestKotlin {
-    compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
-    }
-}
-
 // --- Single-sourced version -------------------------------------------------
 // BuildInfo.VERSION is generated from the Gradle project `version`, so the UI tab,
 // dashboard and MCP server identity can never drift from build.gradle.kts.
 val generatedVersionDir = layout.buildDirectory.dir("generated/version/kotlin")
-val generateBuildInfo by tasks.registering {
+val generateBuildInfo = tasks.register("generateBuildInfo") {
     val outDir = generatedVersionDir
     val ver = project.version.toString()
     inputs.property("version", ver)
@@ -127,8 +112,13 @@ tasks.shadowJar {
     archiveVersion.set("")
 
     // Merge META-INF/services — required for ServiceLoader discovery (Ktor engines,
-    // kotlinx-serialization formats, ...)
+    // kotlinx-serialization formats, ...). Shadow 9 excludes duplicates by default, so
+    // service files (and the Kotlin module metadata Shadow also merges) are let through for
+    // the merge.
     mergeServiceFiles()
+    filesMatching(listOf("META-INF/services/**", "META-INF/*.kotlin_module")) {
+        duplicatesStrategy = DuplicatesStrategy.INCLUDE
+    }
 
     // Signed dependencies (at.favre.lib:hkdf, pulled in by Kwik) ship signature files that
     // stop describing the archive once it is repackaged. Left in, the JVM refuses to define

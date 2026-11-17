@@ -20,12 +20,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Raijin targets Java 21 bytecode (Turbo uses virtual threads). CI pins JDK 21.
-      - name: Set up JDK 21
+      # Raijin targets Java 25 bytecode. CI pins JDK 25.
+      - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: '25'
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4

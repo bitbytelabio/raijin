@@ -236,6 +236,12 @@ internal object XmlXPath {
     const val MAX_DOCUMENT_CHARS = JsonPathLite.MAX_DOCUMENT_CHARS
     const val MAX_DEPTH = 256
 
+    /**
+     * JDK 24 lowered the JDK parser's own element depth limit to 100, below [MAX_DEPTH]; both
+     * parsers are given [MAX_DEPTH] so the bound documented here is the one that applies.
+     */
+    private const val JDK_MAX_ELEMENT_DEPTH = "jdk.xml.maxElementDepth"
+
     private class DepthExceededException : SAXException("XML element depth exceeds $MAX_DEPTH")
 
     private val quietErrors = object : ErrorHandler {
@@ -304,6 +310,7 @@ internal object XmlXPath {
         runCatching { factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false) }
         runCatching { factory.setAttribute("http://javax.xml.XMLConstants/property/accessExternalDTD", "") }
         runCatching { factory.setAttribute("http://javax.xml.XMLConstants/property/accessExternalSchema", "") }
+        runCatching { factory.setAttribute(JDK_MAX_ELEMENT_DEPTH, MAX_DEPTH.toString()) }
         return factory
     }
 
@@ -311,6 +318,7 @@ internal object XmlXPath {
         val sax = saxParserFactory().newSAXParser()
         runCatching { sax.setProperty("http://javax.xml.XMLConstants/property/accessExternalDTD", "") }
         runCatching { sax.setProperty("http://javax.xml.XMLConstants/property/accessExternalSchema", "") }
+        runCatching { sax.setProperty(JDK_MAX_ELEMENT_DEPTH, MAX_DEPTH.toString()) }
         val reader = sax.xmlReader
         reader.setEntityResolver { _, _ -> InputSource(StringReader("")) }
         reader.errorHandler = quietErrors

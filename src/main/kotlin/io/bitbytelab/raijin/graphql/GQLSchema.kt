@@ -52,10 +52,10 @@ class GQLSchema(jsonOrSdlSchema: String) {
     val queries: Map<String, GraphQLFieldDefinition> get() = schema.queryType.fields.associateBy { it.name }
 
     val mutations: Map<String, GraphQLFieldDefinition>
-        get() = if (schema.isSupportingMutations) schema.mutationType.fields.associateBy { it.name } else emptyMap()
+        get() = schema.mutationType?.fields?.associateBy { it.name }.orEmpty()
 
     val subscriptions: Map<String, GraphQLFieldDefinition>
-        get() = if (schema.isSupportingSubscriptions) schema.subscriptionType.fields.associateBy { it.name } else emptyMap()
+        get() = schema.subscriptionType?.fields?.associateBy { it.name }.orEmpty()
 
     /** The schema rendered as SDL text (cached after first access). */
     val sdlSchema: String
