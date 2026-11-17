@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.0.0
 
 ### Remote access and transport
 - Remote/VM mode: a non-loopback bind (operator opt-in `mcp_allow_remote_bind`) or `mcp_require_auth` makes every listener, MCP and dashboard, require `Authorization: Bearer <token>`. The token is generated with `SecureRandom`, kept in `mcp_auth_token`, compared in constant time and never logged. Optional source IP/CIDR allowlist (`mcp_allowed_ips`, the TCP peer only, never `X-Forwarded-For`) and extra allowed host names (`mcp_allowed_hosts`); every setting also has a `-Draijin.*` property. Loopback stays token-free. See [SECURITY.md](docs/dev/ultra/SECURITY.md#remote--vm-mode).
