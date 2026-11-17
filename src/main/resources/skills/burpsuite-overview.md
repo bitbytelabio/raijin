@@ -4,12 +4,12 @@ description: Start here. How the Raijin MCP server is organised, the standard wo
 ---
 # Raijin overview
 
-Raijin exposes Burp Suite through MCP as about 45 tools. Most tools take an `action` parameter: call `tool(action=name, ...)`; the tool description lists every action and its parameters (`*` = required for that action).
+Raijin exposes Burp Suite through MCP as about 45 tools. Most tools take an `action` parameter: call `<tool>(action=<action>, ...)`; the tool description lists every action and its parameters (`*` = required for that action).
 
 | Tool | What it does |
 |---|---|
-| `http_send_request`, `http_send_requests_parallel`, `http_send_request_chain`, `http_send_raw_bytes`, `http_send_pipeline`, `http_fuzz`, `http_race` | Send requests (`http_send_pipeline`: several raw HTTP/1.1 requests over one socket) |
-| `http_rule`, `http_state` | Outgoing traffic rules, session token rules, cookie jar |
+| `http_send_request`, `http_send_requests_parallel`, `http_send_request_chain`, `http_send_raw_bytes`, `http_send_pipeline`, `http_fuzz`, `http_race` | Send requests (`http_send_pipeline`: several raw HTTP/1.1 requests over one socket; `http_fuzz`: Intruder's attack types; `http_race`: single-packet or last-byte races) |
+| `http_rule`, `http_state` | Outgoing traffic rules, session token rules, login macros; cookie jar, kept `http_send_pipeline` connections |
 | `proxy_history`, `proxy_history_search`, `proxy_annotate`, `proxy_auto_auth` | Read and annotate proxy traffic |
 | `proxy_rule`, `proxy_intercept` | Proxy rules; Burp's Intercept switch and a hold queue to edit, forward or drop proxied messages |
 | `scanner`, `scanner_task`, `custom_check`, `bambda_import`, `bambda_templates` | Audits, crawls, tasks, BChecks, scan checks, Bambdas |

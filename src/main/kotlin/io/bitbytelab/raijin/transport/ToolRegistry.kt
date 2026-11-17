@@ -82,7 +82,7 @@ object ToolRegistry {
         ToolConsolidation.apply(scratch, server)
     }
 
-    private fun registerMembers(
+    internal fun registerMembers(
         server: Server,
         bridges: BridgeFactory.Bridges,
         eventBus: EventBus,

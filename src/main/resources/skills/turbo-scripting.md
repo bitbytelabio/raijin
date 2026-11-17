@@ -4,7 +4,7 @@ description: When to use Turbo runs and where the Turbo docs and examples live.
 ---
 # Turbo scripting
 
-Turbo runs a Python script against the request engine. Use it for high-volume sends, single-packet race conditions, HTTP/2 and HTTP/3 gates and desync work. For ordinary requests prefer `http_*`.
+Turbo runs a Python script against the request engine. Use it for high-volume sends, scripted or multi-endpoint race conditions, HTTP/2 and HTTP/3 gates and desync work. For ordinary requests, and for a single-packet or last-byte race of one request, prefer `http_*` (`http_race`).
 
 1. Read docs: `turbo_docs(action=get_docs)` with no topic lists the 12 topics; start with `api-quickstart`, then `engines`, `settings`, `race-conditions`, `response-processing`, `decorators`, `performance`, `desync-techniques`, `misc` as needed.
 2. Pick an example: `turbo_docs(action=list_examples)`, then `turbo_docs(action=get_example, name=...)`. Pass it on as `script` without changing its line endings.

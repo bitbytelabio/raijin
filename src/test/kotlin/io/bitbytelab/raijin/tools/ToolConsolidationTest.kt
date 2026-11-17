@@ -1,37 +1,8 @@
 package io.bitbytelab.raijin.tools
 
-import burp.api.montoya.MontoyaApi
-import io.bitbytelab.raijin.bridge.AiBridge
-import io.bitbytelab.raijin.bridge.BurpSuiteBridge
-import io.bitbytelab.raijin.bridge.ComparerBridge
-import io.bitbytelab.raijin.bridge.ConfigBridge
 import io.bitbytelab.raijin.bridge.DecoderBridge
-import io.bitbytelab.raijin.bridge.FindingsBridge
-import io.bitbytelab.raijin.bridge.LoggingBridge
-import io.bitbytelab.raijin.bridge.OrganizerBridge
-import io.bitbytelab.raijin.bridge.PersistenceBridge
-import io.bitbytelab.raijin.bridge.ProjectBridge
-import io.bitbytelab.raijin.bridge.RepeaterBridge
-import io.bitbytelab.raijin.bridge.ScopeBridge
-import io.bitbytelab.raijin.bridge.SitemapBridge
-import io.bitbytelab.raijin.bridge.UtilitiesBridge
-import io.bitbytelab.raijin.events.EventBus
-import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.testClientConnection
-import io.bitbytelab.raijin.tools.ai.AiTools
-import io.bitbytelab.raijin.tools.burpsuite.BurpSuiteTools
-import io.bitbytelab.raijin.tools.comparer.ComparerTools
-import io.bitbytelab.raijin.tools.config.ConfigTools
 import io.bitbytelab.raijin.tools.decoder.DecoderTools
-import io.bitbytelab.raijin.tools.findings.FindingsTools
-import io.bitbytelab.raijin.tools.logging.LoggingTools
-import io.bitbytelab.raijin.tools.organizer.OrganizerTools
-import io.bitbytelab.raijin.tools.persistence.PersistenceTools
-import io.bitbytelab.raijin.tools.project.ProjectTools
-import io.bitbytelab.raijin.tools.repeater.RepeaterTools
-import io.bitbytelab.raijin.tools.scope.ScopeTools
-import io.bitbytelab.raijin.tools.sitemap.SitemapTools
-import io.bitbytelab.raijin.tools.utilities.UtilitiesTools
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
 import io.modelcontextprotocol.kotlin.sdk.types.CallToolRequest
@@ -43,8 +14,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.*
-import java.io.File
-import java.lang.reflect.Proxy
+import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -76,13 +46,12 @@ class ToolConsolidationTest {
 
     private fun text(r: CallToolResult) = (r.content.first() as TextContent).text
 
-    /** All tool names registered in the source tree, found the same way a reader would. */
-    private fun sourceToolNames(): Set<String> {
-        val re = Regex("""name\s*=\s*"([a-z0-9_]+)"\s*,\s*\n\s*description""")
-        return File("src/main/kotlin/io/bitbytelab/raijin/tools").walkTopDown()
-            .filter { it.extension == "kt" && it.name.endsWith("Tools.kt") }
-            .flatMap { re.findAll(it.readText()).map { m -> m.groupValues[1] } }
-            .toSet()
+    /** The real tools, registered on first use; see [RegisteredTools]. */
+    private val real = lazy { RegisteredTools() }
+
+    @AfterTest
+    fun closeRealTools() {
+        if (real.isInitialized()) real.value.close()
     }
 
     @Test
@@ -94,12 +63,11 @@ class ToolConsolidationTest {
     }
 
     @Test
-    fun `every tool in the sources is grouped or kept, and nothing refers to a missing tool`() {
-        val sources = sourceToolNames()
-        assertTrue(sources.size > 100, "tool scan found only ${sources.size}")
+    fun `every registered tool is grouped or kept, and nothing refers to a missing tool`() {
+        val registered = real.value.members.tools.keys
         val assigned = ToolConsolidation.GROUPS.flatMap { it.actions.values }.toSet() + ToolConsolidation.KEEP
-        assertEquals(emptySet(), sources - assigned, "tools neither grouped nor kept")
-        assertEquals(emptySet(), assigned - sources, "groups name tools that do not exist")
+        assertEquals(emptySet(), registered - assigned, "tools neither grouped nor kept")
+        assertEquals(emptySet(), assigned - registered, "groups name tools that do not exist")
     }
 
     @Test
@@ -248,38 +216,8 @@ class ToolConsolidationTest {
         assertEquals(null, ToolConsolidation.legacyName("http_fuzz", null))
     }
 
-    /** Montoya API whose every call returns null: enough to construct bridges and register their tools. */
-    private fun nullApi(): MontoyaApi =
-        Proxy.newProxyInstance(MontoyaApi::class.java.classLoader, arrayOf(MontoyaApi::class.java)) { _, _, _ -> null } as MontoyaApi
-
-    /** Registers the real tools whose bridges need no live Burp, so their actual schemas get merged. */
-    private fun registerRealTools(s: Server) {
-        val api = nullApi()
-        UtilitiesTools.register(s, UtilitiesBridge(api))
-        LoggingTools.register(s, LoggingBridge(api))
-        ConfigTools.register(s, ConfigBridge(api))
-        BurpSuiteTools.register(s, BurpSuiteBridge(api))
-        ProjectTools.register(s, ProjectBridge(api))
-        PersistenceTools.register(s, PersistenceBridge(api))
-        SitemapTools.register(s, SitemapBridge(api))
-        ScopeTools.register(s, ScopeBridge(api, EventBus()))
-        OrganizerTools.register(s, OrganizerBridge(api))
-        FindingsTools.register(s, FindingsBridge(StateManager()))
-        AiTools.register(s, AiBridge(api))
-        RepeaterTools.register(s, RepeaterBridge(api))
-        ComparerTools.register(s, ComparerBridge(api))
-        DecoderTools.register(s, DecoderBridge { })
-    }
-
-    private fun consolidatedWithRealTools(): Pair<Server, Server> {
-        val legacy = server()
-        registerRealTools(legacy)
-        ToolConsolidation.GROUPS.flatMap { it.actions.values }.filter { it !in legacy.tools }.forEach { fake(legacy, it) }
-        ToolConsolidation.KEEP.filter { it !in legacy.tools }.forEach { fake(legacy, it) }
-        val target = server()
-        ToolConsolidation.apply(legacy, target)
-        return legacy to target
-    }
+    /** Every real member tool, and the tools [ToolConsolidation] publishes from them. */
+    private fun consolidatedWithRealTools(): Pair<Server, Server> = real.value.members to real.value.published
 
     private fun JsonObject.str(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull
 

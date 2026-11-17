@@ -31,12 +31,12 @@ for high-speed work: single-packet race conditions, HTTP/2 and HTTP/3 gates, req
 
 | | |
 |---|---|
-| 🧰 **190+ operations, ~45 tools** | Proxy, Scanner, Repeater, Intruder, Collaborator, Organizer, site map, scope, WebSockets, cookies, config, Burp AI. Families of operations are grouped behind an `action` parameter so the client's tool list stays small. |
+| 🧰 **200+ operations, ~45 tools** | Proxy, Scanner, Repeater, Intruder, Collaborator, Organizer, site map, scope, WebSockets, cookies, config, Burp AI. Families of operations are grouped behind an `action` parameter so the client's tool list stays small. |
 | 🏎️ **Turbo engine** | Python (Jython) scripts on a custom request engine: single-packet attack, HTTP/2 and HTTP/3, pipelining, timing analysis. Runs from Burp's UI or from an agent. |
 | 🔎 **Recon and guided probes** | JS endpoints and source maps, calibrated content discovery, Param Miner-style parameter mining with its wordlists, fingerprinting; CORS, web cache poisoning and deception, GraphQL, injection (ten classes, out-of-band confirmation through Collaborator), access control, IDOR and JWT probes. Findings carry the evidence to re-check them. |
 | 🛂 **Live access-control checks** | Autorize-style proxy tap: matching traffic is replayed in the background under lower-privilege identities; mismatches, with what each identity received, land in findings and on the Autorize tab and survive a reload. |
 | 🕸️ **GraphQL toolkit** | Ported from InQL: query templates per field, points-of-interest and cycle scans, batched alias queries for brute force and rate-limit testing; plus engine fingerprinting, schema brute force without introspection and a subscription probe over WebSocket. |
-| 🧬 **Request smuggling** | HTTP Request Smuggler's desync technique catalog, probe payloads and canaries for Turbo scripts, and `http_send_pipeline` for raw requests over one socket. |
+| 🧬 **Request smuggling** | HTTP Request Smuggler's desync technique catalog, probe payloads and canaries for Turbo scripts, and `http_send_pipeline` for raw requests over one socket (mid-request pauses, the raw response bytes, timing per response). |
 | 🔑 **JWT toolkit** | Key ring (RSA, EC, OKP, oct, password), sign, verify, JWE encrypt/decrypt, and the usual JWT test cases (`alg:none`, algorithm confusion, embedded JWK, psychic signatures, `jku`/`x5u` with the document to host, secret cracking). |
 | 📚 **Built-in skills** | Eight usage guides served as MCP prompts and resources, so an agent learns the tools and workflows on its own. |
 | 🖥️ **Native UI** | A **Raijin** tab that follows Burp's theme (dark or light): MCP activity, proxy explorer, scanner, findings, Autorize, Collaborator, rules (traffic, WebSocket, scope), JWT, Turbo runs, server settings with remote access. |
@@ -116,22 +116,22 @@ With remote access on, every endpoint needs the bearer token; see [Security mode
 
 ## 🧰 Tools
 
-Raijin exposes about **45 MCP tools** over 190+ operations. Frequently used tools stay individual; families of operations are one tool with a required `action` parameter, for example `scope(action=include)` or `scanner(action=start_audit)`. Each tool's description lists its actions and the parameters each one needs (required ones are marked `*`); a parameter several actions share keeps every action's description and allowed values. The member tools behind each action are mapped in [docs/dev/tool-consolidation.md](docs/dev/tool-consolidation.md).
+Raijin exposes about **45 MCP tools** over 200+ operations. Frequently used tools stay individual; families of operations are one tool with a required `action` parameter, for example `scope(action=include)` or `scanner(action=start_audit)`. Each tool's description lists its actions and the parameters each one needs (required ones are marked `*`); a parameter several actions share keeps every action's description and allowed values. The member tools behind each action are mapped in [docs/dev/tool-consolidation.md](docs/dev/tool-consolidation.md).
 
 <details open>
 <summary><b>HTTP and proxy</b></summary>
 
 | Tool | What it does |
 |---|---|
-| `http_send_request` | Send one HTTP request through Burp, from a URL or raw text; HTTP/1.1 or HTTP/2. |
+| `http_send_request` | Send one HTTP request through Burp, from a URL or raw text; HTTP/1.1 or HTTP/2, including a native HTTP/2 header list sent as given (pseudo-headers too); Burp's redirect, SNI, response-timeout and TLS-verification options. |
 | `http_send_requests_parallel` | Send many requests concurrently, across hosts. |
-| `http_send_request_chain` | Send a sequence, extracting values from each response (regex) into the next request. |
+| `http_send_request_chain` | Send a sequence, extracting values from each response (regex, JSONPath or XPath) into the next request. |
 | `http_send_raw_bytes` | Send exact bytes (hex or text) for smuggling and CRLF cases; one request, one response. |
-| `http_send_pipeline` | Several raw HTTP/1.1 requests over one socket; every response read back in order with its framing, trailers and close reason (desync and 0.CL work). |
-| `http_fuzz` | Inject payloads at marked positions (sniper mode; `FUZZ` or `§` markers; built-in payload libraries). |
-| `http_race` | Fire requests together to test race conditions (best effort; use Turbo for single-packet timing). |
-| `http_rule` | Outgoing traffic rules (`rule_action`: modify, drop, spoof a response; `tool_filter` by Burp tool) and session token rules. |
-| `http_state` | Burp cookie jar: get, set, delete. |
+| `http_send_pipeline` | Several raw HTTP/1.1 requests over one socket; every response read back in order with its framing, trailers, close reason, raw bytes and timing (desync and 0.CL work). Requests can pause mid-write; bodies can be shown decompressed. |
+| `http_fuzz` | Intruder's attack types (sniper, battering ram, pitchfork, cluster bomb) on `FUZZ` or `§` positions: payload sets and built-in libraries, encoders, concurrency and rate limit, filters; every response clustered. |
+| `http_race` | Release requests together behind a real barrier to test race conditions: HTTP/2 single-packet through Burp, or HTTP/1.1 last-byte on Raijin's own connections; responses clustered. |
+| `http_rule` | Outgoing traffic rules (`rule_action`: modify, drop, spoof a response; `tool_filter` by Burp tool), session token rules (regex, JSONPath or XPath; injected into a header, cookie, form, query or JSON value) and login macros that log in again when a session expires. |
+| `http_state` | Burp cookie jar: get, set, delete; the connections `http_send_pipeline` keeps open: list, close. |
 | `proxy_history`, `proxy_history_search` | Read and search Proxy HTTP history (sensitive request headers masked unless the full request is asked for). |
 | `proxy_annotate` | Highlight and comment history items. |
 | `proxy_auto_auth` | Set an auth header (replacing any existing one) on every proxied request for a host pattern. |
@@ -217,7 +217,7 @@ The server ships short usage guides so an agent can learn the tool groups and wo
 | Skill | Prompt name | Covers |
 |---|---|---|
 | `burpsuite-overview` | `burpsuite_overview_skill` | **Start here.** Tool map, scope rules, typical workflow. |
-| `http-testing` | `http_testing_skill` | Sending, chaining, fuzzing and racing requests. |
+| `http-testing` | `http_testing_skill` | Sending, chaining, fuzzing and racing requests; traffic rules, session tokens and login macros. |
 | `proxy-traffic` | `proxy_traffic_skill` | History, search, annotations, proxy rules, interception. |
 | `scanner-audit` | `scanner_audit_skill` | Crawls, audits, tasks, BChecks and custom checks. |
 | `recon-and-probes` | `recon_and_probes_skill` | Recon and guided probes on in-scope targets. |

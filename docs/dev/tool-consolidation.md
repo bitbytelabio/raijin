@@ -1,6 +1,6 @@
 # Tool consolidation
 
-Raijin folds families of tools into one tool with an `action` parameter (`tools/ToolConsolidation.kt`): 27 grouped tools and 19 tools kept as they are, 46 in all, over 196 operations. The old per-operation names are not on the server any more, but the Activity tab and the audit log still record each call under its member name (the left column below), so this table also reads those records.
+Raijin folds families of tools into one tool with an `action` parameter (`tools/ToolConsolidation.kt`): 27 grouped tools and 19 tools kept as they are, 46 in all, over 201 operations. The old per-operation names are not on the server any more, but the Activity tab and the audit log still record each call under its member name (the left column below), so this table also reads those records.
 
 Tools kept as they are: `http_send_request`, `http_send_requests_parallel`, `http_send_request_chain`, `http_send_raw_bytes`, `http_send_pipeline`, `http_fuzz`, `http_race`, `proxy_history`, `proxy_history_search`, `proxy_annotate`, `proxy_auto_auth`, `auth_diff`, `api_import_openapi`, `bambda_import`, `bambda_templates`, `jwt_keys`, `search_skills`, `load_skill`, `read_skill_file`.
 
@@ -102,6 +102,7 @@ For example `probe.mode` unites the GraphQL and JWT modes into one enum, and its
 | `http_cookie_jar_get` | `http_state` | `cookie_jar_get` |
 | `http_cookie_jar_set` | `http_state` | `cookie_jar_set` |
 | `http_list_traffic_rules` | `http_rule` | `traffic_rule_list` |
+| `http_pipeline_connections` | `http_state` | `pipeline_connections` |
 | `http_remove_traffic_rule` | `http_rule` | `traffic_rule_remove` |
 | `http_set_traffic_rule` | `http_rule` | `traffic_rule_set` |
 | `idor_hunt` | `probe` | `idor` |
@@ -170,6 +171,10 @@ For example `probe.mode` unites the GraphQL and JWT modes into one enum, and its
 | `scope_remove` | `scope` | `remove` |
 | `session_create_token_rule` | `http_rule` | `token_rule_create` |
 | `session_list_rules` | `http_rule` | `token_rule_list` |
+| `session_macro_list` | `http_rule` | `macro_list` |
+| `session_macro_remove` | `http_rule` | `macro_remove` |
+| `session_macro_run` | `http_rule` | `macro_run` |
+| `session_macro_set` | `http_rule` | `macro_set` |
 | `session_remove_rule` | `http_rule` | `token_rule_remove` |
 | `sitemap_add_issue` | `sitemap` | `add_issue` |
 | `sitemap_add_request` | `sitemap` | `add_request` |
