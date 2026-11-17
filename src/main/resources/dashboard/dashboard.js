@@ -72,27 +72,50 @@ var knownHosts = {};
 // ---- DOM refs ----
 var elList = document.getElementById('activityList');
 var elDetail = document.getElementById('detailPanel');
-var elDetailInner = document.getElementById('detailInner');
 var elSearch = document.getElementById('searchBox');
 var elToast = document.getElementById('toast');
+var elEmpty = document.getElementById('streamEmpty');
+var elFacts = document.getElementById('detailFacts');
+var elActions = document.getElementById('detailActions');
+var elPreview = document.getElementById('detailPreview');
+var previewCommand = '';
+
+// Markup lives in index.html <template> elements; these clone and fill it.
+function fromTemplate(id) { return document.getElementById(id).content.firstElementChild.cloneNode(true); }
+function slot(root, name) { return root.querySelector('[data-slot="' + name + '"]'); }
+function badge(kind, text) { var b = fromTemplate('tpl-badge'); b.classList.add('badge-' + kind); b.textContent = text; return b; }
+function statusClass(code) { return code < 300 ? '2xx' : code < 400 ? '3xx' : code < 500 ? '4xx' : '5xx'; }
+
+document.getElementById('noiseToggle').addEventListener('click', toggleNoise);
+document.getElementById('clearEvents').addEventListener('click', clearAll);
+document.getElementById('detailClose').addEventListener('click', closeDetail);
+elPreview.addEventListener('click', function() { if (previewCommand) copyText(previewCommand); });
+// The logo may be absent from the jar: drop the broken image.
+var elLogo = document.getElementById('brandLogo');
+if (elLogo.complete && elLogo.naturalWidth === 0) elLogo.remove();
+else elLogo.addEventListener('error', function() { elLogo.remove(); });
 
 // ---- Noise toggle ----
 function toggleNoise() {
     noiseHidden = !noiseHidden;
     localStorage.setItem('raijin_noise', noiseHidden ? 'hide' : 'show');
     var btn = document.getElementById('noiseToggle');
-    if (noiseHidden) btn.classList.add('active'); else btn.classList.remove('active');
+    btn.classList.toggle('active', noiseHidden);
+    btn.setAttribute('aria-pressed', String(noiseHidden));
     renderList();
 }
 document.getElementById('noiseToggle').classList.toggle('active', noiseHidden);
+document.getElementById('noiseToggle').setAttribute('aria-pressed', String(noiseHidden));
 
 // ---- Tab switching ----
 document.getElementById('tabNav').addEventListener('click', function(e) {
-    var btn = e.target.closest('.filter-btn');
+    var btn = e.target.closest('[role="tab"]');
     if (!btn) return;
     var tab = btn.dataset.tab;
-    document.querySelectorAll('#tabNav .filter-btn').forEach(function(b){b.classList.remove('active');});
-    btn.classList.add('active');
+    document.querySelectorAll('#tabNav [role="tab"]').forEach(function(b) {
+        b.classList.toggle('active', b === btn);
+        b.setAttribute('aria-selected', String(b === btn));
+    });
     document.querySelectorAll('.tab-panel').forEach(function(p){p.classList.remove('active');});
     var panel = document.getElementById('panel-' + tab);
     if (panel) panel.classList.add('active');
@@ -104,8 +127,10 @@ document.getElementById('typeFilter').addEventListener('click', function(e) {
     var btn = e.target.closest('.filter-btn');
     if (!btn) return;
     activeFilter = btn.dataset.filter;
-    document.querySelectorAll('#typeFilter .filter-btn').forEach(function(b){b.classList.remove('active');});
-    btn.classList.add('active');
+    document.querySelectorAll('#typeFilter .filter-btn').forEach(function(b) {
+        b.classList.toggle('active', b === btn);
+        b.setAttribute('aria-pressed', String(b === btn));
+    });
     renderList();
 });
 
@@ -257,22 +282,16 @@ function passesFilter(evt) {
 }
 
 function updateCounterDisplay() {
-    document.getElementById('sEvents').textContent = counters.events;
-    document.getElementById('sScope').textContent = Object.keys(knownHosts).filter(function(h){return knownHosts[h];}).length;
-    document.getElementById('sApi').textContent = counters.api;
-    document.getElementById('sAuth').textContent = counters.auth;
-    document.getElementById('sParams').textContent = counters.params;
-    document.getElementById('sUpload').textContent = counters.upload;
-    document.getElementById('sAdmin').textContent = counters.admin;
-    document.getElementById('sData').textContent = counters.data;
-    document.getElementById('sFindings').textContent = counters.findings;
-    document.getElementById('sHidden').textContent = counters.hidden;
-    document.getElementById('sToolCalls').textContent = counters.toolCalls;
+    var inScope = Object.keys(knownHosts).filter(function(h){return knownHosts[h];}).length;
+    document.querySelectorAll('[data-count]').forEach(function(el) {
+        var k = el.dataset.count;
+        el.textContent = k === 'scope' ? inScope : counters[k];
+    });
 }
 
 // ---- Render full list (for filter changes) ----
 function renderList() {
-    while (elList.firstChild) elList.removeChild(elList.firstChild);
+    elList.replaceChildren();
     var shown = 0;
     for (var i = 0; i < events.length; i++) {
         if (passesFilter(events[i])) {
@@ -281,117 +300,64 @@ function renderList() {
             if (shown > 500) break;
         }
     }
+    elEmpty.hidden = shown > 0;
     if (shown === 0) {
-        var empty = document.createElement('div');
-        empty.className = 'empty-state';
-        empty.textContent = events.length === 0 ? 'Waiting for events from Burp Suite proxy...' : 'No events match current filters';
-        elList.appendChild(empty);
+        elEmpty.textContent = events.length === 0 ? 'Waiting for events from Burp Suite proxy...' : 'No events match current filters';
     }
 }
 
 function prependEventDOM(evt) {
-    var empty = elList.querySelector('.empty-state');
-    if (empty) empty.remove();
+    elEmpty.hidden = true;
     elList.insertBefore(buildEventRow(evt), elList.firstChild);
     while (elList.children.length > 500) elList.removeChild(elList.lastChild);
 }
 
 function buildEventRow(evt) {
-    var row = document.createElement('div');
-    row.className = 'activity-item' + (evt.isNoise && !noiseHidden ? ' noise' : '') + (evt.id === selectedEventId ? ' selected' : '');
+    var row = fromTemplate('tpl-event-row');
+    var selected = evt.id === selectedEventId;
+    if (evt.isNoise && !noiseHidden) row.classList.add('noise');
+    row.classList.toggle('selected', selected);
+    row.setAttribute('aria-expanded', String(selected));
     row.dataset.eid = evt.id;
-    row.onclick = function() { selectEvent(evt.id); };
-
-    // Time
-    var t = document.createElement('span');
-    t.className = 'activity-time';
-    t.textContent = evt.time;
-    row.appendChild(t);
-
-    // Badges
-    var badges = document.createElement('span');
-    badges.className = 'activity-badges';
-    evt.vectors.forEach(function(v) {
-        var b = document.createElement('span');
-        b.className = 'badge badge-' + v;
-        b.textContent = v.toUpperCase();
-        badges.appendChild(b);
+    row.addEventListener('click', function() { selectEvent(evt.id); });
+    slot(row, 'time').textContent = evt.time;
+    var badges = slot(row, 'badges');
+    (evt.vectors.length ? evt.vectors : [evt.category]).forEach(function(v) {
+        badges.appendChild(badge(v, v.toUpperCase()));
     });
-    if (evt.vectors.length === 0) {
-        var b = document.createElement('span');
-        b.className = 'badge badge-' + evt.category;
-        b.textContent = evt.category.toUpperCase();
-        badges.appendChild(b);
-    }
-    row.appendChild(badges);
-
-    // URL/label area
-    var urlArea = document.createElement('span');
-    urlArea.className = 'activity-url';
-    if (evt.type === 'autorize.match' && evt.method && evt.url) {
-        var verdictBadge = document.createElement('span');
-        verdictBadge.className = 'badge badge-scanner';
-        verdictBadge.textContent = evt.label;
-        urlArea.appendChild(verdictBadge);
-        urlArea.appendChild(document.createTextNode(' '));
-    }
-    if (evt.method && (evt.url || evt.category === 'tool')) {
-        // Method badge — for tool events, show tool name
-        var mb = document.createElement('span');
-        var isToolEvt = evt.category === 'tool' && evt.type === 'tool.called';
-        mb.className = isToolEvt ? 'method-badge method-tool' : ('method-badge method-' + evt.method);
-        mb.textContent = evt.method;
-        urlArea.appendChild(mb);
-        urlArea.appendChild(document.createTextNode(' '));
-
-        // Status if available
-        if (evt.statusCode) {
-            var sc = document.createElement('span');
-            var scCls = evt.statusCode < 300 ? '2xx' : evt.statusCode < 400 ? '3xx' : evt.statusCode < 500 ? '4xx' : '5xx';
-            sc.className = 'status-code status-' + scCls;
-            sc.textContent = evt.statusCode;
-            urlArea.appendChild(sc);
-            urlArea.appendChild(document.createTextNode(' '));
-        }
-
-        // Path
-        var pathParts = evt.path.split('?');
-        var ps = document.createElement('span');
-        ps.className = 'path';
-        ps.textContent = pathParts[0];
-        urlArea.appendChild(ps);
-        if (pathParts[1]) {
-            var qs = document.createElement('span');
-            qs.className = 'query';
-            qs.textContent = '?' + pathParts[1].substring(0, 60);
-            urlArea.appendChild(qs);
-        }
-
-        // Host
-        if (evt.host) {
-            var hs = document.createElement('span');
-            hs.className = 'host';
-            hs.textContent = evt.host;
-            urlArea.appendChild(hs);
-        }
-    } else {
-        urlArea.textContent = evt.label || evt.type;
-    }
-    row.appendChild(urlArea);
-
-    // Host column
-    var hostCol = document.createElement('span');
-    hostCol.style.cssText = 'color:var(--text-muted);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:120px;';
-    hostCol.textContent = evt.host || '';
-    row.appendChild(hostCol);
-
-    // Expand
-    var exp = document.createElement('span');
-    exp.className = 'expand-icon';
-    exp.textContent = '\u25BC';
-    row.appendChild(exp);
-
+    var summary = slot(row, 'summary');
+    if (evt.method && (evt.url || evt.category === 'tool')) summary.appendChild(buildRequestLine(evt));
+    else summary.textContent = evt.label || evt.type;
+    slot(row, 'host').textContent = evt.host || '';
     return row;
+}
+
+// Verdict (Autorize), method or tool name, status, path and query of one event.
+function buildRequestLine(evt) {
+    var line = fromTemplate('tpl-request-line');
+    var verdict = slot(line, 'verdict');
+    if (evt.type === 'autorize.match' && evt.url) verdict.textContent = evt.label;
+    else verdict.remove();
+
+    var method = slot(line, 'method');
+    if (evt.type === 'tool.called') method.classList.add('method-tool');
+    else if (/^[A-Za-z]+$/.test(evt.method)) method.classList.add('method-' + evt.method);
+    method.textContent = evt.method;
+
+    var status = slot(line, 'status');
+    if (evt.statusCode) {
+        status.classList.add('status-' + statusClass(evt.statusCode));
+        status.textContent = evt.statusCode;
+    } else {
+        status.remove();
+    }
+
+    var pathParts = (evt.path || '').split('?');
+    slot(line, 'path').textContent = pathParts[0];
+    var query = slot(line, 'query');
+    if (pathParts[1]) query.textContent = '?' + pathParts[1].substring(0, 60);
+    else query.remove();
+    return line;
 }
 
 // ---- MCP command helpers ----
@@ -434,21 +400,13 @@ function selectEvent(eid) {
 
     // Update row highlights
     elList.querySelectorAll('.activity-item').forEach(function(r) {
-        r.classList.toggle('selected', parseInt(r.dataset.eid) === eid);
+        var isSelected = parseInt(r.dataset.eid) === eid;
+        r.classList.toggle('selected', isSelected);
+        r.setAttribute('aria-expanded', String(isSelected));
     });
 
     var evt = events.find(function(e) { return e.id === eid; });
     if (!evt) return;
-
-    // Build detail content
-    while (elDetailInner.firstChild) elDetailInner.removeChild(elDetailInner.firstChild);
-
-    // Left: request info
-    var left = document.createElement('div');
-    var h4L = document.createElement('h4');
-    h4L.className = 'detail-section';
-    h4L.textContent = 'REQUEST DETAILS';
-    left.appendChild(h4L);
 
     var rows = [];
     if (evt.method) rows.push(['Method', evt.method]);
@@ -470,32 +428,6 @@ function selectEvent(eid) {
             }).join(', ')]);
         }
     }
-
-    rows.forEach(function(r) {
-        var dr = document.createElement('div');
-        dr.className = 'detail-row';
-        var dl = document.createElement('span');
-        dl.className = 'dl';
-        dl.textContent = r[0];
-        var dv = document.createElement('span');
-        dv.className = 'dv';
-        dv.textContent = r[1];
-        dr.appendChild(dl);
-        dr.appendChild(dv);
-        left.appendChild(dr);
-    });
-
-    // Right: MCP tool actions
-    var right = document.createElement('div');
-    var h4R = document.createElement('h4');
-    h4R.className = 'detail-section';
-    h4R.textContent = 'MCP TOOL COMMANDS';
-    right.appendChild(h4R);
-
-    var hint = document.createElement('div');
-    hint.className = 'detail-hint';
-    hint.textContent = 'Click any command below to copy it. Paste and run in your MCP client.';
-    right.appendChild(hint);
 
     // Tool commands (current consolidated tool names; arguments always serialised by JSON.stringify)
     var cmds = [];
@@ -540,47 +472,46 @@ function selectEvent(eid) {
         cmds.push({label: 'View Issue Detail', cmd: mcpCommand('scanner', issueArgs)});
     }
 
-    // Action buttons
-    var actions = document.createElement('div');
-    actions.className = 'detail-actions';
-    cmds.forEach(function(c) {
-        var btn = document.createElement('button');
-        btn.className = 'detail-btn';
+    elFacts.replaceChildren.apply(elFacts, rows.map(function(r) {
+        var fact = fromTemplate('tpl-fact');
+        fact.querySelector('dt').textContent = r[0];
+        fact.querySelector('dd').textContent = r[1];
+        return fact;
+    }));
+
+    elActions.replaceChildren.apply(elActions, cmds.map(function(c) {
+        var btn = fromTemplate('tpl-command');
         btn.textContent = c.label;
-        btn.onclick = function(e) {
+        btn.addEventListener('click', function(e) {
             e.stopPropagation();
             copyText(c.cmd);
             btn.classList.add('copied');
             btn.textContent = 'Copied!';
             setTimeout(function(){ btn.classList.remove('copied'); btn.textContent = c.label; }, 1500);
-        };
-        actions.appendChild(btn);
-    });
-    right.appendChild(actions);
+        });
+        return btn;
+    }));
 
-    // Show first command as preview
-    if (cmds.length > 0) {
-        var pre = document.createElement('div');
-        pre.className = 'detail-mcp';
-        pre.textContent = cmds[0].cmd;
-        pre.title = 'Click to copy';
-        pre.onclick = function(e) {
-            e.stopPropagation();
-            copyText(cmds[0].cmd);
-            showToast('Copied to clipboard');
-        };
-        right.appendChild(pre);
-    }
+    // First command as a copyable preview
+    previewCommand = cmds.length ? cmds[0].cmd : '';
+    elPreview.textContent = previewCommand;
+    elPreview.hidden = !previewCommand;
 
-    elDetailInner.appendChild(left);
-    elDetailInner.appendChild(right);
     elDetail.classList.add('open');
+    elDetail.inert = false;
 }
 
 function closeDetail() {
     selectedEventId = null;
     elDetail.classList.remove('open');
-    elList.querySelectorAll('.activity-item.selected').forEach(function(r) { r.classList.remove('selected'); });
+    // inert drops focus held inside the panel: hand it back to the row that opened it.
+    var openRow = elList.querySelector('.activity-item.selected');
+    if (openRow && elDetail.contains(document.activeElement)) openRow.focus();
+    elDetail.inert = true;
+    elList.querySelectorAll('.activity-item.selected').forEach(function(r) {
+        r.classList.remove('selected');
+        r.setAttribute('aria-expanded', 'false');
+    });
 }
 
 function copyText(text) {
@@ -734,13 +665,18 @@ function connectSSE() {
 // ---- Connection details (real host and ports, from the server) ----
 function fetchInfo() {
     fetchJson('api/info').then(function(d) {
-        if (d.version) document.getElementById('versionText').textContent = 'v' + d.version;
-        document.getElementById('connPrimary').textContent = d.primary_mcp_url || '';
-        document.getElementById('connSecondary').textContent = d.secondary_mcp_url || '';
-        document.getElementById('connDashboard').textContent = d.dashboard_url || location.origin;
-        document.getElementById('connProxyHistory').textContent = d.proxy_history_url || '';
-        document.getElementById('connClientConfig').textContent = d.mcp_client_config ? JSON.stringify(d.mcp_client_config) : '';
-        document.getElementById('connClaudeCode').textContent = d.claude_code_command || '';
+        if (d.version) {
+            var version = document.getElementById('versionText');
+            version.textContent = 'v' + d.version;
+            version.hidden = false;
+        }
+        document.querySelectorAll('[data-info]').forEach(function(el) {
+            var key = el.dataset.info;
+            var value = d[key];
+            if (key === 'dashboard_url' && !value) value = location.origin;
+            if (value !== null && typeof value === 'object') value = JSON.stringify(value);
+            el.textContent = value === null || value === undefined ? '' : value;
+        });
     }).catch(function(){});
 }
 
@@ -763,23 +699,18 @@ function fetchRules() {
             var key = type + '_rules';
             var el = document.getElementById(type + 'RulesList');
             var rules = d[key] || [];
-            while (el.firstChild) el.removeChild(el.firstChild);
+            el.replaceChildren();
             if (rules.length === 0) {
-                var empty = document.createElement('div');
-                empty.className = 'empty-state';
+                var empty = fromTemplate('tpl-empty');
                 empty.textContent = 'No ' + type + ' rules active';
                 el.appendChild(empty);
             } else {
                 rules.forEach(function(r) {
-                    var item = document.createElement('div');
-                    item.className = 'rule-item';
-                    var nameSpan = document.createElement('span');
-                    nameSpan.textContent = r.id || r.name || 'unnamed';
-                    item.appendChild(nameSpan);
-                    var badge = document.createElement('span');
-                    badge.className = 'rule-badge ' + (r.enabled ? 'active' : 'inactive');
-                    badge.textContent = r.enabled ? 'ACTIVE' : 'OFF';
-                    item.appendChild(badge);
+                    var item = fromTemplate('tpl-rule');
+                    slot(item, 'name').textContent = r.id || r.name || 'unnamed';
+                    var state = slot(item, 'state');
+                    state.classList.add(r.enabled ? 'active' : 'inactive');
+                    state.textContent = r.enabled ? 'ACTIVE' : 'OFF';
                     el.appendChild(item);
                 });
             }

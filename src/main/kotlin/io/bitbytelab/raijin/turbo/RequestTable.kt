@@ -296,32 +296,6 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
             val comment = JOptionPane.showInputDialog(menu, "Comment", "", JOptionPane.PLAIN_MESSAGE) as? String
                 ?: return@addActionListener
 
-            val htmlTable = StringBuilder()
-            htmlTable.append("<table>")
-            htmlTable.append("<tr><td>Payload</td><td>Status</td><td>TTFB</td><td>TTLB</td><td>Arrival</td><td>Label</td><td>Queue ID</td><td>Connection ID</td></tr>")
-
-            for (req in getSelectedRequests()) {
-                htmlTable.append("<tr><td>")
-                if (req.words.isNotEmpty()) {
-                    htmlTable.append(req.words[0])
-                }
-                htmlTable.append("</td><td>")
-                htmlTable.append(req.status)
-                htmlTable.append("</td><td>")
-                htmlTable.append(req.ttfb)
-                htmlTable.append("</td><td>")
-                htmlTable.append(req.ttlb)
-                htmlTable.append("</td><td>")
-                htmlTable.append(req.arrival)
-                htmlTable.append("</td><td>")
-                htmlTable.append(req.label)
-                htmlTable.append("</td><td>")
-                htmlTable.append(req.order)
-                htmlTable.append("</td><td>")
-                htmlTable.append(req.connectionId)
-                htmlTable.append("</td></tr>")
-            }
-            htmlTable.append("</table>")
             val montoyaService = reqs[0].httpService()
             val baseReq = HttpRequestResponse.httpRequestResponse(
                 HttpRequest.httpRequest(montoyaService, MontoyaBytes.byteArray(*Utils.stringToBytes(handler.baseRequest))),
@@ -329,7 +303,17 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
             )
             val scheme = if (montoyaService.secure()) "https" else "http"
             val url = "$scheme://${montoyaService.host()}:${montoyaService.port()}"
-            val detail = "<b>Comment: "+comment+"</b><br/><br/><b>Status:</b> "+statusLabel.text + "<br/><br/>\n<pre>"+ handler.code.replace("<", "&lt;")+"</pre>\n"+htmlTable
+            val detail = TurboIssueDetail.html(
+                comment = comment,
+                status = statusLabel.text,
+                script = handler.code,
+                rows = getSelectedRequests().map { req ->
+                    TurboIssueDetail.Row(
+                        req.words.firstOrNull() ?: "", req.status, req.ttfb, req.ttlb, req.arrival,
+                        req.label, req.order, req.connectionId ?: "",
+                    )
+                },
+            )
             val issue = AuditIssue.auditIssue(
                 "Raijin Turbo finding",
                 detail,

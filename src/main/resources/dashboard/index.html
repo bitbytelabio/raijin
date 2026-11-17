@@ -9,100 +9,120 @@
 </head>
 <body>
 
-<!-- Header -->
-<div class="header">
+<header class="header">
     <div class="header-left">
-        <h1><img src="logo.png" alt="" onerror="this.remove()">Raijin</h1>
-        <span class="version" id="versionText"></span>
+        <h1><img src="logo.png" alt="" id="brandLogo">Raijin</h1>
+        <span class="version" id="versionText" hidden></span>
     </div>
     <div class="header-right">
-        <div class="status-dot" id="statusDot"></div>
-        <span id="statusText">Connecting...</span>
-        <span id="uptimeText" style="font-family:var(--mono);font-size:11px;">00:00:00</span>
-        <div class="noise-toggle active" id="noiseToggle" onclick="toggleNoise()">
-            <span class="indicator"></span>
-            <span>Hide Noise</span>
+        <span class="status-dot" id="statusDot" aria-hidden="true"></span>
+        <span id="statusText" role="status">Connecting...</span>
+        <span class="header-uptime" id="uptimeText">00:00:00</span>
+        <button type="button" class="noise-toggle active" id="noiseToggle" aria-pressed="true">
+            <span class="indicator" aria-hidden="true"></span><span>Hide noise</span>
+        </button>
+    </div>
+</header>
+
+<section class="stats-bar" aria-label="Event counters">
+    <div class="stat-pill events"><span class="stat-num" data-count="events">0</span><span class="stat-label">Events</span></div>
+    <div class="stat-pill scope"><span class="stat-num" data-count="scope">0</span><span class="stat-label">In-Scope</span></div>
+    <div class="stats-sep" aria-hidden="true"></div>
+    <div class="stat-pill api"><span class="stat-num" data-count="api">0</span><span class="stat-label">API</span></div>
+    <div class="stat-pill auth"><span class="stat-num" data-count="auth">0</span><span class="stat-label">Auth</span></div>
+    <div class="stat-pill params"><span class="stat-num" data-count="params">0</span><span class="stat-label">Params</span></div>
+    <div class="stat-pill upload"><span class="stat-num" data-count="upload">0</span><span class="stat-label">Upload</span></div>
+    <div class="stat-pill admin"><span class="stat-num" data-count="admin">0</span><span class="stat-label">Admin</span></div>
+    <div class="stat-pill data"><span class="stat-num" data-count="data">0</span><span class="stat-label">Data</span></div>
+    <div class="stats-sep" aria-hidden="true"></div>
+    <div class="stat-pill findings"><span class="stat-num" data-count="findings">0</span><span class="stat-label">Findings</span></div>
+    <div class="stats-sep" aria-hidden="true"></div>
+    <div class="stat-pill tools"><span class="stat-num" data-count="toolCalls">0</span><span class="stat-label">MCP Calls</span></div>
+    <div class="stat-pill hidden"><span class="stat-num" data-count="hidden">0</span><span class="stat-label">Noise</span></div>
+    <div class="stat-uptime" id="statUptime"></div>
+</section>
+
+<div class="filter-bar">
+    <div class="filter-group" id="typeFilter" role="group" aria-label="Event type">
+        <button type="button" class="filter-btn active" data-filter="all" aria-pressed="true">All</button>
+        <button type="button" class="filter-btn" data-filter="proxy" aria-pressed="false">Proxy</button>
+        <button type="button" class="filter-btn" data-filter="scanner" aria-pressed="false">Scanner</button>
+        <button type="button" class="filter-btn" data-filter="scope" aria-pressed="false">Scope</button>
+        <button type="button" class="filter-btn" data-filter="tool" aria-pressed="false">Tool</button>
+        <button type="button" class="filter-btn" data-filter="collab" aria-pressed="false">Collab</button>
+        <button type="button" class="filter-btn" data-filter="websocket" aria-pressed="false">WS</button>
+    </div>
+    <input type="text" class="search-box" id="searchBox" placeholder="Filter by URL, host, method..." aria-label="Filter events">
+    <div class="filter-group" id="tabNav" role="tablist" aria-label="Views">
+        <button type="button" class="filter-btn active" id="tab-stream" data-tab="stream" role="tab" aria-selected="true" aria-controls="panel-stream">Activity stream</button>
+        <button type="button" class="filter-btn" id="tab-rules" data-tab="rules" role="tab" aria-selected="false" aria-controls="panel-rules">Rules</button>
+        <button type="button" class="filter-btn" id="tab-connections" data-tab="connections" role="tab" aria-selected="false" aria-controls="panel-connections">Connections</button>
+    </div>
+    <button type="button" class="filter-clear" id="clearEvents">Clear events</button>
+</div>
+
+<main class="views">
+    <section class="tab-panel active" id="panel-stream" role="tabpanel" aria-labelledby="tab-stream">
+        <div class="activity-head" aria-hidden="true"><span>Time</span><span>Tags</span><span>Request</span><span class="col-host">Host</span><span></span></div>
+        <div class="activity-list" id="activityList"></div>
+        <p class="empty-state" id="streamEmpty">Waiting for events from Burp Suite proxy...</p>
+    </section>
+    <section class="tab-panel" id="panel-rules" role="tabpanel" aria-labelledby="tab-rules">
+        <div class="rules-grid">
+            <div class="rule-section"><h2>Proxy rules</h2><div id="proxyRulesList"><p class="empty-state">No proxy rules active</p></div></div>
+            <div class="rule-section"><h2>Traffic rules</h2><div id="trafficRulesList"><p class="empty-state">No traffic rules active</p></div></div>
+            <div class="rule-section"><h2>Session rules</h2><div id="sessionRulesList"><p class="empty-state">No session rules active</p></div></div>
+        </div>
+    </section>
+    <section class="tab-panel" id="panel-connections" role="tabpanel" aria-labelledby="tab-connections">
+        <div class="conn-grid">
+            <div class="conn-card"><h2>Primary MCP (Streamable HTTP)</h2><div class="url" data-info="primary_mcp_url"></div></div>
+            <div class="conn-card"><h2>Secondary MCP (Streamable HTTP)</h2><div class="url" data-info="secondary_mcp_url"></div></div>
+            <div class="conn-card"><h2>Dashboard</h2><div class="url" data-info="dashboard_url"></div></div>
+            <div class="conn-card"><h2>Dashboard API: proxy history</h2><div class="url" data-info="proxy_history_url"></div></div>
+            <div class="conn-card"><h2>MCP client config</h2><div class="url compact" data-info="mcp_client_config"></div></div>
+            <div class="conn-card"><h2>Claude Code</h2><div class="url compact" data-info="claude_code_command"></div></div>
+        </div>
+    </section>
+</main>
+
+<section class="detail-panel" id="detailPanel" aria-label="Event details" inert>
+    <div class="detail-wrapper">
+        <button type="button" class="detail-close" id="detailClose" aria-label="Close details">&times;</button>
+        <div class="detail-inner">
+            <section class="detail-section">
+                <h2>Request details</h2>
+                <dl class="detail-facts" id="detailFacts"></dl>
+            </section>
+            <section class="detail-section">
+                <h2>MCP tool commands</h2>
+                <p class="detail-hint">Click a command to copy it, then run it in your MCP client.</p>
+                <div class="detail-actions" id="detailActions"></div>
+                <button type="button" class="detail-mcp" id="detailPreview" title="Click to copy" hidden></button>
+            </section>
         </div>
     </div>
-</div>
+</section>
 
-<!-- Stats Bar -->
-<div class="stats-bar">
-    <div class="stat-pill events"><span class="stat-num" id="sEvents">0</span><span class="stat-label">Events</span></div>
-    <div class="stat-pill scope"><span class="stat-num" id="sScope">0</span><span class="stat-label">In-Scope</span></div>
-    <div class="stats-sep"></div>
-    <div class="stat-pill api"><span class="stat-num" id="sApi">0</span><span class="stat-label">API</span></div>
-    <div class="stat-pill auth"><span class="stat-num" id="sAuth">0</span><span class="stat-label">Auth</span></div>
-    <div class="stat-pill params"><span class="stat-num" id="sParams">0</span><span class="stat-label">Params</span></div>
-    <div class="stat-pill upload"><span class="stat-num" id="sUpload">0</span><span class="stat-label">Upload</span></div>
-    <div class="stat-pill admin"><span class="stat-num" id="sAdmin">0</span><span class="stat-label">Admin</span></div>
-    <div class="stat-pill data"><span class="stat-num" id="sData">0</span><span class="stat-label">Data</span></div>
-    <div class="stats-sep"></div>
-    <div class="stat-pill findings"><span class="stat-num" id="sFindings">0</span><span class="stat-label">Findings</span></div>
-    <div class="stats-sep"></div>
-    <div class="stat-pill scope" style="border-color:rgba(63,185,80,0.3);"><span class="stat-num" id="sToolCalls">0</span><span class="stat-label">MCP Calls</span></div>
-    <div class="stat-pill hidden"><span class="stat-num" id="sHidden">0</span><span class="stat-label">Noise</span></div>
-    <div class="stat-uptime" id="statUptime"></div>
-</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-<!-- Filter Bar -->
-<div class="filter-bar">
-    <div class="filter-group" id="typeFilter">
-        <button class="filter-btn active" data-filter="all">All</button>
-        <button class="filter-btn" data-filter="proxy">Proxy</button>
-        <button class="filter-btn" data-filter="scanner">Scanner</button>
-        <button class="filter-btn" data-filter="scope">Scope</button>
-        <button class="filter-btn" data-filter="tool">Tool</button>
-        <button class="filter-btn" data-filter="collab">Collab</button>
-        <button class="filter-btn" data-filter="websocket">WS</button>
-    </div>
-    <input type="text" class="search-box" id="searchBox" placeholder="Filter by URL, host, method...">
-    <div class="filter-group" id="tabNav">
-        <button class="filter-btn active" data-tab="stream">Activity Stream</button>
-        <button class="filter-btn" data-tab="rules">Rules</button>
-        <button class="filter-btn" data-tab="connections">Connections</button>
-    </div>
-    <button class="filter-clear" onclick="clearAll()">Clear All</button>
-</div>
-
-<!-- Activity Stream Tab -->
-<div class="tab-panel active" id="panel-stream">
-    <div class="activity-list" id="activityList">
-        <div class="empty-state">Waiting for events from Burp Suite proxy...</div>
-    </div>
-</div>
-
-<!-- Rules Tab -->
-<div class="tab-panel" id="panel-rules">
-    <div class="rules-grid" id="rulesGrid">
-        <div class="rule-section"><h3>Proxy Rules</h3><div id="proxyRulesList"><div class="empty-state">No proxy rules</div></div></div>
-        <div class="rule-section"><h3>Traffic Rules</h3><div id="trafficRulesList"><div class="empty-state">No traffic rules</div></div></div>
-        <div class="rule-section"><h3>Session Rules</h3><div id="sessionRulesList"><div class="empty-state">No session rules</div></div></div>
-    </div>
-</div>
-
-<!-- Connections Tab -->
-<div class="tab-panel" id="panel-connections">
-    <div class="conn-grid">
-        <div class="conn-card"><h4>Primary MCP (Streamable HTTP)</h4><div class="url" id="connPrimary"></div></div>
-        <div class="conn-card"><h4>Secondary MCP (Streamable HTTP)</h4><div class="url" id="connSecondary"></div></div>
-        <div class="conn-card"><h4>Dashboard</h4><div class="url" id="connDashboard"></div></div>
-        <div class="conn-card"><h4>Dashboard API - Proxy History</h4><div class="url" id="connProxyHistory"></div></div>
-        <div class="conn-card"><h4>MCP Client Config</h4><div class="url" style="font-size:11px;" id="connClientConfig"></div></div>
-        <div class="conn-card"><h4>Claude Code</h4><div class="url" style="font-size:11px;" id="connClaudeCode"></div></div>
-    </div>
-</div>
-
-<!-- Detail Panel (fixed bottom) -->
-<div class="detail-panel" id="detailPanel">
-    <div class="detail-wrapper">
-        <button class="detail-close" onclick="closeDetail()">&times;</button>
-        <div class="detail-inner" id="detailInner"></div>
-    </div>
-</div>
-
-<!-- Toast -->
-<div class="toast" id="toast"></div>
+<template id="tpl-event-row">
+    <button type="button" class="activity-item" aria-expanded="false" aria-controls="detailPanel">
+        <span class="activity-time" data-slot="time"></span>
+        <span class="activity-badges" data-slot="badges"></span>
+        <span class="activity-url" data-slot="summary"></span>
+        <span class="activity-host" data-slot="host"></span>
+        <span class="expand-icon" aria-hidden="true">&#9660;</span>
+    </button>
+</template>
+<template id="tpl-badge"><span class="badge"></span></template>
+<template id="tpl-request-line">
+    <span class="request-line"><span class="badge badge-scanner" data-slot="verdict"></span><span class="method-badge" data-slot="method"></span><span class="status-code" data-slot="status"></span><span class="path" data-slot="path"></span><span class="query" data-slot="query"></span></span>
+</template>
+<template id="tpl-fact"><div class="detail-row"><dt class="dl"></dt><dd class="dv"></dd></div></template>
+<template id="tpl-command"><button type="button" class="detail-btn"></button></template>
+<template id="tpl-rule"><div class="rule-item"><span data-slot="name"></span><span class="rule-badge" data-slot="state"></span></div></template>
+<template id="tpl-empty"><p class="empty-state"></p></template>
 
 <script src="dashboard.js"></script>
 </body>
