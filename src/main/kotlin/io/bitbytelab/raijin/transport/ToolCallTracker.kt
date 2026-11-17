@@ -63,6 +63,7 @@ object ToolCallTracker {
         "http_fuzz",
         "http_send_request_chain",
         "http_send_pipeline",
+        "http_pipeline_connections",
         "proxy_rule",
         "http_rule",
         "scope",

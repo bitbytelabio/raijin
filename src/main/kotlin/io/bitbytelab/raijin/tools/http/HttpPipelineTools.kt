@@ -43,7 +43,7 @@ internal object HttpPipelineTools {
             name = "http_send_pipeline",
             description = """Send multiple raw HTTP/1.1 requests over ONE socket connection and read back multiple responses in order. Unlike every other http_* tool (which goes through Burp's Montoya API, strictly one request in / one response out), this opens its own raw socket — needed for HTTP desync / request-smuggling research (0.CL, stage1+stage2 probes) where a server may respond to one request with two responses, or where you need to observe exactly what came back before a connection died.
 
-HTTP/1.1 only — http_mode must be omitted or "HTTP_1". HTTP/2, HTTP/3 and kettled H2-smuggling escape fields are Turbo-only: use turbo_start_run with Engine.HTTP2 / Engine.HTTP3 / kettled=True for those.
+HTTP/1.1 only — http_mode must be omitted or "HTTP_1". HTTP/2, HTTP/3 and kettled H2-smuggling escape fields are Turbo-only: use turbo_run(action="start") with Engine.HTTP2 / Engine.HTTP3 / kettled=True for those.
 
 Never auto-fixes Content-Length — a deliberately wrong declared length is the point of this tool. If you want byte-exact control without a wrong Content-Length tripping you up, compute it yourself.
 
