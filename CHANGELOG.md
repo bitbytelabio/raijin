@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.1.0
 
 ### Build and dependencies
 - Java 25 bytecode: the jar needs Burp running on Java 25 or newer. Built with Gradle 9.9.1 (Shadow 9) on a JDK 25 toolchain and daemon; CI on JDK 25.
