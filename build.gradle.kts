@@ -28,6 +28,7 @@ dependencies {
 
     // --- MCP server (Kotlin SDK on Ktor CIO) ---
     implementation("io.modelcontextprotocol:kotlin-sdk-server:0.16.0")
+    implementation("io.github.oshai:kotlin-logging:8.0.4")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.13.0")
     // kotlin-sdk-server 0.16.0 was built against Ktor 3.5.2 / serialization 1.11.0; newer minor

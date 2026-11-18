@@ -1,6 +1,6 @@
 ---
 name: scanner-audit
-description: Running Burp audits and crawls, reading issues, and adding custom checks.
+description: Crawls, audits, scan tasks, BChecks, custom scan checks, and Bambdas.
 ---
 # Scanner and audits
 

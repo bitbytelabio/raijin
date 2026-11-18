@@ -1,8 +1,8 @@
 # Tool consolidation
 
-Raijin folds families of tools into one tool with an `action` parameter (`tools/ToolConsolidation.kt`): 27 grouped tools and 19 tools kept as they are, 46 in all, over 201 operations. The old per-operation names are not on the server any more, but the Activity tab and the audit log still record each call under its member name (the left column below), so this table also reads those records.
+Raijin folds families of tools into one tool with an `action` parameter (`tools/ToolConsolidation.kt`): 27 grouped tools and 18 tools kept as they are, 45 in all, over 200 operations. The old per-operation names are not on the server any more, but the Activity tab and the audit log still record each call under its member name (the left column below), so this table also reads those records.
 
-Tools kept as they are: `http_send_request`, `http_send_requests_parallel`, `http_send_request_chain`, `http_send_raw_bytes`, `http_send_pipeline`, `http_fuzz`, `http_race`, `proxy_history`, `proxy_history_search`, `proxy_annotate`, `proxy_auto_auth`, `auth_diff`, `api_import_openapi`, `bambda_import`, `bambda_templates`, `jwt_keys`, `search_skills`, `load_skill`, `read_skill_file`.
+Tools kept as they are: `http_send_request`, `http_send_requests_parallel`, `http_send_request_chain`, `http_send_raw_bytes`, `http_send_pipeline`, `http_fuzz`, `http_race`, `proxy_history`, `proxy_history_search`, `proxy_annotate`, `proxy_auto_auth`, `auth_diff`, `api_import_openapi`, `bambda_import`, `bambda_templates`, `jwt_keys`, `search_skills`, `load_skill`.
 
 Adding a tool: register it in its `tools/<area>/*Tools.kt`, then list it in a group of `ToolConsolidation.GROUPS` (as an action) or in `KEEP`. `ToolConsolidationTest` fails for a tool that is in neither.
 

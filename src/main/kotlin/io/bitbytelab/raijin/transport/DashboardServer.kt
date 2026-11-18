@@ -223,8 +223,6 @@ class DashboardServer(
                         }
                     }
                 }.also { it.start(wait = false) }
-
-                logging.logToOutput("Raijin: Dashboard server started on ${DashboardApi.dashboardUrl(bindHost, port)}")
             } catch (e: Exception) {
                 logging.logToError("Raijin: Dashboard server failed: ${e.message}")
             }

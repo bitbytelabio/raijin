@@ -1,6 +1,6 @@
 ---
-name: burpsuite-overview
-description: Start here. How the Raijin MCP server is organised, the standard workflow, and the scope rules.
+name: overview
+description: Start here: tool map, scope rules, and standard Burp testing workflow.
 ---
 # Raijin overview
 
@@ -22,7 +22,7 @@ Raijin exposes Burp Suite through MCP as about 45 tools. Most tools take an `act
 | `collaborator` | Out-of-band payloads and polling |
 | `scope`, `config`, `burp`, `persistence`, `events`, `log`, `ai`, `send_to_tool` | Burp configuration and integration |
 | `analyze`, `util`, `websocket` | Offline analysis, encoding helpers, WebSockets |
-| `search_skills`, `load_skill`, `read_skill_file` | These guides |
+| `search_skills`, `load_skill` | These guides |
 
 ## Standard workflow
 1. `scope(action=get_config)`, then `scope(action=include)` for the target. Outbound requests are checked against Burp's scope by the operator's `mcp_scope_mode`: `warn` (default) sends them and flags out-of-scope targets, `enforce` refuses them.
@@ -35,4 +35,4 @@ Raijin exposes Burp Suite through MCP as about 45 tools. Most tools take an `act
 - Only run against targets you are authorised to test.
 - Prefer one small request over a broad run; keep result sets small. Most tools page or cap their output; a limit above the cap is clamped and reported as `<param>_clamped_to`.
 - A result with `isError: true` says why in `error`: fix the argument instead of retrying the same call.
-- Other skills: `http-testing`, `proxy-traffic`, `scanner-audit`, `recon-and-probes`, `findings-reporting`, `collaborator-oob`, `turbo-scripting`. Read them as MCP resources at `skill://<name>/SKILL.md`, run them as MCP prompts named `<name>_skill` with `-` as `_` (for example `http_testing_skill`), or load them with `load_skill`.
+- Other skills: `http-testing`, `proxy-traffic`, `scanner-audit`, `recon-probes`, `findings-reporting`, `collaborator-oob`, `turbo-scripting`. Load one with `load_skill(name="<name>")`, read its `skill://<name>/SKILL.md` resource, or run the `<name>` MCP prompt.

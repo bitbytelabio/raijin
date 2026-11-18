@@ -1,6 +1,6 @@
 ---
 name: http-testing
-description: Sending and varying HTTP requests with the http_* tools; when to use each.
+description: Send, chain, pipeline, fuzz, and race HTTP requests; rules and macros.
 ---
 # HTTP testing
 

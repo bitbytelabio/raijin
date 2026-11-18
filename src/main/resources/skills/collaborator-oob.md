@@ -1,6 +1,6 @@
 ---
 name: collaborator-oob
-description: Out-of-band testing with Burp Collaborator.
+description: Out-of-band DNS/HTTP/SMTP payloads and polling with Burp Collaborator.
 ---
 # Collaborator (out-of-band)
 

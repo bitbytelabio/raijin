@@ -75,14 +75,14 @@ class StreamableHttpTest {
         val sessionId = initialize()
         val prompts = result("""{"jsonrpc":"2.0","id":2,"method":"prompts/list","params":{}}""", sessionId)
         val names = prompts.getValue("prompts").jsonArray.map { it.jsonObject.getValue("name").jsonPrimitive.content }
-        assertEquals(SkillCatalog.NAMES.map { SkillCatalog.promptName(it) }, names)
+        assertEquals(SkillCatalog.NAMES, names)
     }
 
     @Test
     fun `prompts get returns the skill body`() = testApplication {
         mount()
         val sessionId = initialize()
-        val name = SkillCatalog.promptName(SkillCatalog.ENTRY_SKILL)
+        val name = SkillCatalog.ENTRY_SKILL
         val prompt = result("""{"jsonrpc":"2.0","id":3,"method":"prompts/get","params":{"name":"$name"}}""", sessionId)
         val text = prompt.getValue("messages").jsonArray.single().jsonObject
             .getValue("content").jsonObject.getValue("text").jsonPrimitive.content

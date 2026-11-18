@@ -10,6 +10,9 @@ import io.bitbytelab.raijin.core.ConnectionInfo
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.skills.SkillCatalog
 import io.bitbytelab.raijin.state.StateManager
+import io.github.oshai.kotlinlogging.DirectLoggerFactory
+import io.github.oshai.kotlinlogging.KotlinLoggingConfiguration
+import io.github.oshai.kotlinlogging.Level
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.cio.*
@@ -85,6 +88,21 @@ class McpServerManager(
     private var servedServer: Server? = null
 
     companion object {
+        init {
+            silenceSdkLogging()
+        }
+
+        /**
+         * Suppresses the MCP SDK's kotlin-logging startup banner and INFO/DEBUG/WARN connection
+         * churn (`New SSE connection...`, `FeatureRegistry Adding Tool...`) without dropping errors.
+         */
+        internal fun silenceSdkLogging() {
+            System.setProperty("kotlin-logging.logStartupMessage", "false")
+            KotlinLoggingConfiguration.logStartupMessage = false
+            KotlinLoggingConfiguration.loggerFactory = DirectLoggerFactory
+            KotlinLoggingConfiguration.direct.logLevel = Level.ERROR
+        }
+
         /** Path of the Streamable HTTP endpoint on both listeners. */
         const val STREAMABLE_HTTP_PATH = ConnectionInfo.MCP_PATH
 
@@ -102,12 +120,10 @@ class McpServerManager(
         internal val SERVER_INSTRUCTIONS: String =
             "Raijin drives Burp Suite (proxy, scanner, Repeater, Turbo scripting, recon). " +
                 "Most tools take an `action` parameter; the tool description lists the actions. " +
-                "New here? Read the resource ${SkillCatalog.uri(SkillCatalog.ENTRY_SKILL)} first; " +
-                "the other skills are at ${SkillCatalog.uri("<name>")}. " +
+                "New here? Load the `${SkillCatalog.ENTRY_SKILL}` skill first " +
+                "(resource `${SkillCatalog.uri(SkillCatalog.ENTRY_SKILL)}`, `load_skill`, or prompt `${SkillCatalog.ENTRY_SKILL}`). " +
                 "Skills: ${SkillCatalog.NAMES.joinToString(", ")}. " +
-                "Each is also an MCP prompt (clients list prompts as slash commands; type /skill): " +
-                "${SkillCatalog.NAMES.joinToString(", ") { SkillCatalog.promptName(it) }}. " +
-                "Check scope first (scope: get_config / check); the recon and probe tools " +
+                "Check scope first (`scope` with `action=get_config` / `check`); recon and probe tools " +
                 "only run against in-scope targets."
 
         /**
@@ -248,12 +264,7 @@ class McpServerManager(
                 assign(server)
 
                 val displayHost = SecurityConfig.formatHostForAuthority(bindHost)
-                if (verifyListening(port)) {
-                    logging.logToOutput(
-                        "Raijin: $label listening: Streamable HTTP at http://$displayHost:$port$STREAMABLE_HTTP_PATH, " +
-                            "legacy SSE at http://$displayHost:$port/ (not '/sse')"
-                    )
-                } else {
+                if (!verifyListening(port)) {
                     logging.logToError(
                         if (portInUse(port))
                             PortPolicy.conflictMessage(
@@ -331,9 +342,7 @@ class McpServerManager(
         val heartbeatJob = launch {
             while (isActive) {
                 delay(SSE_HEARTBEAT_INTERVAL_MS)
-                runWithSendTimeout(sendTimeoutMs, sessionJob, onTimeout = {
-                    logging.logToError("Raijin: SSE heartbeat stalled >${sendTimeoutMs}ms; closing dead session ${raw.sessionId}")
-                }) {
+                runWithSendTimeout(sendTimeoutMs, sessionJob, onTimeout = {}) {
                     send(ServerSentEvent(comments = "keepalive"))
                 }
             }
@@ -488,10 +497,7 @@ private class TimeoutSseTransport(
 ) : Transport by delegate {
     override suspend fun send(message: JSONRPCMessage, options: TransportSendOptions?) {
         runWithSendTimeout(sendTimeoutMs, sessionJob, onTimeout = {
-            logging.logToError(
-                "Raijin: an SSE write stalled >${sendTimeoutMs}ms (client stopped reading the " +
-                    "stream); tearing that session down to recover instead of wedging it — the client reconnects."
-            )
+            logging.logToError("Raijin: SSE write timed out (${sendTimeoutMs}ms); closed session")
         }) { delegate.send(message, options) }
     }
 }

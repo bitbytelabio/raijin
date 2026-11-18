@@ -1,6 +1,6 @@
 ---
 name: turbo-scripting
-description: When to use Turbo runs and where the Turbo docs and examples live.
+description: High-volume, race, and smuggling runs with Python Turbo scripts.
 ---
 # Turbo scripting
 

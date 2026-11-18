@@ -87,7 +87,7 @@ claude mcp add --transport http burpsuite http://127.0.0.1:9876/mcp
 
 **Clients that only speak stdio** (Claude Desktop): bridge to the Streamable HTTP endpoint with [supergateway](https://github.com/supercorp-ai/supergateway), see [`configs/mcp-claude-desktop.json`](configs/mcp-claude-desktop.json).
 
-Then ask your agent something like *"Use the burpsuite_overview_skill, check the scope, and summarise the proxy history for example.com"*.
+Then ask your agent something like *"Load the overview skill, check the scope, and summarise the proxy history for example.com"*.
 
 > [!TIP]
 > The **Raijin → Server** sub-tab shows the exact client config for your current bind address and ports; **Copy MCP Config** includes the bearer token when the listeners require one.
@@ -188,7 +188,7 @@ Raijin exposes about **45 MCP tools** over 200+ operations. Frequently used tool
 | `turbo_run` | Start (blocking or `start_async`), list, poll, read, stop and delete Turbo runs; search responses; save to Organizer. |
 | `turbo_docs` | Turbo documentation (12 topics) and example scripts. Read before `turbo_run`. |
 | `jwt_keys` | JWK key ring: generate, import, list, export, delete. |
-| `search_skills`, `load_skill`, `read_skill_file` | Find and read the built-in skills from a tool call. |
+| `search_skills`, `load_skill` | Find and read the built-in skills from a tool call. |
 
 </details>
 
@@ -214,24 +214,24 @@ Read-only snapshots for clients that browse MCP resources:
 
 The server ships short usage guides so an agent can learn the tool groups and workflows by itself.
 
-| Skill | Prompt name | Covers |
-|---|---|---|
-| `burpsuite-overview` | `burpsuite_overview_skill` | **Start here.** Tool map, scope rules, typical workflow. |
-| `http-testing` | `http_testing_skill` | Sending, chaining, fuzzing and racing requests; traffic rules, session tokens and login macros. |
-| `proxy-traffic` | `proxy_traffic_skill` | History, search, annotations, proxy rules, interception. |
-| `scanner-audit` | `scanner_audit_skill` | Crawls, audits, tasks, BChecks and custom checks. |
-| `recon-and-probes` | `recon_and_probes_skill` | Recon and guided probes on in-scope targets. |
-| `findings-reporting` | `findings_reporting_skill` | Recording findings and producing reports. |
-| `collaborator-oob` | `collaborator_oob_skill` | Out-of-band testing with Collaborator. |
-| `turbo-scripting` | `turbo_scripting_skill` | Writing and running Turbo scripts. |
+| Skill | Covers |
+|---|---|
+| `overview` | **Start here.** Tool map, scope rules, standard Burp testing workflow. |
+| `http-testing` | Send, chain, pipeline, fuzz, and race HTTP requests; rules and macros. |
+| `proxy-traffic` | Proxy history, intercept/hold, rewrite rules, Autorize, and WebSockets. |
+| `scanner-audit` | Crawls, audits, scan tasks, BChecks, custom scan checks, and Bambdas. |
+| `recon-probes` | Recon, param mining, OpenAPI, and CORS/cache/GraphQL/SQLi/IDOR/JWT probes. |
+| `findings-reporting` | Record findings, create Burp issues, export reports, and Organizer notes. |
+| `collaborator-oob` | Out-of-band DNS/HTTP/SMTP payloads and polling with Burp Collaborator. |
+| `turbo-scripting` | High-volume, race, and smuggling runs with Python Turbo scripts. |
 
 Each skill is served three ways:
 
-- **MCP prompts** (no arguments). Clients list them as slash commands: `/mcp__burpsuite__http_testing_skill` in Claude Code, `/burpsuite:http_testing_skill` in omp. **Type `/skill`** to list them all; pickers filter on the name, which is why every prompt ends in `_skill`.
+- **MCP prompts** (no arguments). Clients list them as slash commands: `/mcp__burpsuite__http-testing` in Claude Code, `/burpsuite:http-testing` in omp (type `/burpsuite` to filter them).
 - **MCP resources** at `skill://<name>/SKILL.md` (`text/markdown`), readable through the client's resource reader (`ReadMcpResourceTool` in Claude Code).
-- **Tools**: `search_skills`, `load_skill` and `read_skill_file`, for clients that only call tools.
+- **Tools**: `search_skills` and `load_skill` (accepts `name` or `uri`), for clients that only call tools.
 
-The server `instructions` sent on connect point the agent at `burpsuite-overview` and list every skill.
+The server `instructions` sent on connect point the agent at `overview` and list every skill.
 
 <details>
 <summary><b>No skills show up?</b></summary>

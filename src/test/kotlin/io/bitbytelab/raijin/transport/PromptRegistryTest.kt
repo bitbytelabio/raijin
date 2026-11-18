@@ -12,6 +12,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class PromptRegistryTest {
@@ -24,12 +25,12 @@ class PromptRegistryTest {
     }
 
     @Test
-    fun `every skill is a prompt named by promptName with the skill's description`() {
+    fun `every skill is a prompt named after the skill with the skill's description`() {
         val server = registered()
-        assertEquals(SkillCatalog.NAMES.map { SkillCatalog.promptName(it) }.toSet(), server.prompts.keys)
+        assertEquals(SkillCatalog.NAMES.toSet(), server.prompts.keys)
         SkillCatalog.list().forEach { skill ->
-            val prompt = server.prompts.getValue(SkillCatalog.promptName(skill.name)).prompt
-            assertEquals(SkillCatalog.promptName(skill.name), prompt.name)
+            val prompt = server.prompts.getValue(skill.name).prompt
+            assertEquals(skill.name, prompt.name)
             assertEquals(skill.description, prompt.description)
             assertTrue(prompt.arguments.isNullOrEmpty(), "${skill.name} is a static guide and takes no arguments")
         }
@@ -40,23 +41,23 @@ class PromptRegistryTest {
         val server = registered()
         runBlocking {
             SkillCatalog.list().forEach { skill ->
-                val name = SkillCatalog.promptName(skill.name)
-                val result = server.prompts.getValue(name)
-                    .messageProvider(testClientConnection, GetPromptRequest(GetPromptRequestParams(name)))
+                val result = server.prompts.getValue(skill.name)
+                    .messageProvider(testClientConnection, GetPromptRequest(GetPromptRequestParams(skill.name)))
                 val message = result.messages.single()
-                assertEquals(Role.User, message.role, name)
-                assertEquals(skill.body, (message.content as TextContent).text, name)
+                assertEquals(Role.User, message.role, skill.name)
+                assertEquals(skill.body, (message.content as TextContent).text, skill.name)
             }
         }
     }
 
     @Test
-    fun `prompt names are unique, snake case and end in _skill`() {
-        // Clients turn the name into a slash command (/mcp__burpsuite__<name>, burpsuite:<name>) and
-        // their pickers filter on it: only names containing "skill" are found by typing `skill`.
-        val valid = Regex("[a-z0-9]+(_[a-z0-9]+)*_skill")
-        val names = SkillCatalog.NAMES.map { SkillCatalog.promptName(it) }
-        names.forEach { assertTrue(valid.matches(it), "'$it' is not snake_case ending in _skill") }
+    fun `prompt names are unique kebab-case and have no _skill suffix`() {
+        val valid = Regex("[a-z0-9]+(-[a-z0-9]+)*")
+        val names = SkillCatalog.NAMES
+        names.forEach {
+            assertTrue(valid.matches(it), "'$it' is not kebab-case")
+            assertFalse(it.endsWith("_skill"), "'$it' should not have _skill suffix")
+        }
         assertEquals(names.size, names.toSet().size, "two skills map to the same prompt name")
     }
 }

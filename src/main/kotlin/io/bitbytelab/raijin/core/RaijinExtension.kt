@@ -45,6 +45,7 @@ class RaijinExtension : BurpExtension {
     override fun initialize(api: MontoyaApi) {
         this.api = api
         api.extension().setName("Raijin")
+        McpServerManager.silenceSdkLogging()
 
         // Turbo engine: settings panel, context menus, hotkey (must precede the MCP bridges)
         TurboModule.install(api)

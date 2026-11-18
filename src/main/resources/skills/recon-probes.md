@@ -1,6 +1,6 @@
 ---
-name: recon-and-probes
-description: Guided recon and probe tools (scope-gated): what each does and how to use them safely.
+name: recon-probes
+description: Recon, param mining, OpenAPI, and CORS/cache/GraphQL/SQLi/IDOR/JWT probes.
 ---
 # Recon and probes
 

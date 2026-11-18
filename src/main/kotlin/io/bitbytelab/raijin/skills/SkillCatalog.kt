@@ -10,7 +10,7 @@ import java.io.File
  * Jars cannot list a classpath directory, so [NAMES] is the authoritative list; the catalog test
  * checks every entry resolves and that its frontmatter name matches.
  *
- * Each skill is served two ways: as an MCP prompt named [promptName] (`PromptRegistry`; this is
+ * Each skill is served two ways: as an MCP prompt named after the skill (`PromptRegistry`; this is
  * what Claude Code and omp list as slash commands) and as a `skill://<name>/SKILL.md` resource
  * (`ResourceRegistry`; this is how a model reads one on its own).
  */
@@ -20,18 +20,18 @@ object SkillCatalog {
 
     /** Every shipped skill, in the order [list] reports them. */
     val NAMES: List<String> = listOf(
-        "burpsuite-overview",
+        "overview",
         "http-testing",
         "proxy-traffic",
         "scanner-audit",
-        "recon-and-probes",
+        "recon-probes",
         "findings-reporting",
         "collaborator-oob",
         "turbo-scripting",
     )
 
     /** The skill clients should load first. */
-    const val ENTRY_SKILL = "burpsuite-overview"
+    const val ENTRY_SKILL = "overview"
 
     /**
      * URI for the resource form of a skill: `skill://<name>/SKILL.md`, the shape the Agent
@@ -45,16 +45,6 @@ object SkillCatalog {
 
     /** Extracts the skill name from a `skill://<name>/SKILL.md` URI, or null if malformed. */
     fun nameFromUri(uri: String): String? = uriPattern.matchEntire(uri.trim())?.groupValues?.get(1)
-
-    /**
-     * Name of the MCP prompt for a skill: `http-testing` -> `http_testing_skill`.
-     *
-     * Clients show prompts as slash commands (`/mcp__burpsuite__http_testing_skill` in Claude Code,
-     * `burpsuite:http_testing_skill` in omp) and their pickers filter on the command name, so users find
-     * skills by typing `skill`. Every name therefore ends in `_skill`, as the other MCP servers' skill
-     * prompts do (a prompt called just `http-testing` is never listed for that search).
-     */
-    fun promptName(name: String) = name.replace('-', '_') + "_skill"
 
     /** All skills (parsed once, they are static resources). */
     val all: List<Skill> by lazy { NAMES.mapNotNull { load(it) } }

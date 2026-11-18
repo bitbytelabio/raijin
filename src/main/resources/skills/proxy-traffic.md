@@ -1,6 +1,6 @@
 ---
 name: proxy-traffic
-description: Reading and shaping proxy traffic: history, search, intercept, rules, WebSockets.
+description: Proxy history, intercept/hold, rewrite rules, Autorize, and WebSockets.
 ---
 # Proxy traffic
 

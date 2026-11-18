@@ -1,6 +1,6 @@
 ---
 name: findings-reporting
-description: Recording findings and producing reports.
+description: Record findings, create Burp issues, export reports, and Organizer notes.
 ---
 # Findings and reporting
 

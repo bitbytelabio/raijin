@@ -1,9 +1,14 @@
 package io.bitbytelab.raijin.transport
 
 import io.bitbytelab.raijin.skills.SkillCatalog
+import io.github.oshai.kotlinlogging.DirectLoggerFactory
+import io.github.oshai.kotlinlogging.KotlinLoggingConfiguration
+import io.github.oshai.kotlinlogging.Level
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
@@ -35,7 +40,16 @@ class McpServerCapabilitiesTest {
         assertTrue(text.contains(SkillCatalog.uri(SkillCatalog.ENTRY_SKILL)), "instructions must name the entry skill resource")
         SkillCatalog.NAMES.forEach {
             assertTrue(text.contains(it), "instructions lack skill '$it'")
-            assertTrue(text.contains(SkillCatalog.promptName(it)), "instructions lack prompt '${SkillCatalog.promptName(it)}'")
+            assertFalse("${it.replace('-', '_')}_skill" in text, "instructions still mention ${it}_skill")
         }
+    }
+
+    @Test
+    fun `sdk logging is silenced to errors without slf4j startup noise`() {
+        McpServerManager.silenceSdkLogging()
+        assertEquals("false", System.getProperty("kotlin-logging.logStartupMessage"))
+        assertEquals(false, KotlinLoggingConfiguration.logStartupMessage)
+        assertSame(DirectLoggerFactory, KotlinLoggingConfiguration.loggerFactory)
+        assertEquals(Level.ERROR, KotlinLoggingConfiguration.direct.logLevel)
     }
 }
