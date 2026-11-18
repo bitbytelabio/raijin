@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.2.0
+
+### Skills
+- Skill prompts use the plain kebab-case skill name, without the `_skill` suffix: `/mcp__burpsuite__http-testing` in Claude Code, `burpsuite:http-testing` in omp.
+- Renamed skills: `burpsuite-overview` is now `overview`, `recon-and-probes` is now `recon-probes` (prompts, `skill://<name>/SKILL.md` resources and tools alike).
+- `load_skill` takes a skill `name` (e.g. `overview`) or a `skill://<name>/SKILL.md` `uri`. `read_skill_file` is gone; `search_skills` and `load_skill` cover clients that only call tools.
+
+### Logging
+- The MCP SDK's kotlin-logging startup banner and INFO/WARN connection messages are silenced; SDK errors still reach Burp's error log.
+- Listener and dashboard startup messages are no longer written to the extension output.
+
 ## 2.1.0
 
 ### Build and dependencies
