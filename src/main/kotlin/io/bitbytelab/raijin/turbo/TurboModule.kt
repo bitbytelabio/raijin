@@ -11,6 +11,7 @@ import burp.api.montoya.ui.hotkey.HotKey
 import burp.api.montoya.ui.hotkey.HotKeyContext
 import burp.api.montoya.ui.hotkey.HotKeyEvent
 import burp.api.montoya.ui.hotkey.HotKeyHandler
+import io.bitbytelab.raijin.core.BuildInfo
 import io.bitbytelab.raijin.turbo.mcp.RunManager
 import kotlin.jvm.optionals.getOrNull
 
@@ -41,7 +42,7 @@ object TurboModule {
             // Community Edition has no scanner
             Utils.out("Raijin Turbo: word recording unavailable (${e.message})")
         }
-        Utils.out("Raijin Turbo v${Info.version} loaded")
+        Utils.out("Raijin Turbo v${BuildInfo.VERSION} loaded")
     }
 
     fun uninstall() {

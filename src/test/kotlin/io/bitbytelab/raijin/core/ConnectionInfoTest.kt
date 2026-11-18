@@ -9,18 +9,13 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-/** Clients connect over Streamable HTTP at /mcp; the legacy SSE URL is the root path; no credentials on loopback. */
+/** Clients connect over Streamable HTTP at /mcp; no credentials on loopback. */
 class ConnectionInfoTest {
 
     @Test fun `mcp url is the streamable http path the server mounts`() {
         assertEquals("http://127.0.0.1:9876/mcp", ConnectionInfo.primaryMcpUrl)
         assertEquals("http://127.0.0.1:9877/mcp", ConnectionInfo.secondaryMcpUrl)
         assertEquals(McpServerManager.STREAMABLE_HTTP_PATH, ConnectionInfo.MCP_PATH)
-    }
-
-    @Test fun `legacy sse url is the root path, never slash-sse`() {
-        assertEquals("http://127.0.0.1:9876/", ConnectionInfo.legacySseUrl(9876))
-        assertFalse(ConnectionInfo.legacySseUrl(9876).contains("/sse"))
     }
 
     @Test fun `client config uses streamable http and carries no credentials`() {
@@ -53,7 +48,6 @@ class ConnectionInfoTest {
 
     @Test fun `IPv6 hosts are bracketed in every URL`() {
         assertEquals("http://[::1]:9876/mcp", ConnectionInfo.mcpUrl(9876, "::1"))
-        assertEquals("http://[fd7a::5]:9877/", ConnectionInfo.legacySseUrl(9877, "FD7A:0:0:0:0:0:0:5"))
     }
 
     @Test fun `the dashboard link with a token carries it once, URL-encoded`() {

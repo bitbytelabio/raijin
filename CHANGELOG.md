@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.2.1
+
+### Logging
+- The startup log lists only the Streamable HTTP `/mcp` URLs; the legacy SSE URL is no longer printed (the endpoint is still served at `/`).
+- The Turbo load message reports the Raijin version instead of a fixed `2.1.0`.
+
 ## 2.2.0
 
 ### Skills

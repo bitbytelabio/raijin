@@ -213,7 +213,7 @@ class RaijinExtension : BurpExtension {
         // output log, so one channel covers both surfaces.
         val (toolCount, resourceCount, promptCount) = serverManager.registeredCounts()
         uiTab.log("INFO", "System", "Raijin v${BuildInfo.VERSION} started")
-        uiTab.log("INFO", "System", "MCP (primary):   ${ConnectionInfo.mcpUrl(ssePort, bindHost)}  (legacy SSE: ${ConnectionInfo.legacySseUrl(ssePort, bindHost)})")
+        uiTab.log("INFO", "System", "MCP (primary):   ${ConnectionInfo.mcpUrl(ssePort, bindHost)}")
         uiTab.log("INFO", "System", "MCP (secondary): ${ConnectionInfo.mcpUrl(httpPort, bindHost)}")
         uiTab.log("INFO", "System", "Dashboard:                 ${ConnectionInfo.dashboardUrlForHost(bindHost)}")
         uiTab.log("INFO", "System", "Tools: $toolCount  |  MCP Resources: $resourceCount  |  MCP Prompts: $promptCount")

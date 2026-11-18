@@ -49,9 +49,6 @@ object ConnectionInfo {
     /** The Streamable HTTP endpoint URL for [port] on [host]. */
     fun mcpUrl(port: Int, host: String = "127.0.0.1"): String = "http://${authority(host)}:$port$MCP_PATH"
 
-    /** The legacy SSE endpoint URL for [port] on [host]: the ROOT path `/`, never `/sse`. */
-    fun legacySseUrl(port: Int, host: String = "127.0.0.1"): String = "http://${authority(host)}:$port/"
-
     val primaryMcpUrl: String get() = mcpUrl(endpoints.primaryPort)
     val secondaryMcpUrl: String get() = mcpUrl(endpoints.secondaryPort)
     val dashboardUrl: String get() = dashboardUrlForHost()
