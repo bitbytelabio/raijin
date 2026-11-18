@@ -1,10 +1,13 @@
 package io.bitbytelab.raijin.safety
 
 /**
- * Operator-controlled enforcement level for outbound requests the agent asks
- * Burp to send. Persisted in Burp preferences (key `mcp_scope_mode`); the agent
- * cannot change it. Default is [WARN] so existing workflows keep working while
- * out-of-scope sends are flagged; an operator can harden to [ENFORCE].
+ * Enforcement level for outbound requests the agent asks Burp to send, persisted
+ * in Burp preferences (key `mcp_scope_mode`). The operator sets it in the Server
+ * tab; an MCP client can also change it through `preference_store`, which
+ * validates the value and announces the change (event, Burp output log).
+ * Default is [WARN]: out-of-scope sends go out flagged with `scope_warning`
+ * (tool result, MCP Activity, audit log). [ENFORCE] blocks the classic send
+ * paths; Turbo, Scanner, WebSocket and followed redirects stay advisory-only.
  */
 enum class ScopeMode {
     /** No scope checking (legacy behaviour). */

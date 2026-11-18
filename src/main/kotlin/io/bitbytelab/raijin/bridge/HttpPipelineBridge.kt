@@ -160,9 +160,31 @@ class HttpPipelineBridge(private val api: MontoyaApi) {
             }
         }
 
-        val scheme = if (useTls) "https" else "http"
-        scopeGate.deny("$scheme://$host:$port/")?.let { return it }
+        // Every item: a later request on the socket may target a path the first one does not.
+        val scope = scopeGate.checkRequests(host, port, useTls, requests.asSequence().map { String(it.bytes, Charsets.ISO_8859_1) })
+        if (scope.blocked) return scope.denyJson()
+        return scope.annotate(sendChecked(host, port, useTls, requests, writeMode, writePauseMs, maxResponses,
+            idleTimeoutMs, totalTimeoutMs, keepOpen, connectionId, maxResponseLength, serverName, decodeContent, rawHexMaxBytes, notes))
+    }
 
+    private fun sendChecked(
+        host: String,
+        port: Int,
+        useTls: Boolean,
+        requests: List<PipelineRequestSpec>,
+        writeMode: String,
+        writePauseMs: Long,
+        maxResponses: Int?,
+        idleTimeoutMs: Long,
+        totalTimeoutMs: Long,
+        keepOpen: Boolean,
+        connectionId: String?,
+        maxResponseLength: Int?,
+        serverName: String?,
+        decodeContent: Boolean,
+        rawHexMaxBytes: Int,
+        notes: List<String>,
+    ): JsonObject {
         val deadlineAtMs = System.currentTimeMillis() + totalTimeoutMs
         val target = Target(host, port, useTls, serverName)
         val link = try {

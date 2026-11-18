@@ -46,15 +46,26 @@ class DashboardServer(
     private val primaryMcpPort: Int = PortPolicy.DEFAULT_SSE,
     private val secondaryMcpPort: Int = PortPolicy.DEFAULT_HTTP,
 ) {
+    @Volatile
     private var server: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
+    @Volatile
     private var scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val startTime = Instant.now()
     private val openSseSubscribers = AtomicInteger(0)
 
+    /** Guards [server] and [generation] between a start finishing and a stop or rebind. */
+    private val lifecycle = Any()
+
+    /** Bumped by [stop] and [rebind]: a start that finishes under an older one stops its own listener. */
+    @Volatile
+    private var generation = 0
+
     fun start() {
+        val gen = generation
         scope.launch {
+            var started: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
             try {
-                server = embeddedServer(CIO, port = port, host = bindHost) {
+                started = embeddedServer(CIO, port = port, host = bindHost) {
                     // Host-header allowlist + locked CORS.
                     installLocalhostSecurity(listOf(port), allowedSecurityHosts())
                     install(HttpRequestLifecycle) { cancelCallOnClose = true }
@@ -222,15 +233,29 @@ class DashboardServer(
                             }
                         }
                     }
-                }.also { it.start(wait = false) }
+                }
+                started.start(wait = false)
+                val stale = synchronized(lifecycle) {
+                    (gen != generation).also { if (!it) server = started }
+                }
+                // A stop or rebind ran while this was starting: this listener belongs to no one.
+                if (stale) started.stop(0, 500)
             } catch (e: Exception) {
+                runCatching { started?.stop(0, 0) }
                 logging.logToError("Raijin: Dashboard server failed: ${e.message}")
             }
         }
     }
 
+    /** Takes the current listener out of service, so a start still in flight will not install itself. */
+    private fun retire(): EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? =
+        synchronized(lifecycle) {
+            generation++
+            server.also { server = null }
+        }
+
     fun stop() {
-        server?.stop(1000, 2000)
+        retire()?.stop(1000, 2000)
         scope.cancel()
     }
 
@@ -240,8 +265,7 @@ class DashboardServer(
      * Runs on the caller's thread (blocks briefly) — the UI calls this OFF the EDT.
      */
     fun rebind(newHost: String) {
-        server?.stop(500, 1500)
-        server = null
+        retire()?.stop(500, 1500)
         scope.cancel()
         scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         bindHost = newHost
@@ -337,7 +361,7 @@ internal object DashboardApi {
 
     /** What the table needs: URL, method, status and the other cheap per-item facts. */
     val METADATA_FIELDS: Set<String> = setOf(
-        "index", "host", "port", "secure", "method", "url", "path", "edited", "mime_type",
+        "id", "index", "host", "port", "secure", "method", "url", "path", "edited", "mime_type",
         "has_response", "time", "timing", "status_code", "response_length", "response_mime_type",
         "comment", "highlight",
     )

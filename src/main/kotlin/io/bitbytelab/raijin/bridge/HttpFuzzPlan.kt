@@ -129,6 +129,7 @@ internal object HttpFuzzPlan {
         mode: AttackMode = AttackMode.SNIPER,
         encode: (String) -> String = { it },
         maxRequests: Long = Long.MAX_VALUE,
+        autoFixContentLength: Boolean = true,
     ): AttackResult {
         if (payloadSets.isEmpty() || payloadSets.any { it.isEmpty() }) {
             return AttackResult.Error("Every payload set needs at least one payload.")
@@ -150,6 +151,13 @@ internal object HttpFuzzPlan {
 
         val count = template.positions
         val notes = ArrayList<String>()
+        // A Content-Length that is itself fuzzed is sent as rendered, for the whole run.
+        var fixLength = autoFixContentLength
+        if (fixLength && positionStarts(normalized, mapped, marker).any { lineStartsWithContentLength(normalized, it) }) {
+            fixLength = false
+            notes += "Content-Length is a fuzz position; sent as rendered"
+        }
+        fun withContentLength(request: String): String = if (fixLength) HttpFuzzPlan.withContentLength(request) else request
         val multiSet = mode == AttackMode.PITCHFORK || mode == AttackMode.CLUSTER_BOMB
         if (!multiSet && payloadSets.size > 1) {
             notes += "${mode.id} uses one payload set: the first of ${payloadSets.size} was used."
@@ -302,19 +310,41 @@ internal object HttpFuzzPlan {
      * [payloads] is non-empty (it wins over [count]), else [count] copies of the request. Line
      * endings and Content-Length are handled as in [planAttack].
      */
-    fun raceRequests(rawRequest: String, count: Int, payloads: List<String>?): List<String> {
+    fun raceRequests(rawRequest: String, count: Int, payloads: List<String>?, autoFixContentLength: Boolean = true): List<String> {
         val base = RequestHygiene.normalizeCrlf(rawRequest)
-        if (!payloads.isNullOrEmpty()) return payloads.map { withContentLength(base.replace(FUZZ_KEYWORD, it)) }
-        val fixed = withContentLength(base)
+        val fix: (String) -> String = if (autoFixContentLength) ::withContentLength else { it -> it }
+        if (!payloads.isNullOrEmpty()) return payloads.map { fix(base.replace(FUZZ_KEYWORD, it)) }
+        val fixed = fix(base)
         return List(count) { fixed }
     }
 
     /**
-     * [request] with an unambiguous Content-Length set to its body's UTF-8 byte count (the charset
-     * fuzz and race send with). CL.TE / TE.CL / CL.CL shapes are left alone.
+     * [request] with an unambiguous Content-Length set to its body's byte count in the charset the
+     * request goes out in ([RequestHygiene.wireCharset]). CL.TE / TE.CL / CL.CL shapes are left alone.
      */
     fun withContentLength(request: String): String =
-        RequestHygiene.fixContentLength(request, utf8Body = true).request
+        RequestHygiene.fixContentLength(request, utf8Body = RequestHygiene.wireCharset(request) == Charsets.UTF_8).request
+
+    /** Where each injection point of [request] starts: FUZZ keywords, opening markers, or offset starts. */
+    private fun positionStarts(request: String, positions: List<Pair<Int, Int>>?, marker: String?): List<Int> {
+        val m = effectiveMarker(marker)
+        val pairs = if (countOccurrences(request, m) >= 2) findMarkerPairs(request, m) else emptyList()
+        return when {
+            pairs.isNotEmpty() -> pairs.map { it.first }
+            request.contains(FUZZ_KEYWORD) -> generateSequence(request.indexOf(FUZZ_KEYWORD)) { i ->
+                request.indexOf(FUZZ_KEYWORD, i + FUZZ_KEYWORD.length).takeIf { it >= 0 }
+            }.takeWhile { it >= 0 }.toList()
+            else -> positions.orEmpty().map { it.first }
+        }
+    }
+
+    /** True when the line holding [index] (trimmed at the start) is a Content-Length header line. */
+    private fun lineStartsWithContentLength(request: String, index: Int): Boolean {
+        if (index < 0 || index > request.length) return false
+        val start = if (index == 0) 0 else request.lastIndexOf('\n', index - 1) + 1
+        val end = request.indexOf('\n', index).let { if (it < 0) request.length else it }
+        return request.substring(start, end).trimStart().startsWith("content-length", ignoreCase = true)
+    }
 
     /** A blank marker would match everywhere; it means "use the default `§`". */
     private fun effectiveMarker(marker: String?): String = marker?.takeIf { it.isNotEmpty() } ?: "§"

@@ -206,6 +206,8 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
             if (connections.get() == 0 && opener.openFailures.get() > 0) {
                 // Leaves the dispatcher no run to wait for. It is parked on runState being 0.
                 finish(3)
+                // Nothing was sent, so there is nothing to rank: the run's status is final now.
+                finalized = true
                 throw Exception(failureSummary())
             }
             if (requestsInFlightLimit < targetConcurrency) {
@@ -368,6 +370,8 @@ open class HTTP3RequestEngine @JvmOverloads constructor(
     ): Request = Request(template, payloads, learnBoring ?: 0, label)
 
     override fun openGate(gateName: String) {
+        // A stopped run has nothing to release: the script's openGate is not an error then.
+        if (runState.get() >= 3) return
         check(gateLifecycleAdmissions.tryEnter()) { "HTTP/3 run is no longer accepting gate releases" }
         var admissionTransferred = false
         try {

@@ -3,6 +3,7 @@ package io.bitbytelab.raijin.tools.apiimport
 import io.bitbytelab.raijin.bridge.ApiImportBridge
 import io.bitbytelab.raijin.core.asBodyString
 import io.bitbytelab.raijin.core.asBooleanSafe
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
@@ -20,8 +21,12 @@ object ApiImportTools {
                 "under, and security_schemes, which says how every credential is carried. Parameters: spec_json " +
                 "(required, the document text), spec_url (where the document was downloaded from; resolves relative " +
                 "server URLs), base_url (optional target override), auth_header/auth_value (optional auth for all " +
-                "requests), add_to_scope (bool), add_to_sitemap (bool), send_requests (bool, actually send and get " +
-                "responses).",
+                "requests), add_to_scope (bool: includes the server of every operation; added_to_scope_urls and " +
+                "add_to_scope_errors say what happened), add_to_sitemap (bool), send_requests (bool, actually send and " +
+                "get responses; sending stops with stopped=target_unreachable and not_sent once the target gives no " +
+                "HTTP response). Over the Streamable HTTP endpoint (/mcp) an MCP request is limited to 4 MiB: split a " +
+                "larger spec (the legacy SSE endpoint accepts up to 64 MiB). " +
+                ScopeGate.TOOL_NOTE + " Checked per endpoint: a refused one carries skipped=out_of_scope.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("spec_json") { put("type", "string"); put("description", "The OpenAPI/Swagger document text, JSON or YAML") }

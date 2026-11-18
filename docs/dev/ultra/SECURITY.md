@@ -183,7 +183,7 @@ Host, so a rebound page in your browser could read the dashboard's proxy history
 
 | Preference | Type | Default | Effect |
 |---|---|---|---|
-| `mcp_scope_mode` | string | `warn` | Gates outbound HTTP against Burp's target scope (`off` / `warn` / `enforce`). |
+| `mcp_scope_mode` | string | `warn` | Checks outbound HTTP against Burp's target scope (`off` / `warn` / `enforce`). `warn` sends and adds `scope_warning`; `enforce` refuses on the classic send paths (http, recon, probes, auth_diff, api import, Autorize, session macros); Turbo, Scanner, WebSocket and followed redirects are advisory only (flagged, never refused). Decisions are recorded in the result, the MCP Activity tab and the audit log (`out_of_scope`). |
 | `mcp_allow_destructive` | boolean | `false` | Blocks `burp(action=shutdown)`, `burp(action=import_project_config)` and `burp(action=import_user_config)` until enabled. |
 | `mcp_allow_remote_bind` | boolean | `false` | Required for any non-loopback bind. |
 | `mcp_require_auth` | boolean | `false` | Requires the bearer token on loopback too. |
@@ -194,7 +194,10 @@ and write **string** preferences only. The boolean gates above can be changed on
 (Server tab, Burp preferences, `-D` properties). A connected agent can read and change the string
 settings (`mcp_scope_mode`, `mcp_bind_host`, `mcp_auth_token`, `mcp_allowed_ips`,
 `mcp_allowed_hosts`, the ports): a connected agent already drives Burp. A changed bind host still
-needs the boolean opt-in, and network settings apply on the next rebind or reload.
+needs the boolean opt-in, and network settings apply on the next rebind or reload. `mcp_scope_mode`
+is the one string setting checked on write: only `off`, `warn` or `enforce` is stored (normalised to
+lower case), and every change or delete is announced with a `scope.mode_changed` event, a line in
+Burp's output log and the Server tab, which shows the new mode within one refresh.
 
 ## Hostile input from targets
 

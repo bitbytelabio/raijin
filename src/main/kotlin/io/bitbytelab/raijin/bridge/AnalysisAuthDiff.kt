@@ -72,17 +72,19 @@ internal class AnalysisAuthDiff(private val api: MontoyaApi) {
         AuthIdentityApplier.indistinguishableError(identities)?.let { err ->
             return buildJsonObject { put("error", err) }
         }
+        var scope: ScopeGate.Check? = null
         return try {
-            val scope = scopeGate.check((if (useTls) "https" else "http") + "://$host:$port/")
-            scope.deny?.let { return it }
             val service = HttpService.httpService(host, port, useTls)
             // Normalize request
             val baseRequest = normalizeCrlfMessage(request)
             val identityHeaders = AuthIdentityApplier.identityHeaders(identities)
 
-            // Every level hits the same path (only headers vary across the loop below) — used
-            // only for AuthDiffVerdict's static-asset downgrade (file-extension fallback).
+            // Every level hits the same path (only headers vary across the loop below): the scope
+            // check's URL, and AuthDiffVerdict's static-asset downgrade (file-extension fallback).
             val sharedUrl = try { HttpRequest.httpRequest(service, baseRequest).url() } catch (_: Exception) { null }
+            val check = scopeGate.checkRequest(host, port, useTls, baseRequest)
+            if (check.blocked) return check.denyJson()
+            scope = check
 
             val results = mutableListOf<AuthLevelResponse>()
             val errors = mutableListOf<String>()
@@ -121,10 +123,10 @@ internal class AnalysisAuthDiff(private val api: MontoyaApi) {
                 }
             }
 
-            val report = authDiffReport(results, errors, fields, sharedUrl, deniedRegex)
-            scope.warning?.let { JsonObject(report + ("scope_warning" to JsonPrimitive(it))) } ?: report
+            check.annotate(authDiffReport(results, errors, fields, sharedUrl, deniedRegex))
         } catch (e: Exception) {
-            buildJsonObject { put("error", "Auth diff failed: ${describeException(e)}") }
+            val error = buildJsonObject { put("error", "Auth diff failed: ${describeException(e)}") }
+            scope?.annotate(error) ?: error
         }
     }
 

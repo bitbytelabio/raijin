@@ -1,9 +1,11 @@
 package io.bitbytelab.raijin.tools.graphql
 
 import io.bitbytelab.raijin.bridge.GraphQlBridge
+import io.bitbytelab.raijin.core.ClampedInt
 import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.core.asBooleanSafe
-import io.bitbytelab.raijin.core.asBoundedInt
+import io.bitbytelab.raijin.core.asClampedInt
+import io.bitbytelab.raijin.core.withClampReport
 import io.bitbytelab.raijin.core.asJsonObjectSafe
 import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.core.asStringMapResult
@@ -11,6 +13,7 @@ import io.bitbytelab.raijin.graphql.BatchAttack
 import io.bitbytelab.raijin.graphql.bruteforcer.SchemaBruteforcer
 import io.bitbytelab.raijin.graphql.scanners.POIScanner
 import io.bitbytelab.raijin.graphql.subscriptions.SubscriptionProbe
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.server.Server
@@ -71,7 +74,7 @@ object GraphQlTools {
                 "socket is closed. Every mode accepts 'headers' and 'auto_headers' for auth; query_templates/" +
                 "poi_scan/cycles_scan additionally cache the fetched schema (bypass with 'refresh_schema'). An " +
                 "unreachable target is reported as one error instead of a verdict. " +
-                "Respects the operator scope policy (mcp_scope_mode).",
+                ScopeGate.TOOL_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("url") { put("type", "string"); put("description", "GraphQL endpoint URL (e.g. https://target/graphql); subscription_probe also takes ws:// and wss://") }
@@ -133,10 +136,14 @@ object GraphQlTools {
                 val autoHeaders = a["auto_headers"].asBooleanSafe() ?: false
                 val refreshSchema = a["refresh_schema"].asBooleanSafe() ?: false
 
+                // Limits out of range are clamped and reported (<name>_clamped_to), not refused.
+                val clamps = ArrayList<Pair<String, ClampedInt?>>()
+                fun clamped(name: String, min: Int, max: Int): ClampedInt? =
+                    a[name].asClampedInt(name, min, max).getOrThrow().also { clamps.add(name to it) }
+
                 val result = when (mode) {
                     "query_templates" -> {
-                        val maxDepth = a["max_depth"].asBoundedInt("max_depth", 0, MAX_QUERY_DEPTH)
-                            .getOrElse { return@addTool toolError(it.message ?: "Invalid max_depth") } ?: 6
+                        val maxDepth = clamped("max_depth", 0, MAX_QUERY_DEPTH)?.value ?: 6
                         bridge.queryTemplates(url, maxDepth, headers, autoHeaders, refreshSchema)
                     }
                     "poi_scan" -> {
@@ -155,12 +162,9 @@ object GraphQlTools {
                     }
                     "fingerprint_engine" -> bridge.fingerprintEngine(url, headers, autoHeaders)
                     "bruteforce_schema" -> {
-                        val bucketSize = a["bucket_size"].asBoundedInt("bucket_size", 1, MAX_BUCKET_SIZE)
-                            .getOrElse { return@addTool toolError(it.message ?: "Invalid bucket_size") } ?: 64
-                        val depthLimit = a["depth_limit"].asBoundedInt("depth_limit", 0, MAX_DEPTH_LIMIT)
-                            .getOrElse { return@addTool toolError(it.message ?: "Invalid depth_limit") } ?: 2
-                        val maxRequests = a["max_requests"].asBoundedInt("max_requests", 1, MAX_REQUEST_BUDGET)
-                            .getOrElse { return@addTool toolError(it.message ?: "Invalid max_requests") }
+                        val bucketSize = clamped("bucket_size", 1, MAX_BUCKET_SIZE)?.value ?: 64
+                        val depthLimit = clamped("depth_limit", 0, MAX_DEPTH_LIMIT)?.value ?: 2
+                        val maxRequests = clamped("max_requests", 1, MAX_REQUEST_BUDGET)?.value
                             ?: SchemaBruteforcer.DEFAULT_MAX_REQUESTS
                         bridge.bruteforceSchema(
                             url, headers, autoHeaders, bucketSize, depthLimit,
@@ -168,10 +172,8 @@ object GraphQlTools {
                         )
                     }
                     "subscription_probe" -> {
-                        val waitMs = a["wait_ms"]
-                            .asBoundedInt("wait_ms", SubscriptionProbe.MIN_WAIT_MS.toInt(), SubscriptionProbe.MAX_WAIT_MS.toInt())
-                            .getOrElse { return@addTool toolError(it.message ?: "Invalid wait_ms") }
-                            ?.toLong() ?: SubscriptionProbe.DEFAULT_WAIT_MS
+                        val waitMs = clamped("wait_ms", SubscriptionProbe.MIN_WAIT_MS.toInt(), SubscriptionProbe.MAX_WAIT_MS.toInt())
+                            ?.value?.toLong() ?: SubscriptionProbe.DEFAULT_WAIT_MS
                         val rawPayload = a["connection_payload"]
                         val connectionPayload = rawPayload.asJsonObjectSafe()
                         if (rawPayload != null && rawPayload !is JsonNull && connectionPayload == null) {
@@ -181,10 +183,9 @@ object GraphQlTools {
                     }
                     else -> bridge.probe(url, headers, autoHeaders)
                 }
-                toolJsonResult(
-                    if (headersWarning == null) result
-                    else JsonObject(result + ("headers_warning" to JsonPrimitive(headersWarning)))
-                )
+                var reported = if (headersWarning == null) result else JsonObject(result + ("headers_warning" to JsonPrimitive(headersWarning)))
+                clamps.forEach { (name, arg) -> reported = reported.withClampReport(name, arg) }
+                toolJsonResult(reported)
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }

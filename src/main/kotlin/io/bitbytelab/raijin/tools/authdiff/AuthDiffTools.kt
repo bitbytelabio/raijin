@@ -6,6 +6,7 @@ import io.bitbytelab.raijin.core.asBooleanSafe
 import io.bitbytelab.raijin.core.asBoundedInt
 import io.bitbytelab.raijin.core.asJsonObjectList
 import io.bitbytelab.raijin.core.asStringList
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
@@ -24,7 +25,7 @@ Provide auth_levels as an array of at least 2 objects: [{"name": "admin", "heade
 
 A level's headers replace the request's own (never a second Cookie/Authorization line). A level named "none"/"unauth"/"anonymous" is sent without credentials: Authorization, Cookie, API-key/token headers and every header another level uses for its identity are stripped. Content-Length is corrected for every level. Each response reports headers_set / headers_removed / credential_headers_kept so you can check what was sent.
 
-Analyzes status codes, body content, body length, and headers for differences. Flags critical findings like identical responses across auth levels — except when the target looks like a static asset (content-type or file extension: CSS/JS/image/font), where identical-across-levels is expected and the finding is downgraded to informational instead. Levels that are all refused alike (same 401/403/404/5xx, a redirect to a login page, or a 200 that only carries a login page or a denial message) are informational, never high or critical. A level that times out is listed under errors and not compared.""",
+Analyzes status codes, body content, body length, and headers for differences. Flags critical findings like identical responses across auth levels — except when the target looks like a static asset (content-type or file extension: CSS/JS/image/font), where identical-across-levels is expected and the finding is downgraded to informational instead. Levels that are all refused alike (same 401/403/404/5xx, a redirect to a login page, or a 200 that only carries a login page or a denial message) are informational, never high or critical. A level that times out is listed under errors and not compared.""" + "\n\n" + ScopeGate.TOOL_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("request") { put("type", "string"); put("description", "Raw HTTP request string") }

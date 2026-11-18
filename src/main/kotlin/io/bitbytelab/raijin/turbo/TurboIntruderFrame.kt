@@ -179,8 +179,8 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
                     try {
                         Files.write( Paths.get(comboItem.fullPath), textEditor.text.toByteArray());
 
-                    } catch (e: IOException) {
-                        System.err.println("Failed to write file:$e")
+                    } catch (e: Exception) {
+                        JOptionPane.showMessageDialog(this@TurboIntruderFrame, "Could not save ${comboItem.fullPath}: ${e.message}", "Raijin Turbo", JOptionPane.ERROR_MESSAGE)
                     }
                 }
             }
@@ -252,17 +252,22 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
                         textEditor.text = getDefaultScript()
                     } else {
                         val fileName = codeCombo.getSelectedItem().toString()
-                        if (fileName.startsWith("examples/")) {
-                            textEditor.text = Scripts::class.java.getResource("/" + fileName).readText()
-                            saveButton.isEnabled = false;
-                        } else {
-                            saveButton.isEnabled = true;
-                            val comboItem = codeCombo.getSelectedItem();
-                            if(comboItem is DirectoryItem) {
-                                textEditor.text = String(Files.readAllBytes(Paths.get(comboItem.fullPath)));
+                        try {
+                            if (fileName.startsWith("examples/")) {
+                                textEditor.text = Scripts::class.java.getResource("/" + fileName)!!.readText()
+                                saveButton.isEnabled = false;
                             } else {
-                                textEditor.text = String(Files.readAllBytes(Paths.get(fileName)));
+                                saveButton.isEnabled = true;
+                                val comboItem = codeCombo.getSelectedItem();
+                                if(comboItem is DirectoryItem) {
+                                    textEditor.text = String(Files.readAllBytes(Paths.get(comboItem.fullPath)));
+                                } else {
+                                    textEditor.text = String(Files.readAllBytes(Paths.get(fileName)));
+                                }
                             }
+                        } catch (e: Exception) {
+                            saveButton.isEnabled = false
+                            JOptionPane.showMessageDialog(this@TurboIntruderFrame, "Could not read $fileName: ${e.message}", "Raijin Turbo", JOptionPane.ERROR_MESSAGE)
                         }
                     }
                 }
@@ -298,7 +303,6 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
                         "Configure" -> {
                             val finished = handler
                             val rt = requestTable
-                            val rs = resultStore
                             handler = RunHandler()
                             resultStore = null
                             requestTable = null
@@ -311,9 +315,9 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
                             button.requestFocusInWindow()
                             pane.rootPane.defaultButton = button
                             title = "Raijin Turbo - " + req.request().httpService().host()
+                            // The results stay: the run is still listed (turbo_list_runs) and its store is its own.
                             thread(name = "raijin-turbo-reset") {
                                 finished.abort()
-                                rs?.clear()
                             }
                         }
                         else -> {
@@ -329,7 +333,10 @@ class TurboIntruderFrame(inputReq: HttpRequestResponse, val selectionBounds: Int
                             val localStore = ResultStore()
                             resultStore = localStore
                             TurboModule.runManager.adopt(runHandler, localStore, "GUI")
-                            val localTable = RequestTable(localStore, newService, runHandler)
+                            // A run that ends on its own leaves the button ready to configure the next one.
+                            val localTable = RequestTable(localStore, newService, runHandler) {
+                                if (handler === runHandler && button.text == "Halt") button.text = "Configure"
+                            }
                             requestTable = localTable
                             button.text = "Halt"
                             val requestPanel = JPanel(BorderLayout())

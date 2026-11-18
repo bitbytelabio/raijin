@@ -6,6 +6,7 @@ import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.HttpRequestResponse
 import burp.api.montoya.http.message.requests.HttpRequest
 import io.bitbytelab.raijin.core.BodyText
+import io.bitbytelab.raijin.safety.RequestHygiene
 import io.bitbytelab.raijin.safety.ScopeGate
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -57,7 +58,7 @@ internal class HttpRace(
     }
 
     /**
-     * @param texts the request texts (Content-Length already fixed), sent as UTF-8.
+     * @param texts the request texts (Content-Length already fixed), sent in [RequestHygiene.wireCharset].
      * @param payloads the payload of each request when the batch was built from payloads.
      * @param mode for single_packet, [HttpMode.HTTP_2_IGNORE_ALPN] forces HTTP/2 without ALPN; any
      *   other mode sends HTTP/2.
@@ -77,16 +78,21 @@ internal class HttpRace(
         maxBodyLength: Int?,
         timeoutMs: Long?,
         similarity: Double,
-    ): JsonObject = try {
-        scopeGate.deny((if (useTls) "https" else "http") + "://$host:$port/") ?: when (sync) {
-            Sync.SINGLE_PACKET -> singlePacket(texts, payloads, host, port, useTls, mode, maxBodyLength, timeoutMs, similarity)
-            Sync.LAST_BYTE -> lastByte(texts, payloads, host, port, useTls, sni, maxBodyLength, timeoutMs, similarity)
+    ): JsonObject {
+        val scope = scopeGate.checkRequests(host, port, useTls, texts.asSequence().ifEmpty { sequenceOf("") })
+        if (scope.blocked) return scope.denyJson()
+        val result = try {
+            when (sync) {
+                Sync.SINGLE_PACKET -> singlePacket(texts, payloads, host, port, useTls, mode, maxBodyLength, timeoutMs, similarity)
+                Sync.LAST_BYTE -> lastByte(texts, payloads, host, port, useTls, sni, maxBodyLength, timeoutMs, similarity)
+            }
+        } catch (e: Exception) {
+            buildJsonObject {
+                put("error", "Race condition test failed: ${e.message}")
+                put("is_timeout", e is HttpRequestTimeoutException)
+            }
         }
-    } catch (e: Exception) {
-        buildJsonObject {
-            put("error", "Race condition test failed: ${e.message}")
-            put("is_timeout", e is HttpRequestTimeoutException)
-        }
+        return scope.annotate(result)
     }
 
     private fun singlePacket(
@@ -105,7 +111,7 @@ internal class HttpRace(
         // As Turbo's gated BURP2 engine does: the request line names HTTP/2, the version the batch goes out in.
         val batch = texts.map { text ->
             val h2Text = text.replaceFirst("HTTP/1.1\r\n", "HTTP/2\r\n")
-            HttpRequest.httpRequest(service, BurpByteArray.byteArray(*h2Text.toByteArray(Charsets.UTF_8)))
+            HttpRequest.httpRequest(service, BurpByteArray.byteArray(*h2Text.toByteArray(RequestHygiene.wireCharset(h2Text))))
         }
         val start = System.nanoTime()
         val exchanges: List<HttpRequestResponse?> = timeouts.run(timeoutMs) { api.http().sendRequests(batch, h2Mode) }
@@ -187,7 +193,7 @@ internal class HttpRace(
         val connectTimeoutMs = budgetMs.coerceIn(1, CONNECT_TIMEOUT_MS).toInt()
         val sync = LastByteSync { RawHttpConnector.connect(host, port, useTls, connectTimeoutMs, sni) }
         val result = sync.run(
-            requests = sent.map { it.toByteArray(Charsets.UTF_8) },
+            requests = sent.map { it.toByteArray(RequestHygiene.wireCharset(it)) },
             expectNoBody = sent.map { it.startsWith("HEAD ", ignoreCase = true) },
             totalTimeoutMs = budgetMs,
         )
@@ -330,19 +336,21 @@ internal class LastByteSync(private val connect: (Int) -> Socket) {
                     var socket: Socket? = null
                     try {
                         socket = connect(i)
+                        // Registered at once, so the cleanup closes it even if priming hangs past the run.
+                        sockets.set(i, socket)
                         val bytes = requests[i]
                         if (bytes.size > 1) {
                             val out = socket.getOutputStream()
                             out.write(bytes, 0, bytes.size - 1)
                             out.flush()
                         }
-                        sockets.set(i, socket)
                         if (!state.compareAndSet(i, PENDING, PRIMED)) {
                             sockets.set(i, null)
                             runCatching { socket.close() }
                         }
                     } catch (e: Exception) {
                         errors.set(i, "connect or write failed: ${e.message ?: e.javaClass.simpleName}")
+                        sockets.set(i, null)
                         runCatching { socket?.close() }
                         state.compareAndSet(i, PENDING, ABANDONED)
                     } finally {
@@ -375,19 +383,21 @@ internal class LastByteSync(private val connect: (Int) -> Socket) {
                 }
             }
             val releaseEnd = System.nanoTime()
+            // Priming that used up the budget must not leave released requests no time to answer.
+            val readDeadlineMs = max(deadlineMs, System.currentTimeMillis() + MIN_READ_MS)
 
             val reads = HashMap<Int, Future<HttpPipelineFraming.Outcome>>()
             for (i in ready) {
                 if (released[i] == null) continue
                 val socket = sockets.get(i)!!
                 reads[i] = pool.submit<HttpPipelineFraming.Outcome> {
-                    val idle = max(1L, deadlineMs - System.currentTimeMillis())
-                    HttpPipelineFraming.readOne(socket, StringBuilder(), idle, deadlineMs, maxResponseBytes, expectNoBody.getOrElse(i) { false })
+                    val idle = max(1L, readDeadlineMs - System.currentTimeMillis())
+                    HttpPipelineFraming.readOne(socket, StringBuilder(), idle, readDeadlineMs, maxResponseBytes, expectNoBody.getOrElse(i) { false })
                 }
             }
             for ((i, future) in reads) {
                 responses[i] = try {
-                    future.get(remaining(deadlineMs) + READ_GRACE_MS, TimeUnit.MILLISECONDS)
+                    future.get(remaining(readDeadlineMs) + READ_GRACE_MS, TimeUnit.MILLISECONDS)
                 } catch (e: Exception) {
                     errors.set(i, "reading the response failed: ${e.message ?: e.javaClass.simpleName}")
                     null
@@ -410,5 +420,8 @@ internal class LastByteSync(private val connect: (Int) -> Socket) {
 
         /** Reads are bounded by the deadline themselves; this only covers a reader slow to notice it. */
         const val READ_GRACE_MS = 1_000L
+
+        /** Least time released requests get to answer, whatever priming took. */
+        const val MIN_READ_MS = 5_000L
     }
 }

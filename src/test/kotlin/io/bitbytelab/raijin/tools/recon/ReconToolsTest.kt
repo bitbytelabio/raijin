@@ -117,12 +117,18 @@ class ReconToolsTest {
     @Test
     fun `out-of-range and non-numeric numbers are rejected`() {
         assertRejected("recon_param_mine", mine("offset", json("-1")), "'offset'", "between 0 and")
-        assertRejected("recon_param_mine", mine("limit", json("0")), "'limit'", "between 1 and")
-        assertRejected("recon_param_mine", mine("bucket_size", json("0")), "'bucket_size'", "between 1 and 256")
-        assertRejected("recon_param_mine", mine("bucket_size", json("999")), "'bucket_size'", "got 999")
-        assertRejected("recon_param_mine", mine("max_requests", json("5")), "'max_requests'", "between 20 and 5000")
         assertRejected("recon_param_mine", mine("max_requests", json("\"many\"")), "'max_requests'", "integer")
+        assertRejected("recon_param_mine", mine("bucket_size", json("\"big\"")), "'bucket_size'", "integer")
         assertRejected("recon_js_endpoints", buildJsonObject { put("max_items", "lots") }, "'max_items'", "integer")
+    }
+
+    @Test
+    fun `param mining limits out of range are clamped and reported, not refused`() {
+        for ((name, asked, used) in listOf(Triple("limit", 0, 1), Triple("bucket_size", 999, 256), Triple("max_requests", 5, 20))) {
+            val result = call("recon_param_mine", mine(name, json("$asked")))
+            val body = Json.parseToJsonElement((result.content.first() as TextContent).text).jsonObject
+            assertEquals(used, body.getValue("${name}_clamped_to").jsonPrimitive.int, body.toString())
+        }
     }
 
     @Test

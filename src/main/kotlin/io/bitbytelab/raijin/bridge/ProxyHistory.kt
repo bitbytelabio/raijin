@@ -16,6 +16,10 @@ import io.bitbytelab.raijin.core.StatusCodeRange
 import io.bitbytelab.raijin.core.WebSocketHistoryCriteria
 import io.bitbytelab.raijin.safety.SafeRegex
 import kotlinx.serialization.json.*
+import java.util.concurrent.atomic.AtomicInteger
+
+/** Longest request, response or URL text a history search runs its regex over; longer ones are counted as skipped_oversize. */
+private const val MAX_SEARCH_INPUT = 5_000_000
 
 /**
  * The proxy history reads of [ProxyBridge]: the HTTP and WebSocket history, filtered or searched
@@ -102,9 +106,10 @@ internal class ProxyHistory(private val api: MontoyaApi) {
             put("total_filtered", allItems.size)
             put("start_index", safeStart)
             put("returned", slice.size)
+            nextStart(safeStart, slice.size, allItems.size)?.let { put("next_start_index", it) }
             put("items", buildJsonArray {
-                slice.forEach { item ->
-                    add(serializeHistoryItem(item, includeRequest, includeResponse, maxResponseLength ?: 200_000))
+                slice.forEachIndexed { i, item ->
+                    add(serializeHistoryItem(item, safeStart + i, includeRequest, includeResponse, maxResponseLength ?: 200_000))
                 }
             })
             putNotes(notes)
@@ -131,13 +136,22 @@ internal class ProxyHistory(private val api: MontoyaApi) {
         inScopeOnly: Boolean,
         includeRequest: Boolean,
         includeResponse: Boolean,
-        maxResponseLength: Int?
+        maxResponseLength: Int?,
+        startIndex: Int = 0,
     ): JsonObject {
         val ignoreCase = !caseSensitive
         SafeRegex.validate(pattern, ignoreCase = ignoreCase)?.let { err ->
             return buildJsonObject { put("error", "Invalid regex pattern: $err") }
         }
         val t = ProxyHistorySearch.targets(searchIn)
+        val oversize = AtomicInteger()
+        fun hit(text: String): Boolean {
+            if (text.length > MAX_SEARCH_INPUT) {
+                oversize.incrementAndGet()
+                return false
+            }
+            return SafeRegex.containsMatchIn(pattern, text, ignoreCase = ignoreCase, maxInputLen = MAX_SEARCH_INPUT)
+        }
 
         val filter = ProxyHistoryFilter { item ->
             try {
@@ -148,15 +162,13 @@ internal class ProxyHistory(private val api: MontoyaApi) {
                     // Match against the fully-reconstructed URL (scheme+host+path+query),
                     // which the request text does not expose as one contiguous string.
                     val url = safe { item.request().url() } ?: ""
-                    found = SafeRegex.containsMatchIn(pattern, url, ignoreCase = ignoreCase)
+                    found = hit(url)
                 }
                 if (!found && t.request) {
-                    val reqText = safe { item.request().toString() } ?: ""
-                    found = SafeRegex.containsMatchIn(pattern, reqText, ignoreCase = ignoreCase)
+                    found = hit(safe { item.request().toString() } ?: "")
                 }
                 if (!found && t.response && item.hasResponse()) {
-                    val respText = safe { item.response().toString() } ?: ""
-                    found = SafeRegex.containsMatchIn(pattern, respText, ignoreCase = ignoreCase)
+                    found = hit(safe { item.response().toString() } ?: "")
                 }
                 found
             } catch (_: Exception) {
@@ -166,21 +178,29 @@ internal class ProxyHistory(private val api: MontoyaApi) {
 
         val matches = api.proxy().history(filter)
         val notes = mutableListOf<String>()
-        val limited = page(matches, 0, ProxyLimits.clamp("max_results", maxResults, 0, MAX_PAGE_SIZE, notes))
+        val safeStart = ProxyLimits.clamp("start_index", startIndex, 0, Int.MAX_VALUE, notes)
+        val limited = page(matches, safeStart, ProxyLimits.clamp("max_results", maxResults, 0, MAX_PAGE_SIZE, notes))
 
         return buildJsonObject {
             put("total_matches", matches.size)
+            put("start_index", safeStart)
             put("returned", limited.size)
+            nextStart(safeStart, limited.size, matches.size)?.let { put("next_start_index", it) }
+            if (oversize.get() > 0) put("skipped_oversize", oversize.get())
             put("pattern", pattern)
             put("search_in", searchIn)
             put("items", buildJsonArray {
-                limited.forEach { item ->
-                    add(serializeHistoryItem(item, includeRequest, includeResponse, maxResponseLength ?: 200_000))
+                limited.forEachIndexed { i, item ->
+                    add(serializeHistoryItem(item, safeStart + i, includeRequest, includeResponse, maxResponseLength ?: 200_000))
                 }
             })
             putNotes(notes)
         }
     }
+
+    /** The start_index of the next page, or null when [returned] items from [start] reach [total]. */
+    private fun nextStart(start: Int, returned: Int, total: Int): Int? =
+        (start.toLong() + returned).takeIf { returned > 0 && it < total }?.toInt()
 
     /**
      * Returns WebSocket proxy history with optional filtering.
@@ -240,6 +260,7 @@ internal class ProxyHistory(private val api: MontoyaApi) {
         maxResults: Int,
         webSocketId: Int?,
         url: String?,
+        startIndex: Int = 0,
     ): JsonObject {
         SafeRegex.validate(pattern, ignoreCase = true)?.let { err ->
             return buildJsonObject { put("error", "Invalid regex pattern: $err") }
@@ -250,12 +271,17 @@ internal class ProxyHistory(private val api: MontoyaApi) {
             is WebSocketHistoryCriteria.DirectionFilter.Invalid -> return buildJsonObject { put("error", d.message) }
         }
         val criteria = WebSocketHistoryCriteria(null, dirName, webSocketId, url)
+        val oversize = AtomicInteger()
 
         val filter = ProxyWebSocketHistoryFilter { item ->
             try {
                 if (!matchesCriteria(criteria, item)) return@ProxyWebSocketHistoryFilter false
                 val payloadText = safe { item.payload().toString() } ?: ""
-                SafeRegex.containsMatchIn(pattern, payloadText, ignoreCase = true)
+                if (payloadText.length > MAX_SEARCH_INPUT) {
+                    oversize.incrementAndGet()
+                    return@ProxyWebSocketHistoryFilter false
+                }
+                SafeRegex.containsMatchIn(pattern, payloadText, ignoreCase = true, maxInputLen = MAX_SEARCH_INPUT)
             } catch (_: Exception) {
                 false
             }
@@ -263,11 +289,15 @@ internal class ProxyHistory(private val api: MontoyaApi) {
 
         val matches = api.proxy().webSocketHistory(filter)
         val notes = mutableListOf<String>()
-        val limited = page(matches, 0, ProxyLimits.clamp("max_results", maxResults, 0, MAX_PAGE_SIZE, notes))
+        val safeStart = ProxyLimits.clamp("start_index", startIndex, 0, Int.MAX_VALUE, notes)
+        val limited = page(matches, safeStart, ProxyLimits.clamp("max_results", maxResults, 0, MAX_PAGE_SIZE, notes))
 
         return buildJsonObject {
             put("total_matches", matches.size)
+            put("start_index", safeStart)
             put("returned", limited.size)
+            nextStart(safeStart, limited.size, matches.size)?.let { put("next_start_index", it) }
+            if (oversize.get() > 0) put("skipped_oversize", oversize.get())
             put("pattern", pattern)
             put("items", buildJsonArray {
                 limited.forEach { item -> add(serializeWebSocketItem(item)) }
@@ -302,12 +332,15 @@ internal class ProxyHistory(private val api: MontoyaApi) {
      */
     private fun serializeHistoryItem(
         item: ProxyHttpRequestResponse,
+        position: Int,
         includeRequest: Boolean,
         includeResponse: Boolean,
         maxResponseLength: Int? = null
     ): JsonObject {
         return buildJsonObject {
-            safe { item.id() }?.let { put("index", it) }
+            // id: Burp's own message id (stable); index: the item's place in this filtered list (pages with start_index).
+            safe { item.id() }?.let { put("id", it) }
+            put("index", position)
             safe { item.httpService() }?.let { service ->
                 put("host", service.host())
                 put("port", service.port())

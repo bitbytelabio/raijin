@@ -2,9 +2,12 @@ package io.bitbytelab.raijin.tools.webprobe
 
 import io.bitbytelab.raijin.bridge.WebProbeBridge
 import io.bitbytelab.raijin.core.EnumValidation
+import io.bitbytelab.raijin.core.asClampedInt
 import io.bitbytelab.raijin.core.asLongSafe
+import io.bitbytelab.raijin.core.withClampReport
 import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.core.asStringMapResult
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
@@ -25,7 +28,7 @@ object WebProbeTools {
                 "mistakes: <host>.<other domain> (prefix match), <junk><domain> (suffix match), a dot replaced by a " +
                 "letter (unescaped regex dot), <host>_.<other domain>, a made-up subdomain, and the http:// origin. Each " +
                 "origin is sent as a GET and as an OPTIONS preflight (asking for PUT and a custom header), and a " +
-                "response whose ACAO follows the Origin without 'Vary: Origin' is flagged. Respects the operator scope policy.",
+                "response whose ACAO follows the Origin without 'Vary: Origin' is flagged. " + ScopeGate.TOOL_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("url") { put("type", "string"); put("description", "Target URL") }
@@ -53,7 +56,7 @@ object WebProbeTools {
                 "cannot guarantee isolation when the cache key is unknown. Deception: requests path variants the " +
                 "origin may treat as the page and the cache as a static file (/page/x.css, " +
                 "/page;x.css, /page%23x.css, ...) as the user, then without a session. Pass the logged-in user's request " +
-                "headers as 'headers' to prove a private page gets stored. Respects the operator scope policy.",
+                "headers as 'headers' to prove a private page gets stored. " + ScopeGate.TOOL_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("url") { put("type", "string"); put("description", "Target URL") }
@@ -85,6 +88,9 @@ object WebProbeTools {
                 checks?.forEach { name ->
                     EnumValidation.error(name, WebProbeBridge.CACHE_CHECKS.toSet(), "checks", required = true)?.let { return@addTool toolJsonResult(it) }
                 }
+                // Out of range is clamped and reported (max_requests_clamped_to), not refused.
+                val maxRequests = a["max_requests"]
+                    .asClampedInt("max_requests", CACHE_REQUEST_BUDGETS.first, CACHE_REQUEST_BUDGETS.last).getOrThrow()
                 toolJsonResult(
                     bridge.cacheProbe(
                         url = url,
@@ -92,8 +98,8 @@ object WebProbeTools {
                         headers = a.mapArg("headers", "an object of header names to values"),
                         probeHeaders = a["probe_headers"].asStringList().orEmpty(),
                         probeCookies = a["probe_cookies"].asStringList().orEmpty(),
-                        maxRequests = a.int("max_requests", CACHE_REQUEST_BUDGETS) ?: WebProbeBridge.DEFAULT_CACHE_REQUESTS,
-                    )
+                        maxRequests = maxRequests?.value ?: WebProbeBridge.DEFAULT_CACHE_REQUESTS,
+                    ).withClampReport("max_requests", maxRequests)
                 )
             } catch (e: Exception) { toolError(e.message ?: "Unknown error") }
         }
@@ -101,7 +107,7 @@ object WebProbeTools {
         server.addTool(
             name = "recon_fingerprint",
             description = "Fingerprint server/tech/WAF/framework from a single GET (Server, X-Powered-By, " +
-                "Set-Cookie, WAF headers, and body markers). Drives downstream payload selection. Respects scope policy.",
+                "Set-Cookie, WAF headers, and body markers). Drives downstream payload selection. " + ScopeGate.TOOL_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("url") { put("type", "string"); put("description", "Target URL") }

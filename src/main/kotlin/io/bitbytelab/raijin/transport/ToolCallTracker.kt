@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.transport
 
 import burp.api.montoya.http.message.HttpRequestResponse
+import io.bitbytelab.raijin.core.BodyText
 import io.bitbytelab.raijin.core.truncateJsonForSummary
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.safety.ActionPolicy
@@ -142,8 +143,13 @@ object ToolCallTracker {
         val method: String,
         val host: String,
         val statusCode: Int,
-        val isError: Boolean
+        val isError: Boolean,
+        /** The result reports an out-of-scope target: warned, advised, sent or blocked. */
+        val outOfScope: Boolean = false,
     )
+
+    /** Results above this size are not parsed for the summary; the scope flag then comes from a text search. */
+    private const val MAX_PARSED_RESULT_CHARS = 262_144
 
     /**
      * Builds the [CallSummary] of a call to [mergedToolName]. Grouped tools are reported under the
@@ -158,9 +164,24 @@ object ToolCallTracker {
         }
 
         val resultText = result.content.filterIsInstance<TextContent>().firstOrNull()?.text
-        val resultSummary = resultText?.let { if (it.length > 500) it.take(500) + "..." else it } ?: ""
+        val resultSummary = resultText?.let { if (it.length > 500) BodyText.truncate(it, 500) + "..." else it } ?: ""
 
-        val resultJson = resultText?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() as? JsonObject }
+        val parse = resultText != null && resultText.length <= MAX_PARSED_RESULT_CHARS
+        val resultJson = if (parse) runCatching { Json.parseToJsonElement(resultText) }.getOrNull() as? JsonObject else null
+        val outOfScope = if (parse) {
+            resultJson != null && (
+                resultJson["scope_warning"] != null ||
+                    ((resultJson["scope_warnings"] as? JsonArray)?.isNotEmpty() == true) ||
+                    (resultJson["out_of_scope"] as? JsonPrimitive)?.booleanOrNull == true ||
+                    ((resultJson["sent_out_of_scope"] as? JsonPrimitive)?.intOrNull ?: 0) > 0 ||
+                    ((resultJson["skipped_out_of_scope"] as? JsonPrimitive)?.intOrNull ?: 0) > 0
+                )
+        } else {
+            resultText != null && (
+                resultText.contains("\"scope_warning\":") || resultText.contains("\"out_of_scope\":true") ||
+                    resultText.contains("\"scope_warnings\":[\"")
+                )
+        }
         val requestJson = resultJson?.get("request") as? JsonObject
         val responseJson = resultJson?.get("response") as? JsonObject
         fun JsonObject?.text(key: String): String = ((this?.get(key)) as? JsonPrimitive)?.contentOrNull.orEmpty()
@@ -173,7 +194,7 @@ object ToolCallTracker {
         if (host.isEmpty() && url.isNotEmpty()) host = runCatching { java.net.URI(url).host }.getOrNull().orEmpty()
         val statusCode = resultJson.int("status_code").takeIf { it != 0 } ?: responseJson.int("status_code")
 
-        return CallSummary(toolName, arguments, resultSummary, url, method, host, statusCode, result.isError ?: false)
+        return CallSummary(toolName, arguments, resultSummary, url, method, host, statusCode, result.isError ?: false, outOfScope)
     }
 
     /** The result recorded for a call that threw or was cancelled instead of returning. */
@@ -210,7 +231,8 @@ object ToolCallTracker {
             isError = s.isError,
             argsSummary = s.arguments.toString(),
             resultSummary = s.resultSummary,
-            requestResponse = httpReqResp
+            requestResponse = httpReqResp,
+            outOfScope = s.outOfScope,
         )
 
         // Emit event for web dashboard
@@ -225,14 +247,15 @@ object ToolCallTracker {
             put("method", s.method)
             put("host", s.host)
             put("status_code", s.statusCode)
+            put("out_of_scope", s.outOfScope)
         })
 
         // Durable, append-only audit trail for security-relevant and mutating calls
         val action = (args?.get("action") as? JsonPrimitive)?.contentOrNull
-        if (shouldAudit(s.toolName, s.url, s.host, s.isError, action)) {
+        if (shouldAudit(s.toolName, s.url, s.host, s.isError, action, s.outOfScope)) {
             AuditLog.record(
                 s.toolName, timestamp.toString(), elapsedMs, s.isError,
-                args, s.url, s.host, s.method, s.statusCode
+                args, s.url, s.host, s.method, s.statusCode, s.outOfScope
             )
         }
     }
@@ -242,9 +265,11 @@ object ToolCallTracker {
         url: String,
         host: String,
         isError: Boolean,
-        action: String? = null
+        action: String? = null,
+        outOfScope: Boolean = false,
     ): Boolean =
-        url.isNotEmpty() ||
+        outOfScope ||
+            url.isNotEmpty() ||
             host.isNotEmpty() ||
             isError ||
             ActionPolicy.isDestructive(toolName) ||

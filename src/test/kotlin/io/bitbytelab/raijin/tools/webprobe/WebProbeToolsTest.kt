@@ -81,12 +81,20 @@ class WebProbeToolsTest {
     }
 
     @Test
-    fun `cache_probe rejects unknown checks, a budget out of range and malformed headers`() {
+    fun `cache_probe rejects unknown checks, a non-integer budget and malformed headers`() {
         fun args(extra: JsonObject) = JsonObject(buildJsonObject { put("url", "https://t.example/") } + extra)
         assertRejected("cache_probe", args(buildJsonObject { putJsonArray("checks") { add("poisoning"); add("xss") } }), "'checks'", "xss", "deception")
-        assertRejected("cache_probe", args(buildJsonObject { put("max_requests", 5) }), "'max_requests'", "between 20 and 1000")
-        assertRejected("cache_probe", args(buildJsonObject { put("max_requests", 100000) }), "'max_requests'")
+        assertRejected("cache_probe", args(buildJsonObject { put("max_requests", "many") }), "'max_requests'", "integer")
         assertRejected("cache_probe", args(buildJsonObject { put("headers", 3) }), "'headers'", "object")
+    }
+
+    @Test
+    fun `a cache_probe budget out of range is clamped and reported`() {
+        for ((asked, used) in listOf(5 to 20, 100_000 to 1000)) {
+            val result = call("cache_probe", buildJsonObject { put("url", "https://t.example/"); put("max_requests", asked) })
+            val body = Json.parseToJsonElement((result.content.first() as TextContent).text).jsonObject
+            assertEquals(used, body.getValue("max_requests_clamped_to").jsonPrimitive.int, body.toString())
+        }
     }
 
     @Test

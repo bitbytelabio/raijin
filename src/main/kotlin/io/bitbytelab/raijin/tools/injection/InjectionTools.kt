@@ -1,11 +1,15 @@
 package io.bitbytelab.raijin.tools.injection
 
 import io.bitbytelab.raijin.bridge.InjectionBridge
+import io.bitbytelab.raijin.core.ClampedInt
 import io.bitbytelab.raijin.core.EnumValidation
+import io.bitbytelab.raijin.core.asClampedInt
 import io.bitbytelab.raijin.core.asLongSafe
 import io.bitbytelab.raijin.core.asStringList
+import io.bitbytelab.raijin.core.withClampReport
 import io.bitbytelab.raijin.injection.InjectionClass
 import io.bitbytelab.raijin.injection.PayloadEncoding
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.server.Server
@@ -30,6 +34,8 @@ object InjectionTools {
         val oob: Boolean,
         val oobWaitSeconds: Int,
         val timeBudgetSeconds: Int,
+        /** Limits moved into their range, reported on the result as `<name>_clamped_to`. */
+        val clamps: List<Pair<String, ClampedInt?>> = emptyList(),
     )
 
     fun register(server: Server, bridge: InjectionBridge) {
@@ -52,7 +58,7 @@ object InjectionTools {
                 "narrow the query: base_value must match a real row or document. Every finding carries its payload, a " +
                 "confidence (certain, firm, tentative) and the evidence (baseline next to probe) to re-check it. All " +
                 "classes together send about 130 requests when nothing is found; pass 'classes' to narrow. " +
-                "Scope-gated (mcp_scope_mode).",
+                ScopeGate.TOOL_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("request") {
@@ -117,12 +123,12 @@ object InjectionTools {
         ) { request ->
             try {
                 val args = parseArguments(request.params.arguments ?: emptyMap())
-                toolJsonResult(
-                    bridge.probe(
-                        args.request, args.host, args.port, args.useTls, args.classes, args.delaySeconds,
-                        args.encoding, args.baseValue, args.oob, args.oobWaitSeconds, args.timeBudgetSeconds,
-                    )
+                var result = bridge.probe(
+                    args.request, args.host, args.port, args.useTls, args.classes, args.delaySeconds,
+                    args.encoding, args.baseValue, args.oob, args.oobWaitSeconds, args.timeBudgetSeconds,
                 )
+                args.clamps.forEach { (name, arg) -> result = result.withClampReport(name, arg) }
+                toolJsonResult(result)
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -146,20 +152,28 @@ object InjectionTools {
         EnumValidation.error(encoding, PayloadEncoding.ids.toSet(), "encoding")?.let {
             throw IllegalArgumentException(it["error"]?.jsonPrimitive?.contentOrNull ?: "Parameter 'encoding' has an invalid value")
         }
+        val delay = args.clamped("delay_seconds", InjectionBridge.DELAY_SECONDS)
+        val oobWait = args.clamped("oob_wait_seconds", InjectionBridge.OOB_WAIT_SECONDS)
+        val budget = args.clamped("time_budget_seconds", InjectionBridge.TIME_BUDGET_SECONDS)
         return Arguments(
             request = request,
             host = host,
             port = port,
             useTls = args.bool("use_tls") ?: (port == 443),
             classes = classes,
-            delaySeconds = args.int("delay_seconds", InjectionBridge.DELAY_SECONDS) ?: 5,
+            delaySeconds = delay?.value ?: 5,
             encoding = encoding,
             baseValue = args.string("base_value") ?: "1",
             oob = args.bool("oob") ?: true,
-            oobWaitSeconds = args.int("oob_wait_seconds", InjectionBridge.OOB_WAIT_SECONDS) ?: 5,
-            timeBudgetSeconds = args.int("time_budget_seconds", InjectionBridge.TIME_BUDGET_SECONDS) ?: 300,
+            oobWaitSeconds = oobWait?.value ?: 5,
+            timeBudgetSeconds = budget?.value ?: 300,
+            clamps = listOf("delay_seconds" to delay, "oob_wait_seconds" to oobWait, "time_budget_seconds" to budget),
         )
     }
+
+    /** A limit moved into [range] when outside it; an error only for a value that is not an integer. */
+    private fun Map<String, JsonElement>.clamped(name: String, range: IntRange): ClampedInt? =
+        this[name].asClampedInt(name, range.first, range.last).getOrThrow()
 
     private fun Map<String, JsonElement>.string(name: String): String? {
         val element = this[name]

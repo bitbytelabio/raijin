@@ -85,7 +85,9 @@ class EventsToolsTest {
         assertEquals("not_found", call("events_unsubscribe", buildJsonObject { put("subscription_id", id) }).json().getValue("status").jsonPrimitive.content)
     }
 
-    @Test fun `negative max_events is refused`() {
-        assertEquals(true, call("events_get", buildJsonObject { put("max_events", -1) }).isError)
+    @Test fun `a negative max_events is clamped to 0 and reported`() {
+        val r = call("events_get", buildJsonObject { put("max_events", -1) })
+        assertEquals(false, r.isError ?: false)
+        assertEquals(0, r.json().getValue("max_events_clamped_to").jsonPrimitive.content.toInt())
     }
 }

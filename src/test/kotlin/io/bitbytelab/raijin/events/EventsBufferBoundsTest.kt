@@ -1,8 +1,8 @@
 package io.bitbytelab.raijin.events
 
 import io.bitbytelab.raijin.tools.events.EventsTools
-import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -73,19 +73,16 @@ class EventsBufferBoundsTest {
         assertTrue(issues.all { it.type == "scanner.issue" })
     }
 
-    // --- Tool boundary: EventsTools.validateMaxEvents ----------------------
+    // --- Tool boundary: EventsTools.maxEventsArg ----------------------------
 
-    @Test fun `validateMaxEvents returns explicit error for negative input`() {
-        val result = EventsTools.validateMaxEvents(-1)
-        assertTrue(result != null, "negative max_events must produce an error result")
-        assertEquals(true, result.isError)
-        val text = (result.content.first() as TextContent).text
-        assertTrue(text!!.contains("max_events must be >= 0"), "error body was: $text")
-    }
-
-    @Test fun `validateMaxEvents accepts zero and positive input`() {
-        assertNull(EventsTools.validateMaxEvents(0))
-        assertNull(EventsTools.validateMaxEvents(200))
-        assertNull(EventsTools.validateMaxEvents(Int.MAX_VALUE))
+    @Test fun `max_events outside 0 to 10000 is clamped and flagged`() {
+        val negative = EventsTools.maxEventsArg(mapOf("max_events" to JsonPrimitive(-1)))!!
+        assertEquals(0, negative.value)
+        assertTrue(negative.clamped)
+        val huge = EventsTools.maxEventsArg(mapOf("max_events" to JsonPrimitive(Long.MAX_VALUE)))!!
+        assertEquals(10_000, huge.value)
+        assertTrue(huge.clamped)
+        assertEquals(200, EventsTools.maxEventsArg(mapOf("max_events" to JsonPrimitive(200)))!!.value)
+        assertNull(EventsTools.maxEventsArg(emptyMap()))
     }
 }

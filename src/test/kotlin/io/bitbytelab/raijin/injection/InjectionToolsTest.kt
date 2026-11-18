@@ -163,9 +163,15 @@ class InjectionToolsTest {
         assertTrue("'host'" in rejected("host" to JsonPrimitive("  ")))
         assertTrue("between 1 and 65535" in rejected("port" to JsonPrimitive(70000)))
         assertTrue("'port' must be an integer" in rejected("port" to JsonPrimitive("https")))
-        assertTrue("'delay_seconds' must be between 1 and 30 (got 0)" in rejected("delay_seconds" to JsonPrimitive(0)))
-        assertTrue("'oob_wait_seconds' must be between 0 and 60" in rejected("oob_wait_seconds" to JsonPrimitive(600)))
-        assertTrue("'time_budget_seconds' must be between 10 and 3600" in rejected("time_budget_seconds" to JsonPrimitive(1)))
+        assertTrue("'delay_seconds' must be an integer" in rejected("delay_seconds" to JsonPrimitive("soon")))
+        // Limits out of range are clamped (and reported on the result), not refused.
+        val clamped = InjectionTools.parseArguments(
+            args("delay_seconds" to JsonPrimitive(0), "oob_wait_seconds" to JsonPrimitive(600), "time_budget_seconds" to JsonPrimitive(1))
+        )
+        assertEquals(1, clamped.delaySeconds)
+        assertEquals(60, clamped.oobWaitSeconds)
+        assertEquals(10, clamped.timeBudgetSeconds)
+        assertTrue(clamped.clamps.all { it.second?.clamped == true })
         assertTrue("'oob' must be true or false" in rejected("oob" to JsonPrimitive("maybe")))
         assertTrue("'base_value' must be a string" in rejected("base_value" to buildJsonObject { put("a", 1) }))
 

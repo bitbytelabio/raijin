@@ -200,6 +200,14 @@ class POIScannerTest {
     }
 
     @Test
+    fun `camelCase and plural field names match their keyword`() {
+        val schema = GQLSchema("type Mutation { resetPassword(e: String): Boolean } type Query { passwords: String }")
+        val found = POIScanner(schema).scan().values.flatten().map { it.path }
+        assertTrue("-> resetPassword" in found, found.toString())
+        assertTrue("-> passwords" in found, found.toString())
+    }
+
+    @Test
     fun `identical paths on Query and Mutation are both preserved`() {
         val schema = GQLSchema(
             """

@@ -71,11 +71,17 @@ class POIScanner(
         private val BUILTIN_SCALARS = setOf("Int", "Float", "String", "Boolean", "ID")
 
         /**
-         * A field name matches when one of [alternatives] is the whole name or a whole
-         * `_`-separated part of it. Each alternative is a regex fragment.
+         * A field name matches when one of [alternatives] (or its plural with `s`) is the whole
+         * name or a whole `_`-separated part of it, after [normalizedName]. Each alternative is a
+         * regex fragment.
          */
         private fun keywordPattern(alternatives: List<String>): Regex =
-            Regex("(\\W|^|_)(${alternatives.joinToString("|")})(\\W|\$|_)", RegexOption.IGNORE_CASE)
+            Regex("(\\W|^|_)(${alternatives.joinToString("|")})s?(\\W|\$|_)", RegexOption.IGNORE_CASE)
+
+        private val CAMEL_BOUNDARY = Regex("(?<=[a-z0-9])(?=[A-Z])")
+
+        /** `resetPassword` -> `reset_password`, so camelCase parts are matched like snake_case ones. */
+        internal fun normalizedName(name: String): String = name.replace(CAMEL_BOUNDARY, "_").lowercase()
 
         /**
          * One compiled pattern per bundled category, shared by every scanner. The bundled keywords
@@ -201,7 +207,10 @@ class POIScanner(
         if (flagDeprecated && field.isDeprecated) {
             results.add(FieldResult("deprecated", path, queryType, field.description))
         }
-        val category = patterns.firstOrNull { (_, pattern) -> pattern.containsMatchIn(field.name) }?.first
+        val snake = normalizedName(field.name)
+        val category = patterns.firstOrNull { (_, pattern) ->
+            pattern.containsMatchIn(field.name) || (snake != field.name && pattern.containsMatchIn(snake))
+        }?.first
         if (category != null) results.add(FieldResult(category, path, queryType, field.description))
         return results
     }

@@ -1,6 +1,8 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
+import io.bitbytelab.raijin.events.EventBus
+import io.bitbytelab.raijin.safety.ScopeGate
 import kotlinx.serialization.json.*
 import java.util.concurrent.ConcurrentHashMap
 
@@ -12,11 +14,13 @@ import java.util.concurrent.ConcurrentHashMap
  * list is itself persisted under the special key "_raijin_keys" so it
  * survives extension reloads.
  */
-class PersistenceBridge(private val api: MontoyaApi) {
+class PersistenceBridge(private val api: MontoyaApi, private val eventBus: EventBus) {
 
     companion object {
         private const val KEY_INDEX = "_raijin_keys"
         private const val KEY_SEPARATOR = "\u001F" // Unit separator
+        private val SCOPE_MODES = setOf("off", "warn", "enforce")
+        private const val DEFAULT_SCOPE_MODE = "warn (default)"
     }
 
     /** Shadow store mirroring what is in extensionData. */
@@ -119,6 +123,7 @@ class PersistenceBridge(private val api: MontoyaApi) {
      * Stores a preference value (user-level, survives across projects).
      */
     fun preferenceStore(key: String, value: String): JsonObject {
+        if (key == ScopeGate.PREF_SCOPE_MODE) return storeScopeMode(value)
         api.persistence().preferences().setString(key, value)
 
         return buildJsonObject {
@@ -126,6 +131,39 @@ class PersistenceBridge(private val api: MontoyaApi) {
             put("key", key)
             put("scope", "preferences")
             put("value_length", value.length)
+        }
+    }
+
+    /**
+     * `mcp_scope_mode` stays writable by an MCP client, but only as one of the three modes, and
+     * every change is announced: a `scope.mode_changed` event and a line in Burp's output log.
+     */
+    private fun storeScopeMode(value: String): JsonObject {
+        val normalized = value.trim().lowercase()
+        if (normalized !in SCOPE_MODES) return buildJsonObject { put("error", "mcp_scope_mode must be off, warn or enforce") }
+        val previous = try { api.persistence().preferences().getString(ScopeGate.PREF_SCOPE_MODE) } catch (_: Exception) { null }
+        api.persistence().preferences().setString(ScopeGate.PREF_SCOPE_MODE, normalized)
+        val from = previous ?: DEFAULT_SCOPE_MODE
+        announceScopeMode(from, normalized)
+        return buildJsonObject {
+            put("status", "stored")
+            put("key", ScopeGate.PREF_SCOPE_MODE)
+            put("scope", "preferences")
+            put("value", normalized)
+            put("previous_value", previous)
+            put("note", "scope mode changed from $from to $normalized")
+        }
+    }
+
+    private fun announceScopeMode(from: String, to: String) {
+        eventBus.emit("scope.mode_changed", buildJsonObject {
+            put("from", from)
+            put("to", to)
+            put("source", "preference_store")
+        })
+        try {
+            api.logging().logToOutput("[Raijin] mcp_scope_mode changed by an MCP client: $from -> $to")
+        } catch (_: Exception) {
         }
     }
 
@@ -154,12 +192,15 @@ class PersistenceBridge(private val api: MontoyaApi) {
      * is needed here — Montoya's `Preferences` already exposes `deleteString` directly.
      */
     fun preferenceDelete(key: String): JsonObject {
-        val existed = try { api.persistence().preferences().getString(key) != null } catch (_: Exception) { false }
+        val previous = try { api.persistence().preferences().getString(key) } catch (_: Exception) { null }
         api.persistence().preferences().deleteString(key)
+        val scopeMode = key == ScopeGate.PREF_SCOPE_MODE && previous != null
+        if (scopeMode) announceScopeMode(previous, DEFAULT_SCOPE_MODE)
         return buildJsonObject {
             put("key", key)
             put("scope", "preferences")
-            put("deleted", existed)
+            put("deleted", previous != null)
+            if (scopeMode) put("note", "scope mode changed from $previous to $DEFAULT_SCOPE_MODE")
         }
     }
 }

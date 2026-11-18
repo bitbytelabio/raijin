@@ -35,6 +35,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.Implementation
 import io.modelcontextprotocol.kotlin.sdk.types.JSONRPCMessage
 import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
 import kotlinx.coroutines.*
+import kotlin.time.Duration.Companion.hours
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -70,9 +71,19 @@ class McpServerManager(
     private val httpPort: Int = 9877,
     private val logging: Logging
 ) {
+    @Volatile
     private var sseServer: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
+    @Volatile
     private var httpServer: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
+    @Volatile
     private var scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    /** Guards the listener fields and [generation] between a start finishing and a stop or rebind. */
+    private val lifecycle = Any()
+
+    /** Bumped by [stop] and [rebind]: a start that finishes under an older one stops its own listener. */
+    @Volatile
+    private var generation = 0
 
     /**
      * Hard cap on a single SSE write. The failure mode is a client that stops draining the
@@ -113,6 +124,21 @@ class McpServerManager(
         /** Bound on closing a session or the server; a wedged send can hold a session's lock. */
         private const val SESSION_CLOSE_TIMEOUT_MS = 3_000L
 
+        /** How long [rebind] waits for both listeners to report they came up. */
+        private const val REBIND_WAIT_MS = 10_000L
+
+        /**
+         * Largest MCP request a legacy SSE session accepts. The SDK 0.16 Streamable HTTP route has
+         * no such option and keeps its own 4 MiB limit.
+         */
+        internal const val MAX_REQUEST_BODY_BYTES = 64L * 1024 * 1024
+
+        /** Streamable HTTP: a session idle this long is closed (an agent may pause for hours mid-engagement). */
+        internal val STREAMABLE_SESSION_IDLE = 24.hours
+
+        /** Streamable HTTP: most sessions open at once per listener. */
+        internal const val MAX_STREAMABLE_SESSIONS = 256
+
         /**
          * Sent to every client on initialize. Keep it short (omp keeps only the first 4000
          * characters) and point at the skills; the skills themselves carry the detail.
@@ -123,8 +149,9 @@ class McpServerManager(
                 "New here? Load the `${SkillCatalog.ENTRY_SKILL}` skill first " +
                 "(resource `${SkillCatalog.uri(SkillCatalog.ENTRY_SKILL)}`, `load_skill`, or prompt `${SkillCatalog.ENTRY_SKILL}`). " +
                 "Skills: ${SkillCatalog.NAMES.joinToString(", ")}. " +
-                "Check scope first (`scope` with `action=get_config` / `check`); recon and probe tools " +
-                "only run against in-scope targets."
+                "Check scope first (`scope` with `action=get_config` / `check`). Outbound requests are checked " +
+                "against Burp's scope per the operator's mcp_scope_mode: warn (default) sends and adds scope_warning; " +
+                "enforce refuses (out_of_scope=true). Turbo, Scanner and WebSocket are advisory only."
 
         /**
          * What the server advertises on initialize. Clients only ask for tools, resources or
@@ -198,9 +225,16 @@ class McpServerManager(
      * param — NOT '/sse'.
      */
     fun start() {
+        startAll()
+    }
+
+    /** Starts both listeners; each result completes with whether that listener came up. */
+    private fun startAll(): List<CompletableDeferred<Boolean>> {
         val server = sharedServer()
-        startTransport("Primary SSE", ssePort, server) { sseServer = it }
-        startTransport("Secondary SSE", httpPort, server) { httpServer = it }
+        return listOf(
+            startTransport("Primary SSE", ssePort, server) { sseServer = it },
+            startTransport("Secondary SSE", httpPort, server) { httpServer = it },
+        )
     }
 
     /**
@@ -219,8 +253,11 @@ class McpServerManager(
         port: Int,
         mcpServer: Server,
         assign: (EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>) -> Unit
-    ) {
+    ): CompletableDeferred<Boolean> {
+        val listening = CompletableDeferred<Boolean>()
+        val gen = generation
         scope.launch {
+            var server: EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>? = null
             try {
                 // Pre-flight: if the port is already taken, say so plainly. The old failure text
                 // blamed the build JDK, which is the wrong lead when the real cause is a clash with
@@ -232,9 +269,10 @@ class McpServerManager(
                             if (port == ssePort) PortPolicy.PREF_SSE_PORT else PortPolicy.PREF_HTTP_PORT
                         )
                     )
+                    listening.complete(false)
                     return@launch
                 }
-                val server = embeddedServer(CIO, port = port, host = bindHost) {
+                server = embeddedServer(CIO, port = port, host = bindHost) {
                     installLocalhostSecurity(listOf(port), allowedSecurityHosts())
                     install(HttpRequestLifecycle) { cancelCallOnClose = true }
                     val sessions = ConcurrentHashMap<String, SseServerTransport>()
@@ -261,10 +299,20 @@ class McpServerManager(
                     }
                 }
                 server.start(wait = false)
-                assign(server)
+                val stale = synchronized(lifecycle) {
+                    (gen != generation).also { if (!it) assign(server) }
+                }
+                if (stale) {
+                    // A stop or rebind ran while this was starting: this listener belongs to no one.
+                    server.stop(0, 500)
+                    listening.complete(false)
+                    return@launch
+                }
 
                 val displayHost = SecurityConfig.formatHostForAuthority(bindHost)
-                if (!verifyListening(port)) {
+                val up = verifyListening(port)
+                listening.complete(up)
+                if (!up) {
                     logging.logToError(
                         if (portInUse(port))
                             PortPolicy.conflictMessage(
@@ -278,12 +326,16 @@ class McpServerManager(
                     )
                 }
             } catch (e: CancellationException) {
+                listening.complete(false)
                 throw e
             } catch (e: Exception) {
+                runCatching { server?.stop(0, 0) }
+                listening.complete(false)
                 logging.logToError("Raijin: Failed to start $label transport on $bindHost:$port: ${e.message}")
                 logging.logToError("Raijin: Stack trace: ${e.stackTraceToString()}")
             }
         }
+        return listening
     }
 
     /**
@@ -335,7 +387,8 @@ class McpServerManager(
         sessions: ConcurrentHashMap<String, SseServerTransport>
     ) {
         val sessionJob = coroutineContext.job
-        val raw = SseServerTransport("", this)
+        // Large enough for a whole OpenAPI document or a big raw request (the SDK default is 4 MiB).
+        val raw = SseServerTransport("", this, MAX_REQUEST_BODY_BYTES)
         val tx = TimeoutSseTransport(raw, sessionJob, sendTimeoutMs, logging)
         sessions[raw.sessionId] = raw
         var mcpSession: ServerSession? = null
@@ -416,12 +469,21 @@ class McpServerManager(
      * cancels the coroutine scope. Called from the extension unload handler.
      */
     fun stop() {
-        sseServer?.stop(gracePeriodMillis = 1000, timeoutMillis = 2000)
-        httpServer?.stop(gracePeriodMillis = 1000, timeoutMillis = 2000)
+        retireListeners().forEach { it.stop(gracePeriodMillis = 1000, timeoutMillis = 2000) }
         closeMcpServer()
         scope.cancel()
         logging.logToOutput("Raijin: MCP servers stopped")
     }
+
+    /** Takes both listeners out of service, so a start still in flight will not install itself. */
+    private fun retireListeners(): List<EmbeddedServer<CIOApplicationEngine, CIOApplicationEngine.Configuration>> =
+        synchronized(lifecycle) {
+            generation++
+            listOfNotNull(sseServer, httpServer).also {
+                sseServer = null
+                httpServer = null
+            }
+        }
 
     /**
      * Hot-rebinds both SSE transports to [newHost] WITHOUT an extension reload: a bound socket
@@ -432,14 +494,18 @@ class McpServerManager(
      * exactly as a reload would.
      */
     fun rebind(newHost: String): Boolean {
-        sseServer?.stop(gracePeriodMillis = 500, timeoutMillis = 1500); sseServer = null
-        httpServer?.stop(gracePeriodMillis = 500, timeoutMillis = 1500); httpServer = null
+        retireListeners().forEach { it.stop(gracePeriodMillis = 500, timeoutMillis = 1500) }
         closeMcpServer()
         scope.cancel()
         scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         bindHost = newHost
-        start()
-        return blockingWaitListening(ssePort) && (httpPort == ssePort || blockingWaitListening(httpPort))
+        val (primary, secondary) = startAll()
+        // The starts report whether each listener came up; no second probe of the ports.
+        return runBlocking {
+            withTimeoutOrNull(REBIND_WAIT_MS) {
+                primary.await() && (httpPort == ssePort || secondary.await())
+            } ?: false
+        }
     }
 
     /**
@@ -454,20 +520,6 @@ class McpServerManager(
             logging.logToError("Raijin: closing the MCP server failed: ${e.message}")
         }
     }
-
-    /** Blocking sibling of [verifyListening] for the rebind path (already off the EDT). */
-    private fun blockingWaitListening(port: Int): Boolean {
-        val probe = BindHostPolicy.probeHost(bindHost)
-        repeat(15) {
-            try {
-                java.net.Socket().use { it.connect(java.net.InetSocketAddress(probe, port), 200) }
-                return true
-            } catch (_: Exception) {
-                Thread.sleep(200)
-            }
-        }
-        return false
-    }
 }
 
 /**
@@ -476,7 +528,12 @@ class McpServerManager(
  * because it only knows loopback names and would refuse the opt-in LAN bind.
  */
 internal fun Application.installStreamableHttp(mcpServer: Server) {
-    mcpStreamableHttp(path = McpServerManager.STREAMABLE_HTTP_PATH, enableDnsRebindingProtection = false) { mcpServer }
+    mcpStreamableHttp(
+        path = McpServerManager.STREAMABLE_HTTP_PATH,
+        enableDnsRebindingProtection = false,
+        sessionIdleTimeout = McpServerManager.STREAMABLE_SESSION_IDLE,
+        maxSessions = McpServerManager.MAX_STREAMABLE_SESSIONS,
+    ) { mcpServer }
 }
 
 /**

@@ -4,7 +4,9 @@ import burp.api.montoya.MontoyaApi
 import io.bitbytelab.raijin.core.asBooleanSafe
 import io.bitbytelab.raijin.core.asBoundedInt
 import io.bitbytelab.raijin.safety.SafeRegex
+import io.bitbytelab.raijin.safety.ScopeGate
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
@@ -54,7 +56,15 @@ class AccessControlBridge(api: MontoyaApi) {
             } == true
         }
 
+        // The batch scope convention: refused items counted, warned ones too, an error when all were refused.
+        val skipped = results.count { (it["out_of_scope"] as? JsonPrimitive)?.booleanOrNull == true }
+        val sentOutOfScope = results.count { it[ScopeGate.WARNING] != null }
         return buildJsonObject {
+            if (skipped > 0 && skipped == results.size) {
+                put("error", "Not sent: all $skipped requests are outside Burp's target scope (mcp_scope_mode=enforce).")
+            }
+            if (skipped > 0) put(ScopeGate.SKIPPED, skipped)
+            if (sentOutOfScope > 0) put(ScopeGate.SENT, sentOutOfScope)
             put("requests_tested", requests.size)
             put("identities", identities.size)
             put("requests_with_broken_access_control", flagged)

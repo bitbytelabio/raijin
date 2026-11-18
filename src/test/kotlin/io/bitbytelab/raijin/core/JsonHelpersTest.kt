@@ -106,6 +106,21 @@ class JsonHelpersTest {
         assertEquals(listOf("a", "b"), JsonPrimitive("[\"a\",\"b\"]").asStringList())
         assertEquals(listOf("solo"), JsonPrimitive("solo").asStringList())
         assertNull(null.asStringList())
+        // Not a strict JSON array: the value itself.
+        assertEquals(listOf("[admin]"), JsonPrimitive("[admin]").asStringList())
+        assertEquals(listOf("a"), JsonPrimitive("[\"a\", null]").asStringList())
+    }
+
+    @Test
+    fun `a raw header block keeps names as written and reports duplicates`() {
+        val (map, warning) = JsonPrimitive("Transfer-Encoding : chunked\nX-A: 1\nX-A: 2\nnocolon").asStringMapResult()
+        assertEquals(mapOf("Transfer-Encoding " to "chunked", "X-A" to "2"), map)
+        assertTrue(warning!!.contains("duplicate header 'X-A': last value kept"), warning)
+        assertTrue(warning.contains("lines without ':' skipped: nocolon"), warning)
+
+        val (pairs, pairWarning) = Json.parseToJsonElement("""[["X-B","1"],["X-B","2"]]""").asStringMapResult()
+        assertEquals(mapOf("X-B" to "2"), pairs)
+        assertTrue(pairWarning!!.contains("duplicate header 'X-B'"), pairWarning)
     }
 
     @Test

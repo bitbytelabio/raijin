@@ -6,6 +6,7 @@ import io.bitbytelab.raijin.turbo.Utils
 
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.concurrent.thread
 
 class RunManager(
     private val maxCompletedRuns: Int = 100,
@@ -51,13 +52,13 @@ class RunManager(
 
     fun stopRun(runId: String): String {
         val run = runs[runId] ?: return "not_found"
-        run.handler.abort()
+        abortWithin(listOf(run), ABORT_WAIT_MS)
         return "stopped"
     }
 
     fun deleteRun(runId: String): String {
         val run = runs.remove(runId) ?: return "not_found"
-        run.handler.abort()
+        abortWithin(listOf(run), ABORT_WAIT_MS)
         return "deleted"
     }
 
@@ -66,7 +67,29 @@ class RunManager(
         val active = runs.values.toList()
         runs.clear()
         evictedIds.clear()
-        active.forEach { run -> runCatching { run.handler.abort() } }
+        abortWithin(active, ABORT_WAIT_MS)
+    }
+
+    /**
+     * Aborts [targets] side by side, each on its own thread (an abort waits for the run's workers),
+     * and waits for them against one shared deadline of [waitMs]; an abort still going then
+     * finishes in the background.
+     */
+    private fun abortWithin(targets: List<ActiveRun>, waitMs: Long) {
+        val threads = targets.map { run ->
+            thread(isDaemon = true, name = "turbo-abort-${run.id}") { runCatching { run.handler.abort() } }
+        }
+        val deadline = System.nanoTime() + waitMs * 1_000_000
+        for (t in threads) {
+            val left = (deadline - System.nanoTime()) / 1_000_000
+            if (left <= 0) break
+            try {
+                t.join(left)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return
+            }
+        }
     }
 
     /**
@@ -186,6 +209,8 @@ class RunManager(
     }
 
     internal companion object {
+        /** How long stop, delete and unload wait for aborts, together. */
+        private const val ABORT_WAIT_MS = 10_000L
         private const val MONITOR_INTERVAL_MILLIS = 5_000L
         private const val GARBAGE_RECHECK_NANOS = 60_000_000_000L
         private const val MAX_LOW_MEMORY_HEADROOM = 1_000_000_000L

@@ -143,7 +143,8 @@ internal object HttpResponseClusters {
             val unanswered = statusCounts[0] ?: 0
             val json = buildJsonObject {
                 put("cluster_count", ordered.size)
-                put("uniform", ordered.size <= 1)
+                // Requests that got no answer say nothing about how the target answers.
+                put("uniform", ordered.count { it.overflow || it.status != 0 } <= 1)
                 putJsonArray("clusters") {
                     ordered.forEachIndexed { id, cluster -> add(clusterJson(id, cluster)) }
                 }

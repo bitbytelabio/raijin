@@ -58,6 +58,30 @@ class GraphQlBridge(private val api: MontoyaApi) {
 
     companion object {
         private val AUTO_HEADER_NAMES = setOf("authorization", "cookie", "x-api-key", "x-auth-token")
+        private val CREDENTIAL_HEADER_NAMES = setOf("authorization", "cookie")
+
+        /**
+         * The identity headers of one request: several `Cookie` lines become one, joined with "; ";
+         * any other repeated header keeps its last value.
+         */
+        internal fun mergeAutoHeaders(headers: List<Pair<String, String>>): Map<String, String> {
+            val out = LinkedHashMap<String, String>()
+            val names = HashMap<String, String>()
+            for ((name, value) in headers) {
+                val key = name.lowercase()
+                if (key !in AUTO_HEADER_NAMES) continue
+                val shown = names.getOrPut(key) { name }
+                val previous = out[shown]
+                out[shown] = if (key == "cookie" && previous != null) "$previous; $value" else value
+            }
+            return out
+        }
+
+        /** [explicit] plus the [auto] headers it does not name (compared without case), so none is sent twice. */
+        internal fun withAutoHeaders(explicit: Map<String, String>, auto: Map<String, String>): Map<String, String> {
+            val taken = explicit.keys.mapTo(HashSet()) { it.lowercase() }
+            return auto.filterKeys { it.lowercase() !in taken } + explicit
+        }
 
         /** How much of a response body `batch_attack` echoes back. */
         private const val MAX_RESPONSE_BODY_CHARS = 20_000
@@ -80,25 +104,23 @@ class GraphQlBridge(private val api: MontoyaApi) {
         }?.takeIf { it.isNotEmpty() } ?: return emptyMap()
         return try {
             val filter = ProxyHistoryFilter { it.host().equals(host, ignoreCase = true) }
-            api.proxy().history(filter).lastOrNull()
-                ?.request()
-                ?.headers()
-                ?.filter { it.name().lowercase() in AUTO_HEADER_NAMES }
-                ?.associate { it.name() to it.value() }
-                ?: emptyMap()
+            // The newest request that carried credentials: a later anonymous one (a static file) has none to lend.
+            val withCredentials = api.proxy().history(filter).asReversed().firstOrNull { item ->
+                runCatching { item.request().headers().any { it.name().lowercase() in CREDENTIAL_HEADER_NAMES } }.getOrDefault(false)
+            } ?: return emptyMap()
+            mergeAutoHeaders(withCredentials.request().headers().map { it.name() to it.value() })
         } catch (_: Exception) { emptyMap() }
     }
 
-    /** Explicit [headers] always win; auto-populated ones (when [autoHeaders]) only fill gaps. */
+    /** Explicit [headers] always win, by name in any case; auto-populated ones (when [autoHeaders]) only fill gaps. */
     private fun resolveHeaders(url: String, headers: Map<String, String>?, autoHeaders: Boolean): Map<String, String> {
         if (!autoHeaders) return headers ?: emptyMap()
-        val auto = autoHeadersForHost(url)
-        return if (headers.isNullOrEmpty()) auto else auto + headers
+        return withAutoHeaders(headers.orEmpty(), autoHeadersForHost(url))
     }
 
     fun probe(url: String, headers: Map<String, String>? = null, autoHeaders: Boolean = false): JsonObject {
         val check = scopeGate.check(url)
-        check.deny?.let { return it }
+        if (check.blocked) return check.denyJson()
         val effHeaders = resolveHeaders(url, headers, autoHeaders)
         val result: JsonObject = try {
             val introResp = postQuery(url, GraphQl.INTROSPECTION_QUERY, effHeaders)
@@ -159,7 +181,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
         } catch (e: Exception) {
             buildJsonObject { put("error", "GraphQL probe failed: ${e.message}") }
         }
-        return withScopeWarning(result, check.warning)
+        return check.annotate(result)
     }
 
     /**
@@ -176,10 +198,10 @@ class GraphQlBridge(private val api: MontoyaApi) {
         refreshSchema: Boolean = false,
     ): JsonObject {
         val check = scopeGate.check(url)
-        check.deny?.let { return it }
+        if (check.blocked) return check.denyJson()
         val result = try {
             val (schema, err) = fetchFullSchema(url, resolveHeaders(url, headers, autoHeaders), refreshSchema)
-            if (schema == null) return buildJsonObject { put("error", err) }
+            if (schema == null) return check.annotate(buildJsonObject { put("error", err) })
             buildJsonObject {
                 put("endpoint", url)
                 put("max_depth", maxDepth)
@@ -190,7 +212,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
         } catch (e: Exception) {
             buildJsonObject { put("error", "Query template generation failed: ${e.message}") }
         }
-        return withScopeWarning(result, check.warning)
+        return check.annotate(result)
     }
 
     /**
@@ -206,10 +228,10 @@ class GraphQlBridge(private val api: MontoyaApi) {
         refreshSchema: Boolean = false,
     ): JsonObject {
         val check = scopeGate.check(url)
-        check.deny?.let { return it }
+        if (check.blocked) return check.denyJson()
         val result = try {
             val (schema, err) = fetchFullSchema(url, resolveHeaders(url, headers, autoHeaders), refreshSchema)
-            if (schema == null) return buildJsonObject { put("error", err) }
+            if (schema == null) return check.annotate(buildJsonObject { put("error", err) })
             val scanner = POIScanner(schema, categories ?: POIScanner.DEFAULT_CATEGORIES, customKeywords ?: emptyList())
             val found = scanner.scan()
             buildJsonObject {
@@ -233,7 +255,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
         } catch (e: Exception) {
             buildJsonObject { put("error", "POI scan failed: ${e.message}") }
         }
-        return withScopeWarning(result, check.warning)
+        return check.annotate(result)
     }
 
     /**
@@ -247,10 +269,10 @@ class GraphQlBridge(private val api: MontoyaApi) {
         refreshSchema: Boolean = false,
     ): JsonObject {
         val check = scopeGate.check(url)
-        check.deny?.let { return it }
+        if (check.blocked) return check.denyJson()
         val result = try {
             val (schema, err) = fetchFullSchema(url, resolveHeaders(url, headers, autoHeaders), refreshSchema)
-            if (schema == null) return buildJsonObject { put("error", err) }
+            if (schema == null) return check.annotate(buildJsonObject { put("error", err) })
             val scanner = CyclesScanner(schema).detect()
             val cycles = scanner.cyclesAsStrings()
             val cyclicTypes = scanner.cyclicTypes()
@@ -279,7 +301,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
         } catch (e: Exception) {
             buildJsonObject { put("error", "Cycle scan failed: ${e.message}") }
         }
-        return withScopeWarning(result, check.warning)
+        return check.annotate(result)
     }
 
     /**
@@ -318,7 +340,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
         }
 
         val check = scopeGate.check(url)
-        check.deny?.let { return it }
+        if (check.blocked) return check.denyJson()
         val resp = postQuery(url, expanded.query, resolveHeaders(url, headers, autoHeaders))
         val result = buildJsonObject {
             put("endpoint", url)
@@ -331,7 +353,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
                 put("response_body", BodyText.render(resp.body, MAX_RESPONSE_BODY_CHARS).text)
             }
         }
-        return withScopeWarning(result, check.warning)
+        return check.annotate(result)
     }
 
     /**
@@ -342,7 +364,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
      */
     fun fingerprintEngine(url: String, headers: Map<String, String>? = null, autoHeaders: Boolean = false): JsonObject {
         val check = scopeGate.check(url)
-        check.deny?.let { return it }
+        if (check.blocked) return check.denyJson()
         val effHeaders = resolveHeaders(url, headers, autoHeaders)
         val result = try {
             val outcome = EngineFingerprinter.detect(guardedSender(url, effHeaders))
@@ -363,7 +385,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
         } catch (e: Exception) {
             buildJsonObject { put("error", "Engine fingerprinting failed: ${e.message}") }
         }
-        return withScopeWarning(result, check.warning)
+        return check.annotate(result)
     }
 
     /**
@@ -382,7 +404,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
         maxRequests: Int = SchemaBruteforcer.DEFAULT_MAX_REQUESTS,
     ): JsonObject {
         val check = scopeGate.check(url)
-        check.deny?.let { return it }
+        if (check.blocked) return check.denyJson()
         val effHeaders = resolveHeaders(url, headers, autoHeaders)
         val result = try {
             val reconstruction = SchemaBruteforcer(
@@ -421,7 +443,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
         } catch (e: Exception) {
             buildJsonObject { put("error", "Schema bruteforcing failed: ${e.message}") }
         }
-        return withScopeWarning(result, check.warning)
+        return check.annotate(result)
     }
 
     /**
@@ -449,7 +471,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
         val endpoint = SubscriptionEndpoint.parse(url)
             .getOrElse { return buildJsonObject { put("error", it.message ?: "Invalid URL '$url'") } }
         val check = scopeGate.check(endpoint.httpUrl)
-        check.deny?.let { return it }
+        if (check.blocked) return check.denyJson()
         val identified = resolveHeaders(endpoint.httpUrl, headers, autoHeaders)
         val anonymous = SubscriptionEndpoint.anonymousHeaders(identified)
         val result = try {
@@ -463,7 +485,7 @@ class GraphQlBridge(private val api: MontoyaApi) {
         } catch (e: Exception) {
             buildJsonObject { put("error", "Subscription probe failed: ${e.message}") }
         }
-        return withScopeWarning(result, check.warning)
+        return check.annotate(result)
     }
 
     /**
@@ -536,9 +558,6 @@ class GraphQlBridge(private val api: MontoyaApi) {
             else null
         )
     }
-
-    private fun withScopeWarning(result: JsonObject, warning: String?): JsonObject =
-        if (warning != null) JsonObject(result + ("scope_warning" to JsonPrimitive(warning))) else result
 
     private fun unreachableMessage(url: String): String =
         "Could not reach $url (no HTTP response: the connection failed or timed out) — check the URL and that the target is reachable."

@@ -11,6 +11,7 @@ import io.bitbytelab.raijin.core.PayloadLibraries
 import io.bitbytelab.raijin.core.asJsonObjectSafe
 import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.safety.SafeRegex
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.server.Server
@@ -37,6 +38,9 @@ import kotlinx.serialization.json.putJsonObject
 internal object HttpAttackTools {
 
     private val CONCURRENCY = 1..50
+
+    /** Body chars kept per listed exchange with report=all when the caller gives no max_response_length. */
+    private const val FUZZ_BODY_CAP = 20_000
     private val RATE_LIMIT = 0.0..1_000.0
     private val SIMILARITY = 0.0..100.0
     private val MAX_REQUESTS = 1L..100_000L
@@ -65,14 +69,15 @@ attack_mode (Intruder's attack types):
 - cluster_bomb: one set per position, every combination (position 1 turns fastest).
 Payload sets: payloads (+ payload_library) form one set; for pitchfork/cluster_bomb give payload_sets instead (set i -> position i; with fewer sets than positions the last set is reused). encoders (e.g. ["url"], ["base64","url"]) run on each payload before it is placed: ${PayloadEncoders.names.joinToString(", ")}.
 
-Use \r\n line endings (bare LF in the request line and headers is converted; the body is sent as typed). Content-Length is recomputed after each substitution (left alone with Transfer-Encoding or several Content-Length headers); requests are sent as UTF-8. concurrency (1-50, default 1) requests in flight, rate_limit requests/second (0 = unlimited). timeout_ms bounds each request; a failed or timed-out request is reported in its entry and the run goes on. stop_on_match ({status_codes: [int], body_regex: string}) stops after the first matching response (stopped_early:true). max_requests caps the run (default 10000).
+Use \r\n line endings (bare LF in the request line and headers is converted; the body is sent as typed). Content-Length is recomputed after each substitution, counted in the bytes sent (left alone with Transfer-Encoding or several Content-Length headers, for the whole run when an injection point sits on the Content-Length line, and with auto_fix_content_length=false); a request goes out as ISO-8859-1 (one byte per char), or as UTF-8 when it holds a char above U+00FF. concurrency (1-50, default 1) requests in flight, rate_limit requests/second (0 = unlimited). timeout_ms bounds each request; a failed or timed-out request is reported in its entry and the run goes on. stop_on_match ({status_codes: [int], body_regex: string}) stops after the first matching response (stopped_early:true). max_requests caps the run (default 10000).
 
-Every response is clustered (summary: same status and bodies at least cluster_similarity % alike, default 90; timing outliers). Filters only shorten the list (hidden responses still count in the summary): hide_status [int], filter_length [int or "min-max"] (body bytes), grep_regex (keep only matches), hide_regex. report: "all" (default, every kept exchange in full), "clusters" (one line per kept request plus one full exchange per cluster), "summary" (summary only). Out-of-range numbers are clamped and reported in notes.""",
+Every response is clustered (summary: same status and bodies at least cluster_similarity % alike, default 90; timing outliers). Filters only shorten the list (hidden responses still count in the summary): hide_status [int], filter_length [int or "min-max"] (body bytes), grep_regex (keep only matches), hide_regex. report: "all" (default, every kept exchange in full), "clusters" (one line per kept request plus one full exchange per cluster), "summary" (summary only). With report=all and no max_response_length, each listed body is capped at 20000 chars. Out-of-range numbers are clamped and reported in notes.""" + "\n\n" + ScopeGate.TOOL_NOTE +
+                " The URL checked is the first planned request's.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     property("request", "string", "Request string with FUZZ keyword or § markers")
                     property("host", "string", "Target hostname")
-                    property("port", "integer", "Target port number (1-65535, default 443)")
+                    property("port", "integer", "Target port number (1-65535, default 443, or 80 with use_tls=false)")
                     property("use_tls", "boolean", "Whether to use HTTPS (TLS)")
                     property("tls", "boolean", "Alias for use_tls")
                     property("https", "boolean", "Alias for use_tls")
@@ -104,6 +109,7 @@ Every response is clustered (summary: same status and bodies at least cluster_si
                     enumProperty("report", HttpFuzzRunner.REPORTS, "How much of each exchange is listed (default all)")
                     property("cluster_similarity", "number", "Body similarity (0-100 %) for two responses to share a cluster (default 90)")
                     property("max_requests", "integer", "Cap on the requests sent (1-100000, default 10000)")
+                    property("auto_fix_content_length", "boolean", "Recompute Content-Length after each substitution (default true); false sends every request as rendered")
                     property("max_response_length", "integer", "Truncate response bodies")
                     putJsonObject("stop_on_match") {
                         put("type", "object")
@@ -119,12 +125,20 @@ Every response is clustered (summary: same status and bodies at least cluster_si
 
                 val reqStr = args.string("request") ?: return@addTool toolError("Parameter 'request' is required")
                 val host = args.string("host") ?: return@addTool toolError("Parameter 'host' is required")
-                val port = args.int("port", HttpTools.PORTS) ?: 443
+                val port = args.portOrDefault(HttpTools.PORTS)
                 val useTls = args.tls(port)
                 val httpMode = args.enum("http_mode", HttpTools.HTTP_MODES)
                 val attackMode = HttpFuzzPlan.AttackMode.of(args.enum("attack_mode", HttpFuzzPlan.AttackMode.ids))
                     ?: HttpFuzzPlan.AttackMode.SNIPER
+                val report = args.enum("report", HttpFuzzRunner.REPORTS) ?: HttpFuzzRunner.REPORT_ALL
+                // Every exchange in full, for up to 100000 requests: bound the bodies unless the caller chose a size.
                 val maxResponseLength = args.clampedInt("max_response_length", HttpTools.LENGTHS)
+                    ?: if (report == HttpFuzzRunner.REPORT_ALL) {
+                        args.notes += "bodies capped at $FUZZ_BODY_CAP chars; pass max_response_length to change"
+                        FUZZ_BODY_CAP
+                    } else {
+                        null
+                    }
                 val marker = args.string("marker")
                 val timeoutMs = args.timeoutMs("timeout_ms", HttpTools.DEFAULT_TIMEOUT_MS)
 
@@ -163,7 +177,7 @@ Every response is clustered (summary: same status and bodies at least cluster_si
                     stopOnStatusCodes = stopOnStatusCodes,
                     stopOnBodyRegex = stopOnBodyRegex,
                     filter = filter,
-                    report = args.enum("report", HttpFuzzRunner.REPORTS) ?: HttpFuzzRunner.REPORT_ALL,
+                    report = report,
                     clusterSimilarity = args.clampedDouble("cluster_similarity", SIMILARITY) ?: HttpResponseClusters.DEFAULT_SIMILARITY,
                     payloadsCount = payloadSets.first().size,
                 )
@@ -171,6 +185,7 @@ Every response is clustered (summary: same status and bodies at least cluster_si
                 toolJsonResult(args.withNotes(bridge.fuzz(
                     reqStr, host, port, useTls, positions, payloadSets, marker, attackMode, encoders, maxRequests,
                     httpMode, maxResponseLength, timeoutMs, runOptions,
+                    autoFixContentLength = args.bool("auto_fix_content_length") ?: true,
                 )))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
@@ -187,18 +202,19 @@ sync:
 - "single_packet" (default): the HTTP/2 single-packet attack through Burp's synchronised parallel sender (the engine behind Repeater's "send group in parallel" and Turbo's gated Engine.BURP2): the final frames of every request leave in one TCP packet, so network jitter cannot separate them. Needs a target that speaks HTTP/2 (http_mode HTTP_2_IGNORE_ALPN forces it without ALPN). Exchanges go through Burp (site map, session rules).
 - "last_byte": HTTP/1.1 last-byte synchronisation on Raijin's own connections: each request on its own connection, written except its final byte; once every connection is primed (the barrier) the final bytes go out back to back. Reports per request ttfb_ms/ttlb_ms from its release and the release spread. Bypasses Burp (no session rules, not in the site map); sni sets the TLS server name. At most 256 connections. Chosen by default when http_mode is HTTP_1.
 
-Use the FUZZ keyword with 'payloads' for one request per payload (payloads wins over 'count'); Content-Length is recomputed after substitution; requests are sent as UTF-8. timeout_ms bounds the whole batch.
+Use the FUZZ keyword with 'payloads' for one request per payload (payloads wins over 'count'); Content-Length is recomputed after substitution in the bytes sent (auto_fix_content_length=false sends it as written); a request goes out as ISO-8859-1, or as UTF-8 when it holds a char above U+00FF. timeout_ms bounds the whole batch.
 
-analysis: responses clustered by status code and body similarity (cluster_similarity %, default 90) with timing outliers. race_condition_likely is true when identical requests were answered in more than one way; with payloads compare the clusters with the payloads instead. An equivalent set of responses does not rule a race out: check the application state too. Out-of-range numbers are clamped and reported in notes.""",
+analysis: responses clustered by status code and body similarity (cluster_similarity %, default 90) with timing outliers. race_condition_likely is true when identical requests were answered in more than one way; with payloads compare the clusters with the payloads instead. An equivalent set of responses does not rule a race out: check the application state too. Out-of-range numbers are clamped and reported in notes.""" + "\n\n" + ScopeGate.TOOL_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     property("request", "string", "Request string (use FUZZ keyword for varied payloads)")
                     property("host", "string", "Target hostname")
-                    property("port", "integer", "Target port number (1-65535, default 443)")
+                    property("port", "integer", "Target port number (1-65535, default 443, or 80 with use_tls=false)")
                     property("use_tls", "boolean", "Whether to use HTTPS (TLS)")
                     property("tls", "boolean", "Alias for use_tls")
                     property("https", "boolean", "Alias for use_tls")
                     property("count", "integer", "Number of simultaneous requests (1-1000, default 10)")
+                    property("auto_fix_content_length", "boolean", "Recompute Content-Length (default true); false sends the request as written")
                     putJsonObject("payloads") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Optional payloads for FUZZ keyword") }
                     enumProperty("sync", HttpRace.Sync.ids, "Synchronisation: single_packet (HTTP/2, default) or last_byte (HTTP/1.1)")
                     enumProperty("http_mode", HttpTools.HTTP_MODES, "HTTP_1 selects last_byte; HTTP_2_IGNORE_ALPN forces HTTP/2 without ALPN")
@@ -214,7 +230,7 @@ analysis: responses clustered by status code and body similarity (cluster_simila
                 val args = ToolArgs(request.params.arguments ?: emptyMap())
                 val reqStr = args.string("request") ?: return@addTool toolError("Parameter 'request' is required")
                 val host = args.string("host") ?: return@addTool toolError("Parameter 'host' is required")
-                val port = args.int("port", HttpTools.PORTS) ?: 443
+                val port = args.portOrDefault(HttpTools.PORTS)
                 val useTls = args.tls(port)
                 val count = args.clampedInt("count", RACE_COUNTS) ?: 10
                 val payloads = args["payloads"]?.let {
@@ -242,6 +258,7 @@ analysis: responses clustered by status code and body similarity (cluster_simila
 
                 toolJsonResult(args.withNotes(bridge.raceCondition(
                     reqStr, host, port, useTls, count, payloads, sync, httpMode, sni, maxResponseLength, timeoutMs, similarity,
+                    autoFixContentLength = args.bool("auto_fix_content_length") ?: true,
                 )))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")

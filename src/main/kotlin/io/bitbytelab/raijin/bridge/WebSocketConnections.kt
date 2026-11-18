@@ -20,7 +20,8 @@ import io.bitbytelab.raijin.bridge.WebSocketBridge.Companion.CONNECT_TIMEOUT_MS
 import io.bitbytelab.raijin.bridge.WebSocketBridge.Companion.buildErrorJson
 import io.bitbytelab.raijin.bridge.WebSocketBridge.Companion.validateScheme
 import io.bitbytelab.raijin.events.EventBus
-import io.bitbytelab.raijin.safety.RequestHygiene
+import io.bitbytelab.raijin.safety.HeaderSafety
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.state.WebSocketConnection
 import io.bitbytelab.raijin.state.WebSocketMessage
@@ -50,6 +51,9 @@ internal class WebSocketConnections(
     private val isShutDown: () -> Boolean,
     private val adviseIncomingRules: (url: String?, direction: String, binary: Boolean, content: () -> String) -> Unit,
 ) {
+    /** Advisory only: an out-of-scope socket is flagged, never refused. */
+    private val scopeGate = ScopeGate(api)
+
     /** Maps connection IDs to the Montoya ExtensionWebSocket object for sending messages. */
     private val webSocketHandles = ConcurrentHashMap<String, ExtensionWebSocket>()
 
@@ -89,34 +93,54 @@ internal class WebSocketConnections(
      * @return JSON object with the connection ID and status.
      */
     fun createConnection(url: String, headers: Map<String, String>?, subprotocol: String?): JsonObject {
-        // Parse URL to extract host, port, and path
-        val parsedUrl = try {
-            java.net.URI(url)
-        } catch (e: Exception) {
-            return buildErrorJson("Invalid URL: ${e.message}")
-        }
-        val scheme = parsedUrl.scheme ?: "wss"
+        // Split leniently (hosts with '_', paths with '|', spaces or '{' are a test's business).
+        val parts = HttpRequestBuilder.splitUrl(url)
+            ?: return buildErrorJson("Invalid URL: expected ws://host/path or wss://host/path, got '$url'")
 
         // Reject obviously non-WebSocket schemes before attempting an upgrade so
         // callers get a clear message instead of a generic connection failure.
-        validateScheme(scheme)?.let { return buildErrorJson(it) }
+        validateScheme(parts.scheme)?.let { return buildErrorJson(it) }
 
-        val host = parsedUrl.host ?: return buildErrorJson("Invalid URL: missing host")
-        val useTls = scheme.equals("wss", ignoreCase = true) || scheme.equals("https", ignoreCase = true)
-        val defaultPort = if (useTls) 443 else 80
-        val port = if (parsedUrl.port > 0) parsedUrl.port else defaultPort
-        // Strip control chars so a stray newline in the path/query can't fold into the
-        // request line and kettle the upgrade (issue #7).
-        val path = RequestHygiene.stripControl(if (parsedUrl.rawPath.isNullOrEmpty()) "/" else parsedUrl.rawPath)
-        val query = RequestHygiene.stripControl(if (parsedUrl.rawQuery != null) "?${parsedUrl.rawQuery}" else "")
+        val (host, urlPort) = HttpRequestBuilder.parseHostValue(parts.authority)
+            ?: return buildErrorJson("Invalid URL: missing host")
+        val useTls = parts.scheme.equals("wss", ignoreCase = true) || parts.scheme.equals("https", ignoreCase = true)
+        val port = urlPort ?: if (useTls) 443 else 80
+        val hostLiteral = if (host.contains(':') && !host.startsWith("[")) "[$host]" else host
+        val scope = scopeGate.advise("${if (useTls) "https" else "http"}://$hostLiteral:$port${parts.target}", "websocket")
 
+        // The handshake goes out exactly as given; a raw CR/LF is reported, never removed.
+        val warnings = buildList {
+            val path = parts.target.substringBefore('?')
+            val query = parts.target.substring(path.length)
+            if (HeaderSafety.containsCrlf(path)) add("raw CR/LF in path sent as written")
+            if (HeaderSafety.containsCrlf(query)) add("raw CR/LF in query sent as written")
+            headers?.forEach { (name, value) ->
+                if (HeaderSafety.containsCrlf(name)) add("raw CR/LF in header name '$name' sent as written")
+                if (HeaderSafety.containsCrlf(value)) add("raw CR/LF in header '$name' value sent as written")
+            }
+        }
+        var result = openConnection(url, host, port, useTls, parts.authority, parts.target, headers, subprotocol)
+        if (warnings.isNotEmpty()) result = JsonObject(result + ("warnings" to JsonArray(warnings.map { JsonPrimitive(it) })))
+        return scope.annotate(result)
+    }
+
+    private fun openConnection(
+        url: String,
+        host: String,
+        port: Int,
+        useTls: Boolean,
+        authority: String,
+        target: String,
+        headers: Map<String, String>?,
+        subprotocol: String?,
+    ): JsonObject {
         // Build the HTTP upgrade request. Its Sec-WebSocket-Key identifies the socket when Burp
         // reports it to createWebSocketHandler.
         val wsKey = generateWebSocketKey()
         val httpService = HttpService.httpService(host, port, useTls)
         val requestBuilder = StringBuilder()
-        requestBuilder.append("GET $path$query HTTP/1.1\r\n")
-        requestBuilder.append("Host: $host${if (port != defaultPort) ":$port" else ""}\r\n")
+        requestBuilder.append("GET $target HTTP/1.1\r\n")
+        requestBuilder.append("Host: $authority\r\n")
         requestBuilder.append("Upgrade: websocket\r\n")
         requestBuilder.append("Connection: Upgrade\r\n")
         requestBuilder.append("Sec-WebSocket-Version: 13\r\n")
@@ -127,7 +151,7 @@ internal class WebSocketConnections(
         }
 
         headers?.forEach { (name, value) ->
-            requestBuilder.append("${RequestHygiene.stripControl(name)}: ${RequestHygiene.stripControl(value)}\r\n")
+            requestBuilder.append("$name: $value\r\n")
         }
 
         requestBuilder.append("\r\n")

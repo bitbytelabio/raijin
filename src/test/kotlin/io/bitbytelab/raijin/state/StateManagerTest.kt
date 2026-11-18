@@ -139,4 +139,16 @@ class StateManagerTest {
         assertTrue(sm.websocketConnections.isEmpty())
         assertTrue(sm.autorizeSeenOnce(key), "the dedup guard is cleared too")
     }
+
+    @Test
+    fun `generated ids use ASCII digits whatever the default locale`() {
+        val previous = java.util.Locale.getDefault()
+        try {
+            java.util.Locale.setDefault(java.util.Locale.forLanguageTag("ar"))
+            val id = StateManager().generateId("arule")
+            assertEquals("arule-001", id)
+        } finally {
+            java.util.Locale.setDefault(previous)
+        }
+    }
 }

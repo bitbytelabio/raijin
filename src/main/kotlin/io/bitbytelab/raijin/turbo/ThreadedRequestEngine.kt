@@ -99,8 +99,12 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
 
         internal fun connectionBackoffMillis(consecutiveFailures: Int, adaptive: Boolean): Long {
             val exponent = if (adaptive) consecutiveFailures.coerceIn(1, 7) else consecutiveFailures
-            return Math.pow(2.0, exponent.toDouble()).toLong() * 200L
+            // 2^n grows past any sensible wait (and past Long) for a target that stays down.
+            return (Math.pow(2.0, exponent.toDouble()) * 200.0).coerceAtMost(MAX_CONNECT_BACKOFF_MS.toDouble()).toLong()
         }
+
+        /** Longest pause between connection attempts to a target that keeps refusing. */
+        internal const val MAX_CONNECT_BACKOFF_MS = 30_000L
 
         /**
          * The response body as a string of bytes (ISO-8859-1), decompressed when [headers] name a
@@ -350,7 +354,8 @@ open class ThreadedRequestEngine @JvmOverloads constructor(url: String, val thre
                     }
 
                     for (k in 1..readCount) {
-                        val response = connection.readResponse(ignoreLength) ?: break
+                        val head = inflight.firstOrNull()?.template?.trimStart()?.startsWith("HEAD ", ignoreCase = true) == true
+                        val response = connection.readResponse(ignoreLength, bodyless = head) ?: break
                         if (response.closeConnection) {
                             ditchConnection = true
                         }

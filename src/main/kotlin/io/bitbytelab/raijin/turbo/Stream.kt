@@ -8,11 +8,15 @@ class Stream(val connection: H2Connection, val streamID: Int, val req: Request, 
         const val CLEAN = 0
         const val WANTBODY = 1
         const val DONE = 2
+
+        /** Appended once to a body cut at [Http1ResponseReader.MAX_RESPONSE_BYTES]. */
+        const val TRUNCATED_NOTE = "\n[truncated at 10MB]"
     }
 
     var state = Stream.CLEAN
     var headers: String = ""
     private val body = StringBuilder()
+    private var truncated = false
 
     /** System.nanoTime() when the request's last frame went out; the response timings count from here. */
     @Volatile
@@ -56,8 +60,15 @@ class Stream(val connection: H2Connection, val streamID: Int, val req: Request, 
             }
         }
 
-        if (state == WANTBODY && frame is DataFrame) {
-            body.append(frame.body)
+        if (state == WANTBODY && frame is DataFrame && !truncated) {
+            // Bounded as the HTTP/1 engine is: the rest of an oversized body is read and dropped.
+            val room = Http1ResponseReader.MAX_RESPONSE_BYTES - body.length
+            if (frame.body.length <= room) {
+                body.append(frame.body)
+            } else {
+                body.append(frame.body, 0, room.coerceAtLeast(0)).append(TRUNCATED_NOTE)
+                truncated = true
+            }
         }
 
         if (frame.die) {

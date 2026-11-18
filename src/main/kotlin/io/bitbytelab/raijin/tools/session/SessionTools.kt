@@ -8,6 +8,7 @@ import io.bitbytelab.raijin.bridge.SessionMacroEngine
 import io.bitbytelab.raijin.bridge.SessionRuleEngine
 import io.bitbytelab.raijin.core.asLongSafe
 import io.bitbytelab.raijin.core.asStringList
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.state.SessionMacro
 import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.tools.http.ToolArgs
@@ -148,7 +149,7 @@ object SessionTools {
                 "${SessionMacroEngine.MAX_STEPS} steps and ${SessionMacroEngine.MAX_RUN_MS / 1000} s per run, suspension " +
                 "after max_failures runs that did not help (session_macro_run or session_macro_set resumes it). Steps and " +
                 "retries never trigger a macro; Raijin's internal unauthenticated probes never trigger one nor get its " +
-                "cookies. Replacing a macro resets its state.",
+                "cookies. Replacing a macro resets its state. " + ScopeGate.TOOL_NOTE + " Steps and the retry are checked.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     property("name", "string", "Unique macro name; a macro of the same name is replaced")
@@ -248,7 +249,7 @@ object SessionTools {
             description = "Run a login macro now, whatever its trigger, interval or suspension: to prime the session " +
                 "or debug the steps. Reports each step's status code, extracted variables and Set-Cookie values, the " +
                 "cookies learned and the session rules that captured a new value. A run whose steps all succeed " +
-                "resumes a suspended macro.",
+                "resumes a suspended macro. " + ScopeGate.TOOL_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     property("name", "string", "The macro to run")

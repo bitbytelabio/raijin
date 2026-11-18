@@ -129,4 +129,13 @@ class JsonlStoresTest {
         store.append(finding(3), "P")
         assertEquals(2, reported.size, "a failure after recovery is reported again")
     }
+
+    @Test fun `a line with a lone surrogate is written and read back, after a cut-off last line`() {
+        val file = File(dir, "surrogate.jsonl")
+        file.writeText("{\"cut\":") // a crash left the last record without its newline
+        JsonlStoreSupport.appendLine(file, "{\"v\":\"a\uD800b\"}")
+        val lines = file.readLines(Charsets.UTF_8)
+        assertEquals(listOf("{\"cut\":", "{\"v\":\"a\uFFFDb\"}"), lines)
+        assertEquals("a\uFFFDb", Json.parseToJsonElement(lines[1]).let { (it as kotlinx.serialization.json.JsonObject)["v"].toString().trim('"') })
+    }
 }

@@ -12,6 +12,7 @@ import burp.api.montoya.scanner.audit.Audit
 import burp.api.montoya.sitemap.SiteMapFilter
 import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.safety.SafeRegex
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.state.ScanTask
 import io.bitbytelab.raijin.state.StateManager
 import kotlinx.serialization.json.*
@@ -39,6 +40,9 @@ internal class ScannerTasks(
             requestCount = try { audit?.requestCount() } catch (_: Throwable) { null },
         )
     })
+
+    /** Advisory only: Scanner targets outside scope are flagged, never dropped. */
+    private val scopeGate = ScopeGate(api)
 
     /** Audit task id -> site map URL prefixes of its targets, for [getTaskIssues] when Burp cannot list a task's issues. */
     private val auditTargets = ConcurrentHashMap<String, Set<String>>()
@@ -103,7 +107,7 @@ internal class ScannerTasks(
 
         val statusMsg = try { crawlTask.statusMessage() } catch (_: Exception) { "started" }
 
-        return buildJsonObject {
+        return withScopeAdvice(seeds, buildJsonObject {
             put("task_id", taskId)
             put("type", "crawl")
             put("status", statusMsg)
@@ -120,7 +124,22 @@ internal class ScannerTasks(
                 )
             }
             put("created_at", stateManager.scanTasks[taskId]!!.createdAt)
-        }
+        })
+    }
+
+    /**
+     * [result] plus `scope_warnings` (distinct, at most [MAX_SCOPE_WARNINGS]) and `sent_out_of_scope`
+     * for the [targets] outside Burp's scope. Advisory only: no target is dropped for it.
+     */
+    private fun withScopeAdvice(targets: List<String>, result: JsonObject): JsonObject {
+        val warnings = targets.mapNotNull { scopeGate.advise(it, "scanner").warning }
+        if (warnings.isEmpty()) return result
+        return JsonObject(
+            result + mapOf(
+                "scope_warnings" to JsonArray(warnings.distinct().take(MAX_SCOPE_WARNINGS).map { JsonPrimitive(it) }),
+                ScopeGate.SENT to JsonPrimitive(warnings.size),
+            )
+        )
     }
 
     /**
@@ -249,8 +268,11 @@ internal class ScannerTasks(
             registered = true
 
             val statusMsg = try { auditTask.statusMessage() } catch (_: Throwable) { "started" }
+            val targets = urls.orEmpty() + rawRequests.mapNotNull { decoded ->
+                decoded?.let { runCatching { HttpRequest.httpRequest(BurpByteArray.byteArray(*it)).url() }.getOrNull() }
+            }
 
-            return buildJsonObject {
+            return withScopeAdvice(targets, buildJsonObject {
                 put("task_id", taskId)
                 put("type", "audit")
                 put("status", statusMsg)
@@ -297,7 +319,7 @@ internal class ScannerTasks(
                             "value the request already has. The rule is removed when the audit ends or is deleted."
                     )
                 }
-            }
+            })
         } catch (e: UnsupportedOperationException) {
             return errorJson("Scanner API is not available in Burp Suite Community Edition")
         } catch (e: Exception) {
@@ -497,11 +519,11 @@ internal class ScannerTasks(
             auditTargets.merge(taskId, prefixes) { known, added -> known + added }
 
             val targetHost = host ?: AuditAuthRules.authorityOfRawRequest(requestText)?.let { AuditAuthRules.hostOf(it) }
-            buildJsonObject {
+            withScopeAdvice(listOfNotNull(runCatching { httpRequest.url() }.getOrNull()), buildJsonObject {
                 put("task_id", taskId)
                 put("request_added", true)
                 authScopeNote(scanTask, targetHost)?.let { put("auth_note", it) }
-            }
+            })
         } catch (e: Exception) {
             buildJsonObject {
                 put("error", "Failed to add request: ${e.message}")
@@ -543,6 +565,8 @@ internal class ScannerTasks(
 
     companion object {
         val AUDIT_MODES = setOf("light", "normal", "thorough")
+
+        private const val MAX_SCOPE_WARNINGS = 20
 
         /**
          * Site map URL prefixes (`scheme://host[:port]/`) covering what an audit of [urls] and

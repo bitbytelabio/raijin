@@ -1,12 +1,14 @@
 package io.bitbytelab.raijin.tools.events
 
+import io.bitbytelab.raijin.core.ClampedInt
+import io.bitbytelab.raijin.core.asClampedInt
 import io.bitbytelab.raijin.core.asLongSafe
 import io.bitbytelab.raijin.core.asStringList
+import io.bitbytelab.raijin.core.withClampReport
 import io.bitbytelab.raijin.events.BurpEvent
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
-import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.serialization.json.*
@@ -45,8 +47,8 @@ object EventsTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val maxEvents = maxEventsArg(args)
-                validateMaxEvents(maxEvents)?.let { return@addTool it }
+                val maxEventsArg = maxEventsArg(args)
+                val maxEvents = maxEventsArg?.value ?: DEFAULT_MAX_EVENTS
 
                 val subscriptionId = (args["subscription_id"] as? JsonPrimitive)?.contentOrNull
                 if (subscriptionId != null) {
@@ -64,7 +66,7 @@ object EventsTools {
                         put("last_id", eventBus.lastId())
                         put("missed_events", page.missed)
                         put("events", serializeEvents(page.events))
-                    })
+                    }.withClampReport("max_events", maxEventsArg))
                 }
 
                 val sinceId = args["since_id"].asLongSafe() ?: 0L
@@ -75,7 +77,7 @@ object EventsTools {
                     put("last_id", eventBus.lastId())
                     put("buffer_size", eventBus.size())
                     put("events", serializeEvents(events))
-                })
+                }.withClampReport("max_events", maxEventsArg))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -112,8 +114,8 @@ object EventsTools {
                     ?: return@addTool toolError("Missing required parameter: types (array of strings)")
 
                 val sinceId = args["since_id"].asLongSafe() ?: 0L
-                val maxEvents = maxEventsArg(args)
-                validateMaxEvents(maxEvents)?.let { return@addTool it }
+                val maxEventsArg = maxEventsArg(args)
+                val maxEvents = maxEventsArg?.value ?: DEFAULT_MAX_EVENTS
 
                 val events = eventBus.getEventsByType(types, sinceId, maxEvents)
                 toolJsonResult(buildJsonObject {
@@ -122,7 +124,7 @@ object EventsTools {
                     put("returned", events.size)
                     put("last_id", eventBus.lastId())
                     put("events", serializeEvents(events))
-                })
+                }.withClampReport("max_events", maxEventsArg))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -219,20 +221,14 @@ object EventsTools {
         }
     }
 
-    /** `max_events`, defaulting when absent; out-of-Int-range values clamp so [validateMaxEvents] sees the sign. */
-    private fun maxEventsArg(args: Map<String, JsonElement>): Int =
-        args["max_events"].asLongSafe()?.coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong())?.toInt()
-            ?: DEFAULT_MAX_EVENTS
-
     /**
-     * Validates the max_events argument at the tool boundary. Returns a clean,
-     * client-facing error [CallToolResult] when the value is negative, or null
-     * when the value is acceptable. This gives MCP clients an explicit,
-     * actionable message instead of leaking Kotlin's internal
-     * `IllegalArgumentException` from [Iterable.take].
+     * `max_events` clamped into 0..[MAX_EVENTS] (null when absent): a negative or huge value is
+     * served at the bound and reported as `max_events_clamped_to`; only a non-integer is an error.
      */
-    internal fun validateMaxEvents(maxEvents: Int): CallToolResult? =
-        if (maxEvents < 0) toolError("max_events must be >= 0") else null
+    internal fun maxEventsArg(args: Map<String, JsonElement>): ClampedInt? =
+        args["max_events"].asClampedInt("max_events", 0, MAX_EVENTS).getOrThrow()
+
+    private const val MAX_EVENTS = 10_000
 
     /**
      * Serializes a list of BurpEvent objects to a JsonArray.

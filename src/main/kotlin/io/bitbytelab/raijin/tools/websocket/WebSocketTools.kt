@@ -12,6 +12,7 @@ import io.bitbytelab.raijin.core.asLongSafe
 import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.core.asStringMap
 import io.bitbytelab.raijin.state.StateManager
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.state.WebSocketConnection
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
@@ -39,7 +40,8 @@ object WebSocketTools {
                 "All messages are automatically captured and available via websocket_get_messages. " +
                 "Parameters: url (WebSocket URL, e.g. 'wss://example.com/ws', required), " +
                 "headers (optional object of additional HTTP headers as key-value pairs), " +
-                "subprotocol (optional string, WebSocket subprotocol to request).",
+                "subprotocol (optional string, WebSocket subprotocol to request). The upgrade goes out exactly as given: " +
+                "a raw CR/LF in the path, query or a header is sent as written and reported in warnings. " + ScopeGate.ADVISORY_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("url") { put("type", "string"); put("description", "WebSocket URL, e.g. 'wss://example.com/ws'") }
@@ -262,7 +264,7 @@ object WebSocketTools {
                 "whose responses are the same once the echoed payload, timestamps and ids are masked, largest " +
                 "first, so the small clusters are the anomalies. The run stops early (stopped_early, with " +
                 "next_index to pass as start_index) when timeout_ms runs out or the open connection closes. " +
-                "Numbers out of range are clamped and listed under 'clamped'.",
+                "Numbers out of range are clamped and listed under 'clamped'. " + ScopeGate.ADVISORY_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("connection_id") { put("type", "string"); put("description", "Open connection to fuzz over (from websocket_create); alternative to url") }

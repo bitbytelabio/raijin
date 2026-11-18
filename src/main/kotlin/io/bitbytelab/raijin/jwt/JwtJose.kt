@@ -197,6 +197,22 @@ object JwtJose {
     }
 
     /**
+     * [psychic] in the JWS form (RFC 7518 3.4): r || s as fixed-size big-endian integers, all zero
+     * (64, 96 or 132 bytes). A JOSE library reads this form, a raw DER verifier the other one.
+     */
+    fun psychicRawRs(token: String, alg: String?, overrides: JsonObject?): String {
+        val algorithm = (alg ?: "ES256").uppercase()
+        val size = when (algorithm) {
+            "ES256" -> 64
+            "ES384" -> 96
+            "ES512" -> 132
+            else -> throw IllegalArgumentException("psychic requires ES256, ES384, or ES512")
+        }
+        val (headerB64, payloadB64) = rewrittenParts(token, algorithm, overrides)
+        return "$headerB64.$payloadB64.${Jwt.b64UrlEncode(ByteArray(size))}"
+    }
+
+    /**
      * Writes [url] into the `jku` or `x5u` header and leaves the signature bytes unchanged: enough
      * to see whether the target fetches the URL. [headerUrlSigned] makes a token that verifies.
      */

@@ -96,7 +96,7 @@ internal class Http1Connection(
     fun discard() = reader.discard()
 
     /** The next response, or null when the run is abandoned before it is complete. */
-    fun readResponse(ignoreLength: Boolean): Http1Response? = reader.readResponse(ignoreLength)
+    fun readResponse(ignoreLength: Boolean, bodyless: Boolean = false): Http1Response? = reader.readResponse(ignoreLength, bodyless)
 
     /**
      * Writes [req] whole; or with its last byte held back until its gate opens; or stopping before

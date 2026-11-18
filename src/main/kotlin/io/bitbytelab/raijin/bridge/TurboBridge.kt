@@ -16,9 +16,15 @@ import kotlinx.serialization.json.JsonPrimitive
 /**
  * Bridge between the MCP tools and the Turbo engine. Shares [TurboModule.runManager] with the
  * GUI, so a run started by an agent is visible in the Turbo tab and vice versa.
+ *
+ * @param scopeAdvice the scope warning for a URL (null when in scope): advisory only, MCP-started
+ *   runs are flagged and never refused.
  */
-class TurboBridge(val manager: RunManager = TurboModule.runManager) {
-    val tools = McpToolHandlers(manager, BurpOrganizerProvider(), BurpCollaboratorProvider())
+class TurboBridge(
+    val manager: RunManager = TurboModule.runManager,
+    scopeAdvice: ((String) -> String?)? = null,
+) {
+    val tools = McpToolHandlers(manager, BurpOrganizerProvider(), BurpCollaboratorProvider(), scopeAdvice)
     val resources = McpResourceHandlers(manager) { TurboSettings.desyncAgent }
 
     companion object {

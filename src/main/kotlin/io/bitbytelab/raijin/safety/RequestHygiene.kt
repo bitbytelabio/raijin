@@ -7,8 +7,8 @@ import java.nio.charset.Charset
  *
  * A raw CR/LF in a structured input (method, url, header) — commonly a stray newline emitted by an
  * LLM — reaches the HTTP/2 `:path` pseudo-header or splits a header, so Burp flags the request as
- * **"kettled"** and the server rejects it (`RST_STREAM` PROTOCOL_ERROR). [stripControl] removes those
- * control chars before the request is built (the actual fix), and [scan] reports what was cleaned so
+ * **"kettled"** and the server rejects it (`RST_STREAM` PROTOCOL_ERROR). [stripCrlf] removes those
+ * two chars, and only those, before the request is built (the actual fix), and [scan] reports what was cleaned so
  * the agent can self-correct.
  *
  * Only the STRUCTURED build path is sanitized. `raw_request` only gets its header block's line endings
@@ -18,13 +18,13 @@ import java.nio.charset.Charset
 object RequestHygiene {
 
     /**
-     * Removes raw CR/LF and other C0 control chars (tab excepted) from [s]. A stray newline in an
-     * LLM-supplied url/method/header would otherwise land in the HTTP/2 `:path` or split a header and
-     * get the request kettled / `RST_STREAM`'d. Keeps everything printable (code >= 32) plus tab.
+     * Removes raw CR and LF from [s], and nothing else: a stray newline in an LLM-supplied
+     * url/method/header would otherwise land in the HTTP/2 `:path` or split a header and get the
+     * request kettled / `RST_STREAM`'d. Every other byte (NUL, VT, other C0 chars) reaches the wire.
      */
-    fun stripControl(s: String): String {
-        if (s.none { it != '\t' && it.code < 32 }) return s   // clean → no allocation
-        return buildString(s.length) { for (ch in s) if (ch == '\t' || ch.code >= 32) append(ch) }
+    fun stripCrlf(s: String): String {
+        if (s.indexOf('\r') < 0 && s.indexOf('\n') < 0) return s   // clean → no allocation
+        return buildString(s.length) { for (ch in s) if (ch != '\r' && ch != '\n') append(ch) }
     }
 
     private val REAL_HEADER_END = Regex("\\r?\\n\\r?\\n")
@@ -166,7 +166,7 @@ object RequestHygiene {
         else -> -1
     }
 
-    /** Advisory: reports raw CR/LF found (and removed by [stripControl]) so the agent notices. */
+    /** Advisory: reports raw CR/LF found (and removed by [stripCrlf]) so the agent notices; no other byte is touched. */
     fun scan(method: String?, url: String?, headers: Map<String, String>?): List<String> {
         val out = mutableListOf<String>()
 

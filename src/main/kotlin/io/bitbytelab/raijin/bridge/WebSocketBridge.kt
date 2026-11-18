@@ -6,6 +6,7 @@ import burp.api.montoya.websocket.extension.ExtensionWebSocket
 import burp.api.montoya.websocket.extension.ExtensionWebSocketCreationStatus
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.safety.SafeRegex
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.state.WebSocketConnection
 import io.bitbytelab.raijin.state.WebSocketInterceptRule
@@ -203,7 +204,8 @@ class WebSocketBridge(
             val connection = (created["connection_id"] as? JsonPrimitive)?.contentOrNull
                 ?.let { stateManager.websocketConnections[it] }
             val error = if (connection != null) null else (created["error"] as? JsonPrimitive)?.contentOrNull
-            return WebSocketFuzzHost.Opened(connection, error)
+            val scopeWarning = (created[ScopeGate.WARNING] as? JsonPrimitive)?.contentOrNull
+            return WebSocketFuzzHost.Opened(connection, error, scopeWarning)
         }
 
         override fun sendText(connection: WebSocketConnection, message: String): WebSocketMessage =

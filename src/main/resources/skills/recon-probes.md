@@ -4,7 +4,7 @@ description: Recon, param mining, OpenAPI, and CORS/cache/GraphQL/SQLi/IDOR/JWT 
 ---
 # Recon and probes
 
-Add the target with `scope(action=include)` first. Every request these tools send is checked against Burp's scope by the operator's `mcp_scope_mode`: `warn` (default) sends it and flags an out-of-scope target, `enforce` refuses it. Probes resend a request many times, so do not point them at requests that change data (a delete, a payment) unless you mean to.
+Add the target with `scope(action=include)` first. Every request these tools send is checked against Burp's scope by the operator's `mcp_scope_mode`: `warn` (default) sends it and adds `scope_warning` to the result, `enforce` refuses it (`out_of_scope: true`). Content discovery checks every path and reports `skipped_out_of_scope` / `sent_out_of_scope`. Probes resend a request many times, so do not point them at requests that change data (a delete, a payment) unless you mean to.
 
 ## Recon
 - `recon(action=fingerprint)`: technology and WAF fingerprinting from one GET.

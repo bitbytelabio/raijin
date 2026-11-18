@@ -1,6 +1,8 @@
 package io.bitbytelab.raijin.turbo
 
 import burp.api.montoya.http.message.HttpRequestResponse
+import org.python.core.Py
+import org.python.core.PySystemState
 import org.python.util.PythonInterpreter
 import java.io.PrintWriter
 import java.io.StringWriter
@@ -11,8 +13,15 @@ class Target(val req: String, val rawreq: ByteArray, val endpoint: String, val b
 class Wordlist(val bruteforce: Bruteforce, val observedWords: MutableSet<String>, val clipboard: ArrayList<String>)
 
 fun evalJython(code: String, baseRequest: String, rawRequest: ByteArray, endpoint: String, host: String, baseInput: String, store: ResultStore, handler: RunHandler, reqs: MutableList<HttpRequestResponse>?, requestTable: RequestTable?) {
-    val pyInterp = PythonInterpreter() // todo add path to bs4
+    // Its own PySystemState: modules, sys.path and globals one run's script changes stay out of the next run.
+    var pyInterp: PythonInterpreter? = null
     try {
+        pyInterp = try {
+            PythonInterpreter(null, PySystemState())
+        } catch (e: Throwable) {
+            handler.overrideStatus("Run failed to start: ${e.message ?: e.javaClass.simpleName}")
+            return
+        }
         Utils.out("Starting run...")
         handler.code = code
         handler.baseRequest = baseRequest
@@ -38,6 +47,12 @@ fun evalJython(code: String, baseRequest: String, rawRequest: ByteArray, endpoin
             pyInterp.set("api", Utils.montoyaApi)
             pyInterp.setOut(Utils.outputStream())
             pyInterp.setErr(Utils.errorStream())
+            // Callbacks run on engine worker threads, which Jython gives the default system state,
+            // not this run's: point its streams at Burp's output too, so a callback's print shows.
+            Py.defaultSystemState?.let { shared ->
+                shared.stdout = pyInterp.systemState.stdout
+                shared.stderr = pyInterp.systemState.stderr
+            }
         }
         pyInterp.exec(Scripts.SCRIPTENVIRONMENT)
         pyInterp.exec(code)
@@ -46,12 +61,13 @@ fun evalJython(code: String, baseRequest: String, rawRequest: ByteArray, endpoin
         pyInterp.exec("completed(store.getAllRquests())".trimMargin())
     }
     catch (ex: Exception) {
+        val interp = pyInterp ?: throw ex
         var error = ex
         var stackTrace = errorToStacktrace(error)
         if (stackTrace.contains("Cannot queue any more items - the run has finished")) {
             Utils.out("Run aborted with items waiting to be queued.")
             try {
-                pyInterp.exec("completed(store.getAllRquests())".trimMargin())
+                interp.exec("completed(store.getAllRquests())".trimMargin())
                 handler.abort()
                 return
             } catch (ex2: Exception) {
@@ -64,6 +80,12 @@ fun evalJython(code: String, baseRequest: String, rawRequest: ByteArray, endpoin
         if (message == null) {
             message = error.toString()
         }
+        if (handler.stopping()) {
+            // Whatever the script raises once the run was stopped is the stop surfacing, not a bug.
+            Utils.out("Run stopped: $message")
+            handler.abort()
+            return
+        }
         handler.overrideStatus("User Python error, check extender for full details: $message")
         Utils.out("There was an error executing your Python script. This is probably due to a flaw in your script, rather than a bug in Raijin Turbo :)")
         Utils.out("If you think it is a Raijin Turbo issue, try the 'debug' example script from the script picker.")
@@ -72,7 +94,7 @@ fun evalJython(code: String, baseRequest: String, rawRequest: ByteArray, endpoin
 
         handler.abort()
     } finally {
-        runCatching { pyInterp.close() }
+        runCatching { pyInterp?.close() }
     }
 }
 

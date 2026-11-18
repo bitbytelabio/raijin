@@ -84,11 +84,28 @@ class IdorHuntBridge(private val api: MontoyaApi) {
         val identityHeaders = AuthIdentityApplier.identityHeaders(parties.map { it.identity })
 
         val url = (if (useTls) "https" else "http") + "://$host:$port/"
-        val scope = scopeGate.check(url)
-        scope.deny?.let { return it }
-
         val base = normalizeCrlfMessage(request)
+        val scope = scopeGate.checkRequest(host, port, useTls, base)
+        if (scope.blocked) return scope.denyJson()
+        return scope.annotate(huntChecked(base, url, host, port, useTls, request, named, parties, identityHeaders, idLocation, idValue, idName, transforms, enumerate))
+    }
 
+    private fun huntChecked(
+        base: String,
+        url: String,
+        host: String,
+        port: Int,
+        useTls: Boolean,
+        request: String,
+        named: List<JsonObject>,
+        parties: List<Party>,
+        identityHeaders: Set<String>,
+        idLocation: String?,
+        idValue: String?,
+        idName: String?,
+        transforms: Boolean,
+        enumerate: Int,
+    ): JsonObject {
         // 1. Locate the object reference to swap.
         val ref = IdorHunt.resolveRef(base, idLocation, idValue, idName, parties.mapNotNull { it.objectId })
         if (ref == null && (idValue != null || idName != null)) {
@@ -231,7 +248,7 @@ class IdorHuntBridge(private val api: MontoyaApi) {
                         put("classification", IdorHunt.classify(it.value).note)
                     }
                 } ?: JsonNull)
-                put("identities_tested", identities.size)
+                put("identities_tested", named.size)
                 put("owners_with_object_id", owners.size)
                 put("top_severity", IdorHunt.topSeverity(canaryFindings + transformFindings))
                 put("horizontal_findings", findingsJson(canaryFindings))
@@ -240,7 +257,6 @@ class IdorHuntBridge(private val api: MontoyaApi) {
                 put("transform_probes", transformProbes)
                 transformBaseline?.let { put("transform_baseline", it) }
                 put("identity_diff", identityDiff)
-                scope.warning?.let { put("scope_warning", it) }
                 put(
                     "note",
                     if (ref == null) {

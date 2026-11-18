@@ -110,7 +110,11 @@ class ContentDiscovery(
             index++
             if (response == null) {
                 unanswered++
-                if (++silent >= MAX_SILENT) stopped = STOP_NO_RESPONSE
+                if (++silent >= MAX_SILENT) {
+                    stopped = STOP_NO_RESPONSE
+                    // Continue from the first path of the silent run: none of them got an answer.
+                    resumeFrom = index - silent
+                }
                 continue
             }
             silent = 0

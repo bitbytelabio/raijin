@@ -6,6 +6,8 @@ import burp.api.montoya.http.message.HttpRequestResponse
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
 import io.bitbytelab.raijin.core.BodyText
+import io.bitbytelab.raijin.graphql.ReachabilityGuard
+import io.bitbytelab.raijin.graphql.TargetUnreachableException
 import io.bitbytelab.raijin.openapi.OpenApiDocument
 import io.bitbytelab.raijin.openapi.OpenApiImport
 import io.bitbytelab.raijin.openapi.PlannedRequest
@@ -53,18 +55,33 @@ class ApiImportBridge(
             // scope or site map change.
             val plan = OpenApiImport.plan(OpenApiDocument.parse(specJson), baseUrl, specUrl)
 
+            // Every operation's server, not only the document's first: an operation-level server
+            // would otherwise be sent (and blocked under enforce) outside the scope just added.
+            val addedToScope = ArrayList<String>()
+            val addToScopeErrors = LinkedHashMap<String, String>()
             if (addToScope) {
-                try {
-                    api.scope().includeInScope(plan.server.url)
-                } catch (_: Exception) {}
+                val servers = (listOf(plan.server.url) + plan.requests.map { it.server.url }).distinct()
+                for (url in servers) {
+                    try {
+                        api.scope().includeInScope(url)
+                        addedToScope += url
+                    } catch (e: Exception) {
+                        addToScopeErrors[url] = e.message ?: e.javaClass.simpleName
+                    }
+                }
             }
 
             var requestsSent = 0
             var addedToSitemap = 0
             var skippedOutOfScope = 0
+            var sentOutOfScope = 0
+            var stoppedAt: Int? = null
+            val reachability = ReachabilityGuard()
             val endpoints = buildJsonArray {
-                for (planned in plan.requests) {
+                for ((index, planned) in plan.requests.withIndex()) {
+                    if (stoppedAt != null) break
                     var failure: String? = null
+                    var scope: ScopeGate.Check? = null
                     // With nothing to send or store, the request is only described and Burp is left alone.
                     if (sendRequests || addToSitemap) {
                         try {
@@ -74,18 +91,27 @@ class ApiImportBridge(
                                     HttpRequestResponse.httpRequestResponse(httpRequest, HttpResponse.httpResponse())
                                 )
                                 addedToSitemap++
-                            } else if (scopeGate.deny(httpRequest.url()) != null) {
-                                // Operator scope policy (mcp_scope_mode=enforce): don't send out-of-scope.
-                                skippedOutOfScope++
                             } else {
-                                val result = BoundedHttp.send(api, httpRequest)
-                                if (result == null) {
-                                    failure = "No response: the request timed out or the connection failed"
+                                scope = scopeGate.checkHttpRequest(httpRequest)
+                                if (scope.blocked) {
+                                    skippedOutOfScope++
                                 } else {
-                                    requestsSent++
-                                    if (addToSitemap) {
-                                        api.siteMap().add(result)
-                                        addedToSitemap++
+                                    if (scope.warning != null) sentOutOfScope++
+                                    val result = BoundedHttp.send(api, httpRequest)
+                                    val status = result?.takeIf { it.hasResponse() }?.response()?.statusCode()?.toInt() ?: 0
+                                    if (result == null) {
+                                        failure = "No response: the request timed out or the connection failed"
+                                    } else {
+                                        requestsSent++
+                                        if (addToSitemap) {
+                                            api.siteMap().add(result)
+                                            addedToSitemap++
+                                        }
+                                    }
+                                    try {
+                                        reachability.record(status)
+                                    } catch (_: TargetUnreachableException) {
+                                        stoppedAt = index + 1
                                     }
                                 }
                             }
@@ -94,18 +120,32 @@ class ApiImportBridge(
                             failure = e.message ?: e.javaClass.simpleName
                         }
                     }
-                    add(describe(planned, plan.server, failure))
+                    var entry = describe(planned, plan.server, failure)
+                    if (scope?.blocked == true) entry = JsonObject(entry + ("skipped" to JsonPrimitive("out_of_scope")))
+                    add(scope?.annotate(entry) ?: entry)
                 }
             }
 
             buildJsonObject {
+                if (skippedOutOfScope > 0 && skippedOutOfScope == plan.requests.size) {
+                    put("error", "Not sent: all $skippedOutOfScope requests are outside Burp's target scope (mcp_scope_mode=enforce).")
+                }
                 put("spec_version", plan.version)
                 put("base_url", plan.server.url)
                 put("total_endpoints", plan.requests.size)
                 put("requests_sent", requestsSent)
-                put("skipped_out_of_scope", skippedOutOfScope)
+                if (skippedOutOfScope > 0) put(ScopeGate.SKIPPED, skippedOutOfScope)
+                if (sentOutOfScope > 0) put(ScopeGate.SENT, sentOutOfScope)
+                stoppedAt?.let {
+                    put("stopped", "target_unreachable")
+                    put("not_sent", plan.requests.size - it)
+                }
                 put("added_to_sitemap", addedToSitemap)
-                put("added_to_scope", addToScope)
+                put("added_to_scope", addToScope && addedToScope.isNotEmpty())
+                if (addedToScope.isNotEmpty()) putJsonArray("added_to_scope_urls") { addedToScope.forEach { add(it) } }
+                if (addToScopeErrors.isNotEmpty()) {
+                    putJsonObject("add_to_scope_errors") { addToScopeErrors.forEach { (url, msg) -> put(url, msg) } }
+                }
                 put("security_schemes", plan.securitySchemes)
                 if (plan.warnings.isNotEmpty()) putJsonArray("warnings") { plan.warnings.forEach { add(it) } }
                 put("endpoints", endpoints)

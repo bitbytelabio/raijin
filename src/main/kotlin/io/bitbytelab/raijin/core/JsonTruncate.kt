@@ -20,12 +20,12 @@ fun truncateJsonForSummary(value: JsonElement, maxLen: Int): JsonElement = when 
     value is JsonPrimitive && !value.isString -> value // numbers/booleans/null: short, pass through
     value is JsonPrimitive -> {
         val c = value.content
-        JsonPrimitive(if (c.length > maxLen) c.take(maxLen) + "…" else c)
+        JsonPrimitive(if (c.length > maxLen) BodyText.truncate(c, maxLen) + "…" else c)
     }
     else -> {
         // Object/array: keep the real structure (so it stays a real nested object in the
         // Activity view, not a mangled string) unless its serialized form is itself huge.
         val s = value.toString()
-        if (s.length <= maxLen) value else JsonPrimitive(s.take(maxLen) + "… [truncated ${s.length} chars]")
+        if (s.length <= maxLen) value else JsonPrimitive(BodyText.truncate(s, maxLen) + "… [truncated ${s.length} chars]")
     }
 }

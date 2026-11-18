@@ -116,6 +116,7 @@ internal class HttpFuzzRunner(private val send: (HttpFuzzPlan.AttackRequest) -> 
         val records = ArrayList<Record>()
         val keepJson = options.report == REPORT_ALL
         val keepLeaderJson = options.report == REPORT_CLUSTERS
+        val workerFailures = ArrayList<String>()
 
         fun take(): Pair<Int, HttpFuzzPlan.AttackRequest>? = synchronized(feed) {
             if (stop.get() || !iterator.hasNext()) null else (nextIndex++ to iterator.next())
@@ -149,7 +150,18 @@ internal class HttpFuzzRunner(private val send: (HttpFuzzPlan.AttackRequest) -> 
                         Record(
                             index, request, sent.status, sent.bodyLength, sent.elapsedMs,
                             kept = kept, leader = leader,
-                            json = if ((keepJson && kept) || (keepLeaderJson && leader)) sent.json() else null,
+                            json = if ((keepJson && kept) || (keepLeaderJson && leader)) {
+                                try {
+                                    sent.json()
+                                } catch (e: Exception) {
+                                    buildJsonObject {
+                                        put("index", index)
+                                        put("serialize_error", e.message ?: e.javaClass.simpleName)
+                                    }
+                                }
+                            } else {
+                                null
+                            },
                             error = null, timeout = false,
                         )
                     }
@@ -170,8 +182,9 @@ internal class HttpFuzzRunner(private val send: (HttpFuzzPlan.AttackRequest) -> 
                 for (future in running) {
                     try {
                         future.get()
-                    } catch (_: ExecutionException) {
+                    } catch (e: ExecutionException) {
                         // work() records a failed send itself; anything else ends that worker only.
+                        workerFailures += "worker failed: ${e.cause?.message ?: e.message}"
                     } catch (_: InterruptedException) {
                         stop.set(true)
                         Thread.currentThread().interrupt()
@@ -213,7 +226,8 @@ internal class HttpFuzzRunner(private val send: (HttpFuzzPlan.AttackRequest) -> 
                     done.filter { it.kept }.forEach { add(fullEntry(it, plan.mode, summary)) }
                 })
             }
-            if (plan.notes.isNotEmpty()) putJsonArray("notes") { plan.notes.forEach { add(it) } }
+            val notes = plan.notes + workerFailures
+            if (notes.isNotEmpty()) putJsonArray("notes") { notes.forEach { add(it) } }
         }
     }
 

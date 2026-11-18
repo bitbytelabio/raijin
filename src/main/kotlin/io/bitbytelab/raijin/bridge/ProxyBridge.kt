@@ -95,9 +95,10 @@ class ProxyBridge(
         inScopeOnly: Boolean,
         includeRequest: Boolean = false,
         includeResponse: Boolean = false,
-        maxResponseLength: Int? = null
+        maxResponseLength: Int? = null,
+        startIndex: Int = 0,
     ): JsonObject = history.searchHistory(
-        pattern, searchIn, caseSensitive, maxResults, inScopeOnly, includeRequest, includeResponse, maxResponseLength
+        pattern, searchIn, caseSensitive, maxResults, inScopeOnly, includeRequest, includeResponse, maxResponseLength, startIndex
     )
 
     /** A page of the WebSocket proxy history, optionally filtered; see [ProxyHistory.getWebSocketHistory]. */
@@ -117,7 +118,8 @@ class ProxyBridge(
         maxResults: Int,
         webSocketId: Int? = null,
         url: String? = null,
-    ): JsonObject = history.searchWebSocketHistory(pattern, direction, maxResults, webSocketId, url)
+        startIndex: Int = 0,
+    ): JsonObject = history.searchWebSocketHistory(pattern, direction, maxResults, webSocketId, url, startIndex)
 
     // ---------------------------------------------------------------
     // Intercept control

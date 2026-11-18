@@ -72,19 +72,21 @@ object ResourceRegistry {
             name = "Proxy History",
             description = "Recent HTTP proxy history (metadata-level snapshot, most recent first)."
         ) {
-            bridges.proxy.getHistory(
-                startIndex = 0,
-                count = PROXY_HISTORY_COUNT,
-                host = null,
-                method = null,
-                statusCode = null,
-                mimeType = null,
-                inScopeOnly = false,
-                includeRequest = false,
-                includeResponse = false,
-                statusCodeRange = null,
-                maxResponseLength = null
-            ).toString()
+            newestFirst(PROXY_HISTORY_COUNT) { start, count ->
+                bridges.proxy.getHistory(
+                    startIndex = start,
+                    count = count,
+                    host = null,
+                    method = null,
+                    statusCode = null,
+                    mimeType = null,
+                    inScopeOnly = false,
+                    includeRequest = false,
+                    includeResponse = false,
+                    statusCodeRange = null,
+                    maxResponseLength = null
+                )
+            }.toString()
         }
 
         // ---------------------------------------------------------------
@@ -95,14 +97,11 @@ object ResourceRegistry {
             server,
             uri = "burp://proxy/websocket/history",
             name = "Proxy WebSocket History",
-            description = "Recorded WebSocket messages captured by the proxy."
+            description = "Recorded WebSocket messages captured by the proxy, most recent first."
         ) {
-            bridges.proxy.getWebSocketHistory(
-                startIndex = 0,
-                count = WEBSOCKET_HISTORY_COUNT,
-                host = null,
-                direction = null
-            ).toString()
+            newestFirst(WEBSOCKET_HISTORY_COUNT) { start, count ->
+                bridges.proxy.getWebSocketHistory(startIndex = start, count = count, host = null, direction = null)
+            }.toString()
         }
 
         // ---------------------------------------------------------------
@@ -257,6 +256,17 @@ object ResourceRegistry {
         description: String,
         produce: () -> String
     ) = registerResource(server, uri, name, description, JSON_MIME, produce)
+
+    /**
+     * The last [count] items of a history listing, newest first: one call (count 0) reads the
+     * total, a second fetches the tail, and its items are reversed.
+     */
+    internal fun newestFirst(count: Int, fetch: (start: Int, count: Int) -> JsonObject): JsonObject {
+        val total = fetch(0, 0)["total_filtered"]?.jsonPrimitive?.intOrNull ?: 0
+        val page = fetch(DashboardApi.recentStart(total, count), count)
+        val items = page["items"] as? JsonArray ?: return page
+        return JsonObject(page + ("items" to JsonArray(items.asReversed())))
+    }
 
     private fun registerResource(
         server: Server,

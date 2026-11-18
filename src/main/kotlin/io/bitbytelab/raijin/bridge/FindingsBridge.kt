@@ -1,5 +1,6 @@
 package io.bitbytelab.raijin.bridge
 
+import io.bitbytelab.raijin.core.BodyText
 import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.state.StoredFinding
 import kotlinx.serialization.json.JsonObject
@@ -107,13 +108,13 @@ class FindingsBridge(private val stateManager: StateManager) {
         put("url", f.url)
         put("location", f.location)
         put("detail", f.detail)
-        put("evidence", f.evidence.take(500))
+        put("evidence", BodyText.truncate(f.evidence, 500))
         put("cvss_score", f.cvssScore)
         put("cvss_vector", f.cvssVector)
         put("owasp_category", f.owaspCategory)
         put("steps_to_reproduce", f.stepsToReproduce)
-        put("request", f.request.take(4000))
-        put("response", f.response.take(4000))
+        put("request", BodyText.truncate(f.request, 4000))
+        put("response", BodyText.truncate(f.response, 4000))
         put("created_at", f.createdAt)
     }
 

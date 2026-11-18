@@ -5,6 +5,7 @@ import io.bitbytelab.raijin.core.asClampedInt
 import io.bitbytelab.raijin.core.asLongSafe
 import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.core.withClampReport
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
@@ -34,7 +35,8 @@ object ScannerTools {
             description = "Start a web crawl against one or more target URLs. Returns a task ID for tracking progress. Pro edition only. " +
                 "max_depth is NOT supported by Burp's Montoya API (no depth control exists) and is always ignored — check the response's " +
                 "'ignored' field. in_scope_only IS enforced: out-of-scope seed URLs are dropped before crawling. Burp's own request_count " +
-                "in scanner_task_status can be unreliable; use sitemap_query (only_with_response=true) to gauge real progress.",
+                "in scanner_task_status can be unreliable; use sitemap_query (only_with_response=true) to gauge real progress. " +
+                ScopeGate.ADVISORY_NOTE + " Flagged seeds are listed in scope_warnings (with sent_out_of_scope).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("urls") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Target URLs to crawl") }
@@ -72,7 +74,8 @@ object ScannerTools {
                 "auth_header_name + auth_header_value set one header on the audit's requests: only on Scanner traffic to the hosts in " +
                 "'urls' / the Host headers of 'requests', replacing a value the request already has, and only until the audit ends " +
                 "or is deleted. A Cookie header sets only the cookies it names; the request's other cookies (the Scanner's cookie " +
-                "payloads, CSRF and load balancer cookies) stay.",
+                "payloads, CSRF and load balancer cookies) stay. " + ScopeGate.ADVISORY_NOTE +
+                " Flagged targets are listed in scope_warnings (with sent_out_of_scope).",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("urls") { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "Target URLs to audit (resolved to requests and added directly)") }
@@ -189,7 +192,7 @@ object ScannerTools {
         server.addTool(
             name = "scanner_task_add_request",
             description = "Add an HTTP request to an existing audit task for scanning. The request must be base64-encoded. " +
-                "An auth header the audit was started with stays limited to the hosts it started with.",
+                "An auth header the audit was started with stays limited to the hosts it started with. " + ScopeGate.ADVISORY_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("task_id") { put("type", "string"); put("description", "Audit task ID") }

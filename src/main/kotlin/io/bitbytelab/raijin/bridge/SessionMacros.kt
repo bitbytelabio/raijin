@@ -270,7 +270,7 @@ internal class SessionMacroEngine(
         // Running the login steps and then being refused by the scope policy at `retry()` would
         // waste a login attempt and still count as a macro failure toward the suspend-after circuit
         // breaker; check first, so an out-of-scope URL is simply left alone, as it always was.
-        if (scopeGate.deny(url) != null) return null
+        if (scopeGate.check(url).blocked) return null
         val owner = when (val ticket = entry.state.begin(clock(), sentEpoch)) {
             is MacroRunState.Ticket.Run -> {
                 if (!execute(entry, ticket, manual = false, triggerUrl = url).success) return null
@@ -306,6 +306,8 @@ internal class SessionMacroEngine(
                 finished.learned, finished.error, triggerUrl,
             )
             eventBus.emit("session.macro.run", buildJsonObject {
+                finished.steps.mapNotNull { it.result.scope?.warning }.distinct().takeIf { it.isNotEmpty() }
+                    ?.let { put(ScopeGate.WARNING, it.joinToString("; ")) }
                 put("macro", entry.macro.name)
                 put("trigger", if (manual) "manual" else "automatic")
                 triggerUrl?.let { put("url", it) }
@@ -345,7 +347,14 @@ internal class SessionMacroEngine(
             val cookies = result.exchange?.response()?.let { setCookies(it) }.orEmpty()
             if (macro.updateCookies) learned.putAll(cookies)
             reports += StepReport(index, result, cookies)
-            if (!result.success) return RunOutcome(false, reports, variables, learned, "Step $index failed: ${result.error ?: "unknown error"}")
+            if (!result.success) {
+                val reason = when {
+                    result.outOfScope -> "outside Burp's target scope (mcp_scope_mode=enforce); not sent"
+                    result.error != null -> result.error
+                    else -> "no response"
+                }
+                return RunOutcome(false, reports, variables, learned, "Step $index failed: $reason")
+            }
         }
         return RunOutcome(true, reports, variables, learned, null)
     }
@@ -364,10 +373,12 @@ internal class SessionMacroEngine(
         owner: Boolean,
     ): Reauthenticated? {
         val macro = entry.macro
-        if (scopeGate.deny(url) != null) {
+        val scope = scopeGate.check(url)
+        if (scope.blocked) {
             retried(entry, owner, url, null, "Retry blocked by scope policy (mcp_scope_mode=enforce)")
             return null
         }
+        val scopeWarning = scope.warning
         var request = applyCookies(initiating, url, toolName, suiteInScope)
         request = SessionInjection.applyRules(stateManager.sessionRules, request, url, suiteInScope, eventBus)
         val marked = request.withHeader(MARKER_HEADER, Traffic.RETRY.marker)
@@ -384,18 +395,19 @@ internal class SessionMacroEngine(
         val response = exchange?.response()
         if (response == null) {
             val reason = failure ?: if (exchange == null) "Retry timed out after ${macro.stepTimeoutMs} ms" else "Retry got no response"
-            retried(entry, owner, url, null, reason)
+            retried(entry, owner, url, null, reason, scopeWarning)
             return null
         }
         val status = response.statusCode().toInt()
         val helped = !SessionMacroTrigger.expired(macro, status) { responseText(response) }
-        retried(entry, owner, url, status, if (helped) null else "The retry still shows an expired session")
+        retried(entry, owner, url, status, if (helped) null else "The retry still shows an expired session", scopeWarning)
         return Reauthenticated(response.withAddedHeader(HttpExchangeJson.REAUTHENTICATED_HEADER, macro.name), macro.name)
     }
 
-    private fun retried(entry: Entry, owner: Boolean, url: String, status: Int?, failure: String?) {
+    private fun retried(entry: Entry, owner: Boolean, url: String, status: Int?, failure: String?, scopeWarning: String? = null) {
         val suspendedNow = entry.state.retried(helped = failure == null, owner = owner, error = failure)
         eventBus.emit("session.macro.retry", buildJsonObject {
+            scopeWarning?.let { put(ScopeGate.WARNING, it) }
             put("macro", entry.macro.name)
             put("url", url)
             status?.let { put("status_code", it) }
@@ -513,6 +525,7 @@ internal class SessionMacroEngine(
 
     private fun stepJson(report: StepReport): JsonObject = buildJsonObject {
         val result = report.result
+        result.scope?.warning?.let { put(ScopeGate.WARNING, it) }
         put("step", report.index)
         put("success", result.success)
         result.exchange?.let { exchange ->

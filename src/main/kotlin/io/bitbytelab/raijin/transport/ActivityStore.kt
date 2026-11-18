@@ -1,5 +1,6 @@
 package io.bitbytelab.raijin.transport
 
+import io.bitbytelab.raijin.core.BodyText
 import io.bitbytelab.raijin.state.McpActivityEntry
 import kotlinx.serialization.json.*
 import java.io.File
@@ -158,8 +159,9 @@ object ActivityStore {
         put("host", e.host)
         put("status_code", e.statusCode)
         put("is_error", e.isError)
-        put("args", e.argsSummary.take(MAX_SUMMARY))
-        put("result", e.resultSummary.take(MAX_SUMMARY))
+        put("out_of_scope", e.outOfScope)
+        put("args", BodyText.truncate(e.argsSummary, MAX_SUMMARY))
+        put("result", BodyText.truncate(e.resultSummary, MAX_SUMMARY))
         put("project", project)
     }.toString()
 
@@ -178,7 +180,8 @@ object ActivityStore {
             isError = o["is_error"]?.jsonPrimitive?.booleanOrNull ?: false,
             argsSummary = o["args"]?.jsonPrimitive?.contentOrNull ?: "",
             resultSummary = o["result"]?.jsonPrimitive?.contentOrNull ?: "",
-            requestResponse = null
+            requestResponse = null,
+            outOfScope = o["out_of_scope"]?.jsonPrimitive?.booleanOrNull ?: false,
         ) to (o["project"]?.jsonPrimitive?.contentOrNull ?: "")
     } catch (_: Exception) {
         null
@@ -210,6 +213,7 @@ object ActivityStore {
         put("method", e.method)
         put("host", e.host)
         put("status_code", e.statusCode)
+        put("out_of_scope", e.outOfScope)
     }
 
     /** Appends one entry to the durable store. No-ops when [enabled] is false (session-only mode). */

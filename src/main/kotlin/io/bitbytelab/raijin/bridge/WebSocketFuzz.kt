@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.bridge
 
 import io.bitbytelab.raijin.safety.SafeRegex
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.state.WebSocketConnection
 import io.bitbytelab.raijin.state.WebSocketMessage
 import kotlinx.serialization.json.*
@@ -120,8 +121,11 @@ internal object WebSocketFuzzPlan {
 /** What a fuzz run needs from the bridge; tests supply an in-memory one. */
 internal interface WebSocketFuzzHost {
 
-    /** The outcome of [open]: the new connection, or why there is none. */
-    class Opened(val connection: WebSocketConnection?, val error: String?)
+    /**
+     * The outcome of [open]: the new connection, or why there is none. [scopeWarning] is the
+     * opened socket's advisory scope warning, carried to the fuzz result.
+     */
+    class Opened(val connection: WebSocketConnection?, val error: String?, val scopeWarning: String? = null)
 
     /** True once the extension is unloading: the run stops before its next payload. */
     val stopping: Boolean
@@ -234,11 +238,17 @@ internal object WebSocketFuzz {
             setupMessages = request.setupMessages,
         )
         val began = System.nanoTime()
+        // Every fresh socket goes to the same URL: its first advisory warning speaks for the run.
+        var scopeWarning: String? = null
         val execution = runner.execute(
             frames = frames,
             start = start,
             shared = shared,
-            open = { host.open(url.orEmpty(), request.headers, request.subprotocol) },
+            open = {
+                host.open(url.orEmpty(), request.headers, request.subprotocol).also { opened ->
+                    if (scopeWarning == null) scopeWarning = opened.scopeWarning
+                }
+            },
             delayMs = delayMs,
             budgetNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs),
         )
@@ -250,7 +260,7 @@ internal object WebSocketFuzz {
             .map { TimeUnit.NANOSECONDS.toMillis(it.responseNanos) }
             .sorted()
 
-        return buildJsonObject {
+        return ScopeGate.addWarning(buildJsonObject {
             put("mode", if (shared != null) "connection" else "fresh_connection")
             if (shared != null) put("connection_id", shared.connectionId) else put("url", url)
             put("message_type", if (binary) "BINARY" else "TEXT")
@@ -281,7 +291,7 @@ internal object WebSocketFuzz {
                     add(exchangeJson(exchange, clustering.clusterOf[position], maxFrameLength, binary, perPayloadConnection = shared == null))
                 }
             }
-        }
+        }, scopeWarning)
     }
 
     private fun failure(message: String): JsonObject = buildJsonObject { put("error", message) }

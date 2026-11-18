@@ -2,6 +2,7 @@ package io.bitbytelab.raijin.ui
 
 import io.bitbytelab.raijin.bridge.ScopeBridge
 import io.bitbytelab.raijin.events.EventBus
+import io.bitbytelab.raijin.safety.ScopeMode
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -27,7 +28,10 @@ internal class ScopeViewerPanel(
     private val scope: ScopeBridge,
     private val eventBus: EventBus,
     private val tasks: UiTasks,
+    /** The raw `mcp_scope_mode` preference, shown with what it does. */
+    private val readMode: () -> String?,
 ) : JPanel(BorderLayout()) {
+    private val modeLabel = TintedLabel(" ") { RaijinTheme.muted() }
     private val model = SnapshotTableModel(
         arrayOf("List", "#", "Enabled", "Rule"),
         mapOf(1 to SnapshotTableModel.INT, 2 to SnapshotTableModel.BOOLEAN),
@@ -55,7 +59,11 @@ internal class ScopeViewerPanel(
         val bar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4))
         bar.add(JButton("Refresh").apply { addActionListener { load() } })
         bar.add(status)
-        add(bar, BorderLayout.NORTH)
+        val top = JPanel(BorderLayout())
+        top.add(JPanel(FlowLayout(FlowLayout.LEFT, 6, 2)).apply { add(modeLabel) }, BorderLayout.NORTH)
+        top.add(bar, BorderLayout.SOUTH)
+        add(top, BorderLayout.NORTH)
+        refreshMode()
         add(JScrollPane(table), BorderLayout.CENTER)
 
         addHierarchyListener { e ->
@@ -72,6 +80,13 @@ internal class ScopeViewerPanel(
     }
 
     fun dispose() = eventBus.unsubscribe(subscription)
+
+    /** Re-reads the scope mode (the UI timer calls this), so a change from any source shows up. */
+    fun refreshMode() {
+        val mode = ScopeMode.fromString(runCatching { readMode() }.getOrNull())
+        val text = "Scope mode: ${mode.name} — ${ServerSettings.scopeModeHint(mode)}"
+        if (modeLabel.text != text) modeLabel.text = text
+    }
 
     private fun render(result: JsonObject) {
         val error = (result["error"] as? JsonPrimitive)?.contentOrNull

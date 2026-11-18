@@ -51,7 +51,7 @@ def completed(results):
         assertEquals("running", result["status"])
         assertNotNull(result["run_id"])
         assertNotNull(result["message"])
-        assertTrue((result["message"] as String).contains("turbo_run_status"))
+        assertTrue((result["message"] as String).contains("turbo_run(action=status)"))
         assertFalse(result.containsKey("running"), "Should not contain 'running' boolean")
         assertFalse(result.containsKey("finished"), "Should not contain 'finished' boolean")
         assertNotNull(result["status_message"])
@@ -499,6 +499,7 @@ def completed(results):
 
         // Simulate engine with permaFails but no successful results
         val engine = FakeRequestEngine(permaFailCount = 5, lastErrorMessage = "javax.net.ssl.SSLHandshakeException: Connection refused")
+        engine.finalized = true
         run.handler.setRequestEngine(engine)
         run.handler.markScriptCompleted()
 
@@ -558,8 +559,9 @@ def handleResponse(req, interesting):
 class FakeOrganizerProvider : OrganizerProvider {
     val sentItems = mutableListOf<Pair<io.bitbytelab.raijin.turbo.Request, String>>()
 
-    override fun sendToOrganizer(request: io.bitbytelab.raijin.turbo.Request, notes: String) {
+    override fun sendToOrganizer(request: io.bitbytelab.raijin.turbo.Request, notes: String): Boolean {
         sentItems.add(Pair(request, notes))
+        return true
     }
 }
 

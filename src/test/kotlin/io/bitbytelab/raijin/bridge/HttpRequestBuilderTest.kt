@@ -46,8 +46,31 @@ class HttpRequestBuilderTest {
 
     @Test
     fun `constructRawHttpRequest brackets an IPv6 host in the Host header`() {
-        assertTrue(HttpRequestBuilder.constructRawHttpRequest("http://x/", "GET", emptyMap(), null, "::1", 8080, false).contains("\r\nHost: [::1]:8080\r\n"))
+        // Without a URL authority the Host comes from the connection target.
+        assertTrue(HttpRequestBuilder.constructRawHttpRequest("/", "GET", emptyMap(), null, "::1", 8080, false).contains("\r\nHost: [::1]:8080\r\n"))
         assertTrue(HttpRequestBuilder.constructRawHttpRequest("https://[::1]/", "GET", emptyMap(), null, "[::1]", 443, true).contains("\r\nHost: [::1]\r\n"))
+    }
+
+    @Test
+    fun `a host override moves the connection but the Host header stays the URL's`() {
+        val raw = HttpRequestBuilder.constructRawHttpRequest("http://t/", "GET", emptyMap(), null, "10.0.0.5", 80, false)
+        assertTrue(raw.contains("\r\nHost: t\r\n"), raw)
+    }
+
+    @Test
+    fun `the URL target is sent exactly as written`() {
+        val raw = HttpRequestBuilder.constructRawHttpRequest(
+            "https://t/s?q=<script>alert(1)</script>", "GET", emptyMap(), null, "t", 443, true,
+        )
+        assertTrue(raw.startsWith("GET /s?q=<script>alert(1)</script> HTTP/1.1\r\n"), raw)
+    }
+
+    @Test
+    fun `splitUrl keeps hosts and targets verbatim`() {
+        assertEquals(HttpRequestBuilder.UrlParts("http", "my_host:8080", "/a b|{c}"), HttpRequestBuilder.splitUrl("http://user@my_host:8080/a b|{c}"))
+        assertEquals("/?x=1", HttpRequestBuilder.splitUrl("https://h?x=1")?.target)
+        assertEquals("/", HttpRequestBuilder.splitUrl("https://h")?.target)
+        assertEquals(null, HttpRequestBuilder.splitUrl("/relative"))
     }
 
     // --- native HTTP/2 requests ---

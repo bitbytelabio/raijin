@@ -7,6 +7,7 @@ import io.bitbytelab.raijin.core.asBoundedInt
 import io.bitbytelab.raijin.core.asClampedInt
 import io.bitbytelab.raijin.core.asJsonObjectList
 import io.bitbytelab.raijin.core.withClampReport
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
@@ -30,7 +31,7 @@ object IdorTools {
                 "response is not the reader's own view or a not-found answer, and confirmed when another identity's canary appears in it. " +
                 "The id is swapped at its parameter boundary only (one path segment, one query/form/cookie/header value, one JSON value), so /v1/users/1 " +
                 "never becomes /v2/users/2, and Content-Length is corrected. Auto-detects the object id in path/query/body/header/cookie (preferring an " +
-                "identity's own object_id when the request holds it), or pin it with id_value/id_location/id_name. Scope-gated (mcp_scope_mode) and bounded.",
+                "identity's own object_id when the request holds it), or pin it with id_value/id_location/id_name. Bounded. " + ScopeGate.TOOL_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("request") { put("type", "string"); put("description", "Raw HTTP request A makes to A's own object") }

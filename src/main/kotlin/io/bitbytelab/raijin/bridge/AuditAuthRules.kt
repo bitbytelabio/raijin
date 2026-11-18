@@ -92,7 +92,7 @@ internal class AuditAuthRules(
 
     /** Removes the rules [install] returned [ruleId] for. */
     fun remove(ruleId: String) {
-        stateManager.trafficRules.removeIf { it.ruleId == ruleId || it.ruleId == ruleId + STRIP_SUFFIX }
+        removeRules(stateManager, ruleId)
     }
 
     /** Ties the rules [ruleId] to the audit [taskId], so they go when it does. */
@@ -189,6 +189,14 @@ internal class AuditAuthRules(
         private val PERCENT = Regex("(\\d{1,3})\\s*%")
         private val ENDED = listOf("finished", "cancelled", "canceled", "aborted", "abandoned")
         private const val COOKIE = "Cookie"
+
+        /**
+         * Removes traffic rule [ruleId] and, for an audit auth rule, the `-strip` rule that goes with
+         * it: deleting only the header-setting rule would leave the header stripped from every
+         * Scanner request. True when anything was removed.
+         */
+        fun removeRules(stateManager: StateManager, ruleId: String): Boolean =
+            stateManager.trafficRules.removeIf { it.ruleId == ruleId || it.ruleId == ruleId + STRIP_SUFFIX }
 
         /**
          * Validates the header and works out which hosts it may be sent to.

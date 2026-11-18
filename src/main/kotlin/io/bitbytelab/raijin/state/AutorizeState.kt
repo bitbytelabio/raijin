@@ -299,6 +299,12 @@ class AutorizeSeenGuard(
         return variants.computeIfAbsent(endpoint) { AtomicInteger() }.incrementAndGet() <= maxVariants
     }
 
+    /** The inverse of [seenOnce] for one [key]: the next offer of it replays again. */
+    fun unsee(key: String, endpoint: String = key.substringBefore('?')) {
+        if (!seen.remove(key) || endpoint == key) return
+        variants[endpoint]?.updateAndGet { (it - 1).coerceAtLeast(0) }
+    }
+
     /** Forgets every key, or only those of [ruleId]. */
     fun clear(ruleId: String?) {
         if (ruleId == null) {

@@ -41,6 +41,7 @@ class RunHandlerTest {
     fun `status returns exited-early when engine state is 3 (cancelled)`() {
         val engine = TestRequestEngine()
         engine.setRunState(3) // cancelled
+        engine.finalized = true
 
         handler.setRequestEngine(engine)
 
@@ -51,9 +52,25 @@ class RunHandlerTest {
     fun `status returns completed when engine state is 4`() {
         val engine = TestRequestEngine()
         engine.setRunState(4) // completed
+        engine.finalized = true
 
         handler.setRequestEngine(engine)
+        handler.markScriptCompleted()
 
+        assertEquals("completed", handler.status())
+    }
+
+    @Test
+    fun `a finished engine reads running until it is ranked and the script is done`() {
+        val engine = TestRequestEngine()
+        engine.setRunState(4)
+        handler.setRequestEngine(engine)
+        assertEquals("running", handler.status(), "not ranked yet")
+
+        engine.finalized = true
+        assertEquals("running", handler.status(), "script still in completed()")
+
+        handler.markScriptCompleted()
         assertEquals("completed", handler.status())
     }
 
@@ -212,6 +229,7 @@ class RunHandlerTest {
     fun `a completed run stays completed when it is stopped afterwards`() {
         val engine = TestRequestEngine().apply { start() }
         engine.setRunState(4)
+        engine.finalized = true
         handler.setRequestEngine(engine)
 
         handler.abort()

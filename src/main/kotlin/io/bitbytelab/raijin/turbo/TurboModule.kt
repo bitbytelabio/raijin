@@ -46,6 +46,8 @@ object TurboModule {
     }
 
     fun uninstall() {
+        // First, so every wait a run is in (complete(), the queue, the workers) sees the unload at once.
+        Utils.unloaded = true
         TurboIntruderFrame.closeAll()
         runManager.stopMemoryMonitor()
         runManager.abortAndClearAll()

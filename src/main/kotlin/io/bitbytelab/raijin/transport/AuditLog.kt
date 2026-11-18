@@ -1,6 +1,8 @@
 package io.bitbytelab.raijin.transport
 
+import io.bitbytelab.raijin.core.BodyText
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.io.File
@@ -37,9 +39,10 @@ class AuditFileStore(
         url: String,
         host: String,
         method: String,
-        statusCode: Int
+        statusCode: Int,
+        outOfScope: Boolean = false,
     ) {
-        val line = AuditLog.buildEntry(toolName, timestampIso, durationMs, isError, args, url, host, method, statusCode)
+        val line = AuditLog.buildEntry(toolName, timestampIso, durationMs, isError, args, url, host, method, statusCode, outOfScope)
         lock.withLock {
             try {
                 JsonlStoreSupport.appendLine(file, line)
@@ -130,7 +133,15 @@ object AuditLog {
 
     fun path(): String = store.path()
 
-    /** Builds one JSONL audit record (pure; no I/O). Optional fields are omitted when blank. */
+    /** The Burp project the records belong to, as the activity store names it; set at startup. */
+    @Volatile
+    var project: String = ""
+
+    /**
+     * Builds one JSONL audit record (pure; no I/O). Optional fields are omitted when blank. Each
+     * argument keeps its JSON value: a long string is cut (never inside a surrogate pair), and an
+     * oversized object or array is replaced by a note giving its size.
+     */
     fun buildEntry(
         toolName: String,
         timestampIso: String,
@@ -140,23 +151,37 @@ object AuditLog {
         url: String,
         host: String,
         method: String,
-        statusCode: Int
+        statusCode: Int,
+        outOfScope: Boolean = false,
+        project: String = this.project,
     ): String = buildJsonObject {
         put("ts", timestampIso)
         put("tool", toolName)
         put("duration_ms", durationMs)
         put("is_error", isError)
+        if (outOfScope) put("out_of_scope", true)
+        if (project.isNotEmpty()) put("project", project)
         if (url.isNotEmpty()) put("url", url)
         if (host.isNotEmpty()) put("host", host)
         if (method.isNotEmpty()) put("method", method)
         if (statusCode != 0) put("status_code", statusCode)
         put("args", buildJsonObject {
-            args?.forEach { (k, v) ->
-                val s = v.toString()
-                put(k, if (s.length > MAX_VALUE) s.take(MAX_VALUE) + "...[+${s.length - MAX_VALUE}]" else s)
-            }
+            args?.forEach { (k, v) -> put(k, cappedArg(v)) }
         })
     }.toString()
+
+    private fun cappedArg(value: JsonElement): JsonElement {
+        if (value is JsonPrimitive) {
+            // Every primitive is capped: a lenient client can send a huge unquoted literal too.
+            val s = value.content
+            if (s.length <= MAX_VALUE) return value
+            return JsonPrimitive(BodyText.truncate(s, MAX_VALUE) + "...[+${s.length - MAX_VALUE}]")
+        }
+        // An oversized object or array keeps its start (requests, steps), so the call can still be reconstructed.
+        val text = value.toString()
+        return if (text.length <= MAX_VALUE) value
+        else JsonPrimitive(BodyText.truncate(text, MAX_VALUE) + "…[json truncated: ${text.length} chars]")
+    }
 
     /** Appends an audit record to the log file. */
     fun record(
@@ -168,6 +193,7 @@ object AuditLog {
         url: String,
         host: String,
         method: String,
-        statusCode: Int
-    ) = store.record(toolName, timestampIso, durationMs, isError, args, url, host, method, statusCode)
+        statusCode: Int,
+        outOfScope: Boolean = false,
+    ) = store.record(toolName, timestampIso, durationMs, isError, args, url, host, method, statusCode, outOfScope)
 }

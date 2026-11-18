@@ -2,6 +2,7 @@ package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
 import io.bitbytelab.raijin.events.EventBus
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.state.StateManager
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
@@ -74,7 +75,7 @@ class BridgeFactory {
             eventBus: EventBus,
             stateManager: StateManager
         ): Bridges {
-            val persistence = PersistenceBridge(api)
+            val persistence = PersistenceBridge(api, eventBus)
             val findings = FindingsBridge(stateManager)
             return Bridges(
                 proxy = ProxyBridge(api, eventBus, stateManager, findings),
@@ -88,7 +89,7 @@ class BridgeFactory {
                 comparer = ComparerBridge(api),
                 decoder = DecoderBridge(api),
                 organizer = OrganizerBridge(api),
-                turbo = TurboBridge(),
+                turbo = TurboBridge(scopeAdvice = ScopeGate(api).let { gate -> { url: String -> gate.advise(url, "turbo").warning } }),
                 websocket = WebSocketBridge(api, eventBus, stateManager),
                 burpSuite = BurpSuiteBridge(api),
                 utilities = UtilitiesBridge(api),

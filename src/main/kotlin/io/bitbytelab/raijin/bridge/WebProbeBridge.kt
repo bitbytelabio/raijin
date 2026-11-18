@@ -39,7 +39,11 @@ class WebProbeBridge(private val api: MontoyaApi) {
      */
     fun corsProbe(url: String): JsonObject {
         val check = scopeGate.check(url)
-        check.deny?.let { return it }
+        if (check.blocked) return check.denyJson()
+        return check.annotate(corsProbeChecked(url))
+    }
+
+    private fun corsProbeChecked(url: String): JsonObject {
         return try {
             val seed = transport.seed(url)
             val issues = ArrayList<JsonObject>()
@@ -63,7 +67,12 @@ class WebProbeBridge(private val api: MontoyaApi) {
                             .withHeader("Access-Control-Request-Method", CorsAnalysis.PREFLIGHT_METHOD)
                             .withHeader("Access-Control-Request-Headers", CorsAnalysis.PREFLIGHT_HEADER),
                     )
-                    if (response != null || preflightResponse != null) answered++
+                    if (response != null || preflightResponse != null) {
+                        answered++
+                    } else if (answered == 0) {
+                        // The first origin got nothing back at all: the rest would only wait out timeouts.
+                        return buildJsonObject { put("error", "target unreachable: no response to GET or preflight") }
+                    }
 
                     val acao = response?.header("access-control-allow-origin")
                     val acac = response?.header("access-control-allow-credentials")
@@ -131,7 +140,6 @@ class WebProbeBridge(private val api: MontoyaApi) {
             if (answered == 0) return buildJsonObject { put("error", "No response from $url") }
             buildJsonObject {
                 put("url", url)
-                check.warning?.let { put("scope_warning", it) }
                 put("vulnerable", issues.isNotEmpty())
                 put("highest_severity", highest(severities))
                 put("cors_enabled", corsEnabled)
@@ -166,7 +174,18 @@ class WebProbeBridge(private val api: MontoyaApi) {
         val wanted = checks.orEmpty().map { it.trim().lowercase() }.filter { it.isNotEmpty() }.ifEmpty { CACHE_CHECKS }
         for (name in wanted) EnumValidation.error(name, CACHE_CHECKS.toSet(), "checks")?.let { return it }
         val check = scopeGate.check(url)
-        check.deny?.let { return it }
+        if (check.blocked) return check.denyJson()
+        return check.annotate(cacheProbeChecked(url, wanted, headers, probeHeaders, probeCookies, maxRequests))
+    }
+
+    private fun cacheProbeChecked(
+        url: String,
+        wanted: List<String>,
+        headers: Map<String, String>,
+        probeHeaders: List<String>,
+        probeCookies: List<String>,
+        maxRequests: Int,
+    ): JsonObject {
         return try {
             val seed = transport.seed(url)
             val config = CacheProbe.Config(
@@ -186,7 +205,6 @@ class WebProbeBridge(private val api: MontoyaApi) {
             val severities = report.poisoning.map { it.severity } + report.deception.map { it.severity }
             buildJsonObject {
                 put("url", url)
-                check.warning?.let { put("scope_warning", it) }
                 put("vulnerable", report.poisoning.any { it.verdict == CacheProbe.CONFIRMED } || report.deception.any { it.verdict == CacheProbe.CONFIRMED })
                 put("highest_severity", highest(severities))
                 put("cache", buildJsonObject {
@@ -260,7 +278,11 @@ class WebProbeBridge(private val api: MontoyaApi) {
     /** Fingerprints tech / WAF / framework from a single GET. */
     fun fingerprint(url: String): JsonObject {
         val check = scopeGate.check(url)
-        check.deny?.let { return it }
+        if (check.blocked) return check.denyJson()
+        return check.annotate(fingerprintChecked(url))
+    }
+
+    private fun fingerprintChecked(url: String): JsonObject {
         return try {
             val resp = BoundedHttp.send(api, HttpRequest.httpRequestFromUrl(url))?.response()
                 ?: return buildJsonObject { put("error", "No response from $url") }
@@ -269,7 +291,6 @@ class WebProbeBridge(private val api: MontoyaApi) {
             val techs = Fingerprint.detect(headers, body)
             buildJsonObject {
                 put("url", url)
-                check.warning?.let { put("scope_warning", it) }
                 put("status", resp.statusCode().toInt())
                 put("technologies", buildJsonArray { techs.forEach { add(it) } })
             }

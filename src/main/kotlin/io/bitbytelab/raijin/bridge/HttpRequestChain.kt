@@ -43,9 +43,13 @@ internal class HttpRequestChain(
         val fixReport: Map<String, JsonElement>,
         val error: String? = null,
         val timeout: Boolean = false,
-        val outOfScope: Boolean = false,
+        val scope: ScopeGate.Check? = null,
+        val extractMissed: List<String> = emptyList(),
+        val unresolvedPlaceholders: List<String> = emptyList(),
     ) {
-        val success: Boolean get() = error == null && !outOfScope
+        /** Blocked by the scope gate under enforce: nothing was sent. */
+        val outOfScope: Boolean get() = scope?.blocked == true
+        val success: Boolean get() = error == null && !outOfScope && exchange?.response() != null
     }
 
     /** @param variables every value extracted over the whole run, by name. */
@@ -73,16 +77,18 @@ internal class HttpRequestChain(
         val results = ArrayList<StepResult>()
         for ((index, step) in steps.withIndex()) {
             val fixReport = LinkedHashMap<String, JsonElement>()
+            var scope: ScopeGate.Check? = null
+            var unresolved = emptyList<String>()
             val result = try {
                 val substituted = substituteVariables(step, variables)
+                unresolved = unresolvedPlaceholders(substituted)
                 // Checked before sending, so a malformed extract rule fails the step without a request.
                 val rules = parseExtractRules(substituted["extract"])
                 val request = prepare(HttpRequestBuilder.fromObject(substituted, fixReport))
-                if (scopeGate.deny(request.url()) != null) {
-                    StepResult(
-                        index, null, null, emptyMap(), fixReport, outOfScope = true,
-                        error = "Blocked by scope policy: step target is not in Burp's scope (mcp_scope_mode=enforce).",
-                    )
+                val check = scopeGate.checkHttpRequest(request)
+                scope = check
+                if (check.blocked) {
+                    StepResult(index, null, null, emptyMap(), fixReport, scope = check, unresolvedPlaceholders = unresolved)
                 } else {
                     val start = System.nanoTime()
                     val exchange = timeouts.run(timeoutMs) {
@@ -93,12 +99,17 @@ internal class HttpRequestChain(
                     siteMapNote?.let { api.recordInSiteMap(exchange, it(index)) }
                     val extracted = extract(rules, exchange)
                     variables.putAll(extracted)
-                    StepResult(index, exchange, elapsedMs, extracted, fixReport)
+                    StepResult(
+                        index, exchange, elapsedMs, extracted, fixReport, scope = check,
+                        extractMissed = rules.map { it.name }.filter { it !in extracted },
+                        unresolvedPlaceholders = unresolved,
+                    )
                 }
             } catch (e: Exception) {
                 StepResult(
                     index, null, null, emptyMap(), fixReport,
                     error = e.message ?: "Unknown error", timeout = e is HttpRequestTimeoutException,
+                    scope = scope, unresolvedPlaceholders = unresolved,
                 )
             }
             results += result
@@ -200,6 +211,22 @@ internal class HttpRequestChain(
             }
             is JsonObject -> JsonObject(element.mapValues { (_, value) -> substitute(value, variables) })
             is JsonArray -> buildJsonArray { element.forEach { add(substitute(it, variables)) } }
+        }
+
+        private val PLACEHOLDER = Regex("\\{\\{([^{}]+)}}")
+
+        /** Names of `{{x}}` placeholders still present in any string of [obj] after substitution. */
+        fun unresolvedPlaceholders(obj: JsonElement): List<String> {
+            val out = LinkedHashSet<String>()
+            fun walk(e: JsonElement) {
+                when (e) {
+                    is JsonPrimitive -> if (e.isString) PLACEHOLDER.findAll(e.content).forEach { out += it.groupValues[1] }
+                    is JsonObject -> e.forEach { (k, v) -> if (k != "extract") walk(v) }
+                    is JsonArray -> e.forEach(::walk)
+                }
+            }
+            walk(obj)
+            return out.toList()
         }
 
         private fun JsonObject.text(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull

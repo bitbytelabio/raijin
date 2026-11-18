@@ -18,6 +18,7 @@ import io.bitbytelab.raijin.bridge.HttpPipelineConnectionRegistry
 import io.bitbytelab.raijin.turbo.TurboModule
 import io.bitbytelab.raijin.ui.RaijinTab
 import io.bitbytelab.raijin.ui.RaijinTheme
+import io.bitbytelab.raijin.ui.ServerSettings
 
 class RaijinExtension : BurpExtension {
     private lateinit var api: MontoyaApi
@@ -87,6 +88,7 @@ class RaijinExtension : BurpExtension {
         // the web dashboard (by re-seeding the EventBus ring buffer with the historical events).
         try {
             val projectName = projectKey(api)
+            AuditLog.project = projectName
             // Persistence is operator-controlled (pref mcp_persist_activity, default ON — issue #8).
             // When OFF, don't restore the saved history and don't write new entries (session-only).
             ActivityStore.enabled =
@@ -98,7 +100,7 @@ class RaijinExtension : BurpExtension {
                 ActivityStore.compact(ActivityStore.MAX_LINES)
                 api.logging().logToOutput("Raijin: restored ${restored.size} dashboard activity entries (project: $projectName); persistence ON → ${ActivityStore.path()}")
             } else {
-                api.logging().logToOutput("Raijin: MCP activity persistence is OFF (session only) — toggle it on the Server tab")
+                api.logging().logToOutput("Raijin: MCP activity persistence is OFF (session only) — toggle it on the MCP Activity tab")
             }
             // Listener is always registered; ActivityStore.append() no-ops while persistence is OFF.
             stateManager.mcpActivityListeners.add { entry -> ActivityStore.append(entry, projectName) }
@@ -138,11 +140,11 @@ class RaijinExtension : BurpExtension {
         // the network, so it is only honored when the operator has explicitly opted in
         // (mcp_allow_remote_bind / -Draijin.allowRemoteBind). Otherwise it is refused and
         // downgraded back to loopback. See BindHostPolicy.
-        val requestedHost = System.getProperty("raijin.bindHost")?.trim()?.ifEmpty { null }
-            ?: prefs.getString("mcp_bind_host")?.trim()?.ifEmpty { null }
+        val requestedHost = System.getProperty(ServerSettings.PROP_BIND_HOST)?.trim()?.ifEmpty { null }
+            ?: prefs.getString(ServerSettings.PREF_BIND_HOST)?.trim()?.ifEmpty { null }
             ?: "127.0.0.1"
-        val allowRemoteBind = System.getProperty("raijin.allowRemoteBind")?.toBooleanStrictOrNull()
-            ?: (try { prefs.getBoolean("mcp_allow_remote_bind") } catch (_: Exception) { null } ?: false)
+        val allowRemoteBind = System.getProperty(ServerSettings.PROP_ALLOW_REMOTE_BIND)?.toBooleanStrictOrNull()
+            ?: (try { prefs.getBoolean(ServerSettings.PREF_ALLOW_REMOTE_BIND) } catch (_: Exception) { null } ?: false)
         val bindDecision = BindHostPolicy.resolve(requestedHost, allowRemoteBind)
         val bindHost = bindDecision.effectiveHost
 

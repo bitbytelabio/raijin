@@ -2,6 +2,7 @@ package io.bitbytelab.raijin.tools.accesscontrol
 
 import io.bitbytelab.raijin.bridge.AccessControlBridge
 import io.bitbytelab.raijin.core.asJsonObjectList
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
@@ -19,7 +20,7 @@ object AccessControlTools {
                 "[{name, header_name?, header_value?, headers?, remove_headers?}] — an identity's headers replace the " +
                 "request's own, and a name of none/unauth/anonymous sends the request without any credential header. " +
                 "Uniform refusals (same 401/403/404, a redirect to a login page, a 200 login page or denial message) are " +
-                "informational, never high or critical. Scope-gated (mcp_scope_mode).",
+                "informational, never high or critical. " + ScopeGate.TOOL_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("requests") {

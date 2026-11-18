@@ -1,11 +1,15 @@
 package io.bitbytelab.raijin.tools.turbo
 
 import io.bitbytelab.raijin.bridge.TurboBridge
+import io.bitbytelab.raijin.core.ClampedInt
 import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.core.asBodyString
 import io.bitbytelab.raijin.core.asBooleanSafe
+import io.bitbytelab.raijin.core.asClampedInt
 import io.bitbytelab.raijin.core.asIntSafe
 import io.bitbytelab.raijin.core.asLongSafe
+import io.bitbytelab.raijin.core.withClampReport
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.bitbytelab.raijin.turbo.mcp.McpResourceHandlers
@@ -15,7 +19,7 @@ import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.runInterruptible
 import kotlinx.serialization.json.*
 
 /**
@@ -53,15 +57,23 @@ object TurboTools {
 
     /**
      * Runs [block] off the MCP dispatcher (handlers block on the engine) and maps failures to tool
-     * errors. A handler result carrying an `error` key comes back flagged as an error.
+     * errors. A handler result carrying an `error` key comes back flagged as an error. A cancelled
+     * call interrupts the blocking wait, which then answers with the run's state as it is.
+     * [clamps] are reported on the result (`<name>_clamped_to`).
      */
-    private suspend fun guarded(block: () -> Any?): CallToolResult = try {
-        toolJsonResult(TurboBridge.toJson(withContext(Dispatchers.IO) { block() }))
+    private suspend fun guarded(vararg clamps: Pair<String, ClampedInt?>, block: () -> Any?): CallToolResult = try {
+        var json = TurboBridge.toJson(runInterruptible(Dispatchers.IO) { block() })
+        if (json is JsonObject) clamps.forEach { (name, arg) -> json = (json as JsonObject).withClampReport(name, arg) }
+        toolJsonResult(json)
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
         toolError(e.message ?: e.toString())
     }
+
+    /** An integer argument clamped into [min]..[max], or a tool error for a value that is not an integer. */
+    private inline fun CallToolRequest.clamped(name: String, min: Int, max: Int, onError: (CallToolResult) -> Nothing): ClampedInt? =
+        arg(name).asClampedInt(name, min, max).getOrElse { onError(toolError(it.message ?: "Parameter '$name' must be an integer")) }
 
     fun register(server: Server, bridge: TurboBridge) {
         val runId = "run_id" to prop("string", "Run id")
@@ -71,14 +83,16 @@ object TurboTools {
             description = "Start a Raijin Turbo run: a Python script driving the Turbo request engine (single-packet " +
                 "attack, HTTP/2 + HTTP/3 gates, high-concurrency sends, desync probes). Blocks until the run completes " +
                 "or timeout_ms, then returns the top results by anomaly rank (or a run_id to poll with turbo_run_status). " +
-                "Read turbo_get_docs('api-quickstart') and turbo_list_examples first.",
+                "Read turbo_get_docs('api-quickstart') and turbo_list_examples first. A callback that raises is counted in " +
+                "callback_errors (last_callback_error), not in fails. " + ScopeGate.ADVISORY_NOTE +
+                " The endpoint is checked at start, and every other origin the script queues to once (scope_warnings).",
             inputSchema = ToolSchema(
                 properties = obj(
                     "script" to prop("string", "Python script code that controls the run (defines queueRequests(target, wordlists))"),
                     "base_request" to prop("string", "Base HTTP request template; mark injection points with %s"),
                     "endpoint" to prop("string", "Target endpoint URL, e.g. https://example.com"),
                     "base_input" to prop("string", "Input data fed to the script (e.g. wordlist content)"),
-                    "timeout_ms" to prop("integer", "How long to wait, default 55000. After that the run keeps going and a run_id is returned."),
+                    "timeout_ms" to prop("integer", "How long to wait, default 55000 (1-600000, clamped and reported). After that the run keeps going and a run_id is returned."),
                     "normalize_line_endings" to prop("boolean", "Normalize mixed \\n and \\r\\n to \\r\\n. Default true."),
                 ),
                 required = listOf("script", "base_request", "endpoint")
@@ -86,13 +100,14 @@ object TurboTools {
         ) { req ->
             val script = req.required("script") { return@addTool it }
             val endpoint = req.required("endpoint") { return@addTool it }
-            guarded {
+            val timeout = req.clamped("timeout_ms", 1, 600_000) { return@addTool it }
+            guarded("timeout_ms" to timeout) {
                 bridge.tools.startRun(
                     script = script,
                     baseRequest = req.arg("base_request").asBodyString() ?: "",
                     endpoint = endpoint,
                     baseInput = req.arg("base_input").asBodyString() ?: "",
-                    timeoutMs = (req.long("timeout_ms") ?: 55000L).coerceAtLeast(0L),
+                    timeoutMs = (timeout?.value ?: 55_000).toLong(),
                     normalizeLineEndings = req.bool("normalize_line_endings") ?: true
                 )
             }
@@ -120,7 +135,7 @@ object TurboTools {
             name = "turbo_start_run_async",
             description = "Start a Turbo run and return immediately with a run_id, without blocking. Use this instead " +
                 "of turbo_start_run when the run may take longer than your own call timeout. Poll with " +
-                "turbo_run_status (optionally wait=true) or turbo_list_runs to recover the run_id later.",
+                "turbo_run_status (optionally wait=true) or turbo_list_runs to recover the run_id later. " + ScopeGate.ADVISORY_NOTE,
             inputSchema = ToolSchema(
                 properties = obj(
                     "script" to prop("string", "Python script code that controls the run (defines queueRequests(target, wordlists))"),
@@ -185,19 +200,20 @@ object TurboTools {
                         McpResourceHandlers.SORT_FIELDS
                     ),
                     "descending" to prop("boolean", "Default: the script's sort direction, else true"),
-                    "limit" to prop("integer", "Default 100"),
+                    "limit" to prop("integer", "Default 100 (1-1000, clamped and reported)"),
                     "offset" to prop("integer", "Default 0"),
                 ),
                 required = listOf("run_id")
             )
         ) { req ->
             val id = req.required("run_id") { return@addTool it }
-            guarded {
+            val limit = req.clamped("limit", 1, 1000) { return@addTool it }
+            guarded("limit" to limit) {
                 bridge.resources.getResults(
                     runId = id,
                     sortBy = req.str("sort_by"),
                     descending = req.bool("descending"),
-                    limit = req.int("limit") ?: 100,
+                    limit = limit?.value ?: 100,
                     offset = req.int("offset") ?: 0
                 )
             }

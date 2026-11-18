@@ -28,7 +28,8 @@ internal object HttpExchangeJson {
      */
     fun serialize(result: HttpRequestResponse, elapsedMs: Long?, maxBodyLength: Int? = null): JsonObject = buildJsonObject {
         put("has_response", result.hasResponse())
-        put("url", result.url() ?: "")
+        // Montoya throws for a request it cannot turn into a URL (a malformed target sent on purpose).
+        put("url", runCatching { result.url() }.getOrNull().orEmpty())
 
         try {
             val req = result.request()

@@ -626,7 +626,7 @@ function loadHistory() {
                     status_code: item.status_code || 0,
                     mime_type: item.response_mime_type || item.mime_type || '',
                     in_scope: false,
-                    message_id: item.index || 0
+                    message_id: item.id || 0
                 },
                 timestamp: item.time
             });

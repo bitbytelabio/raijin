@@ -3,6 +3,7 @@ package io.bitbytelab.raijin.bridge
 import burp.api.montoya.MontoyaApi
 import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpService
+import burp.api.montoya.http.RedirectionMode
 import burp.api.montoya.http.handler.HttpHandler
 import burp.api.montoya.http.message.HttpRequestResponse
 import burp.api.montoya.http.message.requests.HttpRequest
@@ -79,6 +80,7 @@ class HttpBridge(
         http2Fields: List<Pair<String, String>>? = null,
         options: HttpSendOptions = HttpSendOptions(),
     ): JsonObject {
+        var scope: ScopeGate.Check? = null
         return try {
             val fixReport = mutableMapOf<String, JsonElement>()
             var mode = HttpModes.resolve(httpMode)
@@ -99,8 +101,10 @@ class HttpBridge(
             }
 
             val targetUrl = try { httpRequest.url() } catch (_: Exception) { url ?: "" }
-            val scope = scopeGate.check(targetUrl)
-            scope.deny?.let { return it }
+            // Where the bytes go (service + path), not what url() reads off the Host header.
+            val check = scopeGate.checkHttpRequest(httpRequest, url)
+            if (check.blocked) return check.denyJson()
+            scope = check
 
             val startTime = System.nanoTime()
             val result: HttpRequestResponse = timeouts.run(timeoutMs) {
@@ -116,13 +120,20 @@ class HttpBridge(
             ToolCallTracker.recordSentResult(result)
 
             val hygiene = if (http2Fields != null) emptyList() else RequestHygiene.scan(method, url, headers)
-            withFixReport(withScopeWarning(withRequestWarnings(HttpExchangeJson.serialize(result, elapsedMs, maxBodyLength), hygiene), scope.warning), fixReport)
+            var json = check.annotate(withFixReport(withRequestWarnings(HttpExchangeJson.serialize(result, elapsedMs, maxBodyLength), hygiene), fixReport))
+            // A followed redirect may land outside scope: flagged, never blocked (advisory).
+            if (options.redirects != null && options.redirects != RedirectionMode.NEVER) {
+                val finalUrl = runCatching { result.request().url() }.getOrNull()
+                if (finalUrl != null && finalUrl != targetUrl) json = scopeGate.advise(finalUrl, "redirect").annotate(json)
+            }
+            json
         } catch (e: Exception) {
-            buildJsonObject {
+            val error = buildJsonObject {
                 put("error", "Failed to send request: ${e.message}")
                 put("is_timeout", e is HttpRequestTimeoutException)
                 put("close_reason", if (e is HttpRequestTimeoutException) "timeout" else "error")
             }
+            scope?.annotate(error) ?: error
         }
     }
 
@@ -152,84 +163,125 @@ class HttpBridge(
         return try {
             val mode = HttpModes.resolve(httpMode)
 
-            // Build all requests, recording original index and any per-request build errors.
-            data class Built(val originalIndex: Int, val request: HttpRequest?, val error: String?)
+            // Build all requests, recording original index, per-item fix reports and build errors.
+            class Built(
+                val originalIndex: Int,
+                val request: HttpRequest?,
+                val error: String?,
+                val fixReport: Map<String, JsonElement>,
+                var scope: ScopeGate.Check? = null,
+            )
             val built = requests.mapIndexed { idx, reqObj ->
+                val fixReport = LinkedHashMap<String, JsonElement>()
                 try {
-                    Built(idx, HttpRequestBuilder.fromObject(reqObj), null)
+                    val request = HttpRequestBuilder.fromObject(reqObj, fixReport)
+                    val service = runCatching { request.httpService() }.getOrNull()
+                    if (service == null) {
+                        Built(idx, null, "no target: raw_request has no Host header and no host argument", fixReport)
+                    } else {
+                        Built(idx, request, null, fixReport)
+                    }
                 } catch (e: Exception) {
-                    Built(idx, null, e.message ?: "Failed to build request")
+                    Built(idx, null, e.message ?: "Failed to build request", fixReport)
                 }
             }
 
-            // Operator scope gate: under ENFORCE, refuse the whole batch if any target is
-            // out of scope, so batching can't bypass the gate http_send_request enforces.
-            val outOfScope = built.mapNotNull { b -> b.request?.url()?.takeIf { scopeGate.deny(it) != null } }
-            if (outOfScope.isNotEmpty()) {
-                return buildJsonObject {
-                    put("error", "Blocked by scope policy: ${outOfScope.size} request(s) target out-of-scope hosts (mcp_scope_mode=enforce).")
-                    put("out_of_scope", true)
-                    put("blocked_urls", buildJsonArray { outOfScope.distinct().take(20).forEach { add(it) } })
-                }
+            // Scope per item: a blocked item is not sent, the rest go out (warned ones flagged).
+            for (b in built) {
+                val request = b.request ?: continue
+                b.scope = scopeGate.checkHttpRequest(request)
             }
+            val blocked = built.filter { it.scope?.blocked == true }
+            val sendable = built.filter { it.request != null && it.scope?.blocked != true }
 
             // Burp's sendRequests() rejects mixed services ("HTTP service on each request must be
             // the same"), so requests are grouped by service and each group dispatched separately.
-            val grouped = built.filter { it.request != null }.groupBy { b ->
+            val grouped = sendable.groupBy { b ->
                 val svc = b.request!!.httpService()
                 Triple(svc.host(), svc.port(), svc.secure())
             }
 
-            // Storage for results in original-input order.
+            // Storage for results and per-slot failures in original-input order.
             val resultsArray = arrayOfNulls<HttpRequestResponse>(requests.size)
+            val failures = arrayOfNulls<JsonObject>(requests.size)
             val perGroupTimings = mutableMapOf<String, Long>()
 
             val totalStart = System.nanoTime()
-            timeouts.run(timeoutMs) {
-                grouped.forEach { (svc, group) ->
-                    val groupKey = "${svc.first}:${svc.second}:${if (svc.third) "tls" else "plain"}"
-                    val groupStart = System.nanoTime()
-                    val groupResults = try {
-                        api.http().sendRequests(group.map { it.request!! }, mode)
-                    } catch (_: Exception) {
-                        // If a single group fails, leave its slots null; carry on with others.
-                        emptyList()
+            // One deadline for the batch: each group gets what is left, so one slow host never
+            // discards the responses other groups already have.
+            val deadline = timeoutMs?.takeIf { it > 0 }?.let { totalStart + it * 1_000_000 }
+            grouped.forEach { (svc, group) ->
+                val groupKey = "${svc.first}:${svc.second}:${if (svc.third) "tls" else "plain"}"
+                val remainingMs = deadline?.let { (it - System.nanoTime()) / 1_000_000 }
+                if (remainingMs != null && remainingMs <= 0) {
+                    val notSent = buildJsonObject {
+                        put("error", "not sent: batch deadline passed")
+                        put("phase", "send")
+                        put("not_sent", true)
                     }
-                    perGroupTimings[groupKey] = (System.nanoTime() - groupStart) / 1_000_000
+                    group.forEach { failures[it.originalIndex] = notSent }
+                    return@forEach
+                }
+                val groupStart = System.nanoTime()
+                try {
+                    val groupResults = timeouts.run(remainingMs) { api.http().sendRequests(group.map { it.request!! }, mode) }
                     group.forEachIndexed { gIdx, b ->
                         if (gIdx < groupResults.size) resultsArray[b.originalIndex] = groupResults[gIdx]
                     }
+                } catch (e: Exception) {
+                    val failure = buildJsonObject {
+                        if (e is HttpRequestTimeoutException) {
+                            put("error", "group send timed out: ${e.message}")
+                            put("is_timeout", true)
+                        } else {
+                            put("error", "group send failed: ${e.message}")
+                        }
+                        put("phase", "send")
+                    }
+                    group.forEach { failures[it.originalIndex] = failure }
                 }
+                perGroupTimings[groupKey] = (System.nanoTime() - groupStart) / 1_000_000
             }
             val totalElapsedMs = (System.nanoTime() - totalStart) / 1_000_000
 
             resultsArray.filterNotNull().forEach { api.recordInSiteMap(it, "[MCP] Parallel request via Raijin") }
 
+            val sentOutOfScope = sendable.count { it.scope?.warning != null }
             buildJsonObject {
+                if (blocked.isNotEmpty() && blocked.size == requests.size) {
+                    put("error", "Not sent: all ${blocked.size} requests are outside Burp's target scope (mcp_scope_mode=enforce).")
+                }
                 put("total_requests", requests.size)
                 put("total_responses", resultsArray.count { it != null })
                 put("total_elapsed_ms", totalElapsedMs)
                 put("groups_dispatched", grouped.size)
+                if (blocked.isNotEmpty()) put(ScopeGate.SKIPPED, blocked.size)
+                if (sentOutOfScope > 0) put(ScopeGate.SENT, sentOutOfScope)
                 put("group_timings_ms", buildJsonObject {
                     perGroupTimings.forEach { (k, v) -> put(k, v) }
                 })
                 put("results", buildJsonArray {
                     built.forEach { b ->
                         val result = resultsArray[b.originalIndex]
-                        add(buildJsonObject {
+                        val item = buildJsonObject {
                             put("index", b.originalIndex)
+                            val scope = b.scope
                             when {
                                 b.error != null -> {
                                     put("error", b.error)
                                     put("phase", "build")
                                 }
+                                scope != null && scope.blocked -> scope.denyJson().forEach { (k, v) -> put(k, v) }
                                 result != null -> HttpExchangeJson.serialize(result, null, maxBodyLength).forEach { (k, v) -> put(k, v) }
+                                failures[b.originalIndex] != null -> failures[b.originalIndex]!!.forEach { (k, v) -> put(k, v) }
                                 else -> {
-                                    put("error", "Send failed (group dispatch error or no response)")
+                                    put("error", "Send failed (no response)")
                                     put("phase", "send")
                                 }
                             }
-                        })
+                            b.fixReport.forEach { (k, v) -> put(k, v) }
+                        }
+                        add(b.scope?.annotate(item) ?: item)
                     }
                 })
             }
@@ -258,19 +310,26 @@ class HttpBridge(
         timeoutMs: Long? = null
     ): JsonObject {
         val result = chain.run(steps, HttpModes.resolve(httpMode), stopOnError, connectionId, timeoutMs)
+        val blocked = result.steps.count { it.outOfScope }
+        val sentOutOfScope = result.steps.count { it.exchange != null && it.scope?.warning != null }
         return buildJsonObject {
+            if (blocked > 0 && blocked == result.steps.size) {
+                put("error", "Not sent: all $blocked requests are outside Burp's target scope (mcp_scope_mode=enforce).")
+            }
             put("total_steps", steps.size)
-            put("completed_steps", result.steps.size)
+            put("completed_steps", result.steps.count { it.exchange != null })
+            if (blocked > 0) put(ScopeGate.SKIPPED, blocked)
+            if (sentOutOfScope > 0) put(ScopeGate.SENT, sentOutOfScope)
             put("variables", buildJsonObject { result.variables.forEach { (k, v) -> put(k, v) } })
             put("steps", buildJsonArray {
                 result.steps.forEach { step ->
-                    add(buildJsonObject {
+                    val item = buildJsonObject {
                         put("step", step.index)
                         put("success", step.success)
                         val exchange = step.exchange
+                        val scope = step.scope
                         if (exchange != null) {
                             HttpExchangeJson.serialize(exchange, step.elapsedMs).forEach { (k, v) -> put(k, v) }
-                            step.fixReport.forEach { (k, v) -> put(k, v) }
                             if (connectionId != null) {
                                 put("connection_id", connectionId)
                                 put("connection_reused", step.index > 0)
@@ -278,12 +337,21 @@ class HttpBridge(
                             if (step.extracted.isNotEmpty()) {
                                 put("extracted", buildJsonObject { step.extracted.forEach { (k, v) -> put(k, v) } })
                             }
+                            if (step.extractMissed.isNotEmpty()) {
+                                put("extract_missed", buildJsonArray { step.extractMissed.forEach { add(it) } })
+                            }
+                        } else if (scope != null && scope.blocked) {
+                            scope.denyJson().forEach { (k, v) -> put(k, v) }
                         } else {
-                            if (step.outOfScope) put("out_of_scope", true)
                             put("error", step.error ?: "Unknown error")
                             if (step.timeout) put("is_timeout", true)
                         }
-                    })
+                        if (step.unresolvedPlaceholders.isNotEmpty()) {
+                            put("unresolved_placeholders", buildJsonArray { step.unresolvedPlaceholders.forEach { add(it) } })
+                        }
+                        step.fixReport.forEach { (k, v) -> put(k, v) }
+                    }
+                    add(step.scope?.annotate(item) ?: item)
                 }
             })
         }
@@ -579,6 +647,7 @@ class HttpBridge(
         maxBodyLength: Int? = null,
         timeoutMs: Long? = null
     ): JsonObject {
+        var scope: ScopeGate.Check? = null
         return try {
             val bytes = if (rawHex != null) {
                 RequestHygiene.decodeHex(rawHex)
@@ -590,11 +659,12 @@ class HttpBridge(
 
             val service = HttpService.httpService(host, port, useTls)
             val httpRequest = HttpRequest.httpRequest(service, BurpByteArray.byteArray(*bytes))
-            val mode = HttpModes.resolve(httpMode)
+            // Byte-level smuggling tests need HTTP/1 framing: AUTO would negotiate h2 and re-frame the bytes.
+            val mode = if (httpMode.isNullOrBlank()) HttpMode.HTTP_1 else HttpModes.resolve(httpMode)
 
-            val targetUrl = try { httpRequest.url() } catch (_: Exception) { (if (useTls) "https" else "http") + "://$host:$port/" }
-            val scope = scopeGate.check(targetUrl)
-            scope.deny?.let { return it }
+            val check = scopeGate.checkRequest(host, port, useTls, String(bytes, Charsets.ISO_8859_1))
+            if (check.blocked) return check.denyJson()
+            scope = check
 
             val startTime = System.nanoTime()
             val result = timeouts.run(timeoutMs) { api.http().sendRequest(httpRequest, mode) }
@@ -603,19 +673,20 @@ class HttpBridge(
             api.recordInSiteMap(result, "[MCP] Raw bytes request via Raijin")
             ToolCallTracker.recordSentResult(result)
 
-            withScopeWarning(HttpExchangeJson.serialize(result, elapsedMs, maxBodyLength), scope.warning)
+            var json = HttpExchangeJson.serialize(result, elapsedMs, maxBodyLength)
+            if (runCatching { result.response()?.httpVersion() }.getOrNull()?.startsWith("HTTP/2") == true) {
+                json = JsonObject(json + ("notes" to buildJsonArray { add("response came back over HTTP/2") }))
+            }
+            check.annotate(json)
         } catch (e: Exception) {
-            buildJsonObject {
+            val error = buildJsonObject {
                 put("error", "Failed to send raw bytes: ${e.message}")
                 put("is_timeout", e is HttpRequestTimeoutException)
                 put("close_reason", if (e is HttpRequestTimeoutException) "timeout" else "error")
             }
+            scope?.annotate(error) ?: error
         }
     }
-
-    /** Returns [base] with a `scope_warning` field appended when [warning] is non-null. */
-    private fun withScopeWarning(base: JsonObject, warning: String?): JsonObject =
-        if (warning == null) base else JsonObject(base + ("scope_warning" to JsonPrimitive(warning)))
 
     /** Merges in any out-of-band fields [HttpRequestBuilder.build] recorded via its `fixReport` parameter
      * (currently just `content_length_rewritten`), so a silent Content-Length rewrite is visible
@@ -662,23 +733,32 @@ class HttpBridge(
         maxBodyLength: Int?,
         timeoutMs: Long?,
         runOptions: HttpFuzzRunner.Options,
+        autoFixContentLength: Boolean = true,
     ): JsonObject {
         runOptions.stopOnBodyRegex?.let { pattern ->
             SafeRegex.validate(pattern)?.let { return buildJsonObject { put("error", "Invalid stop_on_match.body_regex: $it") } }
         }
+        var scope: ScopeGate.Check? = null
         return try {
             val service = HttpService.httpService(host, port, useTls)
             val mode = HttpModes.resolve(httpMode)
-            scopeGate.deny((if (useTls) "https" else "http") + "://$host:$port/")?.let { return it }
             val encode = PayloadEncoders.chain(encoders)
-            val plan = when (val planned = HttpFuzzPlan.planAttack(request, positions, payloadSets, marker, attackMode, encode, maxRequests)) {
+            val planned = HttpFuzzPlan.planAttack(
+                request, positions, payloadSets, marker, attackMode, encode, maxRequests, autoFixContentLength,
+            )
+            val plan = when (planned) {
                 is HttpFuzzPlan.AttackResult.Error -> return buildJsonObject { put("error", planned.message) }
                 is HttpFuzzPlan.AttackResult.Ok -> planned.plan
             }
+            // Every distinct target the run will send (a payload may sit in the path), on host:port.
+            val check = scopeGate.checkRequests(host, port, useTls, plan.requests.map { it.request }.ifEmpty { sequenceOf(request) })
+            if (check.blocked) return check.denyJson()
+            scope = check
             val runner = HttpFuzzRunner { attack -> sendFuzzRequest(attack, service, mode, plan.mode, maxBodyLength, timeoutMs) }
-            runner.run(plan, runOptions)
+            check.annotate(runner.run(plan, runOptions))
         } catch (e: Exception) {
-            buildJsonObject { put("error", "Fuzz failed: ${e.message}") }
+            val error = buildJsonObject { put("error", "Fuzz failed: ${e.message}") }
+            scope?.annotate(error) ?: error
         }
     }
 
@@ -690,7 +770,8 @@ class HttpBridge(
         maxBodyLength: Int?,
         timeoutMs: Long?,
     ): HttpFuzzRunner.Sent {
-        val httpRequest = HttpRequest.httpRequest(service, BurpByteArray.byteArray(*attack.request.toByteArray(Charsets.UTF_8)))
+        val wire = attack.request.toByteArray(RequestHygiene.wireCharset(attack.request))
+        val httpRequest = HttpRequest.httpRequest(service, BurpByteArray.byteArray(*wire))
         val start = System.nanoTime()
         val result = try {
             timeouts.run(timeoutMs) { api.http().sendRequest(httpRequest, mode) }
@@ -739,8 +820,9 @@ class HttpBridge(
         maxBodyLength: Int?,
         timeoutMs: Long?,
         similarity: Double,
+        autoFixContentLength: Boolean = true,
     ): JsonObject = race.run(
-        HttpFuzzPlan.raceRequests(request, count, payloads),
+        HttpFuzzPlan.raceRequests(request, count, payloads, autoFixContentLength),
         payloads?.takeIf { it.isNotEmpty() },
         host, port, useTls, sync, HttpModes.resolve(httpMode), sni, maxBodyLength, timeoutMs, similarity,
     )

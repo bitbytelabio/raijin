@@ -3,10 +3,13 @@ package io.bitbytelab.raijin.ui
 import burp.api.montoya.MontoyaApi
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
+import burp.api.montoya.proxy.ProxyHttpRequestResponse
 import burp.api.montoya.ui.editor.EditorOptions
 import burp.api.montoya.ui.editor.HttpRequestEditor
 import burp.api.montoya.ui.editor.HttpResponseEditor
+import io.bitbytelab.raijin.bridge.AuditAuthRules
 import io.bitbytelab.raijin.bridge.BridgeFactory
+import io.bitbytelab.raijin.bridge.ProxyBridge
 import io.bitbytelab.raijin.core.BuildInfo
 import io.bitbytelab.raijin.core.RaijinExtension
 import io.bitbytelab.raijin.core.RebindOutcome
@@ -17,6 +20,7 @@ import io.bitbytelab.raijin.state.StoredFinding
 import io.bitbytelab.raijin.transport.ActivityStore
 import io.bitbytelab.raijin.transport.FindingsStore
 import io.bitbytelab.raijin.transport.McpServerManager
+import io.bitbytelab.raijin.transport.ResourceRegistry
 import kotlinx.serialization.json.*
 import java.awt.*
 import java.awt.event.MouseEvent
@@ -62,6 +66,8 @@ class RaijinTab(
 ) {
     companion object {
         const val MAX_TABLE_ROWS = 2000
+        private const val MAX_SEEN_INTERACTIONS = 10_000
+        private val SCOPE_WARNING_FIELD = Regex("\"scope_warning\":\"((?:[^\"\\\\]|\\\\.)*)\"")
         private val TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
         private val FINDING_TIME_FORMAT = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss")
 
@@ -87,6 +93,8 @@ class RaijinTab(
     private val tabbedPane = JTabbedPane(JTabbedPane.TOP)
     private val totalToolCalls = AtomicLong(0)
     private val totalErrors = AtomicLong(0)
+    private val totalOutOfScope = AtomicLong(0)
+    private var scopeViewerPanel: ScopeViewerPanel? = null
     private val perToolCounts = ConcurrentHashMap<String, AtomicLong>()
 
     // dispose() runs these newest first; the background pool is registered first, so it stops last.
@@ -106,6 +114,7 @@ class RaijinTab(
     private var shownActivityId: Long? = null
     private val activityPrettyJson = Json { prettyPrint = true; prettyPrintIndent = "  " }
     private val proxyHistoryCache = mutableListOf<JsonObject>()
+    private val proxyStatus = TintedLabel(" ") { RaijinTheme.muted() }
     private var scannerIssuesCache = listOf<JsonObject>()
     private val findingsCache = mutableListOf<StoredFinding>()
     private var findingsSeverityFilter = "Any"
@@ -260,8 +269,9 @@ class RaijinTab(
         // "Clear View" — cosmetic only: empties the visible table, keeps memory + saved history
         // (repopulates on a filter change). Distinct from "Delete Saved History" below. Issue #8.
         fun clearViewOnly() {
+            // The Server tab's call count reads totalToolCalls: it counts calls, not visible rows.
             activityTableModel.rowCount = 0; activityById.clear()
-            totalToolCalls.set(0); totalErrors.set(0); perToolCounts.clear(); updateActivityStats()
+            totalErrors.set(0); totalOutOfScope.set(0); perToolCounts.clear(); updateActivityStats()
         }
         val clearBtn = JButton("Clear View"); clearBtn.font = clearBtn.font.deriveFont(11f); clearBtn.margin = Insets(2, 8, 2, 8)
         clearBtn.toolTipText = "Clear the visible table only — keeps in-memory activity and any saved history"
@@ -328,7 +338,17 @@ class RaijinTab(
         activityTableModel = object : DefaultTableModel(arrayOf("#", "Time", "Tool", "Method", "URL / Detail", "Host", "Status", "ms"), 0) {
             override fun isCellEditable(r: Int, c: Int) = false
         }
-        activityTable = JTable(activityTableModel)
+        activityTable = object : JTable(activityTableModel) {
+            // A call whose result reported an out-of-scope target reads in the warning colour.
+            override fun prepareRenderer(renderer: javax.swing.table.TableCellRenderer, row: Int, column: Int): java.awt.Component {
+                val c = super.prepareRenderer(renderer, row, column)
+                if (!isRowSelected(row)) {
+                    val id = activityTableModel.getValueAt(convertRowIndexToModel(row), 0) as? Long
+                    if (id != null && activityById[id]?.outOfScope == true) c.foreground = RaijinTheme.warning()
+                }
+                return c
+            }
+        }
         activityTable.fillsViewportHeight = true; activityTable.rowHeight = 22; activityTable.setShowGrid(false)
         activityTable.intercellSpacing = Dimension(0, 0); activityTable.autoCreateRowSorter = true
         activityTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
@@ -375,8 +395,9 @@ class RaijinTab(
         val listener: (McpActivityEntry) -> Unit = { entry ->
             totalToolCalls.incrementAndGet()
             if (entry.isError) totalErrors.incrementAndGet()
+            if (entry.outOfScope) totalOutOfScope.incrementAndGet()
             perToolCounts.computeIfAbsent(entry.toolName) { AtomicLong(0) }.incrementAndGet()
-            activityById[entry.id] = entry
+            // activityById holds rendered rows only (addActivityRow), so it stays bounded by the table.
             SwingUtilities.invokeLater {
                 while (activityTableModel.rowCount >= MAX_TABLE_ROWS) {
                     val oldId = activityTableModel.getValueAt(activityTableModel.rowCount - 1, 0) as? Long
@@ -402,6 +423,7 @@ class RaijinTab(
         if (restored.isNotEmpty()) {
             totalToolCalls.set(restored.size.toLong())
             totalErrors.set(restored.count { it.isError }.toLong())
+            totalOutOfScope.set(restored.count { it.outOfScope }.toLong())
             restored.forEach { perToolCounts.computeIfAbsent(it.toolName) { AtomicLong(0) }.incrementAndGet() }
         }
         applyActivityFilter()
@@ -426,6 +448,7 @@ class RaijinTab(
     }
 
     private fun applyActivityFilter() {
+        activityById.clear()
         activityTableModel.rowCount = 0
         for (e in stateManager.mcpActivity.toList()) {
             if (passesActivityFilter(e)) addActivityRow(e, activityTableModel.rowCount)
@@ -438,8 +461,15 @@ class RaijinTab(
 
     private fun updateActivityStats() {
         val top = perToolCounts.entries.sortedByDescending { it.value.get() }.take(3).joinToString("  ") { "${it.key}(${it.value.get()})" }
-        activityStatsLabel.text = "  Calls: ${totalToolCalls.get()}  |  Errors: ${totalErrors.get()}  |  Events: ${eventBus.size()}  |  Top: $top"
+        activityStatsLabel.text = "  Calls: ${totalToolCalls.get()}  |  Errors: ${totalErrors.get()}  |  " +
+            "Out-of-scope: ${totalOutOfScope.get()}  |  Events: ${eventBus.size()}  |  Top: $top"
     }
+
+    /** The `scope_warning` of a result summary (its first key, so it survives the summary's cut), or null. */
+    private fun scopeWarningOf(resultSummary: String): String? =
+        SCOPE_WARNING_FIELD.find(resultSummary)?.groupValues?.get(1)?.let { raw ->
+            runCatching { Json.parseToJsonElement("\"$raw\"").jsonPrimitive.content }.getOrDefault(raw)
+        }
 
     private fun showActivityDetail() {
         val vr = activityTable.selectedRow
@@ -454,7 +484,10 @@ class RaijinTab(
             activityResponseEditor.clear()
             return
         }
+        val scopeLine = scopeWarningOf(entry.resultSummary)?.let { "Scope warning: $it\n" }
+            ?: if (entry.outOfScope) "Scope: out-of-scope target (see the result)\n" else ""
         activityDetailInfo.text = "Tool: ${entry.toolName}  |  Duration: ${entry.durationMs}ms  |  Error: ${entry.isError}\n" +
+            scopeLine +
             "URL: ${entry.url}\nHost: ${entry.host}\n\n" +
             "Arguments:\n${prettyActivityJson(entry.argsSummary)}\n\n" +
             "Result:\n${prettyActivityJson(entry.resultSummary)}"
@@ -539,6 +572,7 @@ class RaijinTab(
         controls.add(fetchBtn)
         controls.add(Box.createHorizontalStrut(12))
         controls.add(JLabel("Regex:")); controls.add(searchField); controls.add(searchBtn)
+        controls.add(proxyStatus)
 
         // Table
         proxyTableModel = object : DefaultTableModel(arrayOf("#", "Method", "URL", "Host", "Status", "MIME", "Length"), 0) {
@@ -575,8 +609,11 @@ class RaijinTab(
             val status = statusField.text.trim().toIntOrNull()
             val count = countField.text.trim().toIntOrNull() ?: 100
             val inScope = scopeCheck.isSelected
+            // The newest entries, newest first: the total first, then the tail of the history.
             tasks.compute("Fetch proxy history", {
-                bridges.proxy.getHistory(0, count, host, method, status, null, inScope, true, true, null)
+                ResourceRegistry.newestFirst(count.coerceIn(1, ProxyBridge.MAX_PAGE_SIZE)) { start, size ->
+                    bridges.proxy.getHistory(start, size, host, method, status, null, inScope, true, true, null)
+                }
             }) { result -> if (!showBridgeError(result, "Fetch proxy history")) showProxyItems(result) }
         }
 
@@ -605,11 +642,13 @@ class RaijinTab(
         val items = result["items"] as? JsonArray ?: JsonArray(emptyList())
         proxyHistoryCache.clear()
         proxyTableModel.rowCount = 0
+        proxyStatus.text = (result["notes"] as? JsonArray)?.joinToString("; ") { it.jsonPrimitive.content }.orEmpty().ifEmpty { " " }
         for (item in items) {
             val obj = item as? JsonObject ?: continue
             proxyHistoryCache.add(obj)
             proxyTableModel.addRow(arrayOf<Any?>(
-                obj["index"]?.jsonPrimitive?.intOrNull ?: 0,
+                // Burp's own message id, the key the real request is looked up by.
+                obj["id"]?.jsonPrimitive?.intOrNull ?: 0,
                 obj["method"]?.jsonPrimitive?.contentOrNull ?: "",
                 obj["url"]?.jsonPrimitive?.contentOrNull ?: "",
                 obj["host"]?.jsonPrimitive?.contentOrNull ?: "",
@@ -628,6 +667,41 @@ class RaijinTab(
             proxyResponseEditor.clear()
             return
         }
+        // Burp's own objects first: the rendered text is cut at max_response_length and re-encoded.
+        val id = item["id"]?.jsonPrimitive?.intOrNull
+        if (id != null) {
+            withProxyItem(id) { real ->
+                // Another row was selected while this one was read: leave the editors to it.
+                val selected = proxyTable.selectedRow.takeIf { it >= 0 }
+                    ?.let { proxyHistoryCache.getOrNull(proxyTable.convertRowIndexToModel(it)) }
+                if (selected?.get("id")?.jsonPrimitive?.intOrNull != id) return@withProxyItem
+                if (real == null) {
+                    showProxyDetailFromText(item)
+                    proxyStatus.text = "Entry $id is no longer in the proxy history: shown from rendered text"
+                    return@withProxyItem
+                }
+                try { proxyRequestEditor.request = real.finalRequest() } catch (_: Exception) { proxyRequestEditor.clear() }
+                try {
+                    val response = if (real.hasResponse()) real.originalResponse() else null
+                    if (response != null) proxyResponseEditor.response = response else proxyResponseEditor.clear()
+                } catch (_: Exception) {
+                    proxyResponseEditor.clear()
+                }
+            }
+            return
+        }
+        showProxyDetailFromText(item)
+    }
+
+    /** Looks a proxy history entry up by Burp [id] off the EDT, then runs [then] on the EDT. */
+    private fun withProxyItem(id: Int, then: (ProxyHttpRequestResponse?) -> Unit) {
+        tasks.compute("Read proxy entry $id", {
+            try { api.proxy().history { it.id() == id }.firstOrNull() } catch (_: Exception) { null }
+        }, then)
+    }
+
+    /** Fallback when the entry is gone from Burp's history: rebuild the exchange from the listed text. */
+    private fun showProxyDetailFromText(item: JsonObject) {
         try {
             val reqStr = item["request"]?.jsonPrimitive?.contentOrNull
             if (reqStr != null) {
@@ -658,19 +732,27 @@ class RaijinTab(
         val url = item["url"]?.jsonPrimitive?.contentOrNull ?: ""
         val host = item["host"]?.jsonPrimitive?.contentOrNull ?: ""
         val menu = JPopupMenu()
+        // The request Burp holds (bytes intact); the rendered text only when the entry is gone.
+        fun withRequest(send: (HttpRequest) -> Unit) {
+            fun fromText() {
+                try {
+                    val reqStr = item["request"]?.jsonPrimitive?.contentOrNull ?: return
+                    val service = burp.api.montoya.http.HttpService.httpService(host, item["port"]?.jsonPrimitive?.intOrNull ?: 443, item["secure"]?.jsonPrimitive?.booleanOrNull ?: true)
+                    send(HttpRequest.httpRequest(service, reqStr))
+                    proxyStatus.text = "sent from rendered text"
+                } catch (_: Exception) {}
+            }
+            val id = item["id"]?.jsonPrimitive?.intOrNull ?: return fromText()
+            withProxyItem(id) { real ->
+                val request = real?.let { runCatching { it.finalRequest() }.getOrNull() }
+                if (request == null) fromText() else runCatching { send(request) }
+            }
+        }
         menu.add(JMenuItem("Send to Repeater").apply { addActionListener {
-            try {
-                val reqStr = item["request"]?.jsonPrimitive?.contentOrNull ?: return@addActionListener
-                val service = burp.api.montoya.http.HttpService.httpService(host, item["port"]?.jsonPrimitive?.intOrNull ?: 443, item["secure"]?.jsonPrimitive?.booleanOrNull ?: true)
-                api.repeater().sendToRepeater(HttpRequest.httpRequest(service, reqStr), "Proxy-$host")
-            } catch (_: Exception) {}
+            withRequest { api.repeater().sendToRepeater(it, "Proxy-$host") }
         }})
         menu.add(JMenuItem("Send to Intruder").apply { addActionListener {
-            try {
-                val reqStr = item["request"]?.jsonPrimitive?.contentOrNull ?: return@addActionListener
-                val service = burp.api.montoya.http.HttpService.httpService(host, item["port"]?.jsonPrimitive?.intOrNull ?: 443, item["secure"]?.jsonPrimitive?.booleanOrNull ?: true)
-                api.intruder().sendToIntruder(HttpRequest.httpRequest(service, reqStr))
-            } catch (_: Exception) {}
+            withRequest { api.intruder().sendToIntruder(it) }
         }})
         menu.addSeparator()
         if (host.isNotEmpty()) menu.add(JMenuItem("Add '$host' to Scope").apply { addActionListener { try { api.scope().includeInScope("https://$host") } catch (_: Exception) {} } })
@@ -1146,14 +1228,22 @@ class RaijinTab(
         // Dedup by interaction id so a hit observed by both a manual poll and
         // the MCP-driven poll (which also emits collaborator.interaction events)
         // is only listed once.
-        val seenInteractions = java.util.Collections.synchronizedSet(HashSet<String>())
+        // Bounded like the table: the oldest ids are forgotten (an LRU set of MAX_SEEN_INTERACTIONS).
+        val seenInteractions: MutableSet<String> = java.util.Collections.newSetFromMap(
+            java.util.Collections.synchronizedMap(object : LinkedHashMap<String, Boolean>(256, 0.75f, true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>): Boolean = size > MAX_SEEN_INTERACTIONS
+            })
+        )
         fun addInteraction(obj: JsonObject) {
             // `id` is the payload's interaction id, shared by every hit of that payload;
             // `seq` is unique per interaction.
             val id = (obj["seq"] ?: obj["id"])?.jsonPrimitive?.contentOrNull ?: ""
             if (id.isNotEmpty() && !seenInteractions.add(id)) return
             val row = interactionRow(obj)
-            SwingUtilities.invokeLater { interTableModel.addRow(row) }
+            SwingUtilities.invokeLater {
+                while (interTableModel.rowCount >= MAX_TABLE_ROWS) interTableModel.removeRow(0)
+                interTableModel.addRow(row)
+            }
         }
 
         // Reflect agent/MCP-driven collaborator activity live. CollaboratorBridge
@@ -1250,12 +1340,13 @@ class RaijinTab(
         proxyRulesTable.addMouseListener(ContextMenuListener { row, e ->
             val menu = JPopupMenu()
             val ruleId = proxyRulesModel.getValueAt(row, 0)?.toString() ?: return@ContextMenuListener
+            // Through the bridge, which holds the rule lock the proxy handlers read under.
             menu.add(JMenuItem("Toggle Enable/Disable").apply { addActionListener {
                 val rule = stateManager.proxyRules.find { it.ruleId == ruleId }
-                if (rule != null) { rule.enabled = !rule.enabled; refreshRulesTab() }
+                if (rule != null) { bridges.proxy.setRule(rule.copy(enabled = !rule.enabled)); refreshRulesTab() }
             }})
             menu.add(JMenuItem("Delete Rule").apply { addActionListener {
-                stateManager.proxyRules.removeIf { it.ruleId == ruleId }; refreshRulesTab()
+                bridges.proxy.removeRule(ruleId); refreshRulesTab()
             }})
             menu.show(e.component, e.x, e.y)
         })
@@ -1263,8 +1354,8 @@ class RaijinTab(
 
         // Traffic Rules
         trafficRulesModel = SnapshotTableModel(
-            arrayOf("ID", "Direction", "Match URL", "Match Host", "Add Header", "Enabled"),
-            mapOf(5 to SnapshotTableModel.BOOLEAN),
+            arrayOf("ID", "Direction", "Match URL", "Match Host", "Add Header", "Remove Header", "Tools", "Enabled"),
+            mapOf(7 to SnapshotTableModel.BOOLEAN),
         )
         trafficRulesTable = rulesTable(trafficRulesModel)
         trafficRulesTable.addMouseListener(ContextMenuListener { row, e ->
@@ -1275,7 +1366,7 @@ class RaijinTab(
                 if (rule != null) { rule.enabled = !rule.enabled; refreshRulesTab() }
             }})
             menu.add(JMenuItem("Delete Rule").apply { addActionListener {
-                stateManager.trafficRules.removeIf { it.ruleId == ruleId }; refreshRulesTab()
+                AuditAuthRules.removeRules(stateManager, ruleId); refreshRulesTab()
             }})
             menu.show(e.component, e.x, e.y)
         })
@@ -1298,7 +1389,10 @@ class RaijinTab(
         rulesTabbed.addTab("WebSocket Rules", JScrollPane(wsRulesTable))
 
         // Burp's target scope, read-only.
-        val scopeViewer = ScopeViewerPanel(bridges.scope, eventBus, tasks)
+        val scopeViewer = ScopeViewerPanel(bridges.scope, eventBus, tasks) {
+            api.persistence().preferences().getString(ServerSettings.PREF_SCOPE_MODE)
+        }
+        scopeViewerPanel = scopeViewer
         disposer.add("scope viewer") { scopeViewer.dispose() }
         rulesTabbed.addTab("Scope", scopeViewer)
 
@@ -1313,11 +1407,15 @@ class RaijinTab(
 
     /** Timer hook: a table is rebuilt only when its rules changed, and keeps the selected rule selected. */
     private fun refreshRulesTab() {
+        scopeViewerPanel?.refreshMode()
         proxyRulesModel.update(stateManager.proxyRules.map { r ->
             listOf<Any?>(r.ruleId, r.type, r.action, r.matchHost ?: "*", r.matchUrl ?: "*", r.matchMethod ?: "*", r.enabled)
         }, proxyRulesTable)
         trafficRulesModel.update(stateManager.trafficRules.map { r ->
-            listOf<Any?>(r.ruleId, r.direction, r.matchUrl ?: "*", r.matchHost ?: "*", r.modifyAddHeader ?: "", r.enabled)
+            listOf<Any?>(
+                r.ruleId, r.direction, r.matchUrl ?: "*", r.matchHost ?: "*", r.modifyAddHeader ?: "",
+                r.modifyRemoveHeader ?: "", r.toolFilter?.sorted()?.joinToString(", ") ?: "all", r.enabled,
+            )
         }, trafficRulesTable)
         sessionRulesModel.update(stateManager.sessionRules.map { r ->
             listOf<Any?>(r.ruleName, r.scope, r.extractFrom, r.injectInto, r.lastExtractedValue ?: "(none)", r.enabled)

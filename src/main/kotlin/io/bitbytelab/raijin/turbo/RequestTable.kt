@@ -25,8 +25,11 @@ import javax.swing.table.DefaultTableCellRenderer
 import javax.swing.table.TableRowSorter
 
 
-class UpdateStatusbar(val message: JLabel, val handler: RunHandler): ActionListener {
+class UpdateStatusbar(val message: JLabel, val handler: RunHandler, val onTerminal: (() -> Unit)? = null): ActionListener {
     lateinit var timer: Timer
+
+    /** When the run was first seen finished; 0 while it runs. */
+    private var terminalSince = 0L
 
     override fun actionPerformed(e: ActionEvent?) {
         val window = SwingUtilities.getWindowAncestor(message)
@@ -38,18 +41,24 @@ class UpdateStatusbar(val message: JLabel, val handler: RunHandler): ActionListe
         // where the rest of the line, underlying error included, can still be read.
         message.toolTipText = if (handler.failureSummary() != null) message.text else null
 
-        if (terminal || window == null) {
-            timer.stop()
-        }
-
-        if (terminal) {
+        if (terminal && terminalSince == 0L) {
+            terminalSince = System.currentTimeMillis()
             when (window) {
                 is Frame -> window.title = window.title?.replace(" - running", " - done")
                 is Dialog -> window.title = window.title?.replace(" - running", " - done")
             }
+            onTerminal?.invoke()
+        }
+
+        // A few more ticks after the end, so a message the script sets in completed() still shows.
+        if (window == null || (terminal && System.currentTimeMillis() - terminalSince >= TERMINAL_GRACE_MS)) {
+            timer.stop()
         }
     }
 
+    private companion object {
+        const val TERMINAL_GRACE_MS = 2_000L
+    }
 }
 
 interface OutputHandler {
@@ -66,7 +75,8 @@ interface OutputHandler {
 internal fun scriptSortOrderToApply(requested: ResultSortOrder?, applied: ResultSortOrder?): ResultSortOrder? =
     requested?.takeIf { it !== applied }
 
-class RequestTable(val store: ResultStore, val service: TurboService, val handler: RunHandler): JPanel() {
+/** @param onTerminal called once on the EDT when the run is first seen finished. */
+class RequestTable(val store: ResultStore, val service: TurboService, val handler: RunHandler, val onTerminal: (() -> Unit)? = null): JPanel() {
     val model = RequestTableModel()
     val issueTable = JTable(model)
     val requestEditor: HttpRequestEditor
@@ -225,7 +235,7 @@ class RequestTable(val store: ResultStore, val service: TurboService, val handle
         statusLabel.horizontalAlignment = SwingConstants.LEFT
         statusPanel.add(statusLabel)
 
-        val updateStatusbar = UpdateStatusbar(statusLabel, handler)
+        val updateStatusbar = UpdateStatusbar(statusLabel, handler, onTerminal)
         panelUpdater = Timer(1000, updateStatusbar)
         updateStatusbar.timer = panelUpdater
         panelUpdater.start()

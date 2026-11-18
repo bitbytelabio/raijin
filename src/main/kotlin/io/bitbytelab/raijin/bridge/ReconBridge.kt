@@ -81,7 +81,7 @@ internal class ProbeTransport(private val api: MontoyaApi) {
  * Reconnaissance/discovery — the capability gap that left the agent only able to
  * test endpoints it was explicitly handed. Provides JS endpoint harvesting,
  * wordlist content discovery (with soft-404 calibration), and hidden-parameter
- * mining. Active probes respect the operator scope policy.
+ * mining. Active probes are checked by [ScopeGate] per the operator's mcp_scope_mode.
  */
 class ReconBridge(private val api: MontoyaApi) {
 
@@ -115,6 +115,7 @@ class ReconBridge(private val api: MontoyaApi) {
 
         private const val MAX_ENDPOINTS = 2000
         private const val MAX_LISTED = 50
+        private const val MAX_SCOPE_WARNINGS = 20
 
         /** Time the passive JS scan may take in total. */
         private const val JS_SCAN_BUDGET_MS = 30_000L
@@ -133,12 +134,19 @@ class ReconBridge(private val api: MontoyaApi) {
 
     // --- JS endpoints -----------------------------------------------------------------------
 
-    private class MapNote(val url: String, val script: String?, val source: String, val parsed: SourceMaps.Parsed?, val status: Int? = null)
+    private class MapNote(
+        val url: String,
+        val script: String?,
+        val source: String,
+        val parsed: SourceMaps.Parsed?,
+        val status: Int? = null,
+        val skippedOutOfScope: Boolean = false,
+    )
 
     /**
      * Harvest endpoint paths/URLs from JavaScript responses already in proxy history, and from
      * the source maps those scripts point to: maps found in history are read, the others are
-     * listed, or fetched when [fetchSourceMaps] is set (in scope only).
+     * listed, or fetched when [fetchSourceMaps] is set (scope-checked per mcp_scope_mode).
      */
     fun jsEndpoints(maxItems: Int, hostFilter: String?, fetchSourceMaps: Boolean = false): JsonObject {
         return try {
@@ -217,7 +225,8 @@ class ReconBridge(private val api: MontoyaApi) {
 
             var skippedOutOfScope = 0
             var fetched = 0
-            var scopeWarning: String? = null
+            val scopeWarnings = LinkedHashSet<String>()
+            var sentOutOfScope = 0
             for ((mapUrl, script) in referenced) {
                 if (mapUrl in maps) continue
                 if (!fetchSourceMaps || fetched >= MAX_MAP_FETCHES) {
@@ -225,12 +234,15 @@ class ReconBridge(private val api: MontoyaApi) {
                     continue
                 }
                 val check = scopeGate.check(mapUrl)
-                if (check.deny != null) {
+                if (check.blocked) {
                     skippedOutOfScope++
-                    maps[mapUrl] = MapNote(mapUrl, script, "referenced", null)
+                    maps[mapUrl] = MapNote(mapUrl, script, "referenced", null, skippedOutOfScope = true)
                     continue
                 }
-                check.warning?.let { scopeWarning = it }
+                check.warning?.let {
+                    sentOutOfScope++
+                    if (scopeWarnings.size < MAX_SCOPE_WARNINGS) scopeWarnings += it
+                }
                 fetched++
                 val result = try {
                     val seed = transport.seed(mapUrl)
@@ -243,7 +255,9 @@ class ReconBridge(private val api: MontoyaApi) {
                 maps[mapUrl] = MapNote(mapUrl, script, "fetched", parsed, result?.status ?: 0)
             }
 
-            buildJsonObject {
+            val warning = if (scopeWarnings.isEmpty()) null else
+                "out_of_scope: $sentOutOfScope source map(s) fetched outside Burp's target scope; see scope_warnings"
+            ScopeGate.addWarning(buildJsonObject {
                 put("js_responses_scanned", scanned)
                 put("endpoint_count", endpoints.size)
                 put("endpoints", buildJsonArray { endpoints.take(MAX_ENDPOINTS).forEach { add(it) } })
@@ -254,6 +268,7 @@ class ReconBridge(private val api: MontoyaApi) {
                             put("url", note.url)
                             note.script?.let { put("script", it) }
                             put("source", note.source)
+                            if (note.skippedOutOfScope) put("skipped", "out_of_scope")
                             note.status?.let { put("status", it) }
                             note.parsed?.let { parsed ->
                                 put("sources_count", parsed.sources.size)
@@ -265,15 +280,16 @@ class ReconBridge(private val api: MontoyaApi) {
                         })
                     }
                 })
-                scopeWarning?.let { put("scope_warning", it) }
-                if (skippedOutOfScope > 0) put("source_maps_out_of_scope", skippedOutOfScope)
+                if (scopeWarnings.isNotEmpty()) put("scope_warnings", buildJsonArray { scopeWarnings.forEach { add(it) } })
+                if (sentOutOfScope > 0) put(ScopeGate.SENT, sentOutOfScope)
+                if (skippedOutOfScope > 0) put(ScopeGate.SKIPPED, skippedOutOfScope)
                 if (incomplete > 0) put("scripts_partly_scanned", incomplete)
                 if (binary > 0) put("binary_skipped", binary)
                 if (outOfTime) put("stopped", "time_budget")
                 if (maps.values.any { it.source == "referenced" } && !fetchSourceMaps) {
                     put("note", "Source maps marked 'referenced' are named by a script but are not in proxy history; set fetch_source_maps=true to request them.")
                 }
-            }
+            }, warning)
         } catch (e: Exception) {
             error("JS endpoint scan failed: ${e.message}")
         }
@@ -289,22 +305,32 @@ class ReconBridge(private val api: MontoyaApi) {
         return try {
             val base = baseUrl.trimEnd('/')
             val baseCheck = scopeGate.check("$base/")
-            baseCheck.deny?.let { return it }
+            if (baseCheck.blocked) return baseCheck.denyJson()
             val seed = transport.seed("$base/")
             val prefix = seed.request.path.trimEnd('/')
 
             // Per-path scope check: Burp scope can exclude specific paths under an in-scope host.
             val considered = paths.take(MAX_PATHS).map { if (it.startsWith("/")) it else "/$it" }
-            val allowed = considered.indices.filter { scopeGate.deny(base + considered[it]) == null }
+            val checks = considered.map { scopeGate.check(base + it) }
+            val allowed = considered.indices.filter { !checks[it].blocked }
+            // Counted where they are sent: rewinds and a stop before the end make positions useless for it.
+            val sentWarned = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
             val engine = ContentDiscovery({ path ->
-                if (scopeGate.deny(base + path) != null) null else transport.send(seed.service, seed.request.copy(target = prefix + path))
+                val check = scopeGate.check(base + path)
+                if (check.blocked) {
+                    null
+                } else {
+                    if (check.warning != null) sentWarned += path
+                    transport.send(seed.service, seed.request.copy(target = prefix + path))
+                }
             })
             val outcome = engine.run(allowed.map { considered[it] })
-            outcome.error?.let { return error(it) }
+            outcome.error?.let { return baseCheck.annotate(error(it)) }
+            val sentOutOfScope = sentWarned.size
 
-            buildJsonObject {
+            val result = buildJsonObject {
                 put("base_url", base)
-                baseCheck.warning?.let { put("scope_warning", it) }
+                if (sentOutOfScope > 0) put(ScopeGate.SENT, sentOutOfScope)
                 put("calibration", buildJsonObject {
                     put("status", outcome.calibration.firstOrNull()?.status ?: 0)
                     put("length", outcome.calibration.firstOrNull()?.length ?: 0)
@@ -321,7 +347,7 @@ class ReconBridge(private val api: MontoyaApi) {
                 })
                 put("tested", outcome.tested)
                 put("requests_sent", outcome.requests)
-                if (allowed.size < considered.size) put("skipped_out_of_scope", considered.size - allowed.size)
+                if (allowed.size < considered.size) put(ScopeGate.SKIPPED, considered.size - allowed.size)
                 if (paths.size > considered.size) put("paths_over_limit", paths.size - considered.size)
                 put("found_count", outcome.found.size)
                 put("found", buildJsonArray {
@@ -363,6 +389,12 @@ class ReconBridge(private val api: MontoyaApi) {
                 if (outcome.unanswered > 0) put("no_response", outcome.unanswered)
                 if (outcome.throttled > 0) put("rate_limited_responses", outcome.throttled)
             }
+            val pathsWarning = if (sentOutOfScope > 0 && baseCheck.warning == null) {
+                "out_of_scope: $sentOutOfScope discovered paths are not in Burp's target scope (mcp_scope_mode=warn); sent anyway"
+            } else {
+                null
+            }
+            ScopeGate.addWarning(baseCheck.annotate(result), pathsWarning)
         } catch (e: Exception) {
             error("Content discovery failed: ${e.message}")
         }
@@ -394,15 +426,26 @@ class ReconBridge(private val api: MontoyaApi) {
         wordlist: String? = null,
         options: ParamMineOptions = ParamMineOptions(),
     ): JsonObject {
+        val check = scopeGate.check(url)
+        if (check.blocked) return check.denyJson()
+        return check.annotate(paramMineChecked(url, candidates, mode, injectIn, method, wordlist, options))
+    }
+
+    private fun paramMineChecked(
+        url: String,
+        candidates: List<String>?,
+        mode: String,
+        injectIn: String,
+        method: String?,
+        wordlist: String?,
+        options: ParamMineOptions,
+    ): JsonObject {
         return try {
             EnumValidation.error(mode, MODES.toSet(), "mode", required = true)?.let { return it }
             val modeId = mode.trim().lowercase()
             val location = ParamLocation.of(injectIn)
                 ?: return EnumValidation.error(injectIn, ParamLocation.IDS.toSet(), "inject_in", required = true)
                     ?: error("Parameter 'inject_in' has an invalid value")
-
-            val check = scopeGate.check(url)
-            check.deny?.let { return it }
 
             val wordlistName = wordlist
                 ?: if (location == ParamLocation.HEADER) ParamMinerWordlists.HEADERS else ParamMinerWordlists.DEFAULT
@@ -416,7 +459,6 @@ class ReconBridge(private val api: MontoyaApi) {
                 // Paging on with next_offset past the last page leaves nothing to test: a result, not an error.
                 return buildJsonObject {
                     put("url", url)
-                    check.warning?.let { put("scope_warning", it) }
                     put("mode", modeId)
                     put("inject_in", location.id)
                     put("wordlist_used", if (candidates == null) wordlistName else null)
@@ -489,7 +531,6 @@ class ReconBridge(private val api: MontoyaApi) {
             val nextOffset = options.offset + (if (outcome.tested >= mined.size) slice.size else positions[outcome.tested])
             buildJsonObject {
                 put("url", url)
-                check.warning?.let { put("scope_warning", it) }
                 put("mode", modeId)
                 put("inject_in", location.id)
                 put("method", base.method)

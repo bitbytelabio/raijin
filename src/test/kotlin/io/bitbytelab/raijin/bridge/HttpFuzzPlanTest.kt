@@ -212,10 +212,21 @@ class HttpFuzzPlanTest {
     @Test
     fun `Content-Length is recomputed after a payload changes the body length`() {
         val base = "POST /login HTTP/1.1\r\nHost: h\r\nContent-Length: 7\r\n\r\nq=§abc§"
-        val sent = texts(plan(base, listOf("much-longer", "é")))
+        val sent = texts(plan(base, listOf("much-longer", "é", "€")))
         assertEquals("POST /login HTTP/1.1\r\nHost: h\r\nContent-Length: 13\r\n\r\nq=much-longer", sent[0])
-        // Counted as the UTF-8 bytes fuzz sends: "q=é" is 4 bytes.
-        assertTrue(sent[1].contains("Content-Length: 4\r\n"), sent[1])
+        // Counted in the charset fuzz sends: "é" fits ISO-8859-1 (one byte), "€" sends the request as UTF-8.
+        assertTrue(sent[1].contains("Content-Length: 3\r\n"), sent[1])
+        assertTrue(sent[2].contains("Content-Length: 5\r\n"), sent[2])
+    }
+
+    @Test
+    fun `a fuzzed Content-Length is sent as rendered`() {
+        val base = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: §5§\r\n\r\nhello"
+        val planned = HttpFuzzPlan.planAttack(base, null, listOf(listOf("0", "100")), null) as HttpFuzzPlan.AttackResult.Ok
+        val sent = planned.plan.requests.map { it.request }.toList()
+        assertTrue(sent[0].contains("Content-Length: 0\r\n"), sent[0])
+        assertTrue(sent[1].contains("Content-Length: 100\r\n"), sent[1])
+        assertTrue("Content-Length is a fuzz position; sent as rendered" in planned.plan.notes)
     }
 
     @Test

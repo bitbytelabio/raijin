@@ -64,7 +64,28 @@ class InjectionBridge(private val api: MontoyaApi) {
         timeBudgetSeconds: Int = 300,
     ): JsonObject {
         val target = (if (useTls) "https" else "http") + "://$host:$port"
-        scopeGate.deny("$target/")?.let { return it }
+        val rendered = runCatching { FuzzTemplate.parse(RequestHygiene.normalizeCrlf(request)).render(baseValue) }.getOrNull()
+        val scope = scopeGate.checkRequest(host, port, useTls, rendered ?: "")
+        if (scope.blocked) return scope.denyJson()
+        return scope.annotate(probeChecked(
+            request, host, port, useTls, target, classes, delaySeconds, encoding, baseValue, oob, oobWaitSeconds, timeBudgetSeconds,
+        ))
+    }
+
+    private fun probeChecked(
+        request: String,
+        host: String,
+        port: Int,
+        useTls: Boolean,
+        target: String,
+        classes: List<String>?,
+        delaySeconds: Int,
+        encoding: String?,
+        baseValue: String,
+        oob: Boolean,
+        oobWaitSeconds: Int,
+        timeBudgetSeconds: Int,
+    ): JsonObject {
         return try {
             val selection = InjectionClass.select(classes)
             selection.error?.let { return failure(it) }

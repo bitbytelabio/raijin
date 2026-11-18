@@ -23,6 +23,7 @@ import kotlinx.serialization.json.put
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -46,6 +47,8 @@ internal object AutorizePolicy {
     const val SKIPPED_SEEN = "skipped_seen"
     const val SKIPPED_BUSY = "skipped_busy"
     const val SKIPPED_OUT_OF_SCOPE = "skipped_out_of_scope"
+    /** Replayed although out of scope (mcp_scope_mode=warn); counted next to [SKIPPED_OUT_OF_SCOPE]. */
+    const val SENT_OUT_OF_SCOPE = "sent_out_of_scope"
     const val SKIPPED_UNCHANGED = "skipped_unchanged"
     const val REPLAYED = "replayed"
     const val REPLAY_FAILED = "replay_failed"
@@ -312,16 +315,23 @@ internal class AutorizeTap(
             val rawResponse = response.toString()
 
             for (identities in replays) {
-                executor.execute {
-                    try {
-                        gate.withSendSlot {
-                            replayAndAssess(identities, service, method, url, captured, rawRequest, rawResponse)
+                try {
+                    executor.execute {
+                        try {
+                            gate.withSendSlot {
+                                replayAndAssess(identities, service, method, url, captured, rawRequest, rawResponse)
+                            }
+                        } catch (_: Exception) {
+                            // Best-effort background check; a failure here must never surface as a proxy error.
+                            unmarkSeen(identities.rule, method, url)
+                        } finally {
+                            gate.release()
                         }
-                    } catch (_: Exception) {
-                        // Best-effort background check; a failure here must never surface as a proxy error.
-                    } finally {
-                        gate.release()
                     }
+                } catch (_: RejectedExecutionException) {
+                    // Not queued: its admission is released in `finally`, and the endpoint stays testable.
+                    unmarkSeen(identities.rule, method, url)
+                    continue
                 }
                 admitted--
             }
@@ -385,8 +395,10 @@ internal class AutorizeTap(
         val rule = identities.rule
         // Hard safety backstop: the operator's global scope policy applies to this outbound replay,
         // independent of rule.inScopeOnly (which only filters which traffic is tapped).
-        if (scopeGate.deny(url) != null) {
+        val scope = scopeGate.check(url)
+        if (scope.blocked) {
             count(rule, AutorizePolicy.SKIPPED_OUT_OF_SCOPE)
+            unmarkSeen(rule, method, url)
             return
         }
         val planned = AutorizePolicy.replays(rawRequest, identities.identities, identities.headers)
@@ -394,6 +406,8 @@ internal class AutorizeTap(
             count(rule, AutorizePolicy.SKIPPED_UNCHANGED)
             return
         }
+        // Counted only once something will actually be replayed.
+        if (scope.warning != null) count(rule, AutorizePolicy.SENT_OUT_OF_SCOPE)
 
         // An identity that took the reference level's name would never be compared with it.
         val reference = if (identities.identities.any { it.name.equals(AutorizePolicy.CAPTURED, ignoreCase = true) }) {
@@ -426,6 +440,8 @@ internal class AutorizeTap(
         }
         if (levels.size < 2) {
             count(rule, AutorizePolicy.REPLAY_FAILED)
+            // Not tested: a later hit on the endpoint may try again.
+            unmarkSeen(rule, method, url)
             return
         }
         count(rule, AutorizePolicy.REPLAYED)
@@ -498,6 +514,13 @@ internal class AutorizeTap(
     }
 
     private fun count(rule: AutorizeRule, outcome: String) = stateManager.autorizeActivity.count(rule.ruleId, outcome)
+
+    /** Forgets this endpoint's dedup mark for [rule], so a request that was not tested can be later. */
+    private fun unmarkSeen(rule: AutorizeRule, method: String, url: String) =
+        stateManager.unmarkAutorizeSeen(
+            StateManager.autorizeSeenKey(rule.ruleId, method, url),
+            StateManager.autorizeEndpointKey(rule.ruleId, method, url),
+        )
 
     private fun log(message: String, error: Boolean = false) {
         try {

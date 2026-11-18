@@ -25,7 +25,7 @@ Raijin exposes Burp Suite through MCP as about 45 tools. Most tools take an `act
 | `search_skills`, `load_skill` | These guides |
 
 ## Standard workflow
-1. `scope(action=get_config)`, then `scope(action=include)` for the target. Outbound requests are checked against Burp's scope by the operator's `mcp_scope_mode`: `warn` (default) sends them and flags out-of-scope targets, `enforce` refuses them.
+1. `scope(action=get_config)`, then `scope(action=include)` for the target. Outbound requests are checked against Burp's scope by the operator's `mcp_scope_mode`: `warn` (default) sends them and adds `scope_warning` to the result, `enforce` refuses them (`out_of_scope: true`, nothing sent), `off` skips the check. Turbo runs, Scanner tasks, WebSocket opens and followed redirects are advisory only: flagged under `warn` and `enforce`, never refused. Batch tools check every item and report `skipped_out_of_scope` / `sent_out_of_scope`.
 2. Look at existing traffic first: `proxy_history`, `proxy_history_search` for traffic that passed through Burp's Proxy; `sitemap(action=query)` for everything else, including anything this server itself sent with `http_send_*` (which never reaches Proxy history).
 3. Understand a request with `analyze(action=request)`, `analyze(action=insertion_points)`, `analyze(action=response)`.
 4. Run focused tests with `http_*` or a guided probe. Use `turbo_run` only when you need volume or timing.

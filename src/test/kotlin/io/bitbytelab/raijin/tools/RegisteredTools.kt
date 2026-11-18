@@ -113,7 +113,7 @@ internal class RegisteredTools : AutoCloseable {
                 utilities = UtilitiesBridge(api),
                 ai = AiBridge(api),
                 bambda = BambdaBridge(api),
-                persistence = PersistenceBridge(api),
+                persistence = PersistenceBridge(api, eventBus),
                 project = ProjectBridge(api),
                 logging = LoggingBridge(api),
                 extension = ExtensionBridge(api, state),

@@ -19,11 +19,14 @@ class ScopeBridge(private val api: MontoyaApi, private val eventBus: EventBus) {
 
     fun include(url: String): JsonObject {
         api.scope().includeInScope(url)
+        // An exclude rule wins over the new include: report what Burp decides, not what was asked.
+        val inScope = try { api.scope().isInScope(url) } catch (_: Exception) { true }
 
         return buildJsonObject {
             put("status", "included")
             put("url", url)
-            put("in_scope", true)
+            put("in_scope", inScope)
+            if (!inScope) put("note", "an exclude rule still covers this URL")
         }
     }
 

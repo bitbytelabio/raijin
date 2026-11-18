@@ -29,6 +29,7 @@ fun JsonElement?.asStringList(): List<String>? {
     return when (this) {
         is JsonArray -> this.mapNotNull {
             when (it) {
+                is JsonNull -> null
                 is JsonPrimitive -> it.contentOrNull
                 else -> it.toString()
             }
@@ -36,9 +37,16 @@ fun JsonElement?.asStringList(): List<String>? {
         is JsonPrimitive -> {
             val str = this.contentOrNull ?: return null
             if (str.trimStart().startsWith("[")) {
-                try {
-                    json.parseToJsonElement(str).jsonArray.map { it.jsonPrimitive.content }
-                } catch (_: Exception) {
+                // Strict parse: "[admin]" is a value, not a lenient one-element array.
+                val parsed = try { Json.parseToJsonElement(str) } catch (_: Exception) { null }
+                // kotlinx reads an unquoted word as a literal without checking it: only real JSON
+                // literals (string, number, boolean, null) make this an array.
+                val strict = parsed is JsonArray && parsed.all {
+                    it is JsonPrimitive && (it.isString || it is JsonNull || it.booleanOrNull != null || it.content.toDoubleOrNull() != null)
+                }
+                if (strict) {
+                    parsed.mapNotNull { if (it is JsonNull) null else it.jsonPrimitive.contentOrNull }
+                } else {
                     listOf(str)
                 }
             } else {
@@ -141,9 +149,12 @@ fun JsonElement?.asStringMapResult(): Pair<Map<String, String>?, String?> {
             } catch (_: Exception) {
                 if (trimmed.contains(":")) {
                     // Best-effort raw HTTP header parsing: "X-Foo: bar\nX-Bar: baz"
-                    val map = parseRawHeaderBlock(str)
-                    if (map.isNotEmpty()) map to "parsed as raw HTTP header block (one 'Name: value' per line)"
-                    else null to "headers string is not JSON and not parseable as 'Name: value' lines"
+                    val (map, warnings) = parseRawHeaderBlock(str)
+                    if (map.isNotEmpty()) {
+                        map to (listOf("parsed as raw HTTP header block (one 'Name: value' per line)") + warnings).joinToString("; ")
+                    } else {
+                        null to "headers string is not JSON and not parseable as 'Name: value' lines"
+                    }
                 } else {
                     null to "headers string is not valid JSON and contains no ':' for raw header parsing"
                 }
@@ -171,7 +182,13 @@ private fun objectToStringMap(obj: JsonObject): Map<String, String> =
  */
 private fun arrayToStringMap(arr: JsonArray): Pair<Map<String, String>?, String?> {
     if (arr.isEmpty()) return emptyMap<String, String>() to null
-    val result = linkedMapOf<String, String>()
+    val result = object : LinkedHashMap<String, String>() {
+        val duplicates = LinkedHashSet<String>()
+        override fun put(key: String, value: String): String? {
+            if (containsKey(key)) duplicates += key
+            return super.put(key, value)
+        }
+    }
     var unrecognized = 0
     for (element in arr) {
         when (element) {
@@ -205,24 +222,41 @@ private fun arrayToStringMap(arr: JsonArray): Pair<Map<String, String>?, String?
             else -> unrecognized++
         }
     }
-    val warning = if (unrecognized > 0)
-        "$unrecognized of ${arr.size} header entries could not be parsed; expected [name,value] pair, {name,value}, {key,value}, or single-entry object"
-    else null
-    return result to warning
+    val warnings = buildList {
+        if (unrecognized > 0) {
+            add("$unrecognized of ${arr.size} header entries could not be parsed; expected [name,value] pair, {name,value}, {key,value}, or single-entry object")
+        }
+        result.duplicates.forEach { add(duplicateHeaderWarning(it)) }
+    }
+    return LinkedHashMap(result) to warnings.takeIf { it.isNotEmpty() }?.joinToString("; ")
 }
 
-private val rawHeaderLineRegex = Regex("^([A-Za-z0-9!#$%&'*+\\-.^_`|~]+)\\s*:\\s*(.*)$")
+private fun duplicateHeaderWarning(name: String) =
+    "duplicate header '$name': last value kept; use raw_request to send duplicates"
 
-private fun parseRawHeaderBlock(block: String): Map<String, String> {
+/**
+ * `Name: value` lines split at the first `:`. The name is kept exactly as written (no token check,
+ * so `Transfer-Encoding : chunked` keeps its space) and the value loses at most one leading space.
+ * Returns the map and warnings for lines without a `:` and for repeated names.
+ */
+private fun parseRawHeaderBlock(block: String): Pair<Map<String, String>, List<String>> {
     val result = linkedMapOf<String, String>()
-    block.lineSequence().forEach { line ->
-        val trimmed = line.trim().trimEnd('\r')
-        if (trimmed.isEmpty()) return@forEach
-        rawHeaderLineRegex.matchEntire(trimmed)?.let { m ->
-            result[m.groupValues[1]] = m.groupValues[2]
+    val warnings = mutableListOf<String>()
+    val noColon = mutableListOf<String>()
+    block.lineSequence().forEach { raw ->
+        val line = raw.removeSuffix("\r")
+        if (line.isBlank()) return@forEach
+        val colon = line.indexOf(':')
+        if (colon < 0) {
+            noColon += line
+            return@forEach
         }
+        val name = line.substring(0, colon)
+        if (name in result) warnings += duplicateHeaderWarning(name)
+        result[name] = line.substring(colon + 1).removePrefix(" ")
     }
-    return result
+    if (noColon.isNotEmpty()) warnings.add(0, "lines without ':' skipped: ${noColon.take(5).joinToString(" | ")}")
+    return result to warnings
 }
 
 /**

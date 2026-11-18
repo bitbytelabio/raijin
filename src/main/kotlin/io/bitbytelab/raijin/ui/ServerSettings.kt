@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.ui
 
 import io.bitbytelab.raijin.core.RebindOutcome
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.safety.ScopeMode
 import io.bitbytelab.raijin.transport.BindHostPolicy
 import io.bitbytelab.raijin.transport.RemoteAccess
@@ -13,18 +14,22 @@ import java.net.InetAddress
  * it is unit-tested.
  */
 internal object ServerSettings {
-    const val PREF_SCOPE_MODE = "mcp_scope_mode"
+    const val PREF_SCOPE_MODE = ScopeGate.PREF_SCOPE_MODE
     const val PREF_ALLOW_DESTRUCTIVE = "mcp_allow_destructive"
     const val PREF_BIND_HOST = "mcp_bind_host"
     const val PREF_ALLOW_REMOTE_BIND = "mcp_allow_remote_bind"
 
-    /** Stored lower-case, the spelling ScopeGate's deny message gives; [ScopeMode.fromString] ignores case. */
+    /** JVM options that override [PREF_BIND_HOST] and [PREF_ALLOW_REMOTE_BIND] at startup. */
+    const val PROP_BIND_HOST = "raijin.bindHost"
+    const val PROP_ALLOW_REMOTE_BIND = "raijin.allowRemoteBind"
+
+    /** Stored lower-case, the spelling PersistenceBridge normalizes to; [ScopeMode.fromString] ignores case. */
     fun scopeModeValue(mode: ScopeMode): String = mode.name.lowercase()
 
     fun scopeModeHint(mode: ScopeMode): String = when (mode) {
         ScopeMode.OFF -> "No scope check on requests the agent sends."
-        ScopeMode.WARN -> "Out-of-scope requests are sent and flagged in the tool result."
-        ScopeMode.ENFORCE -> "Out-of-scope requests are refused."
+        ScopeMode.WARN -> "Out-of-scope requests are sent and flagged with scope_warning (tool result, MCP Activity, audit log). Turbo, Scanner, WebSocket and redirects are advisory only."
+        ScopeMode.ENFORCE -> "Out-of-scope requests are refused. Turbo, Scanner, WebSocket and followed redirects are flagged, never refused."
     }
 
     // Dotted quad without leading zeros: the JDK rejects "010.0.0.1" as ambiguous, so leave that to classify().
@@ -78,6 +83,9 @@ internal object ServerSettings {
         if (sysProp(RemoteAccess.PROP_AUTH_TOKEN) != null) add(RemoteAccess.PREF_AUTH_TOKEN)
         if (sysProp(RemoteAccess.PROP_ALLOWED_IPS) != null) add(RemoteAccess.PREF_ALLOWED_IPS)
         if (sysProp(RemoteAccess.PROP_ALLOWED_HOSTS) != null) add(RemoteAccess.PREF_ALLOWED_HOSTS)
+        // Same reading as RaijinExtension: a blank bind host and a non-boolean opt-in are ignored there.
+        if (!sysProp(PROP_BIND_HOST)?.trim().isNullOrEmpty()) add(PREF_BIND_HOST)
+        if (sysProp(PROP_ALLOW_REMOTE_BIND)?.toBooleanStrictOrNull() != null) add(PREF_ALLOW_REMOTE_BIND)
     }
 
     // NetworkHosts strips the zone id, and a link-local address cannot be bound without it. Java

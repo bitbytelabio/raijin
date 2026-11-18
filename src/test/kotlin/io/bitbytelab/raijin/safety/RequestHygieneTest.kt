@@ -52,32 +52,31 @@ class RequestHygieneTest {
         assertEquals(emptyList(), RequestHygiene.scan("GET", "https://example.com/", mapOf("X" to "a\tb")))
     }
 
-    // --- stripControl(): the actual fix ---
+    // --- stripCrlf(): the actual fix ---
 
-    @Test fun `stripControl removes a trailing newline from a url`() {
-        assertEquals("https://example.com/api/search", RequestHygiene.stripControl("https://example.com/api/search\n"))
+    @Test fun `stripCrlf removes a trailing newline from a url`() {
+        assertEquals("https://example.com/api/search", RequestHygiene.stripCrlf("https://example.com/api/search\n"))
     }
 
-    @Test fun `stripControl removes embedded CR and LF`() {
-        assertEquals("/a/b", RequestHygiene.stripControl("/a\r\n/b"))
-        assertEquals("GET", RequestHygiene.stripControl("GET\r\n"))
+    @Test fun `stripCrlf removes embedded CR and LF`() {
+        assertEquals("/a/b", RequestHygiene.stripCrlf("/a\r\n/b"))
+        assertEquals("GET", RequestHygiene.stripCrlf("GET\r\n"))
     }
 
-    @Test fun `stripControl keeps tabs, spaces and normal characters`() {
-        assertEquals("a\tb c", RequestHygiene.stripControl("a\tb c"))
-        assertEquals("/path?q=1&r=2", RequestHygiene.stripControl("/path?q=1&r=2"))
+    @Test fun `stripCrlf keeps tabs, spaces and normal characters`() {
+        assertEquals("a\tb c", RequestHygiene.stripCrlf("a\tb c"))
+        assertEquals("/path?q=1&r=2", RequestHygiene.stripCrlf("/path?q=1&r=2"))
     }
 
-    @Test fun `stripControl removes other C0 control chars but keeps tab`() {
-        assertEquals("xy", RequestHygiene.stripControl("x\u000By"))  // vertical tab
-        assertEquals("ab", RequestHygiene.stripControl("a\u0007b"))  // BEL
-        assertEquals("cd", RequestHygiene.stripControl("c\u0000d"))  // NUL
-        assertEquals("a\tb", RequestHygiene.stripControl("a\tb"))    // tab kept
+    @Test fun `stripCrlf sends every other control char as given`() {
+        assertEquals("x\u000By", RequestHygiene.stripCrlf("x\u000By"))  // vertical tab
+        assertEquals("c\u0000d", RequestHygiene.stripCrlf("c\u0000d"))  // NUL
+        assertEquals("ab", RequestHygiene.stripCrlf("a\r\nb"))
     }
 
-    @Test fun `stripControl is a no-op on clean input`() {
+    @Test fun `stripCrlf is a no-op on clean input`() {
         val clean = "https://example.com/normal/path"
-        assertEquals(clean, RequestHygiene.stripControl(clean))
+        assertEquals(clean, RequestHygiene.stripCrlf(clean))
     }
 
     // --- normalizeCrlf(): the request-line "kettled :path" fix ---

@@ -105,7 +105,13 @@ internal class ToolArgs(private val args: Map<String, JsonElement>) {
     }
 
     /** TLS flag from `use_tls` or its aliases `tls` / `https`; TLS by default on port 443. */
-    fun tls(port: Int): Boolean = bool("use_tls") ?: bool("tls") ?: bool("https") ?: (port == 443)
+    fun tls(port: Int): Boolean = explicitTls() ?: (port == 443)
+
+    /** use_tls (or its aliases tls / https) when the caller gave one. */
+    fun explicitTls(): Boolean? = bool("use_tls") ?: bool("tls") ?: bool("https")
+
+    /** The `port` argument, else 80 when TLS is explicitly off and 443 otherwise. */
+    fun portOrDefault(ports: IntRange): Int = int("port", ports) ?: if (explicitTls() == false) 80 else 443
 
     /** Non-empty list of objects under [name]; null when absent. Every item must be an object. */
     fun objectList(name: String, what: String): List<JsonObject>? {

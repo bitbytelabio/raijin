@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### Scope
+- One scope gate for every send path. `mcp_scope_mode=warn` (default) sends and puts `scope_warning` first in the result; `enforce` refuses with one error shape (`out_of_scope: true`, `scope_mode`, a pointer to `scope(action=include)`); `off` checks nothing. The URL checked is always where the bytes go: the connection's host and port plus the request path, never the host of an absolute-form request line or a Host header. Fuzz, race and pipeline check every distinct request they will send, and a `host` that cannot be put into a URL is refused under enforce.
+- Batch tools (`http_send_requests_parallel`, `http_send_request_chain`, `api_import_openapi`, content discovery) check every item: a refused item is skipped, the rest go out, and the result counts `skipped_out_of_scope` / `sent_out_of_scope`. Before, one out-of-scope item refused the whole parallel batch.
+- Turbo runs, Scanner tasks, WebSocket opens and followed redirects are advisory: flagged (`scope_warning`, `scope_warnings`), never refused. Turbo flags every origin a script queues to.
+- Scope decisions show in the MCP Activity tab (warning-coloured rows, an Out-of-scope count, the warning in Info), in the `tool.called` event and in the audit log (`out_of_scope: true`, and the call is always audited). The Rules ▸ Scope tab shows the current mode.
+- `preference_store` accepts only `off`, `warn` or `enforce` for `mcp_scope_mode`, and every change or delete is announced (`scope.mode_changed` event, a line in Burp's output). The Server tab follows a change made by a client.
+
+### Sending
+- Structured inputs lose raw CR/LF only (reported in `warnings`); NUL, VT and other bytes reach the wire. The WebSocket and GraphQL subscription handshakes send headers exactly as given.
+- `url` is split leniently: the request target goes out as written (no re-encoding), hosts with `_` work, and the Host header is the URL's authority while `host`/`port` only move the connection. `url` with `raw_request` sends the raw request to the url's target. `use_tls=false` without a port means port 80.
+- `http_send_raw_bytes` defaults to HTTP/1 and notes an HTTP/2 response.
+- `http_fuzz` and `http_race` count Content-Length in the bytes they send (ISO-8859-1 unless a char needs UTF-8), keep a fuzzed Content-Length as rendered, and take `auto_fix_content_length`.
+- Raw header blocks keep names as written; duplicate headers and lines without `:` are reported. A list argument like `"[admin]"` stays one value.
+- Batch items honour `auto_fix_content_length` and `preserve_headers`, report their own fix and header warnings, and refuse fields only `http_send_request` supports.
+- Parallel sends keep the responses a slow group did not time out; a chain step needs a response to succeed and reports `extract_missed` and `unresolved_placeholders`.
+- `report=all` fuzz runs cap listed bodies at 20,000 characters unless `max_response_length` is given.
+
+### Turbo
+- A run reads `completed` only after its responses are ranked and the script has finished; callback exceptions are counted in `callback_errors` / `last_callback_error` instead of as connection failures.
+- Each run gets its own Python state; a stop no longer reports a "User Python error"; a cancel from a callback no longer waits for itself; every engine of a multi-engine run is stopped and counted, with unique request ids.
+- HEAD, 204, 304 and 1xx responses end at their head; `Connection: close` and HTTP/1.0 responses close the connection. HTTP/2 and HTTP/3 bodies are capped at 10 MB like HTTP/1.
+- A payload containing `%s` is not substituted again. `timeout_ms` and `limit` are clamped; a cancelled wait answers with the current state. Organizer saves report failures; exports write the exact bytes.
+
+### Other fixes
+- Proxy history items carry Burp's `id` and their list `index`; `proxy_annotate` takes that `id` (the parameter was `index`); searches take `start_index`, return `next_start_index` and count `skipped_oversize`. The Proxy Explorer shows the newest entries first and sends Burp's own request to Repeater and Intruder.
+- GraphQL POI scan matches camelCase and plural field names; `auto_headers` takes the newest request that carried credentials and never sends a header twice.
+- Limits of injection, GraphQL, recon, cache probe and events tools are clamped and reported instead of refused.
+- JWT `psychic` also returns `token_raw_rs`; HMAC `alg` is case-insensitive. `scope(action=include)` reports when an exclude rule still wins.
+- Stores replace lone surrogates, repair a cut-off last line and create owner-only files; the audit log keeps arguments as JSON and records the project.
+- Listener restarts cannot leave a stale listener behind; Streamable HTTP sessions idle out after 24 hours (256 at most), and legacy SSE accepts requests up to 64 MiB.
+
 ## 2.2.1
 
 ### Logging

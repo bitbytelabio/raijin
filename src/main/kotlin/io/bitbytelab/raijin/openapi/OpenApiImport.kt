@@ -158,8 +158,8 @@ object OpenApiImport {
                 // A line break in an example must not split the header it is sent in.
                 "header" -> if (name.lowercase() !in TRANSPORT_HEADERS) {
                     headers.add(
-                        budget.take(RequestHygiene.stripControl(name)) to
-                            budget.take(RequestHygiene.stripControl(pathText(name, value, style) { it }))
+                        budget.take(RequestHygiene.stripCrlf(name)) to
+                            budget.take(RequestHygiene.stripCrlf(pathText(name, value, style) { it }))
                     )
                 }
                 "cookie" -> formPairs(name, value, style) { percentEncode(it, COOKIE_SAFE) }

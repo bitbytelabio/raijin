@@ -93,8 +93,8 @@ class JwtBridge(
                         }
                         else -> publicKey
                     }
-                    val hmacAlg = alg ?: "HS256"
-                    if (hmacAlg.uppercase() !in HMAC_ALGS) {
+                    val hmacAlg = (alg ?: "HS256").uppercase()
+                    if (hmacAlg !in HMAC_ALGS) {
                         return err("alg_confusion signs with HMAC, so alg must be HS256, HS384 or HS512")
                     }
                     val forged = Jwt.resign(token, key, hmacAlg, overrides) ?: return err("Not a decodable JWT")
@@ -121,8 +121,8 @@ class JwtBridge(
                 "sign" -> {
                     val s = secret ?: return err("sign requires 'secret'")
                     if (s.isEmpty()) return err("sign needs a non-empty secret; mode=empty_hmac signs with the empty one")
-                    val hmacAlg = alg ?: "HS256"
-                    if (hmacAlg.uppercase() !in HMAC_ALGS) {
+                    val hmacAlg = (alg ?: "HS256").uppercase()
+                    if (hmacAlg !in HMAC_ALGS) {
                         return err("sign takes an HMAC secret, so alg must be HS256, HS384 or HS512. Use sign_key with key_id for $hmacAlg")
                     }
                     val signed = Jwt.resign(token, s, hmacAlg, overrides) ?: return err("Not a decodable JWT")
@@ -154,7 +154,11 @@ class JwtBridge(
                     buildJsonObject { put("token", JwtJose.embedJwk(token, key.jwk, alg, overrides)) }
                 }
                 "empty_hmac" -> buildJsonObject { put("token", JwtJose.emptyHmac(token, alg, overrides)) }
-                "psychic" -> buildJsonObject { put("token", JwtJose.psychic(token, alg, overrides)) }
+                "psychic" -> buildJsonObject {
+                    put("token", JwtJose.psychic(token, alg, overrides))
+                    put("token_raw_rs", JwtJose.psychicRawRs(token, alg, overrides))
+                    put("note", "token: DER-encoded zero signature; token_raw_rs: the same as JWS raw r||s zero bytes. Try both.")
+                }
                 "header_url" -> {
                     val target = url?.takeIf { it.isNotBlank() } ?: return err("header_url requires url")
                     if (keyId != null) {

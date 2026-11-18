@@ -87,7 +87,10 @@ internal class HttpGlobalHandler(
         // Session handling: macro cookies replace same-named ones, then session rules inject their
         // values. Never for internal probes, nor for macro steps, which are sent as stored.
         if (!internalProbe && macroTraffic == null) {
-            val url = requestToBeSent.url()
+            // A request whose target Montoya cannot turn into a URL still goes out, untouched by sessions.
+            val url = runCatching { requestToBeSent.url() }.getOrNull()
+                ?: return if (currentRequest === requestToBeSent) RequestToBeSentAction.continueWith(requestToBeSent)
+                else RequestToBeSentAction.continueWith(currentRequest, annotations)
             val suite by lazy { isInSuiteScope(url) }
             currentRequest = sessionMacros.applyCookies(currentRequest, url, toolName) { suite }
             currentRequest = SessionInjection.applyRules(stateManager.sessionRules, currentRequest, url, { suite }, eventBus)

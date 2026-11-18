@@ -91,6 +91,22 @@ class ToolCallTrackerTest {
         AuditLog.buildEntry(s.toolName, "ts", 1, s.isError, args, s.url, s.host, s.method, s.statusCode)
     }
 
+    @Test fun `a result reporting an out-of-scope target is flagged and audited`() {
+        val warned = ToolCallTracker.summarize("http_send_request", null, text("""{"scope_warning":"x","status_code":200}"""))
+        assertTrue(warned.outOfScope)
+        assertTrue(ToolCallTracker.shouldAudit("findings_list", "", "", false, null, warned.outOfScope))
+        val line = AuditLog.buildEntry(warned.toolName, "ts", 1, false, null, "", "", "", 0, warned.outOfScope, project = "p")
+        assertEquals("true", Json.parseToJsonElement(line).jsonObject["out_of_scope"]?.jsonPrimitive?.content)
+
+        assertTrue(ToolCallTracker.summarize("http_send_requests_parallel", null, text("""{"skipped_out_of_scope":1}""")).outOfScope)
+        assertFalse(ToolCallTracker.summarize("http_send_request", null, text("""{"status_code":200}""")).outOfScope)
+        assertFalse(ToolCallTracker.summarize("http_send_request", null, text("""{"sent_out_of_scope":0}""")).outOfScope)
+
+        // Past the parse limit the flag comes from the text alone.
+        val big = """{"scope_warning":"x","body":"${"a".repeat(300_000)}"}"""
+        assertTrue(ToolCallTracker.summarize("http_send_request", null, text(big)).outOfScope)
+    }
+
     @Test fun `http details come from the result first, then nested objects, then arguments`() {
         val fromResult = ToolCallTracker.summarize(
             "http_send_request",

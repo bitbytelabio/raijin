@@ -106,15 +106,18 @@ internal class ServerPanel(
     private var clientHostsSource: Pair<String?, List<String>>? = null
     private var renderedConfig: Pair<String, String?>? = null
     private var savedForm: ServerSettings.RemoteForm? = null
+    /** True while [syncScopeMode] sets the combo, so its listener does not store the value again. */
+    private var syncingScope = false
 
     init {
         border = EmptyBorder(12, 12, 12, 12)
         add(JScrollPane(buildContent()).apply { verticalScrollBar.unitIncrement = 16 }, BorderLayout.CENTER)
 
         // Initial values first, listeners after, so loading the saved settings writes nothing back.
-        val scopeMode = ScopeMode.fromString(prefString(ServerSettings.PREF_SCOPE_MODE))
+        val rawScopeMode = prefString(ServerSettings.PREF_SCOPE_MODE)
+        val scopeMode = ScopeMode.fromString(rawScopeMode)
         scopeModeCombo.selectedItem = scopeMode
-        scopeHint.text = ServerSettings.scopeModeHint(scopeMode)
+        scopeHint.text = scopeHintFor(rawScopeMode, scopeMode)
         destructiveCheck.isSelected = prefBool(ServerSettings.PREF_ALLOW_DESTRUCTIVE) ?: false
         bindHostCombo.isEditable = true
         bindHostCombo.model = DefaultComboBoxModel(ServerSettings.bindHostSuggestions(initialBindHost, emptyList()).toTypedArray())
@@ -138,6 +141,7 @@ internal class ServerPanel(
 
     /** Re-reads the live listener and security state and the statistics; call on the EDT. */
     fun refresh() {
+        syncScopeMode()
         val host = ConnectionInfo.endpoints.host
         primaryUrlLabel.text = ConnectionInfo.primaryMcpUrlForHost(host)
         secondaryUrlLabel.text = ConnectionInfo.secondaryMcpUrlForHost(host)
@@ -273,6 +277,8 @@ internal class ServerPanel(
 
     private fun wireListeners() {
         scopeModeCombo.addActionListener {
+            // Showing a change made elsewhere (preference_store) must not write it back.
+            if (syncingScope) return@addActionListener
             val mode = scopeModeCombo.selectedItem as? ScopeMode ?: return@addActionListener
             scopeHint.text = ServerSettings.scopeModeHint(mode)
             prefs.setString(ServerSettings.PREF_SCOPE_MODE, ServerSettings.scopeModeValue(mode))
@@ -338,6 +344,8 @@ internal class ServerPanel(
         lock(RemoteAccess.PREF_AUTH_TOKEN, RemoteAccess.PROP_AUTH_TOKEN, tokenField, regenerateBtn)
         lock(RemoteAccess.PREF_ALLOWED_IPS, RemoteAccess.PROP_ALLOWED_IPS, allowedIpsField)
         lock(RemoteAccess.PREF_ALLOWED_HOSTS, RemoteAccess.PROP_ALLOWED_HOSTS, allowedHostsField)
+        lock(ServerSettings.PREF_BIND_HOST, ServerSettings.PROP_BIND_HOST, bindHostCombo)
+        lock(ServerSettings.PREF_ALLOW_REMOTE_BIND, ServerSettings.PROP_ALLOW_REMOTE_BIND, allowRemoteCheck)
     }
 
     private fun onBindHostEdited() {
@@ -549,6 +557,31 @@ internal class ServerPanel(
     private fun showError(message: String, title: String) {
         JOptionPane.showMessageDialog(this, message, title, JOptionPane.ERROR_MESSAGE)
     }
+
+    /**
+     * Shows the stored scope mode when it was changed outside this tab (an MCP client's
+     * preference_store), without writing it back.
+     */
+    private fun syncScopeMode() {
+        val raw = prefString(ServerSettings.PREF_SCOPE_MODE)
+        val mode = ScopeMode.fromString(raw)
+        if (mode == scopeModeCombo.selectedItem) return
+        syncingScope = true
+        try {
+            scopeModeCombo.selectedItem = mode
+        } finally {
+            syncingScope = false
+        }
+        scopeHint.text = scopeHintFor(raw, mode) + " (changed outside this tab)"
+    }
+
+    /** The hint for [mode], or a warning when the stored [raw] value is not one of the three modes. */
+    private fun scopeHintFor(raw: String?, mode: ScopeMode): String =
+        if (raw != null && raw.trim().lowercase() !in setOf("off", "warn", "enforce")) {
+            "Unrecognised value '$raw', treated as warn."
+        } else {
+            ServerSettings.scopeModeHint(mode)
+        }
 
     private fun prefString(key: String): String? = try { prefs.getString(key) } catch (_: Exception) { null }
 

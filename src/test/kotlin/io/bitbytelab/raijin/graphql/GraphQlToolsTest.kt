@@ -158,7 +158,7 @@ class GraphQlToolsTest {
     }
 
     @Test
-    fun `numeric arguments outside their bounds are refused with the parameter named`() {
+    fun `numeric arguments outside their bounds are clamped and reported`() {
         val cases = listOf(
             Triple("query_templates", "max_depth", 21),
             Triple("query_templates", "max_depth", -1),
@@ -171,8 +171,8 @@ class GraphQlToolsTest {
             Triple("subscription_probe", "wait_ms", 60_000),
         )
         for ((mode, parameter, value) in cases) {
-            val message = errorOf(call("url" to url, "mode" to mode, parameter to value))
-            assertTrue("'$parameter'" in message && "between" in message, "$mode $parameter=$value: $message")
+            val body = json(call("url" to url, "mode" to mode, parameter to value))
+            assertTrue("${parameter}_clamped_to" in body, "$mode $parameter=$value: $body")
         }
         val notANumber = errorOf(call("url" to url, "mode" to "bruteforce_schema", "bucket_size" to "many"))
         assertTrue("'bucket_size' must be an integer" in notANumber, notANumber)

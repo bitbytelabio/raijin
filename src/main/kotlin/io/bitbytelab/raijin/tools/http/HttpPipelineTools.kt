@@ -5,6 +5,7 @@ import io.bitbytelab.raijin.bridge.HttpPipelineFraming
 import io.bitbytelab.raijin.bridge.PipelineRequestSpec
 import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.safety.RequestHygiene
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.server.Server
@@ -75,11 +76,12 @@ Returns:
 - unparsed: {bytes, raw_hex, raw_truncated, kept_for_next_call} — bytes received past the last returned response.
 - write_error: why not every request byte was written (e.g. the server closed the connection early); the responses read are still returned.
 - connection_id, connection_reused, bytes_sent, bytes_received, responses_received, close_reason ("max_responses"|"idle"|"total_timeout"|"fin"|"rst"|"error"|"switching_protocols"), connection_open.
-All *_ms are milliseconds with microsecond precision, counted from the first request byte written unless stated otherwise.""",
+All *_ms are milliseconds with microsecond precision, counted from the first request byte written unless stated otherwise.""" + "\n\n" + ScopeGate.TOOL_NOTE +
+                " The URL checked is the first request's.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     property("host", "string", "Target hostname")
-                    property("port", "integer", "Target port number (1-65535, default 443)")
+                    property("port", "integer", "Target port number (1-65535, default 443, or 80 with use_tls=false)")
                     property("use_tls", "boolean", "Whether to use HTTPS (TLS)")
                     property("tls", "boolean", "Alias for use_tls")
                     property("https", "boolean", "Alias for use_tls")
@@ -124,7 +126,7 @@ All *_ms are milliseconds with microsecond precision, counted from the first req
                     ?: return@addTool toolError("Parameter 'host' is required")
                 val requests = requestSpecs(args)
                     ?: return@addTool toolError("Parameter 'requests' is required (array of {raw_request} or {raw_request_hex} objects)")
-                val port = args.int("port", PORTS) ?: 443
+                val port = args.portOrDefault(PORTS)
                 val useTls = args.tls(port)
                 val httpMode = args.enum("http_mode", PIPELINE_HTTP_MODES)
                 val writeMode = args.enum("write_mode", WRITE_MODES) ?: "concat"
@@ -201,7 +203,10 @@ Returns: connections (those still kept: connection_id, host, port, use_tls, sni 
         val bytes = requestBytes(itemArgs)
         require(bytes.isNotEmpty()) { "the request is empty" }
         val pauseBefore = itemArgs.clampedLong("pause_before", -bytes.size.toLong()..bytes.size + 1L)?.toInt() ?: 0
-        val markers = pauseMarkers(itemArgs["pause_markers"])
+        // A UTF-8 request holds é as two bytes: its markers are matched in that encoding too.
+        val requestUtf8 = itemArgs.string("raw_request_hex") == null &&
+            itemArgs.string("raw_request")?.let { RequestHygiene.wireCharset(RequestHygiene.unescapeLineEndings(it)) } == Charsets.UTF_8
+        val markers = pauseMarkers(itemArgs["pause_markers"], requestUtf8)
         val pauseMs = itemArgs.clampedLong("pause_ms", PAUSES_MS) ?: PipelineRequestSpec.DEFAULT_PAUSE_MS
         val offsets = PipelineRequestSpec.pauseOffsets(bytes, pauseBefore, markers.map { it.second })
         markers.filter { (_, marker) -> PipelineRequestSpec.indexOf(bytes, marker, 0) < 0 }.forEach { (text, _) ->
@@ -224,16 +229,17 @@ Returns: connections (those still kept: connection_id, host, port, use_tls, sni 
     }
 
     /**
-     * `pause_markers` as (text as given, bytes to match): ISO-8859-1, or UTF-8 for text with a char
-     * above U+00FF, after the same `\r\n` escape decoding as `raw_request`.
+     * `pause_markers` as (text as given, bytes to match), after the same `\r\n` escape decoding as
+     * `raw_request`: in the charset the request goes out in ([requestUtf8]), else ISO-8859-1, or
+     * UTF-8 for text with a char above U+00FF.
      */
-    private fun pauseMarkers(element: JsonElement?): List<Pair<String, ByteArray>> {
+    private fun pauseMarkers(element: JsonElement?, requestUtf8: Boolean): List<Pair<String, ByteArray>> {
         val texts = element?.let { it.asStringList() ?: throw IllegalArgumentException("'pause_markers' must be an array of strings") }
             ?: return emptyList()
         return texts.mapIndexed { k, text ->
             val marker = RequestHygiene.unescapeLineEndings(text)
             require(marker.isNotEmpty()) { "pause_markers[$k] is empty" }
-            text to marker.toByteArray(RequestHygiene.wireCharset(marker))
+            text to marker.toByteArray(if (requestUtf8) Charsets.UTF_8 else RequestHygiene.wireCharset(marker))
         }
     }
 }

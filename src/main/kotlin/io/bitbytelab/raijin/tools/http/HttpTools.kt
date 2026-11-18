@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.tools.http
 
 import burp.api.montoya.core.ToolType
+import io.bitbytelab.raijin.bridge.AuditAuthRules
 import io.bitbytelab.raijin.bridge.HttpBridge
 import io.bitbytelab.raijin.bridge.HttpSendOptions
 import io.bitbytelab.raijin.core.asBodyString
@@ -8,6 +9,7 @@ import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.core.asStringMap
 import io.bitbytelab.raijin.core.asStringMapResult
 import io.bitbytelab.raijin.safety.SafeRegex
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.state.StateManager
 import io.bitbytelab.raijin.state.TrafficRule
 import io.bitbytelab.raijin.tools.toolError
@@ -74,7 +76,8 @@ Parameters:
 - preserve_headers (bool, default true): when false, falls back to Burp's httpRequestFromUrl which adds default headers
 - auto_fix_content_length (bool, default true): when false, uses raw_request CL as-is. When true and the declared Content-Length didn't match the body, the result includes content_length_rewritten:{from,to}.
 
-Out-of-range numbers are clamped and reported in notes. Returns full response with headers, body, status code, and timing; reauthenticated:<macro> when a session login macro re-established the session and sent the request again.""",
+Out-of-range numbers are clamped and reported in notes. Returns full response with headers, body, status code, and timing; reauthenticated:<macro> when a session login macro re-established the session and sent the request again.""" + "\n\n" + ScopeGate.TOOL_NOTE +
+                " A followed redirect that lands outside scope is flagged (scope_warning), never blocked.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     property("url", "string", "Target URL (use this OR raw_request)")
@@ -171,15 +174,16 @@ Out-of-range numbers are clamped and reported in notes. Returns full response wi
 Mixed hosts are supported: requests are grouped by HTTP service (host+port+tls) and dispatched per-group, then merged back into the original input order. Per-group dispatch failures do not abort the batch — failed slots come back with error/phase fields.
 
 Parameters:
-- requests (array, required): per-request objects with the same fields as http_send_request
+- requests (array, required): per-request objects with url, method, headers, body, raw_request, host, port, use_tls, auto_fix_content_length and preserve_headers (both default true). http2_headers, follow_redirects, sni, verify_tls and response_timeout_ms are http_send_request only: an item carrying one fails to build. Each item reports its own content_length_rewritten, headers_warning and warnings (raw CR/LF removed). A group that times out or fails marks only its own items; groups not started before timeout_ms ran out come back not_sent.
 - http_mode (string): "AUTO" | "HTTP_1" | "HTTP_2" | "HTTP_2_IGNORE_ALPN"
 - max_response_length (int): truncate response bodies
 - timeout_ms (number, $TIMEOUT_DESCRIPTION): hard timeout for the entire batch
 
-Returns array of results in original order, plus group_timings_ms and groups_dispatched.""",
+Returns array of results in original order, plus group_timings_ms and groups_dispatched.""" + "\n\n" + ScopeGate.TOOL_NOTE +
+                " Checked per item: a refused item carries out_of_scope and is not sent, the others go out.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    putJsonObject("requests") { put("type", "array"); putJsonObject("items") { put("type", "object") }; put("description", "Per-request objects with the same fields as http_send_request") }
+                    putJsonObject("requests") { put("type", "array"); putJsonObject("items") { put("type", "object") }; put("description", "Per-request objects: url, method, headers, body, raw_request, host, port, use_tls, auto_fix_content_length, preserve_headers") }
                     enumProperty("http_mode", HTTP_MODES, "HTTP version for every request (default AUTO)")
                     property("max_response_length", "integer", "Truncate response bodies")
                     property("timeout_ms", "number", "Hard timeout for the entire batch in milliseconds ($TIMEOUT_DESCRIPTION)")
@@ -207,7 +211,8 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
         // ---------------------------------------------------------------
         server.addTool(
             name = "http_send_request_chain",
-            description = "Send a chain of HTTP requests sequentially with variable extraction between steps. Each step can extract values from its response with a regex (first capture group), a JSONPath or an XPath, and inject them into later steps via {{variable}} placeholders. Useful for CSRF tokens, session tokens, and multi-step workflows. A step's extract rules are checked before its request is sent; timeout_ms bounds each step. Optional connection_id pins/reuses one Montoya connection across every step — steps stay fully sequential either way (no pipelining); for genuine multi-request-per-socket pipelining use http_send_pipeline instead.",
+            description = "Send a chain of HTTP requests sequentially with variable extraction between steps. Each step can extract values from its response with a regex (first capture group), a JSONPath or an XPath, and inject them into later steps via {{variable}} placeholders. Useful for CSRF tokens, session tokens, and multi-step workflows. A step's extract rules are checked before its request is sent; timeout_ms bounds each step. Optional connection_id pins/reuses one Montoya connection across every step — steps stay fully sequential either way (no pipelining); for genuine multi-request-per-socket pipelining use http_send_pipeline instead. A step reports extract_missed (rules that matched nothing) and unresolved_placeholders ({{x}} left after substitution); success needs a response. " +
+                ScopeGate.TOOL_NOTE + " Checked per step.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("steps") { put("type", "array"); putJsonObject("items") { put("type", "object") }; put("description", "Array of step objects with url/raw_request and an optional 'extract' key. 'extract' MUST be an ARRAY of {name, pattern | json_path | xpath, from} objects (from = \"body\" (default) or \"header\"; a header rule takes a pattern over the 'Name: value' lines, every Set-Cookie included), e.g. extract:[{\"name\":\"csrf\",\"pattern\":\"name=csrf value=([^ ]+)\"},{\"name\":\"jwt\",\"json_path\":\"$.data.token\"}]. Passing a single object instead of an array is rejected with a validation error.") }
@@ -518,7 +523,8 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
             try {
                 val args = ToolArgs(request.params.arguments ?: emptyMap())
                 val ruleId = args.string("rule_id") ?: return@addTool toolError("Parameter 'rule_id' is required")
-                val removed = stateManager.trafficRules.removeIf { it.ruleId == ruleId }
+                // An audit auth rule goes with its -strip companion.
+                val removed = AuditAuthRules.removeRules(stateManager, ruleId)
 
                 toolJsonResult(buildJsonObject {
                     put("rule_id", ruleId)
@@ -535,17 +541,18 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
         // ---------------------------------------------------------------
         server.addTool(
             name = "http_send_raw_bytes",
-            description = "Send a raw byte-level HTTP request for HTTP request smuggling and CRLF injection testing. Accepts either hex-encoded bytes (raw_request_hex; whitespace between digits is ignored) or request text (raw_request). Preserves exact byte sequences without normalization: raw_request's literal \\r\\n / \\n escapes are decoded only when the text contains no real line break, and a character above U+00FF sends the whole text as UTF-8 (use raw_request_hex for exact bytes). Requires host, port, and use_tls parameters. Sends ONE request and reads ONE response (Montoya's api.http().sendRequest has no partial-read API, so a failed/timed-out send cannot report bytes_received or distinguish fin/rst — it only returns is_timeout and close_reason=\"timeout\"|\"error\"). HTTP/2/3 and kettled H2-smuggling escape fields (^~, ^xNN, ...) are not available here — this is HTTP/1 only; for those, or for sending several requests over one socket and reading back several responses, use http_send_pipeline (HTTP/1.1 pipelining) or Turbo (turbo_start_run with Engine.HTTP2/HTTP3, kettled=True).",
+            description = "Send a raw byte-level HTTP request for HTTP request smuggling and CRLF injection testing. Accepts either hex-encoded bytes (raw_request_hex; whitespace between digits is ignored) or request text (raw_request). Preserves exact byte sequences without normalization: raw_request's literal \\r\\n / \\n escapes are decoded only when the text contains no real line break, and a character above U+00FF sends the whole text as UTF-8 (use raw_request_hex for exact bytes). Requires host, port, and use_tls parameters. Sends ONE request and reads ONE response (Montoya's api.http().sendRequest has no partial-read API, so a failed/timed-out send cannot report bytes_received or distinguish fin/rst — it only returns is_timeout and close_reason=\"timeout\"|\"error\"). HTTP/2/3 and kettled H2-smuggling escape fields (^~, ^xNN, ...) are not available here — this is HTTP/1 only; for those, or for sending several requests over one socket and reading back several responses, use http_send_pipeline (HTTP/1.1 pipelining) or Turbo (turbo_start_run with Engine.HTTP2/HTTP3, kettled=True). " +
+                ScopeGate.TOOL_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     property("raw_request_hex", "string", "Hex-encoded request bytes (use this OR raw_request)")
                     property("raw_request", "string", "Request text; literal \\r\\n escapes are decoded only when it has no real line breaks")
                     property("host", "string", "Target hostname")
-                    property("port", "integer", "Target port number (1-65535, default 443)")
+                    property("port", "integer", "Target port number (1-65535, default 443, or 80 with use_tls=false)")
                     property("use_tls", "boolean", "Whether to use HTTPS (TLS)")
                     property("tls", "boolean", "Alias for use_tls")
                     property("https", "boolean", "Alias for use_tls")
-                    enumProperty("http_mode", HTTP_MODES, "HTTP version to use (default AUTO)")
+                    enumProperty("http_mode", HTTP_MODES, "HTTP version to use (default HTTP_1, so the bytes keep HTTP/1 framing; notes say when the response still came back over HTTP/2)")
                     property("max_response_length", "integer", "Truncate response body in result")
                     property("timeout_ms", "number", "Hard timeout in milliseconds ($TIMEOUT_DESCRIPTION)")
                 },
@@ -561,7 +568,7 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                 if (rawHex == null && rawString == null) {
                     return@addTool toolError("Either 'raw_request_hex' or 'raw_request' must be provided")
                 }
-                val port = args.int("port", PORTS) ?: 443
+                val port = args.portOrDefault(PORTS)
                 val useTls = args.tls(port)
                 val httpMode = args.enum("http_mode", HTTP_MODES)
                 val maxResponseLength = args.clampedInt("max_response_length", LENGTHS)

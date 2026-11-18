@@ -151,7 +151,6 @@ class ApiImportBridgeTest {
                  "base_url": "https://api.example.com/v1",
                  "total_endpoints": 2,
                  "requests_sent": 0,
-                 "skipped_out_of_scope": 0,
                  "added_to_sitemap": 0,
                  "added_to_scope": false,
                  "security_schemes": {"key": {"type": "apiKey", "in": "header", "name": "X-Key",

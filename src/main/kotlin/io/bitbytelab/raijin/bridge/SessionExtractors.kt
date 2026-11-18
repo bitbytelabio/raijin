@@ -362,6 +362,9 @@ internal object XmlXPath {
  */
 internal object ValueSelector {
 
+    /** Longest text a regex selector searches. */
+    const val MAX_EXTRACT_INPUT = 5_000_000
+
     /** @param regex applied last; null or empty for none. */
     fun select(source: String, jsonPath: String?, xpath: String?, regex: String?): String? {
         val selected = when {
@@ -370,7 +373,8 @@ internal object ValueSelector {
             else -> source
         }
         if (regex.isNullOrEmpty()) return selected
-        val match = SafeRegex.find(regex, selected) ?: return null
+        // Responses are routinely larger than SafeRegex's default input cap; the timeout still bounds the match.
+        val match = SafeRegex.find(regex, selected, maxInputLen = MAX_EXTRACT_INPUT) ?: return null
         return if (match.groupValues.size > 1) match.groupValues[1] else match.value
     }
 

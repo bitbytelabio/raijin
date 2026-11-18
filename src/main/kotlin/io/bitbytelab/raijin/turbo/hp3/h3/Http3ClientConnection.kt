@@ -1,5 +1,7 @@
 package io.bitbytelab.raijin.turbo.hp3.h3
 
+import io.bitbytelab.raijin.turbo.Http1ResponseReader
+import io.bitbytelab.raijin.turbo.Stream
 import io.bitbytelab.raijin.turbo.hp3.h3.qpack.FieldLine
 import io.bitbytelab.raijin.turbo.hp3.h3.qpack.PrefixInteger
 import io.bitbytelab.raijin.turbo.hp3.h3.qpack.QpackDecoder
@@ -581,6 +583,7 @@ class Http3ClientConnection private constructor(
         var trailers: List<FieldLine> = listOf()
         var interimResponses = 0
         val body = ByteArrayOutputStream()
+        var truncated = false
 
         var frame: Http3Frame?
         while (reader.readFrameIgnoringUnknown().also { frame = it } != null) {
@@ -615,7 +618,18 @@ class Http3ClientConnection private constructor(
                                 "response's HEADERS frame"
                         })
                 }
-                body.writeBytes(f.payload())
+                // Bounded as the HTTP/1 engine is: the rest of an oversized body is read and dropped.
+                if (!truncated) {
+                    val payload = f.payload()
+                    val room = Http1ResponseReader.MAX_RESPONSE_BYTES - body.size()
+                    if (payload.size <= room) {
+                        body.writeBytes(payload)
+                    } else {
+                        body.write(payload, 0, room.coerceAtLeast(0))
+                        body.writeBytes(Stream.TRUNCATED_NOTE.toByteArray(Charsets.ISO_8859_1))
+                        truncated = true
+                    }
+                }
             }
             // Any other known frame type is legal here but of no interest to a client.
         }

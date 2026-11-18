@@ -102,9 +102,10 @@ internal class Http1ResponseReader(
     /**
      * Reads the next response. With [ignoreLength] the length headers are ignored, and so are
      * interim responses: whatever arrives until the connection goes quiet is the response.
-     * Returns null when the run is abandoned before the response is complete.
+     * Returns null when the run is abandoned before the response is complete. [bodyless] says the
+     * request was a HEAD, whose response never has a body.
      */
-    fun readResponse(ignoreLength: Boolean): Http1Response? {
+    fun readResponse(ignoreLength: Boolean, bodyless: Boolean = false): Http1Response? {
         val interim = StringBuilder()
         var headEnd: Int
         while (true) {
@@ -140,14 +141,20 @@ internal class Http1ResponseReader(
 
         val head = takeString(headEnd - start)
         val headCompletedAt = lastTakenAt
-        val contentLength = contentLength(head)
+        // A response to HEAD, and 1xx / 204 / 304, ends at its head whatever its length headers say.
+        // Not 101: the connection now speaks another protocol, whose bytes are read until quiet and
+        // the connection dropped, as before.
+        val noBody = !ignoreLength && (bodyless || statusCode(head).let { (it in 100..199 && it != 101) || it == 204 || it == 304 })
+        val contentLength = if (noBody) -1 else contentLength(head)
         if (contentLength > MAX_RESPONSE_BYTES) {
             throw ConnectException("Response too large - 10mb max")
         }
 
-        var closeConnection = false
+        var closeConnection = closesConnection(head)
         val body: ByteArray
-        if (!ignoreLength && contentLength != -1) {
+        if (noBody) {
+            body = EMPTY_BODY
+        } else if (!ignoreLength && contentLength != -1) {
             while (buffered < contentLength) {
                 if (shouldAbandon()) return null
                 if (!fill()) {
@@ -386,6 +393,17 @@ internal class Http1ResponseReader(
         fun isChunked(head: String): Boolean {
             val value = headerValue(head, "Transfer-Encoding") ?: return false
             return value.substringAfterLast(',').trim().equals("chunked", ignoreCase = true)
+        }
+
+        /** The status code of a response head, or -1 when its status line has none. */
+        fun statusCode(head: String): Int =
+            head.substringBefore('\n').split(' ').getOrNull(1)?.trim()?.toIntOrNull() ?: -1
+
+        /** True when the server ends the connection after [head]: `Connection: close`, or HTTP/1.0 without keep-alive. */
+        fun closesConnection(head: String): Boolean {
+            val tokens = headerValue(head, "Connection")?.split(',')?.map { it.trim().lowercase() }.orEmpty()
+            if ("close" in tokens) return true
+            return head.startsWith("HTTP/1.0") && "keep-alive" !in tokens
         }
     }
 }

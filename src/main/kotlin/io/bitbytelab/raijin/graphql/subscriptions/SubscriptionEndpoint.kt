@@ -1,6 +1,5 @@
 package io.bitbytelab.raijin.graphql.subscriptions
 
-import io.bitbytelab.raijin.safety.RequestHygiene
 import java.net.URI
 
 /**
@@ -24,14 +23,13 @@ class SubscriptionEndpoint private constructor(
     /**
      * The HTTP/1.1 upgrade request asking for [subprotocol]. [headers] are the caller's: a `Host`
      * among them replaces the default, and the headers the handshake itself defines are dropped so
-     * that the probe decides the subprotocol. Control characters are stripped, as a stray newline
-     * would break the request apart.
+     * that the probe decides the subprotocol. Names and values are written exactly as given.
      */
     fun upgradeRequest(subprotocol: String, headers: Map<String, String>, key: String): String = buildString {
         val custom = headers.filterKeys { it.trim().lowercase() !in HANDSHAKE_HEADERS }
         val hostOverride = custom.entries.firstOrNull { it.key.trim().equals("Host", ignoreCase = true) }?.value
         append("GET ").append(target).append(" HTTP/1.1\r\n")
-        append("Host: ").append(hostOverride?.let { RequestHygiene.stripControl(it) } ?: authority).append("\r\n")
+        append("Host: ").append(hostOverride ?: authority).append("\r\n")
         append("Upgrade: websocket\r\n")
         append("Connection: Upgrade\r\n")
         append("Sec-WebSocket-Version: 13\r\n")
@@ -39,7 +37,7 @@ class SubscriptionEndpoint private constructor(
         append("Sec-WebSocket-Protocol: ").append(subprotocol).append("\r\n")
         for ((name, value) in custom) {
             if (name.trim().equals("Host", ignoreCase = true)) continue
-            append(RequestHygiene.stripControl(name)).append(": ").append(RequestHygiene.stripControl(value)).append("\r\n")
+            append(name).append(": ").append(value).append("\r\n")
         }
         append("\r\n")
     }
@@ -90,7 +88,7 @@ class SubscriptionEndpoint private constructor(
                     port = port,
                     secure = secure,
                     authority = if (port == defaultPort) rawHost else "$rawHost:$port",
-                    target = RequestHygiene.stripControl(path + query),
+                    target = path + query,
                 )
             )
         }

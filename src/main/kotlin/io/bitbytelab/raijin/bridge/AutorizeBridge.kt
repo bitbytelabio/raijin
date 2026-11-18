@@ -58,6 +58,10 @@ class AutorizeBridge(private val stateManager: StateManager) {
         }
         val rule = synchronized(ruleLock) {
             val existing = ruleId?.let { id -> stateManager.autorizeRules.firstOrNull { it.ruleId == id } }
+            // A patch (no identities) to an id nobody has is a mistake; with identities it creates the rule under that id.
+            if (ruleId != null && existing == null && identities == null) {
+                return buildJsonObject { put("error", "Rule not found: $ruleId") }
+            }
             val resolvedIdentities = identities ?: existing?.identities
             if (resolvedIdentities.isNullOrEmpty()) {
                 return buildJsonObject {
@@ -69,7 +73,9 @@ class AutorizeBridge(private val stateManager: StateManager) {
                     )
                 }
             }
-            val id = ruleId ?: stateManager.generateId("arule")
+            // Restored rules keep their ids, and the id counter restarts with Burp: skip any in use.
+            val id = ruleId ?: generateSequence { stateManager.generateId("arule") }
+                .first { candidate -> stateManager.autorizeRules.none { it.ruleId == candidate } }
             val rule = AutorizeRule(
                 ruleId = id,
                 identities = resolvedIdentities,

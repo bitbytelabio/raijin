@@ -5,6 +5,7 @@ import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.core.asJsonObjectList
 import io.bitbytelab.raijin.core.asLongSafe
 import io.bitbytelab.raijin.core.asStringList
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
@@ -32,7 +33,8 @@ object AutorizeTools {
                 "setting the rule — no need to resend anything yourself. State-changing methods (POST, PUT, DELETE, " +
                 "PATCH) are not replayed unless include_mutating=true, and originals that were not authenticated " +
                 "(no credentials, or answered 401) or answered 404 are skipped. Matches persist per Burp project and " +
-                "are emitted as 'autorize.match' events. Setting a rule (new or updated) re-tests endpoints it already replayed.",
+                "are emitted as 'autorize.match' events. Setting a rule (new or updated) re-tests endpoints it already replayed. " +
+                ScopeGate.TOOL_NOTE + " Each replay is checked: the rule's skipped_out_of_scope and sent_out_of_scope counters show the outcome.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("rule_id") { put("type", "string"); put("description", "Omit to create a new rule; pass an existing id to update it") }

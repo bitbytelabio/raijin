@@ -142,18 +142,22 @@ open class Request(val template: String, val words: List<String?>, val learnBori
             Utils.out("Bad base request - nowhere to inject payload")
         }
 
-        var req = template
-
-        for (w in words){
-            req = req.replaceFirst("%s", w.toString(), false)
+        // One left-to-right pass over the template: a payload that itself contains %s is never
+        // taken for the next injection point.
+        val req = StringBuilder(template.length + words.sumOf { it.toString().length })
+        var cursor = 0
+        for (w in words) {
+            val at = template.indexOf("%s", cursor)
+            if (at < 0) break
+            req.append(template, cursor, at).append(w.toString())
+            cursor = at + 2
         }
-
-        if (req.contains("%s")) {
-
+        if (template.indexOf("%s", cursor) >= 0) {
             Utils.out("Bad base request ${words.size} words and more %s")
         }
+        req.append(template, cursor, template.length)
 
-        return fixContentLength(req)
+        return fixContentLength(req.toString())
     }
 
     fun getRequestAsBytes(): ByteArray {

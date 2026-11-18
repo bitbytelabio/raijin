@@ -38,6 +38,9 @@ abstract class RequestEngine(
 
         /** How often openGate() moves the pre-start backlog on while the gate's requests are staged. */
         const val GATE_BACKLOG_POLL_MILLIS = 1L
+
+        /** Longest callback error text kept in [lastCallbackError]. */
+        const val MAX_CALLBACK_ERROR_CHARS = 4000
     }
 
 
@@ -58,8 +61,18 @@ abstract class RequestEngine(
      * than a ConcurrentHashMap, which would reject the None (null) values scripts store.
      */
     val userState: MutableMap<String, Any> = Collections.synchronizedMap(HashMap())
-    val lastRequestID = AtomicInteger(0)
+    /** Request id counter; [RunHandler.setRequestEngine] shares one across a run's engines. */
+    var lastRequestID = AtomicInteger(0)
     var connections = AtomicInteger(0)
+    /** Set once [showSummary] has run (ranking included): only then is a terminal run's status final. */
+    @Volatile var finalized = false
+    /** Told each request's target URL as it is queued (scope advice for MCP-started runs); null for none. */
+    @Volatile var targetObserver: ((String) -> Unit)? = null
+    /** Exceptions raised by the script's own callbacks; they are not request failures ([permaFails]). */
+    val callbackFailures = AtomicInteger(0)
+    @Volatile var lastCallbackError: String? = null
+    /** True on a thread while it runs a user callback, so a cancel from inside one does not wait for itself. */
+    private val inCallback = ThreadLocal<Boolean>()
     val runState = AtomicInteger(0) // 0 = connecting, 1 = live, 2 = fully queued, 3 = cancelled, 4 = completed
     lateinit var completedLatch: CountDownLatch
     // Iterated by every worker on every response, added to rarely: copy-on-write.
@@ -192,12 +205,18 @@ abstract class RequestEngine(
 
     fun invokeCallback(req: Request, interesting: Boolean){
         updateLastLife()
+        inCallback.set(true)
         try {
             req.invokeCallback(interesting)
         } catch (ex: Throwable){
             Utils.out("Error in user-defined callback: $ex")
             ex.printStackTrace()
-            permaFails.incrementAndGet()
+            // The script's bug, not a failed request: counted apart so a run is not reported as
+            // "all requests failed with connection errors" when every response came back.
+            callbackFailures.incrementAndGet()
+            lastCallbackError = ex.toString().take(MAX_CALLBACK_ERROR_CHARS)
+        } finally {
+            inCallback.remove()
         }
     }
 
@@ -336,6 +355,8 @@ abstract class RequestEngine(
         request.pauseTime = pauseTime
         request.pauseMarkers = pauseMarkers
         request.endpointOverride = endpoint
+        // Advice only: neither an unset target nor a failing scope lookup may stop a request being queued.
+        targetObserver?.let { observe -> runCatching { observe(endpoint ?: target.toString()) } }
         request.autoFixContentLength = fixContentLength
         request.connectionId = connectionId
         request.kettled = kettled
@@ -472,6 +493,8 @@ abstract class RequestEngine(
     }
 
     open fun openGate(gateName: String) {
+        // A stopped run has nothing to release: the script's openGate is not an error then.
+        if (runState.get() >= 3) return
         openGateOnce(gateName)
     }
 
@@ -636,6 +659,20 @@ abstract class RequestEngine(
             sealCompletion()
             Utils.out("Cancelled run")
 
+            if (inCallback.get() == true) {
+                // Cancelled from a callback: this worker would wait for itself below. The run is
+                // ended already; the wait, the ranking and the cleanup go to a thread of their own,
+                // as the idle-timeout cancel does.
+                thread(isDaemon = true, name = "turbo-cancel-${System.identityHashCode(this)}") {
+                    if (completionInitialized() && !awaitCompletion(30L, TimeUnit.SECONDS)) {
+                        Utils.err("Warning: Worker threads did not complete within 30s during cancellation")
+                    }
+                    runTerminalFinalizer { showSummary() }
+                    cleanup()
+                }
+                return
+            }
+
             // Wait for all worker threads to finish their callbacks before calculating anomaly rankings
             // This prevents ConcurrentModificationException when iterating the request list
             if (completionInitialized()) {
@@ -724,23 +761,28 @@ abstract class RequestEngine(
     }
 
     fun showSummary() {
-        // todo or invoke completedCallback here?
-        Utils.unregisterEngine(this)
-        val duration = elapsedNanos().toFloat()
-        val requests = successfulRequests.get().toFloat()
-        Utils.err("Sent ${requests.toInt()} requests over ${connections.toInt()} connections in ${duration / 1000000000} seconds")
-        Utils.err(String.format("RPS: %.0f\n", requests / ceil((duration / 1000000000).toDouble())))
+        try {
+            // todo or invoke completedCallback here?
+            Utils.unregisterEngine(this)
+            val duration = elapsedNanos().toFloat()
+            val requests = successfulRequests.get().toFloat()
+            Utils.err("Sent ${requests.toInt()} requests over ${connections.toInt()} connections in ${duration / 1000000000} seconds")
+            Utils.err(String.format("RPS: %.0f\n", requests / ceil((duration / 1000000000).toDouble())))
 
-        // Calculate anomaly rankings when run is stopped or completed
-        if (runState.get() >= 3) {
-            // All worker threads have finished (waited in cancel() or showStats())
-            // so it's safe to iterate the request list for anomaly ranking
-            calculateAnomalyRankings()
-        }
+            // Calculate anomaly rankings when run is stopped or completed
+            if (runState.get() >= 3) {
+                // All worker threads have finished (waited in cancel() or showStats())
+                // so it's safe to iterate the request list for anomaly ranking
+                calculateAnomalyRankings()
+            }
 
-        // Clean up memory when run is completed
-        if (runState.get() >= 4) {
-            cleanup()
+            // Clean up memory when run is completed
+            if (runState.get() >= 4) {
+                cleanup()
+            }
+        } finally {
+            // Status readers wait for this: a run is only reported finished once it is ranked.
+            finalized = true
         }
     }
 

@@ -50,7 +50,8 @@ object ProxyTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "proxy_history",
-            description = "Get HTTP proxy history entries with optional filtering by host, method, status code, status code range, MIME type. Returns request/response metadata and optionally full request/response text.",
+            description = "Get HTTP proxy history entries with optional filtering by host, method, status code, status code range, MIME type. Returns request/response metadata and optionally full request/response text. " +
+                "Each item has 'id' (Burp's message id, what proxy_annotate takes) and 'index' (its place in the filtered list); next_start_index pages on.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     intProp("start_index", "Start index of history entries (default 0)", min = 0)
@@ -94,7 +95,9 @@ object ProxyTools {
         // ---------------------------------------------------------------
         server.addTool(
             name = "proxy_history_search",
-            description = "Search proxy history using a regex pattern. Can search in request, response, or both. Returns matching history entries.",
+            description = "Search proxy history using a regex pattern. Can search in request, response, or both. Returns matching history entries: " +
+                "id is Burp's message id, index the place in the match list; next_start_index pages on. Texts over 5,000,000 characters " +
+                "are not searched and counted in skipped_oversize.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("pattern") { put("type", "string"); put("description", "Regex pattern to search for") }
@@ -105,6 +108,7 @@ object ProxyTools {
                     putJsonObject("include_request") { put("type", "boolean"); put("description", "Include full request text (default false). Also unmasks sensitive request header values (Cookie, Authorization, …) which are otherwise redacted in request_headers") }
                     putJsonObject("include_response") { put("type", "boolean"); put("description", "Include full response text (default false)") }
                     intProp("max_response_length", "Truncate request/response text to this many characters (default 200000)", min = 1)
+                    intProp("start_index", "Index of the first match to return (default 0); pass the result's next_start_index for the next page", min = 0)
                 },
                 required = listOf("pattern")
             )
@@ -129,6 +133,7 @@ object ProxyTools {
                     includeRequest = args.bool("include_request", false),
                     includeResponse = args.bool("include_response", false),
                     maxResponseLength = args.int("max_response_length", 1..Int.MAX_VALUE),
+                    startIndex = args.integer("start_index") ?: 0,
                 )
                 toolJsonResult(result)
             } catch (e: Exception) {
@@ -183,6 +188,7 @@ object ProxyTools {
                     intProp("max_results", "Maximum number of results (default 100; above ${ProxyBridge.MAX_PAGE_SIZE} is served as ${ProxyBridge.MAX_PAGE_SIZE} with a note)", min = 0)
                     intProp("websocket_id", "Only messages of this proxied connection (the 'websocket_id' of an item)", min = 0)
                     putJsonObject("url") { put("type", "string"); put("description", "Only messages whose upgrade request URL contains this (case-insensitive)") }
+                    intProp("start_index", "Index of the first match to return (default 0); pass the result's next_start_index for the next page", min = 0)
                 },
                 required = listOf("pattern")
             )
@@ -199,6 +205,7 @@ object ProxyTools {
                     maxResults = args.integer("max_results") ?: 100,
                     webSocketId = args.integer("websocket_id"),
                     url = args.string("url"),
+                    startIndex = args.integer("start_index") ?: 0,
                 )
                 toolJsonResult(result)
             } catch (e: Exception) {
@@ -398,20 +405,20 @@ object ProxyTools {
             description = "Annotate a proxy history item by setting a comment and/or highlight color. Highlight colors: NONE, RED, ORANGE, YELLOW, GREEN, CYAN, BLUE, PINK, MAGENTA, GRAY.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
-                    intProp("index", "Proxy history item ID", min = 0)
+                    intProp("id", "Burp's id of the proxy history item (the 'id' of a proxy_history item, not its 'index')", min = 0)
                     putJsonObject("comment") { put("type", "string"); put("description", "Comment to set on the item") }
                     enumProp("highlight", HIGHLIGHT_COLORS, "Highlight color (case-insensitive); NONE clears it")
                 },
-                required = listOf("index")
+                required = listOf("id")
             )
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
 
-                val index = args.int("index", 0..Int.MAX_VALUE)
-                    ?: return@addTool toolError("Parameter 'index' is required (proxy history item ID)")
+                val id = args.int("id", 0..Int.MAX_VALUE)
+                    ?: return@addTool toolError("Parameter 'id' is required (the 'id' of a proxy_history item)")
 
-                toolJsonResult(bridge.annotateHistoryItem(index, args.string("comment"), args.string("highlight")))
+                toolJsonResult(bridge.annotateHistoryItem(id, args.string("comment"), args.string("highlight")))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }

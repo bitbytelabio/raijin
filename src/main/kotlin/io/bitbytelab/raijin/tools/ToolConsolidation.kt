@@ -220,7 +220,7 @@ object ToolConsolidation {
             ),
         ),
         Group(
-            "recon", "Recon on in-scope targets: JS endpoints, content discovery, parameter mining, fingerprinting.",
+            "recon", "Recon: JS endpoints, content discovery, parameter mining, fingerprinting.",
             prefixed(
                 "recon_", "recon_js_endpoints", "recon_content_discovery", "recon_param_mine",
                 "recon_fingerprint",
@@ -228,7 +228,7 @@ object ToolConsolidation {
         ),
         Group(
             "probe",
-            "Guided probes on in-scope targets: CORS, web cache poisoning/deception, GraphQL, injection, access control, IDOR, JWT.",
+            "Guided probes: CORS, web cache poisoning/deception, GraphQL, injection, access control, IDOR, JWT.",
             mapOf(
                 "cors" to "cors_probe", "cache" to "cache_probe", "graphql" to "graphql_probe",
                 "injection" to "injection_probe",

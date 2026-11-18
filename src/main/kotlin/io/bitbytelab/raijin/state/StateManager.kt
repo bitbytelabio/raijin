@@ -130,7 +130,9 @@ data class McpActivityEntry(
     val isError: Boolean,
     val argsSummary: String,
     val resultSummary: String,
-    val requestResponse: HttpRequestResponse? = null
+    val requestResponse: HttpRequestResponse? = null,
+    /** The call's result reported an out-of-scope target (scope_warning, out_of_scope, ...). */
+    val outOfScope: Boolean = false,
 )
 
 /**
@@ -279,6 +281,10 @@ class StateManager {
     fun autorizeSeenOnce(key: String, endpoint: String = key.substringBefore('?')): Boolean =
         autorizeSeen.seenOnce(key, endpoint)
 
+    /** The inverse of [autorizeSeenOnce]: a replay that did not happen leaves [key] testable again. */
+    fun unmarkAutorizeSeen(key: String, endpoint: String = key.substringBefore('?')) =
+        autorizeSeen.unsee(key, endpoint)
+
     /** Records a flagged [AutorizeRule] mismatch; see [AutorizeMatchLog.add] for the bounds. */
     fun addAutorizeMatch(
         ruleId: String,
@@ -347,7 +353,8 @@ class StateManager {
         isError: Boolean,
         argsSummary: String,
         resultSummary: String,
-        requestResponse: HttpRequestResponse? = null
+        requestResponse: HttpRequestResponse? = null,
+        outOfScope: Boolean = false,
     ): McpActivityEntry {
         val entry = McpActivityEntry(
             id = mcpActivityIdCounter.incrementAndGet(),
@@ -361,7 +368,8 @@ class StateManager {
             isError = isError,
             argsSummary = argsSummary,
             resultSummary = resultSummary,
-            requestResponse = requestResponse
+            requestResponse = requestResponse,
+            outOfScope = outOfScope,
         )
         mcpActivity.addFirst(entry)
         mcpActivityCount.incrementAndGet()
@@ -402,7 +410,8 @@ class StateManager {
      * The counter is shared across all id types to guarantee global uniqueness.
      */
     fun generateId(prefix: String): String {
-        return "$prefix-${String.format("%03d", idCounter.incrementAndGet())}"
+        // Not String.format: under an Arabic or Persian default locale it writes non-ASCII digits.
+        return "$prefix-${idCounter.incrementAndGet().toString().padStart(3, '0')}"
     }
 
     /**

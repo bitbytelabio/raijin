@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.tools.recon
 
 import io.bitbytelab.raijin.bridge.ReconBridge
+import io.bitbytelab.raijin.core.ClampedInt
 import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.core.ParamMinerWordlists
 import io.bitbytelab.raijin.core.asBodyString
@@ -10,6 +11,7 @@ import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.core.asStringMapResult
 import io.bitbytelab.raijin.core.withClampReport
 import io.bitbytelab.raijin.recon.ParamLocation
+import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
@@ -33,7 +35,8 @@ object ReconTools {
                 "literals (`/users/\${id}` comes back as /users/{id}). Also follows source maps: a map already in history " +
                 "(.js.map) is read for its original file names and the endpoints in its embedded sources; maps a script " +
                 "only points to (sourceMappingURL comment, SourceMap header) are listed, and requested when " +
-                "fetch_source_maps=true (in scope only). Browse the target first, then run this.",
+                "fetch_source_maps=true (scope-checked per mcp_scope_mode). Browse the target first, then run this. " +
+                ScopeGate.TOOL_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     intProp("max_items", "Max recent history items to scan (default 500); a larger value is clamped to ${ReconBridge.MAX_HISTORY_ITEMS} and reported as max_items_clamped_to", HISTORY_ITEMS)
@@ -67,7 +70,7 @@ object ReconTools {
                 "host that answers 200 to everything, repeats the path in its error page or redirects every unknown " +
                 "path yields no false finds. A 429 is waited out and the pace slowed; if it persists, or a WAF starts " +
                 "answering, the scan stops and reports stopped_at so you can continue later. At most " +
-                "${ReconBridge.MAX_PATHS} paths per call. Respects the operator scope policy (mcp_scope_mode).",
+                "${ReconBridge.MAX_PATHS} paths per call. " + ScopeGate.TOOL_NOTE + " Checked per path.",
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("base_url") { put("type", "string"); put("description", "Base URL, e.g. https://target.com") }
@@ -98,7 +101,7 @@ object ReconTools {
                 "inject_in=header). A candidate may be 'name~value' to send a value of that shape (%s = canary, " +
                 "%h = target host), as the header list does for host/origin/x-forwarded-host. headers/cookies/body set " +
                 "the request the names are added to; offset/limit page through the list (the result gives next_offset); " +
-                "max_requests caps the run. Respects the operator scope policy.",
+                "max_requests caps the run. " + ScopeGate.TOOL_NOTE,
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     putJsonObject("url") { put("type", "string"); put("description", "Target URL") }
@@ -122,15 +125,19 @@ object ReconTools {
             try {
                 val a = request.params.arguments ?: emptyMap()
                 val url = a.string("url") ?: return@addTool toolError("Parameter 'url' is required")
+                // Limits out of range are clamped and reported (<name>_clamped_to), not refused.
+                val limit = a.clamped("limit", LIMITS)
+                val bucketSize = a.clamped("bucket_size", BUCKET_SIZES)
+                val maxRequests = a.clamped("max_requests", REQUEST_BUDGETS)
                 val options = ReconBridge.ParamMineOptions(
                     offset = a.int("offset", OFFSETS) ?: 0,
-                    limit = a.int("limit", LIMITS),
+                    limit = limit?.value,
                     headers = a.mapArg("headers", "an object of header names to values"),
                     cookies = a.cookiesArg("cookies"),
                     body = a["body"].asBodyString(),
                     cacheBuster = a.bool("cache_buster") ?: true,
-                    bucketSize = a.int("bucket_size", BUCKET_SIZES),
-                    maxRequests = a.int("max_requests", REQUEST_BUDGETS) ?: ReconBridge.DEFAULT_MAX_REQUESTS,
+                    bucketSize = bucketSize?.value,
+                    maxRequests = maxRequests?.value ?: ReconBridge.DEFAULT_MAX_REQUESTS,
                 )
                 toolJsonResult(
                     bridge.paramMine(
@@ -141,11 +148,16 @@ object ReconTools {
                         a.string("method"),
                         a.oneOf("wordlist", ParamMinerWordlists.names().sorted()),
                         options,
-                    )
+                    ).withClampReport("limit", limit).withClampReport("bucket_size", bucketSize)
+                        .withClampReport("max_requests", maxRequests)
                 )
             } catch (e: Exception) { toolError(e.message ?: "Unknown error") }
         }
     }
+
+    /** An optional limit moved into [range] when outside it; only a non-integer throws. */
+    private fun Map<String, JsonElement>.clamped(name: String, range: IntRange): ClampedInt? =
+        this[name].asClampedInt(name, range.first, range.last).getOrThrow()
 
     // ---------------------------------------------------------------
     // Argument and schema helpers: a bad value throws IllegalArgumentException with the message

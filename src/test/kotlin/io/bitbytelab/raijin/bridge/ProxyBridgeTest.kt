@@ -140,7 +140,7 @@ class ProxyBridgeTest {
         return ProxyBridge(api, EventBus(), state, FindingsBridge(state), autorizeStore = null).also { bridges += it }
     }
 
-    private fun ids(result: JsonObject, key: String = "index"): List<Int> =
+    private fun ids(result: JsonObject, key: String = "id"): List<Int> =
         result["items"]!!.jsonArray.map { it.jsonObject[key]!!.jsonPrimitive.int }
 
     private fun notes(result: JsonObject): List<String> =

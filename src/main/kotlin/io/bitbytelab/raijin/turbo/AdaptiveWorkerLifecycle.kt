@@ -107,15 +107,23 @@ internal class AdaptiveWorkerLifecycle(
         if (adaptive) registry.seal()
     }
 
-    /** Interrupts the workers still running and gives each a second to stop, for the engine's cleanup. */
+    /**
+     * Interrupts every worker still running, then gives them two seconds between them to stop, for
+     * the engine's cleanup. All are interrupted before any is waited for, so N slow workers cost
+     * one wait, not N.
+     */
     fun stopAll() {
-        val running = synchronized(workerThreads) { workerThreads.toList() }
+        val running = synchronized(workerThreads) { workerThreads.toList() }.filter { it.isAlive }
+        running.forEach { runCatching { it.interrupt() } }
+        val deadline = System.nanoTime() + STOP_WAIT_NANOS
         for (worker in running) {
+            val left = (deadline - System.nanoTime()) / 1_000_000
+            if (left <= 0) break
             try {
-                if (worker.isAlive) {
-                    worker.interrupt()
-                    worker.join(1000)
-                }
+                worker.join(left)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
             } catch (_: Exception) {
                 // Ignore exceptions during cleanup; a worker still running is left to finish.
             }
@@ -140,5 +148,10 @@ internal class AdaptiveWorkerLifecycle(
     private fun recordStartFailure(failure: Throwable) {
         if (isRecoverableAdaptiveCapacityFailure(failure)) engine.recordTransportFailure(failure)
         else throw failure
+    }
+
+    private companion object {
+        /** How long [stopAll] waits for all interrupted workers together. */
+        const val STOP_WAIT_NANOS = 2_000_000_000L
     }
 }

@@ -2,6 +2,7 @@ package io.bitbytelab.raijin.turbo.mcp
 
 import io.bitbytelab.raijin.turbo.Request
 import io.bitbytelab.raijin.turbo.SortField
+import io.bitbytelab.raijin.turbo.Utils
 import java.io.File
 import kotlin.io.path.createTempDirectory
 
@@ -72,15 +73,22 @@ class McpResourceHandlers(
         val run = manager.getRun(runId)
             ?: return runNotFoundError(runId)
 
+        var interrupted = false
         if (waitMs > 0 && run.handler.status() == "running") {
             val deadline = System.currentTimeMillis() + waitMs
-            while (run.handler.status() == "running" && System.currentTimeMillis() < deadline) {
-                Thread.sleep(100)
+            try {
+                while (run.handler.status() == "running" && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(100)
+                }
+            } catch (_: InterruptedException) {
+                // The tool call was cancelled: answer with the state as it is, and keep the interrupt.
+                Thread.currentThread().interrupt()
+                interrupted = true
             }
         }
 
         val status = run.handler.status()
-        val baseStatus = mapOf(
+        val baseStatus = mutableMapOf<String, Any?>(
             "run_id" to run.id,
             "status" to status,
             "status_message" to run.handler.statusString(),
@@ -88,6 +96,9 @@ class McpResourceHandlers(
             "fails" to run.handler.failCount(),
             "created_at" to run.createdAt
         )
+        putCallbackErrors(baseStatus, run)
+        run.handler.scopeWarnings.takeIf { it.isNotEmpty() }?.let { baseStatus["scope_warnings"] = it.toList() }
+        if (interrupted) baseStatus["note"] = "wait interrupted"
 
         // Include summary when run is not running
         if (status != "running") {
@@ -172,19 +183,25 @@ class McpResourceHandlers(
             val tempDir = createTempDirectory("turbo-${run.id}-").toFile()
             val requestFile = File(tempDir, "request-$requestId.txt")
             val responseFile = File(tempDir, "response-$requestId.txt")
+            // Registered directory first: deleteOnExit runs in reverse order, files before their directory.
+            tempDir.deleteOnExit()
+            requestFile.deleteOnExit()
+            responseFile.deleteOnExit()
 
-            requestFile.writeText(request.getRequest())
-            request.response?.let { responseFile.writeText(it) }
+            // The bytes as they went over the wire (one char per byte), not re-encoded text.
+            requestFile.writeBytes(request.getRequestAsBytes())
+            val response = request.response
+            if (response != null) responseFile.writeBytes(Utils.stringToBytes(response))
 
-            return mapOf(
-                "request_file" to requestFile.absolutePath,
-                "response_file" to responseFile.absolutePath,
-                "status" to request.code,
-                "length" to request.length,
-                "ttfb" to request.ttfb,
-                "ttlb" to request.ttlb,
-                "words" to request.words
-            )
+            return buildMap {
+                put("request_file", requestFile.absolutePath)
+                if (response != null) put("response_file", responseFile.absolutePath)
+                put("status", request.code)
+                put("length", request.length)
+                put("ttfb", request.ttfb)
+                put("ttlb", request.ttlb)
+                put("words", request.words)
+            }
         }
 
         val response = request.response

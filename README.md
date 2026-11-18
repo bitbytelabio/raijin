@@ -344,7 +344,7 @@ On loopback (the default) there is **no token to manage**. Protection is:
 > [!CAUTION]
 > On loopback any local process can call the tools, and the tools drive your Burp (including running Python through Turbo). Do not run Raijin on a shared machine.
 
-Outbound requests from the `http_*`, recon and probe tools are checked against Burp's target scope by `mcp_scope_mode`: `warn` (default) sends them and flags out-of-scope targets, `enforce` refuses them, `off` skips the check. Set the scope with `scope(action=include)` first.
+Outbound requests from the `http_*`, recon and probe tools are checked against Burp's target scope by `mcp_scope_mode`: `warn` (default) sends them and adds `scope_warning` to the result, `enforce` refuses them (`out_of_scope: true`, nothing sent), `off` skips the check. Turbo runs, Scanner tasks, WebSocket opens and followed redirects are advisory only: flagged under `warn` and `enforce`, never refused. Every scope decision shows in the tool result, in the MCP Activity tab (warning-coloured rows, an Out-of-scope count) and in the audit log (`out_of_scope: true`). Set the scope with `scope(action=include)` first. An MCP client can change the mode with `persistence(action=preference_store)`: only `off`, `warn` or `enforce` is accepted, and every change is announced (a `scope.mode_changed` event and a line in Burp's output) and shown on the Server tab.
 
 ---
 
