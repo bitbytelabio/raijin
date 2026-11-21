@@ -7,6 +7,8 @@
 - `raijin up [project] [--ui]` starts Burp with Raijin for a named `.burp` project, headless by default, detached, on free ports, under an isolated profile (`~/.raijin/burp-profile`, seeded once from your Burp user config without its extensions); several projects run at once. `raijin down`, `raijin status`. On macOS Burp is started through its app launcher: PortSwigger's bundled `java` refuses other parents.
 - `raijin mcp`: a stdio MCP gateway with three tools (`discover`, `execute`, `skill`), so an agent loads tool schemas per domain instead of all 45 up front. `execute` also runs `burp_up` / `burp_down` / `burp_status` and the history tools; results over `[mcp] inline_limit_kb` are saved to `.raijin/tool-results/` and returned as `{saved_to, preview}`. `--surface full` also lists every Raijin tool; `--remote <url>` drives an already-running Raijin.
 - `theme = "dark" | "light"` in `raijin.toml` (default `dark`) sets Burp's look and feel on every `raijin up`.
+- `task_engine = "running" | "paused"` (default `running`): Burp pauses every task when it reopens a project, so proxy traffic stopped reaching the site map; `raijin up` now passes `--unpause-spider-and-scanner` unless set to `paused` (unfinished scans in the project resume too).
+- A headless launch on macOS no longer leaves Burp's splash screen on screen.
 - `install.sh`, attached to each release: `curl -LsSf https://github.com/bitbytelabio/raijin/releases/latest/download/install.sh | sh` installs the CLI for the current platform and the extension as `raijin.jar` into `~/.local/bin` after checking their `.sha256` (`RAIJIN_VERSION`, `RAIJIN_INSTALL_DIR` override).
 - `raijin history list|show|search|endpoints|diff|export` (and the matching `history_*` tools) read every `.burp` project of a target in parallel without Burp, through a vendored copy of amber (see NOTICE), together with Raijin's archive of tool-sent traffic and scanner issues.
 
@@ -32,6 +34,7 @@
 - Batch items honour `auto_fix_content_length` and `preserve_headers`, report their own fix and header warnings, and refuse fields only `http_send_request` supports.
 - Parallel sends keep the responses a slow group did not time out; a chain step needs a response to succeed and reports `extract_missed` and `unresolved_placeholders`.
 - `report=all` fuzz runs cap listed bodies at 20,000 characters unless `max_response_length` is given.
+- Exchanges the `http_send_*` tools add to the site map carry their `[MCP]` note, so `sitemap(note_contains="[MCP]")` finds them; the note used to be set after Burp had stored its copy.
 
 ### Turbo
 - A run reads `completed` only after its responses are ranked and the script has finished; callback exceptions are counted in `callback_errors` / `last_callback_error` instead of as connection failures.

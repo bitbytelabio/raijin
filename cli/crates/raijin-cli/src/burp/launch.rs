@@ -17,7 +17,7 @@ use serde_json::{Map, Value, json};
 use super::install::{self, Launcher};
 use super::instance::{self, Instance, Ports, State, Status};
 use super::{profile, vmoptions};
-use crate::config::{Mode, Target, home_dir, user_state_dir};
+use crate::config::{Mode, Target, TaskEngine, home_dir, user_state_dir};
 use crate::jar;
 use crate::util::{hex, now_ms, private_dir};
 
@@ -83,15 +83,14 @@ pub async fn up(target: &Target, project: &str, mode: Mode, wait: Duration) -> R
     let token = control_token()?;
 
     let jvm = jvm_flags(mode, ports, &token, &archive);
-    let app_args = [
-        format!("--data-dir={}", profile_dir.display()),
-        format!("--project-file={}", project_file.display()),
-        format!("--user-config-file={}", user_overlay.display()),
-        format!("--config-file={}", project_overlay.display()),
-        "--disable-auto-update".to_owned(),
-    ];
     let mut command = burp_command(&launcher, mode, project, &jvm)?;
-    command.args(&app_args);
+    command.args(app_args(
+        target,
+        &profile_dir,
+        &project_file,
+        &user_overlay,
+        &project_overlay,
+    ));
     let log_file = open_log(&log)?;
     command
         .current_dir(&target.root)
@@ -184,11 +183,40 @@ fn jvm_flags(mode: Mode, ports: Ports, token: &str, archive: &Path) -> Vec<Strin
     jvm
 }
 
+/// Burp's own arguments.
+fn app_args(
+    target: &Target,
+    profile_dir: &Path,
+    project_file: &Path,
+    user_overlay: &Path,
+    project_overlay: &Path,
+) -> Vec<String> {
+    let mut args = vec![
+        format!("--data-dir={}", profile_dir.display()),
+        format!("--project-file={}", project_file.display()),
+        format!("--user-config-file={}", user_overlay.display()),
+        format!("--config-file={}", project_overlay.display()),
+        "--disable-auto-update".to_owned(),
+    ];
+    // Burp pauses every task when it reopens an existing project file, including the live passive
+    // crawl that feeds proxy traffic into the site map.
+    if target.config.task_engine == TaskEngine::Running {
+        args.push("--unpause-spider-and-scanner".to_owned());
+    }
+    args
+}
+
 /// The process to spawn, without Burp's own arguments.
 fn burp_command(launcher: &Launcher, mode: Mode, project: &str, jvm: &[String]) -> Result<Command> {
     Ok(match launcher {
         Launcher::MacStub { stub } => {
             let mut c = Command::new(stub);
+            // The install4j stub draws Burp's splash before the JVM starts unless its own VM
+            // options (`-J`, allowed by `i4j.allowPassthrough`) say headless; JAVA_TOOL_OPTIONS
+            // reaches only the JVM, so a headless Burp would keep the splash on screen.
+            if mode == Mode::Headless {
+                c.arg("-J-Djava.awt.headless=true");
+            }
             c.env("JAVA_TOOL_OPTIONS", java_tool_options(jvm)?);
             c
         }

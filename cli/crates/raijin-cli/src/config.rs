@@ -49,6 +49,15 @@ impl Theme {
     }
 }
 
+/// Burp's task engine after `raijin up` reopens a project file (Burp itself pauses it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskEngine {
+    #[default]
+    Running,
+    Paused,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExtensionKind {
@@ -119,6 +128,8 @@ pub struct Config {
     pub mode: Mode,
     #[serde(default)]
     pub theme: Theme,
+    #[serde(default)]
+    pub task_engine: TaskEngine,
     #[serde(default = "default_projects_dir")]
     pub projects_dir: PathBuf,
     pub jar: Option<PathBuf>,
@@ -352,6 +363,7 @@ mod tests {
         assert_eq!(config.default_project, "main");
         assert_eq!(config.mode, Mode::Headless);
         assert_eq!(config.theme, Theme::Dark);
+        assert_eq!(config.task_engine, TaskEngine::Running);
         assert_eq!(config.projects_dir, PathBuf::from("burp"));
         assert_eq!(config.mcp.inline_limit_kb, 24);
         assert!(config.remote.is_none());

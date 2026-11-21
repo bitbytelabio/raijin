@@ -107,12 +107,13 @@ internal object HttpModes {
  * the Burp UI. Best effort: a site map or annotation failure never fails the send.
  */
 internal fun MontoyaApi.recordInSiteMap(result: HttpRequestResponse, note: String) {
+    // Annotate first: the site map stores a copy at add(), so a note set afterwards never reaches it.
     try {
-        siteMap().add(result)
+        result.annotations().setNotes(note)
     } catch (_: Exception) {
     }
     try {
-        result.annotations().setNotes(note)
+        siteMap().add(result)
     } catch (_: Exception) {
     }
 }

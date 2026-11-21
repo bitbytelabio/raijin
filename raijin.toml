@@ -10,6 +10,10 @@ mode = "headless"
 # Burp look and feel: "dark" or "light".
 theme = "dark"
 
+# Burp pauses its task engine when it reopens a project; "running" resumes it on `raijin up`
+# (live passive crawl fills the site map, unfinished scans continue), "paused" keeps it paused.
+task_engine = "running"
+
 # Folder holding the .burp project files, relative to this file.
 projects_dir = "burp"
 
