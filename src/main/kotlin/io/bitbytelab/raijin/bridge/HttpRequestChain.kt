@@ -96,7 +96,7 @@ internal class HttpRequestChain(
                         else api.http().sendRequest(request, mode)
                     }
                     val elapsedMs = (System.nanoTime() - start) / 1_000_000
-                    siteMapNote?.let { api.recordInSiteMap(exchange, it(index)) }
+                    siteMapNote?.let { api.recordToolExchange(exchange, it(index), "http_send_request_chain") }
                     val extracted = extract(rules, exchange)
                     variables.putAll(extracted)
                     StepResult(

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### raijin CLI
+- New Rust CLI `raijin` (`cli/`), released per platform as `raijin-cli-<version>-<target>.tar.gz`. `raijin init` makes a folder a target (`raijin.toml`, `burp/`, `.raijin/`) and registers `raijin mcp` in `.mcp.json` and `.omp/mcp.json`.
+- `raijin up [project] [--ui]` starts Burp with Raijin for a named `.burp` project, headless by default, detached, on free ports, under an isolated profile (`~/.raijin/burp-profile`, seeded once from your Burp user config without its extensions); several projects run at once. `raijin down`, `raijin status`. On macOS Burp is started through its app launcher: PortSwigger's bundled `java` refuses other parents.
+- `raijin mcp`: a stdio MCP gateway with three tools (`discover`, `execute`, `skill`), so an agent loads tool schemas per domain instead of all 45 up front. `execute` also runs `burp_up` / `burp_down` / `burp_status` and the history tools; results over `[mcp] inline_limit_kb` are saved to `.raijin/tool-results/` and returned as `{saved_to, preview}`. `--surface full` also lists every Raijin tool; `--remote <url>` drives an already-running Raijin.
+- `raijin history list|show|search|endpoints|diff|export` (and the matching `history_*` tools) read every `.burp` project of a target in parallel without Burp, through a vendored copy of amber (see NOTICE), together with Raijin's archive of tool-sent traffic and scanner issues.
+
+### CLI support in the extension
+- Headless Burp (`-Djava.awt.headless=true`): no Raijin tab; the startup lines go to Burp's output log.
+- `POST /api/shutdown` on the dashboard, only when `-Draijin.controlToken` is set and the `X-Raijin-Control-Token` header matches.
+- With `-Draijin.archiveDir`, the requests `http_send_request`, `http_send_requests_parallel`, `http_send_raw_bytes`, `http_send_request_chain`, `http_race` and `http_send_pipeline` send, and the scanner issues Burp reports, are appended to `exchanges.jsonl` / `issues.jsonl` there.
+- The jar ships `catalog/tools.json`: every published tool's schema, grouped into domains (`tools/ToolDomains.kt`).
+
 ### Scope
 - One scope gate for every send path. `mcp_scope_mode=warn` (default) sends and puts `scope_warning` first in the result; `enforce` refuses with one error shape (`out_of_scope: true`, `scope_mode`, a pointer to `scope(action=include)`); `off` checks nothing. The URL checked is always where the bytes go: the connection's host and port plus the request path, never the host of an absolute-form request line or a Host header. Fuzz, race and pipeline check every distinct request they will send, and a `host` that cannot be put into a URL is refused under enforce.
 - Batch tools (`http_send_requests_parallel`, `http_send_request_chain`, `api_import_openapi`, content discovery) check every item: a refused item is skipped, the rest go out, and the result counts `skipped_out_of_scope` / `sent_out_of_scope`. Before, one out-of-scope item refused the whole parallel batch.

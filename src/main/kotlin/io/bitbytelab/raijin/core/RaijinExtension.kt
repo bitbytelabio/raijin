@@ -9,6 +9,7 @@ import io.bitbytelab.raijin.transport.FindingsStore
 import io.bitbytelab.raijin.transport.JsonlStoreSupport
 import io.bitbytelab.raijin.transport.McpServerManager
 import io.bitbytelab.raijin.transport.DashboardServer
+import io.bitbytelab.raijin.transport.ExchangeArchive
 import io.bitbytelab.raijin.transport.PortPolicy
 import io.bitbytelab.raijin.transport.RemoteAccess
 import io.bitbytelab.raijin.events.EventBus
@@ -75,12 +76,14 @@ class RaijinExtension : BurpExtension {
             try { eventBus.clearAll() } catch (_: Exception) {}
             try { stateManager.cleanup() } catch (_: Exception) {}
             JsonlStoreSupport.errorSink = null
+            ExchangeArchive.logging = null
             api.logging().logToOutput("Raijin: Extension unloaded")
         }
 
         // Disk-store failures (activity, findings, audit log) reach Burp's error log, once per
         // distinct failure until the store recovers, whichever thread hit them.
         JsonlStoreSupport.errorSink = { message -> api.logging().logToError(message) }
+        ExchangeArchive.logging = api.logging()
 
         // Restore the dashboard MCP activity from the durable store so it survives extension
         // reloads / Burp restarts / crashes (the in-memory deque + EventBus are otherwise lost
@@ -198,9 +201,11 @@ class RaijinExtension : BurpExtension {
             // Register Burp Suite event handlers for proxy, scanner, scope, websocket, and HTTP traffic
             registerBurpHandlers(bridges)
 
-            // Initialize and register the UI tab
-            uiTab = RaijinTab(api, serverManager, eventBus, stateManager, bridges, bindHost, ::rebindServers)
-            api.userInterface().registerSuiteTab("Raijin", uiTab.getComponent())
+            // Initialize and register the UI tab; a headless Burp (raijin CLI default) has no Swing to build it on
+            if (!java.awt.GraphicsEnvironment.isHeadless()) {
+                uiTab = RaijinTab(api, serverManager, eventBus, stateManager, bridges, bindHost, ::rebindServers)
+                api.userInterface().registerSuiteTab("Raijin", uiTab.getComponent())
+            }
         } catch (t: Throwable) {
             api.logging().logToError(
                 "Raijin: initialization failed after the servers started — stopping them so " +
@@ -211,14 +216,14 @@ class RaijinExtension : BurpExtension {
             throw t
         }
 
-        // Single startup banner with REAL counts. uiTab.log() also writes to Burp's
-        // output log, so one channel covers both surfaces.
+        // Single startup banner with REAL counts. systemLog() writes Burp's output log with or
+        // without the tab, so one channel covers both surfaces.
         val (toolCount, resourceCount, promptCount) = serverManager.registeredCounts()
-        uiTab.log("INFO", "System", "Raijin v${BuildInfo.VERSION} started")
-        uiTab.log("INFO", "System", "MCP (primary):   ${ConnectionInfo.mcpUrl(ssePort, bindHost)}")
-        uiTab.log("INFO", "System", "MCP (secondary): ${ConnectionInfo.mcpUrl(httpPort, bindHost)}")
-        uiTab.log("INFO", "System", "Dashboard:                 ${ConnectionInfo.dashboardUrlForHost(bindHost)}")
-        uiTab.log("INFO", "System", "Tools: $toolCount  |  MCP Resources: $resourceCount  |  MCP Prompts: $promptCount")
+        systemLog("INFO", "Raijin v${BuildInfo.VERSION} started")
+        systemLog("INFO", "MCP (primary):   ${ConnectionInfo.mcpUrl(ssePort, bindHost)}")
+        systemLog("INFO", "MCP (secondary): ${ConnectionInfo.mcpUrl(httpPort, bindHost)}")
+        systemLog("INFO", "Dashboard:                 ${ConnectionInfo.dashboardUrlForHost(bindHost)}")
+        systemLog("INFO", "Tools: $toolCount  |  MCP Resources: $resourceCount  |  MCP Prompts: $promptCount")
         api.logging().raiseInfoEvent("Raijin v${BuildInfo.VERSION} started on $bindHost (SSE $ssePort/$httpPort, dashboard $dashboardPort)")
 
         // Surface the bind-host gate decision. A refused (downgraded) request and — especially —
@@ -228,13 +233,13 @@ class RaijinExtension : BurpExtension {
             val msg = bindDecision.message ?: "requested bind host was refused; using loopback"
             // A warning about a deliberate/edge choice, not a failure — Output tab, not Errors.
             api.logging().logToOutput("Raijin: ⚠ $msg")
-            uiTab.log("WARN", "System", msg)
+            if (::uiTab.isInitialized) uiTab.log("WARN", "System", msg)
         }
         if (bindDecision.exposed) {
             val msg = "SECURITY: ${bindDecision.message}"
             // Loud, but it's an operator-chosen exposure warning — Output tab, not Errors.
             api.logging().logToOutput("Raijin: ⚠ $msg")
-            uiTab.log("WARN", "System", msg)
+            if (::uiTab.isInitialized) uiTab.log("WARN", "System", msg)
             AuditLog.record(
                 toolName = "server.remote_bind",
                 timestampIso = java.time.Instant.now().toString(),
@@ -243,7 +248,7 @@ class RaijinExtension : BurpExtension {
             )
         }
 
-        uiTab.log("INFO", "System", "Ready-to-paste MCP client config: Raijin -> Server tab.")
+        if (::uiTab.isInitialized) uiTab.log("INFO", "System", "Ready-to-paste MCP client config: Raijin -> Server tab.")
     }
 
     /**
@@ -324,10 +329,13 @@ class RaijinExtension : BurpExtension {
     }
 
     private fun logRemoteAccess(lines: List<Pair<String, String>>) {
-        lines.forEach { (level, message) ->
-            if (::uiTab.isInitialized) uiTab.log(level, "System", message)
-            else api.logging().logToOutput(if (level == "WARN") "Raijin [WARN/System]: $message" else "Raijin: $message")
-        }
+        lines.forEach { (level, message) -> systemLog(level, message) }
+    }
+
+    /** System line to the Raijin tab (which also writes Burp's output log), or to Burp's output log alone when there is no tab (headless). */
+    private fun systemLog(level: String, message: String) {
+        if (::uiTab.isInitialized) uiTab.log(level, "System", message)
+        else api.logging().logToOutput(if (level == "WARN") "Raijin [WARN/System]: $message" else "Raijin: $message")
     }
 
     private fun registerBurpHandlers(bridges: BridgeFactory.Bridges) {

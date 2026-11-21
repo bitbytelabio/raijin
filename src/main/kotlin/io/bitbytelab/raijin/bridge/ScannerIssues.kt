@@ -17,6 +17,7 @@ import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.core.ServiceParts
 import io.bitbytelab.raijin.events.EventBus
 import io.bitbytelab.raijin.safety.RequestHygiene
+import io.bitbytelab.raijin.transport.ExchangeArchive
 import kotlinx.serialization.json.*
 import java.util.Base64
 
@@ -293,6 +294,7 @@ internal class ScannerIssues(
         return AuditIssueHandler { issue ->
             val data = serializeIssue(issue)
             eventBus.emit("scanner.issue", data)
+            ExchangeArchive.appendIssue(issue)
         }
     }
 

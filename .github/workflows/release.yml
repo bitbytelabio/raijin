@@ -23,6 +23,8 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    outputs:
+      jar_sha256: ${{ steps.package.outputs.jar_sha256 }}
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
@@ -54,10 +56,12 @@ jobs:
         run: ./gradlew build --no-daemon --stacktrace
 
       - name: Package assets
+        id: package
         run: |
           mkdir dist
           cp build/libs/raijin.jar "dist/raijin-$VERSION.jar"
           (cd dist && sha256sum "raijin-$VERSION.jar" > "raijin-$VERSION.jar.sha256")
+          echo "jar_sha256=$(cut -d' ' -f1 "dist/raijin-$VERSION.jar.sha256")" >> "$GITHUB_OUTPUT"
 
       - name: Release notes from CHANGELOG.md
         run: |
@@ -78,6 +82,8 @@ jobs:
           1. Download \`raijin-$VERSION.jar\` below (check it against the \`.sha256\` file).
           2. In Burp Suite 2026.2 or newer, running on Java 25 or newer: **Extensions → Installed → Add → Java →** select the jar.
           3. Connect your MCP client: \`claude mcp add --transport http burpsuite http://127.0.0.1:9876/mcp\`
+
+          CLI: download \`raijin-cli-$VERSION-<target>.tar.gz\`, put \`raijin\` on PATH, run \`raijin init\` in your target folder.
           EOF
 
       - name: Publish release
@@ -97,3 +103,64 @@ jobs:
               --verify-tag \
               "${flags[@]}"
           fi
+
+  cli:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Check tag matches the CLI version
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' cli/Cargo.toml)
+          echo "CLI version: $version, tag: $TAG"
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match [workspace.package] version $version in cli/Cargo.toml"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # The CLI checks the jar it downloads against this digest of the jar the release job built.
+      - name: Build
+        working-directory: cli
+        env:
+          RAIJIN_JAR_SHA256: ${{ needs.release.outputs.jar_sha256 }}
+        run: |
+          if [ -z "$RAIJIN_JAR_SHA256" ]; then
+            echo "::error::the release job did not report the jar digest"
+            exit 1
+          fi
+          cargo build --release --locked -p raijin-cli --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          name="raijin-cli-$VERSION-${{ matrix.target }}.tar.gz"
+          tar -czf "$name" -C "cli/target/${{ matrix.target }}/release" raijin
+          shasum -a 256 "$name" > "$name.sha256"
+          echo "ASSET=$name" >> "$GITHUB_ENV"
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber

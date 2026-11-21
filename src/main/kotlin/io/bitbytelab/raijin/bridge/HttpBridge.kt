@@ -116,7 +116,7 @@ class HttpBridge(
             }
             val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
 
-            api.recordInSiteMap(result, "[MCP] http_send_request via Raijin")
+            api.recordToolExchange(result, "[MCP] http_send_request via Raijin", "http_send_request")
             ToolCallTracker.recordSentResult(result)
 
             val hygiene = if (http2Fields != null) emptyList() else RequestHygiene.scan(method, url, headers)
@@ -244,7 +244,7 @@ class HttpBridge(
             }
             val totalElapsedMs = (System.nanoTime() - totalStart) / 1_000_000
 
-            resultsArray.filterNotNull().forEach { api.recordInSiteMap(it, "[MCP] Parallel request via Raijin") }
+            resultsArray.filterNotNull().forEach { api.recordToolExchange(it, "[MCP] Parallel request via Raijin", "http_send_requests_parallel") }
 
             val sentOutOfScope = sendable.count { it.scope?.warning != null }
             buildJsonObject {
@@ -670,7 +670,7 @@ class HttpBridge(
             val result = timeouts.run(timeoutMs) { api.http().sendRequest(httpRequest, mode) }
             val elapsedMs = (System.nanoTime() - startTime) / 1_000_000
 
-            api.recordInSiteMap(result, "[MCP] Raw bytes request via Raijin")
+            api.recordToolExchange(result, "[MCP] Raw bytes request via Raijin", "http_send_raw_bytes")
             ToolCallTracker.recordSentResult(result)
 
             var json = HttpExchangeJson.serialize(result, elapsedMs, maxBodyLength)

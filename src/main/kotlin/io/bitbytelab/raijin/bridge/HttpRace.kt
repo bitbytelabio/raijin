@@ -138,7 +138,7 @@ internal class HttpRace(
                     payload,
                 )
             )
-            if (exchange != null) api.recordInSiteMap(exchange, "[MCP] Race single_packet #$index via Raijin")
+            if (exchange != null) api.recordToolExchange(exchange, "[MCP] Race single_packet #$index via Raijin", "http_race")
             results += buildJsonObject {
                 put("index", index)
                 if (payload != null) put("payload", payload)

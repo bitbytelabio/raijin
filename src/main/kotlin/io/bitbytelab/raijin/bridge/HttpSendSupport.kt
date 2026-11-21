@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
+import io.bitbytelab.raijin.transport.ExchangeArchive
 import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.RedirectionMode
 import burp.api.montoya.http.RequestOptions
@@ -114,4 +115,10 @@ internal fun MontoyaApi.recordInSiteMap(result: HttpRequestResponse, note: Strin
         result.annotations().setNotes(note)
     } catch (_: Exception) {
     }
+}
+
+/** [recordInSiteMap], plus the exchange archive the `raijin` CLI reads offline (a no-op unless `-Draijin.archiveDir` is set). */
+internal fun MontoyaApi.recordToolExchange(result: HttpRequestResponse, note: String, tool: String) {
+    recordInSiteMap(result, note)
+    ExchangeArchive.appendExchange(tool, result)
 }

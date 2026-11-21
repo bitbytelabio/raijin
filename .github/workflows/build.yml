@@ -45,3 +45,28 @@ jobs:
             build/test-results/
           if-no-files-found: ignore
           retention-days: 14
+
+  cli:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      - name: Test
+        run: cargo test --locked
+
+      # --no-deps -p raijin-cli: crates/amber is vendored verbatim (see NOTICE) and is not held
+      # to clippy lints newer than its upstream.
+      - name: Clippy
+        run: cargo clippy --locked -p raijin-cli --no-deps --all-targets -- -D warnings

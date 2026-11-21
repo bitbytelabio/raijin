@@ -5,6 +5,7 @@ import burp.api.montoya.core.ByteArray as BurpByteArray
 import io.bitbytelab.raijin.bridge.HttpPipelineFraming.Outcome
 import io.bitbytelab.raijin.core.BodyText
 import io.bitbytelab.raijin.safety.ScopeGate
+import io.bitbytelab.raijin.transport.ExchangeArchive
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
@@ -213,6 +214,7 @@ class HttpPipelineBridge(private val api: MontoyaApi) {
             if (read.closeReason == "fin" || read.closeReason == "rst") control.peerClosed()
             val writerFinished = awaitWriter(writing, control, socket, deadlineAtMs, stopNow = read.closeReason == "total_timeout")
             val progress = writer.progress()
+            archive(target, requests, read.responses, progress)
             val writeError = if (writerFinished) {
                 writer.error
             } else {
@@ -365,6 +367,41 @@ class HttpPipelineBridge(private val api: MontoyaApi) {
         val openedAtMs = System.currentTimeMillis()
         val socket = RawHttpConnector.connect(target.host, target.port, target.useTls, timeoutMs, target.sni)
         return Link(socket, null, reused = false, targetMismatch = targetMismatch, openedAtMs)
+    }
+
+    /**
+     * One exchange-archive line per request (a no-op unless `-Draijin.archiveDir` is set). The pipeline
+     * keeps only the framed response, so the archived response is rebuilt from it (`reconstructed`).
+     */
+    private fun archive(
+        target: Target,
+        requests: List<PipelineRequestSpec>,
+        responses: List<Outcome.Ok>,
+        progress: List<PipelineWriter.Progress>,
+    ) {
+        if (!ExchangeArchive.enabled()) return
+        val scheme = if (target.useTls) "https" else "http"
+        val host = if (':' in target.host && !target.host.startsWith("[")) "[${target.host}]" else target.host
+        requests.forEachIndexed { i, spec ->
+            // A request the writer never started did not reach the wire.
+            if ((progress.getOrNull(i)?.written ?: 0) == 0) return@forEachIndexed
+            val firstLine = String(spec.bytes, Charsets.ISO_8859_1).substringBefore('\n').trimEnd('\r')
+            val parts = firstLine.split(' ')
+            val method = parts.getOrElse(0) { "" }
+            val path = parts.getOrElse(1) { "" }
+            val response = responses.getOrNull(i)?.response
+            val rebuilt = response?.let { r ->
+                buildString {
+                    append(r.statusLine).append("\r\n")
+                    r.headers.forEach { (name, value) -> append(name).append(": ").append(value).append("\r\n") }
+                    append("\r\n").append(r.body)
+                }.toByteArray(Charsets.ISO_8859_1)
+            }
+            ExchangeArchive.appendRaw(
+                "http_send_pipeline", method, "$scheme://$host:${target.port}$path",
+                spec.bytes, rebuilt, response?.statusCode, reconstructed = true
+            )
+        }
     }
 
     /** Responses read, and why reading stopped: [failure] is the outcome that ended it early. */

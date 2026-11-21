@@ -1,0 +1,22 @@
+# Vendored from https://github.com/overspace-labs/amber (crates/amber)
+# at commit e52bfd3b8ac0b7d9e6c3b518054ef9f0ad8a50c5 (tag v0.2.0), copied verbatim.
+# No upstream license; vendored by maintainer decision (see NOTICE).
+
+[package]
+name = "amber"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+getrandom.workspace = true
+memchr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

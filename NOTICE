@@ -114,6 +114,15 @@ Param Miner
   Vendored: src/main/resources/wordlists/param-miner-params.txt  (resources/params)
             src/main/resources/wordlists/param-miner-headers.txt (resources/headers)
 
+amber
+  https://github.com/overspace-labs/amber
+  Commit e52bfd3b8ac0b7d9e6c3b518054ef9f0ad8a50c5 (tag v0.2.0).
+  No upstream license; vendored by maintainer decision, unlike the
+  Apache-2.0 components above.
+  Vendored: cli/crates/amber/ (the `amber` library crate, copied verbatim;
+            only its Cargo.toml gained a provenance header). The raijin CLI
+            uses it to read .burp project files offline.
+
 Autorize
   https://github.com/PortSwigger/autorize (Barak Tawily, AppSec Labs)
   The autorize tool (live proxy tap that replays requests under other

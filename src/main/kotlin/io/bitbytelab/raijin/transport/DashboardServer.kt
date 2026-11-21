@@ -114,6 +114,8 @@ class DashboardServer(
                         }
 
                         route("/api") {
+                            with(ControlEndpoint) { shutdownRoute { bridges.burpSuite.shutdown(promptUser = false) } }
+
                             get("/info") {
                                 call.respondJson(
                                     DashboardApi.info(BuildInfo.VERSION, bindHost, port, primaryMcpPort, secondaryMcpPort)
