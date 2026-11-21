@@ -22,6 +22,9 @@ default_project = "{project}"
 # "headless" (no window) or "ui"; `raijin up --ui` / `--headless` override it per launch.
 mode = "headless"
 
+# Burp look and feel: "dark" or "light".
+theme = "dark"
+
 # Folder holding the .burp project files, relative to this file.
 projects_dir = "burp"
 

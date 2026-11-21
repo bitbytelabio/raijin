@@ -92,6 +92,17 @@ Then ask your agent something like *"Load the overview skill, check the scope, a
 > [!TIP]
 > The **Raijin → Server** sub-tab shows the exact client config for your current bind address and ports; **Copy MCP Config** includes the bearer token when the listeners require one.
 
+### CLI (optional)
+
+The `raijin` CLI launches Burp with Raijin per target folder and serves the `raijin mcp` stdio gateway (macOS and Linux, x86_64 and arm64):
+
+```bash
+curl -LsSf https://github.com/bitbytelabio/raijin/releases/latest/download/install.sh | sh
+raijin init              # in your target folder
+```
+
+`RAIJIN_VERSION` (e.g. `2.3.0`; default latest) picks the release and `RAIJIN_INSTALL_DIR` the destination (default `~/.local/bin`). The script installs `raijin` and the matching extension `raijin.jar` there (load it in Burp as in step 2), checks both against their `.sha256`, and does not edit your shell profile.
+
 ### Endpoints
 
 | Endpoint | Default URL | Notes |

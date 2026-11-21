@@ -61,6 +61,7 @@ jobs:
           mkdir dist
           cp build/libs/raijin.jar "dist/raijin-$VERSION.jar"
           (cd dist && sha256sum "raijin-$VERSION.jar" > "raijin-$VERSION.jar.sha256")
+          cp install.sh dist/install.sh
           echo "jar_sha256=$(cut -d' ' -f1 "dist/raijin-$VERSION.jar.sha256")" >> "$GITHUB_OUTPUT"
 
       - name: Release notes from CHANGELOG.md
@@ -83,7 +84,7 @@ jobs:
           2. In Burp Suite 2026.2 or newer, running on Java 25 or newer: **Extensions → Installed → Add → Java →** select the jar.
           3. Connect your MCP client: \`claude mcp add --transport http burpsuite http://127.0.0.1:9876/mcp\`
 
-          CLI: download \`raijin-cli-$VERSION-<target>.tar.gz\`, put \`raijin\` on PATH, run \`raijin init\` in your target folder.
+          CLI: \`curl -LsSf https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh | RAIJIN_VERSION=$VERSION sh\` (installs \`raijin\` and \`raijin.jar\` into \`~/.local/bin\`), then \`raijin init\` in your target folder (or download \`raijin-cli-$VERSION-<target>.tar.gz\` manually).
           EOF
 
       - name: Publish release
@@ -164,3 +165,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
+
+  # Runs the published one-liner against the assets just uploaded: download, checksum, extract.
+  install-smoke:
+    needs: cli
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-14 ]
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Install with install.sh
+        run: |
+          version="${TAG#v}"
+          curl -LsSf "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh" \
+            | RAIJIN_VERSION="$version" RAIJIN_INSTALL_DIR="$RUNNER_TEMP/bin" sh
+          "$RUNNER_TEMP/bin/raijin" --version | grep -Fx "raijin $version"
+          unzip -l "$RUNNER_TEMP/bin/raijin.jar" catalog/tools.json

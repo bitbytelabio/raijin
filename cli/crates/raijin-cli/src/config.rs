@@ -31,6 +31,24 @@ impl fmt::Display for Mode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Theme {
+    /// Burp's `user_options.display.user_interface.look_and_feel` value.
+    pub const fn burp_name(self) -> &'static str {
+        match self {
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExtensionKind {
@@ -99,6 +117,8 @@ pub struct Config {
     pub default_project: String,
     #[serde(default)]
     pub mode: Mode,
+    #[serde(default)]
+    pub theme: Theme,
     #[serde(default = "default_projects_dir")]
     pub projects_dir: PathBuf,
     pub jar: Option<PathBuf>,
@@ -331,9 +351,17 @@ mod tests {
         let config = Config::parse("").unwrap();
         assert_eq!(config.default_project, "main");
         assert_eq!(config.mode, Mode::Headless);
+        assert_eq!(config.theme, Theme::Dark);
         assert_eq!(config.projects_dir, PathBuf::from("burp"));
         assert_eq!(config.mcp.inline_limit_kb, 24);
         assert!(config.remote.is_none());
+    }
+
+    #[test]
+    fn theme_is_dark_or_light() {
+        let light = Config::parse("theme = \"light\"\n").expect("light theme");
+        assert_eq!(light.theme.burp_name(), "Light");
+        assert!(Config::parse("theme = \"blue\"\n").is_err());
     }
 
     #[test]

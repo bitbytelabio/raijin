@@ -70,3 +70,13 @@ jobs:
       # to clippy lints newer than its upstream.
       - name: Clippy
         run: cargo clippy --locked -p raijin-cli --no-deps --all-targets -- -D warnings
+
+  # install.sh runs under any POSIX sh (`curl ... | sh`). The download path is smoke-tested by
+  # release.yml against the published assets: releases up to 2.2.1 carry no CLI archives.
+  install-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shellcheck
+        run: shellcheck -s sh install.sh

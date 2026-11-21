@@ -392,6 +392,7 @@ fn user_options(target: &Target, project: &str, mode: Mode, jar: &Path) -> Resul
         extensions.push(extension_entry(&name, &path, ext.kind.as_str(), stream));
     }
     Ok(json!({"user_options": {
+        "display": {"user_interface": {"look_and_feel": target.config.theme.burp_name()}},
         "extender": {"extensions": extensions},
         "misc": {
             "api": {"enabled": false},
@@ -499,5 +500,21 @@ mod tests {
         let entry = extension_entry("Raijin", Path::new("/x/raijin.jar"), "java", "console");
         assert!(entry.get("bapp_uuid").is_none() && entry.get("bapp_serial_version").is_none());
         assert_eq!(entry["errors"], "console");
+    }
+
+    #[test]
+    fn overlay_sets_the_configured_theme() {
+        let look = |target: &Target| {
+            let options = user_options(target, "main", Mode::Ui, Path::new("/x/raijin.jar"))
+                .expect("overlay");
+            options["user_options"]["display"]["user_interface"]["look_and_feel"].clone()
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let scaffolded = Target::discover_or_init(dir.path()).expect("auto init");
+        assert_eq!(look(&scaffolded), "Dark");
+        fs::write(dir.path().join(crate::config::CONFIG_FILE), "theme = \"light\"\n")
+            .expect("config");
+        let light = Target::discover_or_init(dir.path()).expect("reload");
+        assert_eq!(look(&light), "Light");
     }
 }
