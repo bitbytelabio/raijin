@@ -80,6 +80,10 @@ internal object ExchangeArchive {
                     put("base_url", issue.baseUrl())
                     put("detail", issue.detail()?.ifEmpty { null })
                     put("remediation", issue.remediation()?.ifEmpty { null })
+                    // Burp's built-in issues often leave detail/remediation empty; the text lives in the definition.
+                    val definition = issue.definition()
+                    put("background", definition?.background()?.ifEmpty { null })
+                    put("remediation_background", definition?.remediation()?.ifEmpty { null })
                     putJsonArray("evidence") {
                         issue.requestResponses().orEmpty().take(MAX_EVIDENCE).forEach { rr ->
                             addJsonObject {

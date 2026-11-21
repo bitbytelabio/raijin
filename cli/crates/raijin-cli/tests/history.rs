@@ -148,6 +148,33 @@ fn diff_and_show_read_single_exchanges() {
     let issue = history(&fixture, &["show", "p1:i1"]);
     assert_eq!(issue["name"], "SQL injection");
     assert_eq!(issue["evidence"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        issue["background"],
+        Value::Null,
+        "lines written before background existed still parse"
+    );
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_raijin"))
+        .args(["history", "show", "p1:999"])
+        .current_dir(fixture.root())
+        .env("HOME", fixture.root())
+        .output()
+        .expect("raijin runs");
+    assert!(!missing.status.success());
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("no proxy entry p1:999") && !stderr.contains("malformed"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn limit_zero_returns_only_the_total() {
+    let fixture = common::target("");
+    let out = history(&fixture, &["list", "-n", "0"]);
+    assert_eq!(out["total"], 6);
+    assert_eq!(out["rows"], serde_json::json!([]));
+    assert!(out.get("limit_clamped_to").is_none(), "{out}");
 }
 
 #[test]

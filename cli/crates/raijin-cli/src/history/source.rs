@@ -395,6 +395,12 @@ pub struct IssueLine {
     pub base_url: String,
     pub detail: Option<String>,
     pub remediation: Option<String>,
+    /// The issue type's description (Burp's issue definition), absent in lines older Raijin versions wrote.
+    #[serde(default)]
+    pub background: Option<String>,
+    /// The issue type's generic remediation (Burp's issue definition).
+    #[serde(default)]
+    pub remediation_background: Option<String>,
     #[serde(default)]
     pub evidence: Vec<Evidence>,
 }
@@ -486,7 +492,23 @@ pub fn proxy_entry(source: &Source, entry_id: u64) -> Result<(Row, Vec<u8>, Opti
         .as_ref()
         .with_context(|| format!("project {} has no .burp file", source.project))?;
     let project = Project::open(burp).with_context(|| format!("reading {}", burp.display()))?;
-    let entry = project.entry(entry_id)?;
+    // Project::entry reports a missing id as a malformed project; look it up here instead.
+    let filter = amber::HistoryFilter {
+        entry_id: Some(entry_id),
+        ..amber::HistoryFilter::default()
+    };
+    let mut found = None;
+    project.for_each(&filter, |entry| {
+        found = Some(entry);
+        Ok(())
+    })?;
+    let entry = found.with_context(|| {
+        format!(
+            "no proxy entry {}:{entry_id} in {}; history_list shows the refs",
+            source.project,
+            burp.display()
+        )
+    })?;
     let request = message_bytes(&project, &entry.request)?;
     let response = entry
         .response

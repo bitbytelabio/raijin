@@ -5,6 +5,7 @@ import burp.api.montoya.http.message.HttpRequestResponse
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
 import burp.api.montoya.scanner.audit.issues.AuditIssue
+import burp.api.montoya.scanner.audit.issues.AuditIssueDefinition
 import burp.api.montoya.scanner.audit.issues.AuditIssueConfidence
 import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity
 import kotlinx.serialization.json.Json
@@ -85,6 +86,9 @@ class ExchangeArchiveTest {
             when (it) {
                 "name" -> "SQL injection"; "severity" -> AuditIssueSeverity.HIGH; "confidence" -> AuditIssueConfidence.FIRM
                 "baseUrl" -> "https://t.test/"; "detail" -> "d"; "remediation" -> ""
+                "definition" -> fake<AuditIssueDefinition> { m ->
+                    when (m) { "background" -> "Why it matters"; "remediation" -> "How to fix"; else -> null }
+                }
                 "requestResponses" -> List(5) { exchange("GET / HTTP/1.1\r\n\r\n", "HTTP/1.1 200 OK\r\n\r\n") }
                 else -> null
             }
@@ -92,10 +96,15 @@ class ExchangeArchiveTest {
         ExchangeArchive.appendIssue(issue)
         val line = lines(ExchangeArchive.ISSUES_FILE).single()
         assertEquals(
-            setOf("seq", "time_epoch_ms", "name", "severity", "confidence", "base_url", "detail", "remediation", "evidence"),
+            setOf(
+                "seq", "time_epoch_ms", "name", "severity", "confidence", "base_url", "detail", "remediation",
+                "background", "remediation_background", "evidence",
+            ),
             line.keys
         )
         assertEquals(JsonNull, line["remediation"])
+        assertEquals("Why it matters", line["background"]!!.jsonPrimitive.content)
+        assertEquals("How to fix", line["remediation_background"]!!.jsonPrimitive.content)
         assertEquals(3, line["evidence"]!!.jsonArray.size)
         assertEquals(setOf("request_b64", "response_b64"), line["evidence"]!!.jsonArray[0].jsonObject.keys)
     }

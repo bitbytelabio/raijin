@@ -119,8 +119,14 @@ fn add(groups: &mut BTreeMap<Key, Endpoint>, ex: &Exchange) {
     entry.projects.insert(ex.row.project.clone());
 }
 
-/// Form keys of an urlencoded body, or top-level keys of a JSON object body.
+/// Form keys of an urlencoded body, or top-level keys of a JSON object body; blank names are skipped.
 fn body_params(request: &[u8]) -> Vec<String> {
+    let mut names = body_keys(request);
+    names.retain(|n| !n.trim().is_empty());
+    names
+}
+
+fn body_keys(request: &[u8]) -> Vec<String> {
     let body = split_message(request).1;
     if body.is_empty() {
         return Vec::new();
@@ -149,6 +155,8 @@ mod tests {
         assert_eq!(body_params(form), ["a", "b[]"]);
         let json = b"POST / HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"name\":\"x\",\"n\":{\"deep\":1}}";
         assert_eq!(body_params(json), ["name", "n"]);
+        let blank = b"POST / HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n ";
+        assert_eq!(body_params(blank), [] as [String; 0]);
         assert_eq!(
             body_params(b"GET / HTTP/1.1\r\n\r\n"),
             [] as [std::string::String; 0]

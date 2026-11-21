@@ -51,7 +51,7 @@ pub struct ListParams {
     /// Keep one row per method + URL + request body.
     #[arg(long)]
     pub dedupe: bool,
-    /// Rows to return (default 100, max 1000).
+    /// Rows to return (default 100, max 1000; 0 returns only `total`).
     #[arg(short = 'n', long)]
     pub limit: Option<u64>,
     /// Rows to skip.
@@ -72,7 +72,7 @@ pub fn run(target: &Target, params: &ListParams) -> Result<ListResult> {
     let sources = source::discover(target, &params.selection)?;
     let which = params.source.unwrap_or_default();
     let requested = params.limit.unwrap_or(DEFAULT_LIMIT);
-    let limit = requested.clamp(1, MAX_LIMIT);
+    let limit = requested.min(MAX_LIMIT);
     let offset = usize::try_from(params.offset.unwrap_or(0)).unwrap_or(usize::MAX);
     let take = usize::try_from(limit).unwrap_or(usize::MAX);
 

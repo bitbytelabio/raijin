@@ -10,6 +10,10 @@
 ### raijin CLI
 - `execute` accepts `name` for `tool`, `args`/`params`/`parameters`/`input` for `arguments`, `arguments` as a JSON string, and tool parameters put next to `tool`. Old tool names (`scanner_start_crawl`) and `scope.list` run the grouped tool with that action. On the lean surface, a Raijin tool called directly runs as `execute`.
 - `discover` takes a tool name as the domain (adds `matched_tool`) and shows each tool's annotations. Unknown parameters and skills get "did you mean" hints. Instructions, tool descriptions and the `raijin-gateway` skill show literal JSON calls and how to recover from each error.
+- Archived scanner issues also store the issue type's `background` and `remediation_background` (Burp's issue definition), which `history show` returns: Burp's built-in passive issues leave `detail` and `remediation` empty.
+- `history show` of a proxy ref that does not exist says `no proxy entry <project>:<id>` instead of calling the project malformed.
+- `history list` with `limit: 0` returns only `total`, as `proxy_history count=0` does, instead of raising the limit to 1.
+- `history endpoints` skips blank body parameter names (a form body of a single space).
 - The jar default is `raijin.jar` beside the `raijin` binary (where `install.sh` puts it) when its SHA-256 is this release's, else the download to `~/.raijin/jars/`.
 
 ## 2.3.0

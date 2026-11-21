@@ -131,6 +131,11 @@ fn issue(source: &Source, seq: u64, max_body: Option<usize>) -> Result<Value> {
     if let Some(obj) = out.as_object_mut() {
         obj.insert("detail".to_owned(), json!(line.detail));
         obj.insert("remediation".to_owned(), json!(line.remediation));
+        obj.insert("background".to_owned(), json!(line.background));
+        obj.insert(
+            "remediation_background".to_owned(),
+            json!(line.remediation_background),
+        );
         obj.insert("evidence".to_owned(), Value::Array(evidence));
     }
     Ok(out)
