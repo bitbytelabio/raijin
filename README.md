@@ -54,9 +54,27 @@ for high-speed work: single-packet race conditions, HTTP/2 and HTTP/3 gates, req
 
 - **Burp Suite 2026.2 or newer** (Montoya API), Community or Professional.
   The Turbo HTTP/3 engine and the `AUTO` engine need **Professional**.
-- **JDK 25** to build. Another default JDK on `PATH` is fine: `gradle/gradle-daemon-jvm.properties` pins Gradle to 25. The jar needs Burp running on **Java 25 or newer**.
+- Burp running on **Java 25 or newer**.
+- To build from source only: **JDK 25**. Another default JDK on `PATH` is fine: `gradle/gradle-daemon-jvm.properties` pins Gradle to 25.
 
-### 2. Build and load
+### 2. Install and load
+
+**Install script** (macOS and Linux, x86_64 and arm64): installs the `raijin` CLI and the extension `raijin.jar` into `~/.local/bin`.
+
+```bash
+curl -LsSf https://github.com/bitbytelabio/raijin/releases/latest/download/install.sh | sh
+```
+
+| Variable | Default | Effect |
+|---|---|---|
+| `RAIJIN_VERSION` | latest release | Release to install, e.g. `2.3.0` or `v2.3.0`. |
+| `RAIJIN_INSTALL_DIR` | `~/.local/bin` | Destination folder. |
+
+The script needs `curl` or `wget` and `sha256sum` or `shasum`. It checks both downloads against their `.sha256` before installing anything, and does not edit your shell profile: when the folder is not on `PATH`, it prints the `export PATH=...` line to add. Run it again to upgrade.
+
+**Release jar only**: download `raijin-<version>.jar` from [Releases](https://github.com/bitbytelabio/raijin/releases/latest) and check it against `raijin-<version>.jar.sha256`.
+
+**From source**:
 
 ```bash
 git clone git@github.com:bitbytelabio/raijin.git
@@ -64,8 +82,8 @@ cd raijin
 ./gradlew build          # -> build/libs/raijin.jar
 ```
 
-In Burp: **Extensions → Installed → Add → Extension type: Java →** select `build/libs/raijin.jar`.
-A **Raijin** tab appears, and the extension output prints the endpoints and counts (`MCP Prompts: 8`, ...).
+In Burp: **Extensions → Installed → Add → Extension type: Java →** select the jar (`~/.local/bin/raijin.jar`, the downloaded one, or `build/libs/raijin.jar`).
+A **Raijin** tab appears, and the extension output prints the endpoints and counts (`MCP Prompts: 8`, ...). With the CLI you can skip this step: `raijin up` loads the extension itself (see [CLI](#cli-optional)).
 
 ### 3. Connect your MCP client
 
@@ -94,14 +112,17 @@ Then ask your agent something like *"Load the overview skill, check the scope, a
 
 ### CLI (optional)
 
-The `raijin` CLI launches Burp with Raijin per target folder and serves the `raijin mcp` stdio gateway (macOS and Linux, x86_64 and arm64):
+The `raijin` CLI (installed by the script in step 2) launches Burp with Raijin per target folder and serves the `raijin mcp` stdio gateway:
 
 ```bash
-curl -LsSf https://github.com/bitbytelabio/raijin/releases/latest/download/install.sh | sh
-raijin init              # in your target folder
+cd my-target
+raijin init              # raijin.toml, burp/, .raijin/; registers `raijin mcp` in .mcp.json and .omp/mcp.json
+raijin up                # headless Burp for the default project; `raijin up <project> --ui` for a window
+raijin status
+raijin down
 ```
 
-`RAIJIN_VERSION` (e.g. `2.3.0`; default latest) picks the release and `RAIJIN_INSTALL_DIR` the destination (default `~/.local/bin`). The script installs `raijin` and the matching extension `raijin.jar` there (load it in Burp as in step 2), checks both against their `.sha256`, and does not edit your shell profile.
+`raijin up` loads the Raijin jar matching the CLI version, downloaded once to `~/.raijin/jars/` (`RAIJIN_JAR` or `jar` in `raijin.toml` overrides it). Settings in `raijin.toml` include `mode` (`headless` / `ui`), `theme` (`dark` / `light`, default `dark`) and `task_engine` (`running` / `paused`, default `running`: Burp pauses its tasks when it reopens a project, `running` resumes them so proxy traffic keeps reaching the site map).
 
 ### Endpoints
 
