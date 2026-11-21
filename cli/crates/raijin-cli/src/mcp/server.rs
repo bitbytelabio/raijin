@@ -12,7 +12,7 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
     GetPromptResponse, GetPromptResult, Implementation, JsonObject, ListPromptsResult,
     ListToolsResult, PaginatedRequestParams, Prompt, PromptMessage, Role, ServerCapabilities,
-    ServerConfig, Tool,
+    ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
@@ -29,7 +29,7 @@ use crate::catalog::{Catalog, Skill, ToolSpec, cli_skills};
 use crate::config::{Mode, Remote, Target, user_state_dir};
 use crate::history;
 use crate::jar::{self, Assets};
-use crate::util::closest;
+use crate::util::{closest, edit_distance};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Surface {
@@ -39,14 +39,18 @@ pub enum Surface {
     Full,
 }
 
-const INSTRUCTIONS_HEAD: &str = "Raijin drives Burp Suite through three gateway tools. 1) discover() lists domains, \
-running Burp instances and routing notes; pick ONE domain by what you want to do. 2) discover(domain) gives exact tool \
-names and parameter schemas; never guess parameters. 3) execute(tool, arguments, project?) runs a tool. ";
+const INSTRUCTIONS_HEAD: &str = "Raijin drives Burp Suite through three tools. 1) discover() lists domains, running \
+Burp instances and routing notes. 2) discover({\"domain\":\"<domain>\"}) gives exact tool names and inputSchema; copy \
+parameter names from it, never guess. 3) execute({\"tool\":\"<name>\",\"arguments\":{<that tool's parameters>}}). \
+Grouped tools take \"action\" inside arguments: \
+execute({\"tool\":\"scope\",\"arguments\":{\"action\":\"check\",\"url\":\"https://example.com\"}}). ";
 const INSTRUCTIONS_LOCAL: &str =
-    "Burp tools need a running Burp: execute('burp_up', {project}) first; ";
-const INSTRUCTIONS_REMOTE: &str = "Burp is remote and not managed here; burp_status checks it; ";
-const INSTRUCTIONS_TAIL: &str = "offline .burp review (history domain) needs no Burp. 4) Results over the inline limit \
-come back as {saved_to, preview}: parse the file with jq/python or a subagent, never read it whole. Read \
+    "Burp tools need a running Burp: execute({\"tool\":\"burp_up\",\"arguments\":{}}) first; ";
+const INSTRUCTIONS_REMOTE: &str = "Burp is remote and not managed here; \
+execute({\"tool\":\"burp_status\",\"arguments\":{}}) checks it; ";
+const INSTRUCTIONS_TAIL: &str = "offline .burp review (domain history) needs no Burp. 4) An error result says what to \
+fix and often gives 'usage' and 'example': fix the arguments from them, never resend the same call. 5) Results over the \
+inline limit come back as {saved_to, preview}: parse the file with jq/python, never read it whole. Read \
 skill('raijin-gateway') first; skill() lists playbooks, and tool names inside them run through execute.";
 
 const LIFECYCLE: &str = "lifecycle";
@@ -56,16 +60,17 @@ const OTHER: &str = "other";
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DiscoverArgs {
-    /// Domain to describe; omit for the overview of every domain and running instance.
+    /// Domain from `discover()` such as `http` or `proxy`; a tool name works too. Omit for the overview.
     domain: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ExecuteArgs {
-    /// Exact tool name from discover(domain).
+    /// Exact tool name from `discover(domain)`, e.g. `http_send_request` or `scope`.
     tool: String,
-    /// The tool's own parameters, as its inputSchema describes.
+    /// The tool's own parameters as a JSON object, per its inputSchema; grouped tools need "action"
+    /// here, e.g. {"action":"check","url":"https://example.com"}.
     #[serde(default)]
     arguments: Option<JsonObject>,
     /// Project whose Burp runs the tool (needed when several are running). For `burp_up`, `burp_down`
@@ -128,6 +133,16 @@ struct LocalTool {
     domain: &'static str,
     description: &'static str,
     schema: fn() -> JsonObject,
+    /// MCP `readOnlyHint`.
+    read_only: bool,
+    /// MCP `destructiveHint`.
+    destructive: bool,
+}
+
+impl LocalTool {
+    fn annotations(&self) -> Value {
+        json!({"readOnlyHint": self.read_only, "destructiveHint": self.destructive, "openWorldHint": false})
+    }
 }
 
 const LOCAL_TOOLS: &[LocalTool] = &[
@@ -136,54 +151,72 @@ const LOCAL_TOOLS: &[LocalTool] = &[
         domain: LIFECYCLE,
         description: "Start Burp with Raijin for a project of this target (detached; survives this session).",
         schema: schema_of::<UpArgs>,
+        read_only: false,
+        destructive: false,
     },
     LocalTool {
         name: "burp_down",
         domain: LIFECYCLE,
         description: "Stop a project's Burp (graceful, then SIGTERM, then SIGKILL), or every one with all=true.",
         schema: schema_of::<DownArgs>,
+        read_only: false,
+        destructive: true,
     },
     LocalTool {
         name: "burp_status",
         domain: LIFECYCLE,
         description: "Every project of this target and its Burp state; in remote mode, whether the remote Raijin answers.",
         schema: schema_of::<StatusArgs>,
+        read_only: true,
+        destructive: false,
     },
     LocalTool {
         name: "history_list",
         domain: HISTORY,
         description: "Exchanges (Proxy history of every .burp project + Raijin's archive of tool traffic) or scanner issues, oldest first, filtered and paged.",
         schema: schema_of::<history::list::ListParams>,
+        read_only: true,
+        destructive: false,
     },
     LocalTool {
         name: "history_show",
         domain: HISTORY,
         description: "One exchange or issue by ref (<project>:<id>, <project>:a<seq>, <project>:i<seq>): headers whole, bodies cut at max_body.",
         schema: schema_of::<history::show::ShowParams>,
+        read_only: true,
+        destructive: false,
     },
     LocalTool {
         name: "history_search",
         domain: HISTORY,
         description: "Regex over raw requests/responses of every project; up to 3 hits per entry with context.",
         schema: schema_of::<history::search::SearchParams>,
+        read_only: true,
+        destructive: false,
     },
     LocalTool {
         name: "history_endpoints",
         domain: HISTORY,
         description: "API map: exchanges grouped by host + method + path, with query/body parameter names, statuses and projects.",
         schema: schema_of::<history::endpoints::EndpointsParams>,
+        read_only: true,
+        destructive: false,
     },
     LocalTool {
         name: "history_diff",
         domain: HISTORY,
         description: "Unified diff of two exchanges (response by default).",
         schema: schema_of::<history::diff::DiffParams>,
+        read_only: true,
+        destructive: false,
     },
     LocalTool {
         name: "history_export",
         domain: HISTORY,
         description: "amber JSON export of each project (plus the archive files) under .raijin/exports/.",
         schema: schema_of::<history::export::ExportParams>,
+        read_only: false,
+        destructive: false,
     },
 ];
 
@@ -232,10 +265,15 @@ fn parse_args<T: DeserializeOwned + JsonSchema>(
         .and_then(Value::as_object)
         .map(|p| p.keys().map(String::as_str).collect())
         .unwrap_or_default();
-    let unknown: Vec<&str> = arguments
+    let unknown: Vec<String> = arguments
         .keys()
-        .map(String::as_str)
-        .filter(|k| !known.contains(k))
+        .filter(|k| !known.contains(k.as_str()))
+        .map(|k| match closest(k, known.iter().copied(), 1).first() {
+            Some(near) if edit_distance(k, near) <= (k.len() / 3).max(2) => {
+                format!("{k} (did you mean {near}?)")
+            }
+            _ => k.clone(),
+        })
         .collect();
     if !unknown.is_empty() {
         let mut expected: Vec<&str> = known.into_iter().collect();
@@ -247,6 +285,99 @@ fn parse_args<T: DeserializeOwned + JsonSchema>(
         ));
     }
     serde_json::from_value(Value::Object(arguments)).map_err(|e| format!("{tool}: {e}"))
+}
+
+/// Keys a model sends for `execute`'s `arguments`, in the order they are tried.
+const ARGUMENT_ALIASES: [&str; 4] = ["args", "params", "parameters", "input"];
+
+/// Rewrites the usual wrong shapes of an `execute` call into `{tool, arguments, project}`: `name`
+/// for `tool`, `args`/`params`/`parameters`/`input` for `arguments`, `arguments` sent as a JSON
+/// string, and tool parameters put next to `tool` instead of inside `arguments`. An alias key the
+/// tool itself declares (`declares(tool, key)`) is one of its parameters, not `arguments`.
+fn normalize_execute(
+    raw: Option<JsonObject>,
+    declares: impl Fn(&str, &str) -> bool,
+) -> Result<JsonObject, String> {
+    let mut raw = raw.unwrap_or_default();
+    if !raw.contains_key("tool")
+        && let Some(name) = raw.remove("name")
+    {
+        raw.insert("tool".to_owned(), name);
+    }
+    let tool = raw
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if !raw.contains_key("arguments")
+        && let Some(key) = ARGUMENT_ALIASES.into_iter().find(|k| {
+            !declares(&tool, k)
+                && raw.get(*k).is_some_and(|v| {
+                    v.is_object()
+                        || v.as_str()
+                            .is_some_and(|s| serde_json::from_str::<JsonObject>(s).is_ok())
+                })
+        })
+        && let Some(value) = raw.remove(key)
+    {
+        raw.insert("arguments".to_owned(), value);
+    }
+    let mut arguments = match raw.remove("arguments") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(o)) => Some(o),
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(&s) {
+            Ok(Value::Object(o)) => Some(o),
+            _ => {
+                return Err("execute: 'arguments' must be a JSON object such as {\"url\":\"https://example.com\"}; got a string that is not one".to_owned());
+            }
+        },
+        Some(other) => {
+            let kind = match other {
+                Value::Array(_) => "array",
+                Value::Number(_) => "number",
+                _ => "boolean",
+            };
+            return Err(format!(
+                "execute: 'arguments' must be a JSON object (the tool's parameters), got {kind}"
+            ));
+        }
+    };
+    let stray: Vec<String> = raw
+        .keys()
+        .filter(|k| !matches!(k.as_str(), "tool" | "project"))
+        .cloned()
+        .collect();
+    for key in stray {
+        if let Some(value) = raw.remove(&key) {
+            arguments
+                .get_or_insert_with(JsonObject::new)
+                .entry(key)
+                .or_insert(value);
+        }
+    }
+    if !raw.get("tool").is_some_and(Value::is_string) {
+        return Err("execute: 'tool' is required, e.g. execute({\"tool\":\"proxy_history\",\"arguments\":{\"limit\":5}}); discover(domain) lists tool names".to_owned());
+    }
+    if let Some(arguments) = arguments {
+        raw.insert("arguments".to_owned(), Value::Object(arguments));
+    }
+    Ok(raw)
+}
+
+/// Whether `tool` (a local tool, or a catalog tool or alias) declares parameter `key`.
+fn tool_declares(catalog: Option<&Catalog>, tool: &str, key: &str) -> bool {
+    let has = |schema: &Value| {
+        schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|p| p.contains_key(key))
+    };
+    if let Some(local) = local_tool(tool.trim()) {
+        return has(&Value::Object((local.schema)()));
+    }
+    catalog
+        .and_then(|c| c.tool(&c.resolve(tool)?.0))
+        .is_some_and(|spec| has(&spec.input_schema))
 }
 
 pub struct Gateway {
@@ -424,13 +555,45 @@ impl Gateway {
                 .overview(catalog, live_names.as_ref(), &other, warnings)
                 .await;
         };
-        self.describe_domain(
+        let domain = domain.trim().to_lowercase();
+        let is_domain = domain == LIFECYCLE
+            || domain == HISTORY
+            || (domain == OTHER && !other.is_empty())
+            || catalog.is_some_and(|c| c.domain(&domain).is_some());
+        // A tool name instead of a domain: describe the domain that owns it.
+        let matched = if is_domain {
+            None
+        } else if let Some(local) = local_tool(&domain) {
+            Some((local.domain.to_owned(), local.name.to_owned(), None))
+        } else {
+            catalog.and_then(|c| {
+                let (tool, action) = c.resolve(&domain)?;
+                let owner = c.domain_of(&tool)?.name.clone();
+                Some((owner, tool, action))
+            })
+        };
+        let described = match &matched {
+            Some((owner, _, _)) => owner.as_str(),
+            None => domain.as_str(),
+        };
+        match self.describe_domain(
             catalog,
             live.as_deref(),
             &other,
-            &domain,
+            described,
             assets.as_ref().err(),
-        )
+        ) {
+            Ok(mut out) => {
+                if let Some((_, tool, action)) = matched {
+                    out["matched_tool"] = json!(tool);
+                    if let Some(action) = action {
+                        out["matched_action"] = json!(action);
+                    }
+                }
+                text(&out)
+            }
+            Err(e) => fail(e),
+        }
     }
 
     /// `discover()` without a domain.
@@ -494,8 +657,8 @@ impl Gateway {
         other: &[String],
         domain: &str,
         catalog_error: Option<&String>,
-    ) -> CallToolResult {
-        let tool_json = |name: &str, description: Option<&str>, schema: Value| json!({"name": name, "description": description, "inputSchema": schema});
+    ) -> Result<Value, String> {
+        let tool_json = |t: &LocalTool| json!({"name": t.name, "description": t.description, "annotations": t.annotations(), "inputSchema": Value::Object((t.schema)())});
         let (skill, tools): (String, Vec<Value>) = if domain == LIFECYCLE || domain == HISTORY {
             let tools = if domain == LIFECYCLE {
                 self.lifecycle_tools()
@@ -509,10 +672,7 @@ impl Gateway {
             };
             (
                 skill.to_owned(),
-                tools
-                    .iter()
-                    .map(|t| tool_json(t.name, Some(t.description), Value::Object((t.schema)())))
-                    .collect(),
+                tools.iter().map(|t| tool_json(t)).collect(),
             )
         } else if domain == OTHER && !other.is_empty() {
             let live = live.unwrap_or_default();
@@ -551,12 +711,12 @@ impl Gateway {
             let unavailable = catalog_error
                 .map(|e| format!(" (tool catalog unavailable: {e})"))
                 .unwrap_or_default();
-            return fail(format!(
-                "unknown domain {domain:?}; valid: {}{unavailable}",
+            return Err(format!(
+                "unknown domain {domain:?}; valid: {}{unavailable}. Call discover() with no domain for the overview.",
                 valid.join(", ")
             ));
         };
-        text(&json!({"domain": domain, "skill": skill, "tools": tools}))
+        Ok(json!({"domain": domain, "skill": skill, "tools": tools}))
     }
 
     async fn all_skills(&self) -> Vec<Skill> {
@@ -578,9 +738,11 @@ impl Gateway {
                     CallToolResult::success(vec![ContentBlock::text(skill.body.clone())])
                 } else {
                     let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+                    let near = closest(&name, names.iter().copied(), 2);
                     fail(format!(
-                        "unknown skill {name:?}; available: {}",
-                        names.join(", ")
+                        "unknown skill {name:?}; available: {}; closest: {}",
+                        names.join(", "),
+                        near.join(", ")
                     ))
                 }
             }
@@ -588,19 +750,42 @@ impl Gateway {
     }
 
     async fn execute(&self, args: ExecuteArgs) -> CallToolResult {
-        let tool = args.tool.clone();
+        let mut tool = args.tool.trim().to_owned();
+        let mut arguments = args.arguments;
+        if local_tool(&tool).is_none()
+            && let Ok(assets) = self.assets().await
+            && let Some((resolved, action)) = assets.catalog.resolve(&tool)
+        {
+            // A grouped member's old name (`scope_list`) or `scope.list`: call the group with the action.
+            tool = resolved;
+            if let Some(action) = action {
+                arguments
+                    .get_or_insert_with(JsonObject::new)
+                    .entry("action")
+                    .or_insert_with(|| json!(action));
+            }
+        }
         let result = if let Some(local) = local_tool(&tool) {
-            let arguments = with_project(local, args.arguments, args.project);
+            let arguments = with_project(local, arguments, args.project);
             if local.domain == LIFECYCLE {
                 self.lifecycle(&tool, arguments).await
             } else {
                 self.history(&tool, arguments).await
             }
         } else {
-            self.forward(&tool, args.arguments, args.project.as_deref())
+            self.forward(&tool, arguments, args.project.as_deref())
                 .await
         };
         spill::apply(result, &tool, self.inline_limit, &self.spill_dir())
+    }
+
+    /// Whether `execute` can run `name`: a local tool, a catalog tool or a resolvable alias.
+    async fn runnable(&self, name: &str) -> bool {
+        local_tool(name.trim()).is_some()
+            || self
+                .assets()
+                .await
+                .is_ok_and(|a| a.catalog.resolve(name).is_some())
     }
 
     async fn forward(
@@ -618,6 +803,7 @@ impl Gateway {
                     LOCAL_TOOLS.iter().map(|t| t.name.to_owned()).collect();
                 if let Ok(a) = &assets {
                     names.extend(a.catalog.tools.iter().map(|t| t.name.clone()));
+                    names.extend(a.catalog.aliases.keys().cloned());
                 }
                 names.extend(live.iter().map(|t| t.name.to_string()));
                 let near = closest(tool, names.iter().map(String::as_str), 3);
@@ -625,17 +811,14 @@ impl Gateway {
                     .first()
                     .and_then(|n| {
                         local_tool(n).map(|t| t.domain.to_owned()).or_else(|| {
-                            assets
-                                .as_ref()
-                                .ok()?
-                                .catalog
-                                .domain_of(n)
-                                .map(|d| d.name.clone())
+                            let catalog = &assets.as_ref().ok()?.catalog;
+                            let (tool, _) = catalog.resolve(n)?;
+                            catalog.domain_of(&tool).map(|d| d.name.clone())
                         })
                     })
                     .unwrap_or_default();
                 return fail(format!(
-                    "unknown tool {tool:?}; closest: {}; re-run discover({domain:?})",
+                    "unknown tool {tool:?}; closest: {}; list exact names with discover({domain:?})",
                     near.join(", ")
                 ));
             }
@@ -776,17 +959,17 @@ impl Gateway {
         vec![
             Tool::new(
                 "discover",
-                "Start here. No domain: domains, running Burp instances, routing notes. With a domain: exact tool names and parameter schemas.",
+                "Step 1. discover() with no domain: domains, running Burp instances, routing notes. discover({\"domain\":\"http\"}): exact tool names, descriptions, annotations and inputSchema of that domain (a tool name works as domain too).",
                 schema_of::<DiscoverArgs>(),
             ),
             Tool::new(
                 "execute",
-                "Run one tool by exact name (from discover(domain)) with its arguments object; project picks the Burp when several run.",
+                "Step 2. Run one tool: {\"tool\":\"<exact name from discover>\",\"arguments\":{<that tool's parameters>},\"project\":\"<optional>\"}. Grouped tools need \"action\" inside arguments. Examples: {\"tool\":\"proxy_history\",\"arguments\":{\"limit\":5}}, {\"tool\":\"scope\",\"arguments\":{\"action\":\"check\",\"url\":\"https://example.com\"}}. project picks the Burp when several run.",
                 schema_of::<ExecuteArgs>(),
             ),
             Tool::new(
                 "skill",
-                "Playbooks: no name lists them; a name returns its markdown.",
+                "Playbooks: skill() lists them; skill({\"name\":\"raijin-gateway\"}) returns one as markdown. Tool names inside run through execute.",
                 schema_of::<SkillArgs>(),
             ),
         ]
@@ -794,11 +977,19 @@ impl Gateway {
 }
 
 fn live_json(tool: &Tool) -> Value {
-    json!({"name": tool.name, "description": tool.description, "inputSchema": Value::Object((*tool.input_schema).clone())})
+    let mut out = json!({"name": tool.name, "description": tool.description, "inputSchema": Value::Object((*tool.input_schema).clone())});
+    if let Some(annotations) = &tool.annotations {
+        out["annotations"] = json!(annotations);
+    }
+    out
 }
 
 fn spec_json(spec: &ToolSpec) -> Value {
-    json!({"name": spec.name, "description": spec.description, "inputSchema": spec.input_schema})
+    let mut out = json!({"name": spec.name, "description": spec.description, "inputSchema": spec.input_schema});
+    if let Some(annotations) = &spec.annotations {
+        out["annotations"] = annotations.clone();
+    }
+    out
 }
 
 impl ServerHandler for Gateway {
@@ -824,11 +1015,19 @@ impl ServerHandler for Gateway {
         {
             for spec in &assets.catalog.tools {
                 let schema = spec.input_schema.as_object().cloned().unwrap_or_default();
-                tools.push(Tool::new_with_raw(
+                let mut tool = Tool::new_with_raw(
                     spec.name.clone(),
                     spec.description.clone().map(Cow::Owned),
                     schema,
-                ));
+                );
+                if let Some(annotations) = spec
+                    .annotations
+                    .clone()
+                    .and_then(|v| serde_json::from_value::<ToolAnnotations>(v).ok())
+                {
+                    tool = tool.with_annotations(annotations);
+                }
+                tools.push(tool);
             }
         }
         Ok(ListToolsResult::with_all_items(tools))
@@ -846,20 +1045,35 @@ impl ServerHandler for Gateway {
                 Ok(args) => self.discover(args).await,
                 Err(e) => fail(e),
             },
-            "execute" => match parse_args::<ExecuteArgs>(&name, arguments) {
-                Ok(args) => self.execute(args).await,
-                Err(e) => fail(e),
-            },
+            "execute" => {
+                let assets = self.assets().await.ok();
+                let catalog = assets.as_deref().map(|a| &a.catalog);
+                match normalize_execute(arguments, |tool, key| tool_declares(catalog, tool, key))
+                    .and_then(|a| parse_args::<ExecuteArgs>(&name, Some(a)))
+                {
+                    Ok(args) => self.execute(args).await,
+                    Err(e) => fail(e),
+                }
+            }
             "skill" => match parse_args::<SkillArgs>(&name, arguments) {
                 Ok(args) => self.skill(args).await,
                 Err(e) => fail(e),
             },
+            // A Raijin tool called directly: run it as execute would.
+            _ if self.runnable(&name).await => {
+                self.execute(ExecuteArgs {
+                    tool: name,
+                    arguments,
+                    project: None,
+                })
+                .await
+            }
             _ if self.surface == Surface::Full => {
                 let result = self.forward(&name, arguments, None).await;
                 spill::apply(result, &name, self.inline_limit, &self.spill_dir())
             }
             _ => fail(format!(
-                "unknown tool {name:?}; this server has discover, execute and skill"
+                "unknown tool {name:?}; this server has three tools: discover, execute, skill. Run Raijin tools through execute, e.g. execute({{\"tool\":\"proxy_history\",\"arguments\":{{\"limit\":5}}}})"
             )),
         };
         Ok(CallToolResponse::Complete(result))
@@ -895,5 +1109,37 @@ impl ServerHandler for Gateway {
             GetPromptResult::new(vec![PromptMessage::new_text(Role::User, skill.body)]);
         result.description = Some(skill.description);
         Ok(GetPromptResponse::Complete(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object(value: Value) -> JsonObject {
+        serde_json::from_value(value).expect("object")
+    }
+
+    #[test]
+    fn an_alias_key_the_tool_declares_stays_a_parameter() {
+        let declares_input = |tool: &str, key: &str| tool == "t" && key == "input";
+        let own = normalize_execute(
+            Some(object(json!({"tool": "t", "input": {"a": 1}}))),
+            declares_input,
+        )
+        .expect("normalized");
+        assert_eq!(
+            Value::Object(own),
+            json!({"tool": "t", "arguments": {"input": {"a": 1}}})
+        );
+        let alias = normalize_execute(
+            Some(object(json!({"tool": "u", "input": {"a": 1}}))),
+            declares_input,
+        )
+        .expect("normalized");
+        assert_eq!(
+            Value::Object(alias),
+            json!({"tool": "u", "arguments": {"a": 1}})
+        );
     }
 }

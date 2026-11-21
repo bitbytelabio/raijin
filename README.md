@@ -122,7 +122,7 @@ raijin status
 raijin down
 ```
 
-`raijin up` loads the Raijin jar matching the CLI version, downloaded once to `~/.raijin/jars/` (`RAIJIN_JAR` or `jar` in `raijin.toml` overrides it). Settings in `raijin.toml` include `mode` (`headless` / `ui`), `theme` (`dark` / `light`, default `dark`) and `task_engine` (`running` / `paused`, default `running`: Burp pauses its tasks when it reopens a project, `running` resumes them so proxy traffic keeps reaching the site map).
+`raijin up` loads `raijin.jar` from beside the `raijin` binary when it is the jar of the same release (what the install script installs), else the matching release jar downloaded once to `~/.raijin/jars/` (`RAIJIN_JAR` or `jar` in `raijin.toml` overrides it). Settings in `raijin.toml` include `mode` (`headless` / `ui`), `theme` (`dark` / `light`, default `dark`) and `task_engine` (`running` / `paused`, default `running`: Burp pauses its tasks when it reopens a project, `running` resumes them so proxy traffic keeps reaching the site map).
 
 ### Endpoints
 

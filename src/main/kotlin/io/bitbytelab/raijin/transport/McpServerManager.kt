@@ -145,11 +145,15 @@ class McpServerManager(
          */
         internal val SERVER_INSTRUCTIONS: String =
             "Raijin drives Burp Suite (proxy, scanner, Repeater, Turbo scripting, recon). " +
-                "Most tools take an `action` parameter; the tool description lists the actions. " +
+                "Grouped tools take an \"action\" argument plus that action's parameters, e.g. " +
+                "scope {\"action\": \"check\", \"url\": \"https://example.com\"}; the tool description lists each action " +
+                "and marks required parameters with *. Use only parameter names from the inputSchema: unknown names are rejected. " +
+                "An error result says what to fix and usually carries 'usage' and 'example': correct the arguments from them " +
+                "instead of resending the same call. " +
                 "New here? Load the `${SkillCatalog.ENTRY_SKILL}` skill first " +
                 "(resource `${SkillCatalog.uri(SkillCatalog.ENTRY_SKILL)}`, `load_skill`, or prompt `${SkillCatalog.ENTRY_SKILL}`). " +
                 "Skills: ${SkillCatalog.NAMES.joinToString(", ")}. " +
-                "Check scope first (`scope` with `action=get_config` / `check`). Outbound requests are checked " +
+                "Check scope first (scope with action=get_config / check). Outbound requests are checked " +
                 "against Burp's scope per the operator's mcp_scope_mode: warn (default) sends and adds scope_warning; " +
                 "enforce refuses (out_of_scope=true). Turbo, Scanner and WebSocket are advisory only."
 

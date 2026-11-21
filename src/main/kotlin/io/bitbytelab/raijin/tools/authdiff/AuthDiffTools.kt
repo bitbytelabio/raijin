@@ -35,6 +35,7 @@ Analyzes status codes, body content, body length, and headers for differences. F
                         put("description", "Target port number (default 443)")
                     }
                     putJsonObject("use_tls") { put("type", "boolean"); put("description", "Whether to use HTTPS (TLS) (default: port==443)") }
+                    putJsonObject("tls") { put("type", "boolean"); put("description", "Alias for use_tls") }
                     putJsonObject("auth_levels") {
                         put("type", "array"); putJsonObject("items") { put("type", "object") }
                         put("description", "At least 2 auth level objects: {name, header_name?, header_value?, headers?, remove_headers?}; name none/unauth/anonymous sends no credentials")

@@ -132,7 +132,7 @@
   "tools": [
     {
       "name": "ai",
-      "description": "Burp AI: status and prompts. Pick one `action`; parameters marked * are required for that action.\n- status(): Check whether Burp Suite's AI feature is enabled and available.\n- prompt(messages*, context): Send a prompt to Burp Suite's built-in AI and receive a response.",
+      "description": "Burp AI: status and prompts.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"prompt\",\"messages\":[\"<messages>\"]}\n- status(): Check whether Burp Suite's AI feature is enabled and available.\n- prompt(messages*, context): Send a prompt to Burp Suite's built-in AI and receive a response.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -160,11 +160,16 @@
           "action"
         ]
       },
-      "domain": "settings"
+      "domain": "settings",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "analyze",
-      "description": "Offline analysis of requests, responses and traffic (no new traffic is sent unless stated). Pick one `action`; parameters marked * are required for that action.\n- request(request*): Parse and analyze a raw HTTP request.\n- response(response*): Parse and analyze a raw HTTP response.\n- find_reflected(request*, response*, additional_values): Find reflected parameter values in an HTTP response.\n- extract_params(request*): Extract all parameters from an HTTP request including URL query params, body params, cookies, headers, JSON body fields (recursively flattened), and XML elem...\n- insertion_points(request*, host*, port*, use_tls): Identify all potential injection/insertion points in an HTTP request.\n- diff(item1*, item2*, type*): Compare two HTTP requests or two HTTP responses and identify differences.\n- response_body_search(pattern*, max_results, in_scope_only): Search response bodies across the proxy history for a regex pattern.\n- http_keywords(response*, keywords*, case_sensitive): Analyze an HTTP response for keyword occurrences using Burp's built-in keyword analysis engine.\n- http_variations(responses*): Analyze variations across multiple HTTP responses.\n- passive_intel(max_items, in_scope_only, categories, host_filter): Scan proxy history for sensitive data: cloud and API keys (AWS, Google, GitHub including fine-grained github_pat_, GitLab glpat-, OpenAI sk-proj-, Anthropic...",
+      "description": "Offline analysis of requests, responses and traffic (no new traffic is sent unless stated).\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"request\",\"request\":\"<request>\"}\n- request(request*): Parse and analyze a raw HTTP request.\n- response(response*): Parse and analyze a raw HTTP response.\n- find_reflected(request*, response*, additional_values): Find reflected parameter values in an HTTP response.\n- extract_params(request*): Extract all parameters from an HTTP request including URL query params, body params, cookies, headers, JSON body fields (recursively flattened), and XML elem...\n- insertion_points(request*, host*, port*, use_tls): Identify all potential injection/insertion points in an HTTP request.\n- diff(item1*, item2*, type*): Compare two HTTP requests or two HTTP responses and identify differences.\n- response_body_search(pattern*, max_results, in_scope_only): Search response bodies across the proxy history for a regex pattern.\n- http_keywords(response*, keywords*, case_sensitive): Analyze an HTTP response for keyword occurrences using Burp's built-in keyword analysis engine.\n- http_variations(responses*): Analyze variations across multiple HTTP responses.\n- passive_intel(max_items, in_scope_only, categories, host_filter): Scan proxy history for sensitive data: cloud and API keys (AWS, Google, GitHub including fine-grained github_pat_, GitLab glpat-, OpenAI sk-proj-, Anthropic...",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -241,7 +246,7 @@
           },
           "in_scope_only": {
             "type": "boolean",
-            "description": "[response_body_search] Restrict to in-scope URLs (default false)\n[passive_intel] Only scan in-scope items, default false"
+            "description": "[response_body_search] Restrict to in-scope URLs (default false)\n[analyze(action=passive_intel)] Only scan in-scope items, default false"
           },
           "keywords": {
             "type": "array",
@@ -265,25 +270,31 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 100000,
-            "description": "Maximum proxy history items to scan (the most recent ones), default 1000 [actions: passive_intel]"
+            "description": "Maximum proxy history items to scan (the most recent ones), default 1000 [actions: analyze(action=passive_intel)]"
           },
           "categories": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Optional array of pattern names to check; a partial name selects every pattern containing it (\"aws\" selects aws_access_key and aws_secret_key). The available names are listed in the tool description. [actions: passive_intel]"
+            "description": "Optional array of pattern names to check; a partial name selects every pattern containing it (\"aws\" selects aws_access_key and aws_secret_key). The available names are listed in the tool description. [actions: analyze(action=passive_intel)]"
           },
           "host_filter": {
             "type": "string",
-            "description": "Optional regex to filter by host [actions: passive_intel]"
+            "description": "Optional regex to filter by host [actions: analyze(action=passive_intel)]"
           }
         },
         "required": [
           "action"
         ]
       },
-      "domain": "analysis"
+      "domain": "analysis",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "api_import_openapi",
@@ -328,7 +339,12 @@
           "spec_json"
         ]
       },
-      "domain": "recon"
+      "domain": "recon",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "auth_diff",
@@ -353,6 +369,10 @@
           "use_tls": {
             "type": "boolean",
             "description": "Whether to use HTTPS (TLS) (default: port==443)"
+          },
+          "tls": {
+            "type": "boolean",
+            "description": "Alias for use_tls"
           },
           "auth_levels": {
             "type": "array",
@@ -385,11 +405,16 @@
           "auth_levels"
         ]
       },
-      "domain": "authz"
+      "domain": "authz",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "autorize",
-      "description": "Live broken-access-control detection: taps proxy traffic and replays matching requests under lower-privilege identities in the background, flagging mismatches (the probe(action=access_control) idea applied continuously instead of to a caller-supplied request list). Flagged mismatches are also pushed to findings(action=add). Pick one `action`; parameters marked * are required for that action.\n- set_rule(rule_id, identities, in_scope_only, include_host_pattern, exclude_url_regex, methods, include_mutating, ignore_static_assets, similarity_threshold, enabled): Start (or update) a live broken-access-control tap: every proxied request matching the filters is cloned and replayed under each of 'identities' in the backg...\n- list_rules(): List configured live Autorize-style tap rules.\n- remove_rule(rule_id*): Stop and remove a live Autorize-style tap rule by id.\n- list_matches(rule_id, min_severity, start_index, count, match_id, include_replays): List flagged mismatches recorded by live Autorize-style taps, newest first, with the original exchange and what each identity received when replayed (match_i...\n- clear_matches(rule_id, reset_seen): Clear recorded Autorize-style matches (optionally scoped to one rule), and optionally reset the dedup guard so already-tested endpoints get retested.",
+      "description": "Live broken-access-control detection: taps proxy traffic and replays matching requests under lower-privilege identities in the background, flagging mismatches (the probe(action=access_control) idea applied continuously instead of to a caller-supplied request list). Flagged mismatches are also pushed to findings(action=add).\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"remove_rule\",\"rule_id\":\"<rule_id>\"}\n- set_rule(rule_id, identities, in_scope_only, include_host_pattern, exclude_url_regex, methods, include_mutating, ignore_static_assets, similarity_threshold, enabled): Start (or update) a live broken-access-control tap: every proxied request matching the filters is cloned and replayed under each of 'identities' in the backg...\n- list_rules(): List configured live Autorize-style tap rules.\n- remove_rule(rule_id*): Stop and remove a live Autorize-style tap rule by id.\n- list_matches(rule_id, min_severity, start_index, count, match_id, include_replays): List flagged mismatches recorded by live Autorize-style taps, newest first, with the original exchange and what each identity received when replayed (match_i...\n- clear_matches(rule_id, reset_seen): Clear recorded Autorize-style matches (optionally scoped to one rule), and optionally reset the dedup guard so already-tested endpoints get retested.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -406,7 +431,7 @@
           },
           "rule_id": {
             "type": "string",
-            "description": "[set_rule] Omit to create a new rule; pass an existing id to update it\n[remove_rule] Rule id from autorize_set_rule/autorize_list_rules\n[list_matches] Optional: limit to one rule\n[clear_matches] Optional: limit to one rule; omit to clear all"
+            "description": "[set_rule] Omit to create a new rule; pass an existing id to update it\n[remove_rule] Rule id from autorize(action=set_rule)/autorize(action=list_rules)\n[list_matches] Optional: limit to one rule\n[clear_matches] Optional: limit to one rule; omit to clear all"
           },
           "identities": {
             "type": "array",
@@ -488,7 +513,12 @@
           "action"
         ]
       },
-      "domain": "authz"
+      "domain": "authz",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      }
     },
     {
       "name": "bambda_import",
@@ -517,7 +547,12 @@
           "script"
         ]
       },
-      "domain": "scanner"
+      "domain": "scanner",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
     },
     {
       "name": "bambda_templates",
@@ -527,11 +562,17 @@
         "properties": {},
         "required": []
       },
-      "domain": "scanner"
+      "domain": "scanner",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "burp",
-      "description": "Burp Suite itself: version, project and extension info, config import/export, task engine, shutdown. Pick one `action`; parameters marked * are required for that action.\n- version(): Get Burp Suite version information including product name, version number, build number, and edition (Professional/Community).\n- export_project_config(paths): Export Burp Suite project-level configuration as JSON.\n- export_user_config(paths): Export Burp Suite user-level configuration as JSON.\n- import_project_config(config_json*): Import project-level configuration into Burp Suite from a JSON string.\n- import_user_config(config_json*): Import user-level configuration into Burp Suite from a JSON string.\n- task_engine_state(): Get the current state of Burp Suite's task execution engine (running or paused).\n- task_engine_set(state*): Set the state of Burp Suite's task execution engine.\n- command_line_args(): Get the command line arguments that were used to launch Burp Suite.\n- shutdown(prompt_user): Initiate a Burp Suite shutdown.\n- project_info(): Get information about the current Burp Suite project including its name, unique identifier, and description.\n- extension_info(): Get comprehensive information about the Raijin extension including its version, filename, Burp Suite version/edition, MCP server bind host and ports, remote-...",
+      "description": "Burp Suite itself: version, project and extension info, config import/export, task engine, shutdown.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"import_project_config\",\"config_json\":\"<config_json>\"}\n- version(): Get Burp Suite version information including product name, version number, build number, and edition (Professional/Community).\n- export_project_config(paths): Export Burp Suite project-level configuration as JSON.\n- export_user_config(paths): Export Burp Suite user-level configuration as JSON.\n- import_project_config(config_json*): Import project-level configuration into Burp Suite from a JSON string.\n- import_user_config(config_json*): Import user-level configuration into Burp Suite from a JSON string.\n- task_engine_state(): Get the current state of Burp Suite's task execution engine (running or paused).\n- task_engine_set(state*): Set the state of Burp Suite's task execution engine.\n- command_line_args(): Get the command line arguments that were used to launch Burp Suite.\n- shutdown(prompt_user): Initiate a Burp Suite shutdown.\n- project_info(): Get information about the current Burp Suite project including its name, unique identifier, and description.\n- extension_info(): Get comprehensive information about the Raijin extension including its version, filename, Burp Suite version/edition, MCP server bind host and ports, remote-...",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -580,11 +621,16 @@
           "action"
         ]
       },
-      "domain": "settings"
+      "domain": "settings",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "collaborator",
-      "description": "Burp Collaborator out-of-band testing: clients, payloads, polling. Pick one `action`; parameters marked * are required for that action.\n- create_client(): Create a Burp Collaborator client for out-of-band (OOB) payloads; its secret key is saved in the Burp project, so it survives an extension reload.\n- restore_client(secret_key*): Restore a Collaborator client from its secret key (clients created in this Burp project come back by themselves; this is for a key from elsewhere).\n- get_secret(client_id*): Get the secret key for a Collaborator client.\n- generate_payload(client_id*, custom_data): Generate a unique Collaborator payload (subdomain) for OOB detection and return its payload_id, the id carried by every interaction it causes.\n- default_payload(without_server_location): Generate a Collaborator payload using Burp's DEFAULT generator (no client_id needed).\n- poll(client_id*, type, payload_id, since, limit, max_body_length): Poll for Collaborator interactions (DNS, HTTP with full request and response, SMTP); all are kept in a history, so filters and repeated polls lose nothing.\n- server_info(client_id*): Get the Collaborator server address and metadata for a given client.\n- remove_client(client_id*): Drop a Collaborator client from Raijin's tracking, with its saved secret key and its recorded interactions, so it is not restored on the next load.\n- list_clients(): List the Collaborator clients registered in this Burp project, including the ones restored after an extension reload.",
+      "description": "Burp Collaborator out-of-band testing: clients, payloads, polling.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"restore_client\",\"secret_key\":\"<secret_key>\"}\n- create_client(): Create a Burp Collaborator client for out-of-band (OOB) payloads; its secret key is saved in the Burp project, so it survives an extension reload.\n- restore_client(secret_key*): Restore a Collaborator client from its secret key (clients created in this Burp project come back by themselves; this is for a key from elsewhere).\n- get_secret(client_id*): Get the secret key for a Collaborator client.\n- generate_payload(client_id*, custom_data): Generate a unique Collaborator payload (subdomain) for OOB detection and return its payload_id, the id carried by every interaction it causes.\n- default_payload(without_server_location): Generate a Collaborator payload using Burp's DEFAULT generator (no client_id needed).\n- poll(client_id*, type, payload_id, since, limit, max_body_length): Poll for Collaborator interactions (DNS, HTTP with full request and response, SMTP); all are kept in a history, so filters and repeated polls lose nothing.\n- server_info(client_id*): Get the Collaborator server address and metadata for a given client.\n- remove_client(client_id*): Drop a Collaborator client from Raijin's tracking, with its saved secret key and its recorded interactions, so it is not restored on the next load.\n- list_clients(): List the Collaborator clients registered in this Burp project, including the ones restored after an extension reload.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -630,7 +676,7 @@
           },
           "payload_id": {
             "type": "string",
-            "description": "Return only interactions of this payload: the payload_id from collaborator_generate_payload, or the payload host [actions: poll]"
+            "description": "Return only interactions of this payload: the payload_id from collaborator(action=generate_payload), or the payload host [actions: poll]"
           },
           "since": {
             "type": "integer",
@@ -654,11 +700,16 @@
           "action"
         ]
       },
-      "domain": "oob"
+      "domain": "oob",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      }
     },
     {
       "name": "config",
-      "description": "Burp configuration: proxy listeners, match/replace rules, upstream proxy, payload processors. Pick one `action`; parameters marked * are required for that action.\n- proxy_listeners_list(): List all configured proxy listeners in the current Burp Suite project.\n- proxy_listener_add(interface*, tls, redirect_host, redirect_port, certificate): Add a new proxy listener to Burp Suite's proxy configuration.\n- proxy_listener_remove(interface*): Remove a proxy listener by its interface binding string.\n- match_replace_add(type*, match*, replace*, comment, enabled): Add a match-and-replace rule to Burp Suite's proxy configuration.\n- match_replace_list(): List all match-and-replace rules configured in Burp Suite's proxy.\n- match_replace_remove(rule_index*): Remove a match-and-replace rule by its index.\n- upstream_proxy_set(host*, port*, type, auth_user, auth_pass, destination_host): Configure an upstream proxy server that Burp Suite will route traffic through.\n- intruder_payload_processor_register(name*, transform_type*, prefix_value, suffix_value, regex_pattern, regex_replacement): Register a custom payload processor with Intruder that transforms payloads during a run.",
+      "description": "Burp configuration: proxy listeners, match/replace rules, upstream proxy, payload processors.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"proxy_listener_add\",\"interface\":\"<interface>\"}\n- proxy_listeners_list(): List all configured proxy listeners in the current Burp Suite project.\n- proxy_listener_add(interface*, tls, redirect_host, redirect_port, certificate): Add a new proxy listener to Burp Suite's proxy configuration.\n- proxy_listener_remove(interface*): Remove a proxy listener by its interface binding string.\n- match_replace_add(type*, match*, replace*, comment, enabled): Add a match-and-replace rule to Burp Suite's proxy configuration.\n- match_replace_list(): List all match-and-replace rules configured in Burp Suite's proxy.\n- match_replace_remove(rule_index*): Remove a match-and-replace rule by its index.\n- upstream_proxy_set(host*, port*, type, auth_user, auth_pass, destination_host): Configure an upstream proxy server that Burp Suite will route traffic through.\n- intruder_payload_processor_register(name*, transform_type*, prefix_value, suffix_value, regex_pattern, regex_replacement): Register a custom payload processor with Intruder that transforms payloads during a run.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -796,11 +847,16 @@
           "action"
         ]
       },
-      "domain": "settings"
+      "domain": "settings",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "custom_check",
-      "description": "Custom Burp checks: BChecks and passive/active scan checks (create from a template, import, dry-run against proxy history, list, remove). Pick one `action`; parameters marked * are required for that action.\n- bcheck_create(name*, description*, type*, match_pattern, match_location, match_condition, payloads, response_match_pattern, path, collaborator_payload_type, severity*, confidence*, author, tags, issue_detail, issue_remediation): Generate and deploy a BCheck custom scan check from structured parameters.\n- bcheck_import(script*): Import a raw BCheck script directly into Burp Suite.\n- bcheck_list(): List all BChecks that have been deployed via MCP.\n- bcheck_remove(id*): Remove a deployed BCheck from MCP tracking by its ID.\n- bcheck_templates(): Get all BCheck templates with full examples, DSL reference, and usage guidance.\n- bcheck_dry_run(type*, match_pattern, match_location, match_condition, payloads, response_match_pattern, path, collaborator_payload_type, url_pattern, in_scope_only, max_items, max_matches): Try a bcheck_create definition against the proxy history Burp has already recorded, before deploying it.\n- scancheck_create_passive(name*, description*, conditions*, match_mode, severity*, confidence*, issue_detail*, issue_remediation): Create a passive Script-mode scan check that analyzes every response during scanning.\n- scancheck_create_active(name*, description*, steps*, match_mode, severity*, confidence*, issue_detail*, issue_remediation): Create an active Script-mode scan check that injects payloads at insertion points during active scanning.\n- scancheck_list(): List all custom scan checks deployed via MCP, including those registered with scanner_register_check.\n- scancheck_remove(id*): Remove a deployed Script-mode scan check by its ID.\n- scancheck_templates(): Get Script-mode scan check templates, examples, and full condition reference.\n- scancheck_dry_run(conditions, steps, match_mode, url_pattern, in_scope_only, max_items, max_matches): Try a Script-mode scan check definition against the proxy history Burp has already recorded, before deploying it.",
+      "description": "Custom Burp checks: BChecks and passive/active scan checks (create from a template, import, dry-run against proxy history, list, remove).\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"bcheck_create\",\"name\":\"<name>\",\"description\":\"<description>\",\"type\":\"passive_response\",\"severity\":\"high\",\"confidence\":\"certain\"}\n- bcheck_create(name*, description*, type*, match_pattern, match_location, match_condition, payloads, response_match_pattern, path, collaborator_payload_type, severity*, confidence*, author, tags, issue_detail, issue_remediation): Generate and deploy a BCheck custom scan check from structured parameters.\n- bcheck_import(script*): Import a raw BCheck script directly into Burp Suite.\n- bcheck_list(): List all BChecks that have been deployed via MCP.\n- bcheck_remove(id*): Remove a deployed BCheck from MCP tracking by its ID.\n- bcheck_templates(): Get all BCheck templates with full examples, DSL reference, and usage guidance.\n- bcheck_dry_run(type*, match_pattern, match_location, match_condition, payloads, response_match_pattern, path, collaborator_payload_type, url_pattern, in_scope_only, max_items, max_matches): Try a custom_check(action=bcheck_create) definition against the proxy history Burp has already recorded, before deploying it.\n- scancheck_create_passive(name*, description*, conditions*, match_mode, severity*, confidence*, issue_detail*, issue_remediation): Create a passive Script-mode scan check that analyzes every response during scanning.\n- scancheck_create_active(name*, description*, steps*, match_mode, severity*, confidence*, issue_detail*, issue_remediation): Create an active Script-mode scan check that injects payloads at insertion points during active scanning.\n- scancheck_list(): List all custom scan checks deployed via MCP, including those registered with scanner(action=register_check).\n- scancheck_remove(id*): Remove a deployed Script-mode scan check by its ID.\n- scancheck_templates(): Get Script-mode scan check templates, examples, and full condition reference.\n- scancheck_dry_run(conditions, steps, match_mode, url_pattern, in_scope_only, max_items, max_matches): Try a Script-mode scan check definition against the proxy history Burp has already recorded, before deploying it.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -824,11 +880,11 @@
           },
           "name": {
             "type": "string",
-            "description": "Check name [actions: bcheck_create, scancheck_create_passive, scancheck_create_active]"
+            "description": "Check name [actions: custom_check(action=bcheck_create), custom_check(action=scancheck_create_passive), custom_check(action=scancheck_create_active)]"
           },
           "description": {
             "type": "string",
-            "description": "What the check detects [actions: bcheck_create, scancheck_create_passive, scancheck_create_active]"
+            "description": "What the check detects [actions: custom_check(action=bcheck_create), custom_check(action=scancheck_create_passive), custom_check(action=scancheck_create_active)]"
           },
           "type": {
             "type": "string",
@@ -840,15 +896,15 @@
               "path_level",
               "collaborator"
             ],
-            "description": "Check type [actions: bcheck_create, bcheck_dry_run]"
+            "description": "Check type [actions: custom_check(action=bcheck_create), custom_check(action=bcheck_dry_run)]"
           },
           "match_pattern": {
             "type": "string",
-            "description": "Regex or text to match. For collaborator: the header value to inject [actions: bcheck_create, bcheck_dry_run]"
+            "description": "Regex or text to match. For collaborator: the header value to inject [actions: custom_check(action=bcheck_create), custom_check(action=bcheck_dry_run)]"
           },
           "match_location": {
             "type": "string",
-            "description": "Where to match. passive_response: response_body, response_headers, status_code. passive_request: request_url, request_headers, request_body. collaborator: the header to set [actions: bcheck_create, bcheck_dry_run]"
+            "description": "Where to match. passive_response: response_body, response_headers, status_code. passive_request: request_url, request_headers, request_body. collaborator: the header to set [actions: custom_check(action=bcheck_create), custom_check(action=bcheck_dry_run)]"
           },
           "match_condition": {
             "type": "string",
@@ -857,22 +913,22 @@
               "is",
               "contains"
             ],
-            "description": "How a pattern is compared (default matches) [actions: bcheck_create, bcheck_dry_run]"
+            "description": "How a pattern is compared (default matches) [actions: custom_check(action=bcheck_create), custom_check(action=bcheck_dry_run)]"
           },
           "payloads": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "insertion_point: payloads to inject. path_level: suffixes to append to each path [actions: bcheck_create, bcheck_dry_run]"
+            "description": "insertion_point: payloads to inject. path_level: suffixes to append to each path [actions: custom_check(action=bcheck_create), custom_check(action=bcheck_dry_run)]"
           },
           "response_match_pattern": {
             "type": "string",
-            "description": "What the response body must show (insertion_point, host_level; optional for path_level) [actions: bcheck_create, bcheck_dry_run]"
+            "description": "What the response body must show (insertion_point, host_level; optional for path_level) [actions: custom_check(action=bcheck_create), custom_check(action=bcheck_dry_run)]"
           },
           "path": {
             "type": "string",
-            "description": "host_level: the path requested on every host (default /) [actions: bcheck_create, bcheck_dry_run]"
+            "description": "host_level: the path requested on every host (default /) [actions: custom_check(action=bcheck_create), custom_check(action=bcheck_dry_run)]"
           },
           "collaborator_payload_type": {
             "type": "string",
@@ -880,7 +936,7 @@
               "dns",
               "http"
             ],
-            "description": "Collaborator interaction that counts (default dns) [actions: bcheck_create, bcheck_dry_run]"
+            "description": "Collaborator interaction that counts (default dns) [actions: custom_check(action=bcheck_create), custom_check(action=bcheck_dry_run)]"
           },
           "severity": {
             "type": "string",
@@ -890,7 +946,7 @@
               "low",
               "information"
             ],
-            "description": "Issue severity [actions: bcheck_create, scancheck_create_passive, scancheck_create_active]"
+            "description": "Issue severity [actions: custom_check(action=bcheck_create), custom_check(action=scancheck_create_passive), custom_check(action=scancheck_create_active)]"
           },
           "confidence": {
             "type": "string",
@@ -899,51 +955,51 @@
               "firm",
               "tentative"
             ],
-            "description": "Issue confidence [actions: bcheck_create, scancheck_create_passive, scancheck_create_active]"
+            "description": "Issue confidence [actions: custom_check(action=bcheck_create), custom_check(action=scancheck_create_passive), custom_check(action=scancheck_create_active)]"
           },
           "author": {
             "type": "string",
-            "description": "Author name [actions: bcheck_create]"
+            "description": "Author name [actions: custom_check(action=bcheck_create)]"
           },
           "tags": {
             "type": "string",
-            "description": "Comma-separated tags [actions: bcheck_create]"
+            "description": "Comma-separated tags [actions: custom_check(action=bcheck_create)]"
           },
           "issue_detail": {
             "type": "string",
-            "description": "Detailed issue description [actions: bcheck_create, scancheck_create_passive, scancheck_create_active]"
+            "description": "Detailed issue description [actions: custom_check(action=bcheck_create), custom_check(action=scancheck_create_passive), custom_check(action=scancheck_create_active)]"
           },
           "issue_remediation": {
             "type": "string",
-            "description": "How to fix the issue [actions: bcheck_create, scancheck_create_passive, scancheck_create_active]"
+            "description": "How to fix the issue [actions: custom_check(action=bcheck_create), custom_check(action=scancheck_create_passive), custom_check(action=scancheck_create_active)]"
           },
           "script": {
             "type": "string",
-            "description": "Full BCheck DSL script [actions: bcheck_import]"
+            "description": "Full BCheck DSL script [actions: custom_check(action=bcheck_import)]"
           },
           "id": {
             "type": "string",
-            "description": "[bcheck_remove] ID of the check to remove\n[scancheck_remove] Scan check ID (or name) to remove"
+            "description": "[custom_check(action=bcheck_remove)] ID of the check to remove\n[custom_check(action=scancheck_remove)] Scan check ID (or name) to remove"
           },
           "url_pattern": {
             "type": "string",
-            "description": "Only read history items whose URL matches this regex (case-insensitive) [actions: bcheck_dry_run, scancheck_dry_run]"
+            "description": "Only read history items whose URL matches this regex (case-insensitive) [actions: custom_check(action=bcheck_dry_run), custom_check(action=scancheck_dry_run)]"
           },
           "in_scope_only": {
             "type": "boolean",
-            "description": "Only read in-scope history items (default false) [actions: bcheck_dry_run, scancheck_dry_run]"
+            "description": "Only read in-scope history items (default false) [actions: custom_check(action=bcheck_dry_run), custom_check(action=scancheck_dry_run)]"
           },
           "max_items": {
             "type": "integer",
             "minimum": 1,
             "maximum": 5000,
-            "description": "How many of the newest matching history items to read (default 200) [actions: bcheck_dry_run, scancheck_dry_run]"
+            "description": "How many of the newest matching history items to read (default 200) [actions: custom_check(action=bcheck_dry_run), custom_check(action=scancheck_dry_run)]"
           },
           "max_matches": {
             "type": "integer",
             "minimum": 1,
             "maximum": 200,
-            "description": "How many matches to list in full (default 20) [actions: bcheck_dry_run, scancheck_dry_run]"
+            "description": "How many matches to list in full (default 20) [actions: custom_check(action=bcheck_dry_run), custom_check(action=scancheck_dry_run)]"
           },
           "conditions": {
             "type": "array",
@@ -986,7 +1042,7 @@
                 "pattern"
               ]
             },
-            "description": "Condition objects: location, pattern, condition_type, negate [actions: scancheck_create_passive, scancheck_dry_run]"
+            "description": "Condition objects: location, pattern, condition_type, negate [actions: custom_check(action=scancheck_create_passive), custom_check(action=scancheck_dry_run)]"
           },
           "match_mode": {
             "type": "string",
@@ -994,7 +1050,7 @@
               "all",
               "any"
             ],
-            "description": "How conditions in a list combine: all (default) or any [actions: scancheck_create_passive, scancheck_create_active, scancheck_dry_run]"
+            "description": "How conditions in a list combine: all (default) or any [actions: custom_check(action=scancheck_create_passive), custom_check(action=scancheck_create_active), custom_check(action=scancheck_dry_run)]"
           },
           "steps": {
             "type": "array",
@@ -1065,18 +1121,23 @@
                 "payload"
               ]
             },
-            "description": "Step objects: payload, response_conditions[], match_mode, stop_if_no_match [actions: scancheck_create_active, scancheck_dry_run]"
+            "description": "Step objects: payload, response_conditions[], match_mode, stop_if_no_match [actions: custom_check(action=scancheck_create_active), custom_check(action=scancheck_dry_run)]"
           }
         },
         "required": [
           "action"
         ]
       },
-      "domain": "scanner"
+      "domain": "scanner",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "events",
-      "description": "Event feed: subscribe, read recent or typed events, clear. Pick one `action`; parameters marked * are required for that action.\n- subscribe(types): Open a poll subscription: a type filter plus a cursor starting after the latest event.\n- unsubscribe(subscription_id*): Unsubscribe from event bus notifications.\n- get(since_id, max_events, subscription_id): Retrieve events from the event bus using cursor-based polling.\n- get_by_type(types*, since_id, max_events): Retrieve events from the event bus filtered by event type(s).\n- clear(): Clear all buffered events and drop every subscription opened with events_subscribe.",
+      "description": "Event feed: subscribe, read recent or typed events, clear.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"unsubscribe\",\"subscription_id\":\"<subscription_id>\"}\n- subscribe(types): Open a poll subscription: a type filter plus a cursor starting after the latest event.\n- unsubscribe(subscription_id*): Unsubscribe from event bus notifications.\n- get(since_id, max_events, subscription_id): Retrieve events from the event bus using cursor-based polling.\n- get_by_type(types*, since_id, max_events): Retrieve events from the event bus filtered by event type(s).\n- clear(): Clear all buffered events and drop every subscription opened with events(action=subscribe).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1100,7 +1161,7 @@
           },
           "subscription_id": {
             "type": "string",
-            "description": "[unsubscribe] Subscription ID returned by events_subscribe\n[get] Poll this subscription (from events_subscribe) from its own cursor"
+            "description": "[unsubscribe] Subscription ID returned by events(action=subscribe)\n[get] Poll this subscription (from events(action=subscribe)) from its own cursor"
           },
           "since_id": {
             "type": "integer",
@@ -1116,11 +1177,16 @@
           "action"
         ]
       },
-      "domain": "findings"
+      "domain": "findings",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "findings",
-      "description": "Findings you record during testing: add, list, remove. Pick one `action`; parameters marked * are required for that action.\n- add(type*, severity, url*, location, detail, evidence, cvss_score, cvss_vector, owasp_category, steps_to_reproduce, request, response): Record a confirmed or suspected finding in the agent's deduplicated findings store (working memory, separate from Burp's scanner).\n- list(severity, type): List the recorded findings, optionally filtered by severity and/or type.\n- remove(id*): Remove a recorded finding by id (from findings_add's response or findings_list).",
+      "description": "Findings you record during testing: add, list, remove.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"add\",\"type\":\"<type>\",\"url\":\"<url>\"}\n- add(type*, severity, url*, location, detail, evidence, cvss_score, cvss_vector, owasp_category, steps_to_reproduce, request, response): Record a confirmed or suspected finding in the agent's deduplicated findings store (working memory, separate from Burp's scanner).\n- list(severity, type): List the recorded findings, optionally filtered by severity and/or type.\n- remove(id*): Remove a recorded finding by id (from findings(action=add)'s response or findings(action=list)).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1197,7 +1263,12 @@
           "action"
         ]
       },
-      "domain": "findings"
+      "domain": "findings",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "http_fuzz",
@@ -1375,7 +1446,12 @@
           "host"
         ]
       },
-      "domain": "http"
+      "domain": "http",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "http_race",
@@ -1462,11 +1538,16 @@
           "host"
         ]
       },
-      "domain": "http"
+      "domain": "http",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "http_rule",
-      "description": "Outgoing HTTP traffic rules, session tokens and bounded login macros. Pick one `action`; parameters marked * are required for that action.\n- traffic_rule_set(rule_id, direction*, match_url, match_host, match_header, rule_action, modify_add_header, modify_remove_header, modify_replace_header, spoof_response, tool_filter, enabled): Register a global HTTP traffic rule.\n- traffic_rule_list(): List all registered global HTTP traffic modification rules.\n- traffic_rule_remove(rule_id*): Remove a global HTTP traffic modification rule by its rule ID.\n- token_rule_create(rule_name*, scope*, scope_pattern, extract_from*, extract_header_name, extract_regex, extract_json_path, extract_xpath, inject_into*, inject_name*, inject_value_template*, inject_if_missing, enabled): Create a session handling rule: extract a value (CSRF token, session ID, bearer token) from responses in scope and inject it into later requests in scope.\n- token_rule_list(): List session handling rules: extraction (header/body, regex, JSONPath, XPath) and injection (target, name, template, inject_if_missing) settings, enabled fla...\n- token_rule_remove(rule_name*): Remove a session handling rule by its name.\n- macro_set(name*, steps*, scope*, scope_pattern, trigger_status, trigger_regex, tool_filter, require_credentials, update_cookies, min_interval_ms, max_failures, step_timeout_ms, http_mode, enabled): Create or replace (by name) a login macro that re-establishes an expired session automatically.\n- macro_list(): List login macros with their settings and state: runs, last run time and result, consecutive failures, suspension, retries and the names of the cookies they...\n- macro_remove(name*): Remove a login macro by name; it no longer runs and its learned cookies are no longer applied.\n- macro_run(name*): Run a login macro now, whatever its trigger, interval or suspension: to prime the session or debug the steps.",
+      "description": "Outgoing HTTP traffic rules, session tokens and bounded login macros.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"traffic_rule_set\",\"direction\":\"request\"}\n- traffic_rule_set(rule_id, direction*, match_url, match_host, match_header, rule_action, modify_add_header, modify_remove_header, modify_replace_header, spoof_response, tool_filter, enabled): Register a global HTTP traffic rule.\n- traffic_rule_list(): List all registered global HTTP traffic modification rules.\n- traffic_rule_remove(rule_id*): Remove a global HTTP traffic modification rule by its rule ID.\n- token_rule_create(rule_name*, scope*, scope_pattern, extract_from*, extract_header_name, extract_regex, extract_json_path, extract_xpath, inject_into*, inject_name*, inject_value_template*, inject_if_missing, enabled): Create a session handling rule: extract a value (CSRF token, session ID, bearer token) from responses in scope and inject it into later requests in scope.\n- token_rule_list(): List session handling rules: extraction (header/body, regex, JSONPath, XPath) and injection (target, name, template, inject_if_missing) settings, enabled fla...\n- token_rule_remove(rule_name*): Remove a session handling rule by its name.\n- macro_set(name*, steps*, scope*, scope_pattern, trigger_status, trigger_regex, tool_filter, require_credentials, update_cookies, min_interval_ms, max_failures, step_timeout_ms, http_mode, enabled): Create or replace (by name) a login macro that re-establishes an expired session automatically.\n- macro_list(): List login macros with their settings and state: runs, last run time and result, consecutive failures, suspension, retries and the names of the cookies they...\n- macro_remove(name*): Remove a login macro by name; it no longer runs and its learned cookies are no longer applied.\n- macro_run(name*): Run a login macro now, whatever its trigger, interval or suspension: to prime the session or debug the steps.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1683,7 +1764,12 @@
           "action"
         ]
       },
-      "domain": "http"
+      "domain": "http",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      }
     },
     {
       "name": "http_send_pipeline",
@@ -1804,11 +1890,16 @@
           "requests"
         ]
       },
-      "domain": "http"
+      "domain": "http",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "http_send_raw_bytes",
-      "description": "Send a raw byte-level HTTP request for HTTP request smuggling and CRLF injection testing. Accepts either hex-encoded bytes (raw_request_hex; whitespace between digits is ignored) or request text (raw_request). Preserves exact byte sequences without normalization: raw_request's literal \\r\\n / \\n escapes are decoded only when the text contains no real line break, and a character above U+00FF sends the whole text as UTF-8 (use raw_request_hex for exact bytes). Requires host, port, and use_tls parameters. Sends ONE request and reads ONE response (Montoya's api.http().sendRequest has no partial-read API, so a failed/timed-out send cannot report bytes_received or distinguish fin/rst — it only returns is_timeout and close_reason=\"timeout\"|\"error\"). HTTP/2/3 and kettled H2-smuggling escape fields (^~, ^xNN, ...) are not available here — this is HTTP/1 only; for those, or for sending several requests over one socket and reading back several responses, use http_send_pipeline (HTTP/1.1 pipelining) or Turbo (turbo_start_run with Engine.HTTP2/HTTP3, kettled=True). Scope: checked against Burp's target scope per the operator's mcp_scope_mode: warn (default) sends and adds scope_warning; enforce refuses (out_of_scope=true, nothing sent); off skips the check.",
+      "description": "Send a raw byte-level HTTP request for HTTP request smuggling and CRLF injection testing. Accepts either hex-encoded bytes (raw_request_hex; whitespace between digits is ignored) or request text (raw_request). Preserves exact byte sequences without normalization: raw_request's literal \\r\\n / \\n escapes are decoded only when the text contains no real line break, and a character above U+00FF sends the whole text as UTF-8 (use raw_request_hex for exact bytes). Requires host, port, and use_tls parameters. Sends ONE request and reads ONE response (Montoya's api.http().sendRequest has no partial-read API, so a failed/timed-out send cannot report bytes_received or distinguish fin/rst — it only returns is_timeout and close_reason=\"timeout\"|\"error\"). HTTP/2/3 and kettled H2-smuggling escape fields (^~, ^xNN, ...) are not available here — this is HTTP/1 only; for those, or for sending several requests over one socket and reading back several responses, use http_send_pipeline (HTTP/1.1 pipelining) or Turbo (turbo_run(action=start) with Engine.HTTP2/HTTP3, kettled=True). Scope: checked against Burp's target scope per the operator's mcp_scope_mode: warn (default) sends and adds scope_warning; enforce refuses (out_of_scope=true, nothing sent); off skips the check.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1863,7 +1954,12 @@
           "host"
         ]
       },
-      "domain": "http"
+      "domain": "http",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "http_send_request",
@@ -1962,7 +2058,12 @@
         },
         "required": []
       },
-      "domain": "http"
+      "domain": "http",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "http_send_request_chain",
@@ -2004,7 +2105,12 @@
           "steps"
         ]
       },
-      "domain": "http"
+      "domain": "http",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "http_send_requests_parallel",
@@ -2042,11 +2148,16 @@
           "requests"
         ]
       },
-      "domain": "http"
+      "domain": "http",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "http_state",
-      "description": "Burp cookie jar (read, set, delete) and raw pipeline connections (list, close). Pick one `action`; parameters marked * are required for that action.\n- cookie_jar_get(domain): Get cookies from Burp Suite's cookie jar.\n- cookie_jar_set(name*, value*, domain*, path, expiration): Set a cookie in Burp Suite's cookie jar.\n- cookie_jar_delete(name*, domain*, path): Delete a cookie from Burp Suite's cookie jar.\n- pipeline_connections(close, close_all, force): List the connections http_send_pipeline keeps open for reuse (keep_open: true), optionally closing some first.",
+      "description": "Burp cookie jar (read, set, delete) and raw pipeline connections (list, close).\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"cookie_jar_set\",\"name\":\"<name>\",\"value\":\"<value>\",\"domain\":\"<domain>\"}\n- cookie_jar_get(domain): Get cookies from Burp Suite's cookie jar.\n- cookie_jar_set(name*, value*, domain*, path, expiration): Set a cookie in Burp Suite's cookie jar.\n- cookie_jar_delete(name*, domain*, path): Delete a cookie from Burp Suite's cookie jar.\n- pipeline_connections(close, close_all, force): List the connections http_send_pipeline keeps open for reuse (keep_open: true), optionally closing some first.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2100,7 +2211,12 @@
           "action"
         ]
       },
-      "domain": "http"
+      "domain": "http",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "jwt_keys",
@@ -2222,7 +2338,12 @@
           "action"
         ]
       },
-      "domain": "authz"
+      "domain": "authz",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "load_skill",
@@ -2241,11 +2362,17 @@
         },
         "required": []
       },
-      "domain": null
+      "domain": null,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "log",
-      "description": "Write to the Raijin log and activity feed. Pick one `action`; parameters marked * are required for that action.\n- message(message*, level): Write a message to Burp Suite's extension output or error log stream.\n- event(message*, level): Raise an event in Burp Suite's event log panel at a specified severity level.",
+      "description": "Write to the Raijin log and activity feed.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"message\",\"message\":\"<message>\"}\n- message(message*, level): Write a message to Burp Suite's extension output or error log stream.\n- event(message*, level): Raise an event in Burp Suite's event log panel at a specified severity level.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2277,11 +2404,16 @@
           "action"
         ]
       },
-      "domain": "findings"
+      "domain": "findings",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
     },
     {
       "name": "organizer",
-      "description": "Burp Organizer: send items to it, read them back, annotate. Pick one `action`; parameters marked * are required for that action.\n- send(request*, response, host*, port*, use_tls): Send an HTTP request (and optionally a response) to Burp Suite's Organizer tool for bookmarking and note-taking.\n- get_items(url_prefix, max_results, include_request, include_response, max_response_length): Retrieve items from Burp Suite's Organizer tool.\n- annotate(id*, notes, highlight): Set notes and/or a highlight color on an Organizer item by id (from organizer_get_items).",
+      "description": "Burp Organizer: send items to it, read them back, annotate.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"send\",\"request\":\"<request>\",\"host\":\"<host>\",\"port\":1}\n- send(request*, response, host*, port*, use_tls): Send an HTTP request (and optionally a response) to Burp Suite's Organizer tool for bookmarking and note-taking.\n- get_items(url_prefix, max_results, include_request, include_response, max_response_length): Retrieve items from Burp Suite's Organizer tool.\n- annotate(id*, notes, highlight): Set notes and/or a highlight color on an Organizer item by id (from organizer(action=get_items)).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2341,7 +2473,7 @@
           },
           "id": {
             "type": "integer",
-            "description": "Organizer item id, from organizer_get_items [actions: annotate]"
+            "description": "Organizer item id, from organizer(action=get_items) [actions: annotate]"
           },
           "notes": {
             "type": "string",
@@ -2368,11 +2500,16 @@
           "action"
         ]
       },
-      "domain": "proxy"
+      "domain": "proxy",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
     },
     {
       "name": "persistence",
-      "description": "Key/value storage in the Burp project (persistence) and user preferences. Pick one `action`; parameters marked * are required for that action.\n- store(key*, value*): Store a string value in Burp Suite's extension persistence store.\n- get(key*): Retrieve a value from Burp Suite's extension persistence store by key.\n- delete(key*): Delete a key-value pair from Burp Suite's extension persistence store.\n- list(): List all key-value pairs stored in Burp Suite's extension persistence store.\n- preference_store(key*, value*): Store a value in Burp Suite's user-level preferences.\n- preference_get(key*): Retrieve a value from Burp Suite's user-level preferences by key.\n- preference_delete(key*): Delete a key from Burp Suite's user-level preferences.",
+      "description": "Key/value storage in the Burp project (persistence) and user preferences.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"store\",\"key\":\"<key>\",\"value\":\"<value>\"}\n- store(key*, value*): Store a string value in Burp Suite's extension persistence store.\n- get(key*): Retrieve a value from Burp Suite's extension persistence store by key.\n- delete(key*): Delete a key-value pair from Burp Suite's extension persistence store.\n- list(): List all key-value pairs stored in Burp Suite's extension persistence store.\n- preference_store(key*, value*): Store a value in Burp Suite's user-level preferences.\n- preference_get(key*): Retrieve a value from Burp Suite's user-level preferences by key.\n- preference_delete(key*): Delete a key from Burp Suite's user-level preferences.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2391,22 +2528,27 @@
           },
           "key": {
             "type": "string",
-            "description": "[store] The storage key\n[get] The storage key to look up\n[delete] The storage key to delete\n[preference_store] The preference key\n[preference_get] The preference key to look up\n[preference_delete] The preference key to delete"
+            "description": "[store] The storage key\n[get] The storage key to look up\n[delete] The storage key to delete\n[persistence(action=preference_store)] The preference key\n[persistence(action=preference_get)] The preference key to look up\n[persistence(action=preference_delete)] The preference key to delete"
           },
           "value": {
             "type": "string",
-            "description": "The value to store [actions: store, preference_store]"
+            "description": "The value to store [actions: store, persistence(action=preference_store)]"
           }
         },
         "required": [
           "action"
         ]
       },
-      "domain": "settings"
+      "domain": "settings",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "probe",
-      "description": "Guided probes: CORS, web cache poisoning/deception, GraphQL, injection, access control, IDOR, JWT. Pick one `action`; parameters marked * are required for that action.\n- cors(url*): Probe a URL's CORS policy by sending crafted Origin headers and classifying the Access-Control-Allow-Origin/-Credentials response (compared trimmed, case-ins...\n- cache(url*, checks, headers, probe_headers, probe_cookies, max_requests): Probe a URL for web cache poisoning and web cache deception.\n- graphql(url*, mode, max_depth, categories, custom_keywords, template, values, send, headers, auto_headers, refresh_schema, bucket_size, depth_limit, bruteforce_arguments, max_requests, subscription_query, connection_payload, wait_ms): Probe or exploit a GraphQL endpoint; pick 'mode'.\n- injection(request*, host*, port, use_tls, classes, encoding, base_value, delay_seconds, oob, oob_wait_seconds, time_budget_seconds): Guided injection detection with confirmation oracles (not blind fuzzing).\n- access_control(requests*, identities*, denied_regex): Batch broken-access-control / IDOR test: replays each request under every identity and flags where a lower-privilege or unauthenticated identity gets a respo...\n- idor(request*, host*, port, use_tls, identities*, id_value, id_location, id_name, transforms, enumerate): Horizontal-IDOR / BOLA hunter with CANARY confirmation — the object-id-swap that auth_diff/access_control_sweep do not do.\n- jwt(token*, mode, secret, public_key, wordlist, alg, enc, key_id, header, url, payload_overrides): Run or inspect a JSON Web Token.",
+      "description": "Guided probes: CORS, web cache poisoning/deception, GraphQL, injection, access control, IDOR, JWT.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"cors\",\"url\":\"<url>\"}\n- cors(url*): Probe a URL's CORS policy by sending crafted Origin headers and classifying the Access-Control-Allow-Origin/-Credentials response (compared trimmed, case-ins...\n- cache(url*, checks, headers, probe_headers, probe_cookies, max_requests): Probe a URL for web cache poisoning and web cache deception.\n- graphql(url*, mode, max_depth, categories, custom_keywords, template, values, send, headers, auto_headers, refresh_schema, bucket_size, depth_limit, bruteforce_arguments, max_requests, subscription_query, connection_payload, wait_ms): Probe or exploit a GraphQL endpoint; pick 'mode'.\n- injection(request*, host*, port, use_tls, classes, encoding, base_value, delay_seconds, oob, oob_wait_seconds, time_budget_seconds): Guided injection detection with confirmation oracles (not blind fuzzing).\n- access_control(requests*, identities*, denied_regex): Batch broken-access-control / IDOR test: replays each request under every identity and flags where a lower-privilege or unauthenticated identity gets a respo...\n- idor(request*, host*, port, use_tls, tls, identities*, id_value, id_location, id_name, transforms, enumerate): Horizontal-IDOR / BOLA hunter with CANARY confirmation — the object-id-swap that auth_diff/probe(action=access_control) do not do.\n- jwt(token*, mode, secret, public_key, wordlist, alg, enc, key_id, header, url, payload_overrides): Run or inspect a JSON Web Token.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2663,6 +2805,10 @@
             "type": "string",
             "description": "Optional regex (case-insensitive): a response whose body matches is treated as denied whatever its status [actions: access_control]"
           },
+          "tls": {
+            "type": "boolean",
+            "description": "Alias for use_tls [actions: idor]"
+          },
           "id_value": {
             "type": "string",
             "description": "Optional: the object-id value in 'request' to swap (else auto-detected). It must stand alone as a path segment, a parameter/cookie/header value or a JSON value, or begin a path segment before a character that is not a letter or digit (42 in /users/42-alice) [actions: idor]"
@@ -2787,7 +2933,12 @@
           "action"
         ]
       },
-      "domain": "recon"
+      "domain": "recon",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "proxy_annotate",
@@ -2825,7 +2976,12 @@
           "id"
         ]
       },
-      "domain": "proxy"
+      "domain": "proxy",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
     },
     {
       "name": "proxy_auto_auth",
@@ -2850,7 +3006,12 @@
           "header_value"
         ]
       },
-      "domain": "proxy"
+      "domain": "proxy",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
     },
     {
       "name": "proxy_history",
@@ -2910,7 +3071,13 @@
         },
         "required": []
       },
-      "domain": "proxy"
+      "domain": "proxy",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "proxy_history_search",
@@ -2968,11 +3135,17 @@
           "pattern"
         ]
       },
-      "domain": "proxy"
+      "domain": "proxy",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "proxy_intercept",
-      "description": "Proxy interception: Burp's Intercept switch and a bounded hold queue for inspecting, editing, forwarding or dropping messages. An unanswered hold forwards itself. Pick one `action`; parameters marked * are required for that action.\n- enable(): Turn on Burp's own proxy interception: the Intercept tab holds each message for a person at Burp to review.\n- disable(): Turn off Burp's own proxy interception: messages pass through Burp's Intercept tab without being held.\n- status(): Get the proxy interception state: Burp's own Intercept switch, and Raijin's hold queue (armed, filters, held count, totals).\n- hold(target, match_host, match_url, match_method, in_scope_only, timeout_seconds, max_held, max_messages): Hold proxied requests and/or responses that match the filters until you forward, edit or drop them (Raijin's own queue; Burp's Intercept tab is separate).\n- list_held(wait_seconds, include_raw, max_length): List the messages held right now, oldest first, with their raw text, optionally waiting for one to arrive.\n- forward(id, all, raw, auto_fix_content_length, method, path, status_code, set_headers, remove_headers, body): Forward a held message, edited or as it is, or every held message unchanged (all=true).\n- drop(id, all): Drop a held message so it never reaches the server (request) or the browser (response), or drop every held message (all=true).\n- release(): Stop holding and forward every held message unchanged.",
+      "description": "Proxy interception: Burp's Intercept switch and a bounded hold queue for inspecting, editing, forwarding or dropping messages. An unanswered hold forwards itself.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"enable\"}\n- enable(): Turn on Burp's own proxy interception: the Intercept tab holds each message for a person at Burp to review.\n- disable(): Turn off Burp's own proxy interception: messages pass through Burp's Intercept tab without being held.\n- status(): Get the proxy interception state: Burp's own Intercept switch, and Raijin's hold queue (armed, filters, held count, totals).\n- hold(target, match_host, match_url, match_method, in_scope_only, timeout_seconds, max_held, max_messages): Hold proxied requests and/or responses that match the filters until you forward, edit or drop them (Raijin's own queue; Burp's Intercept tab is separate).\n- list_held(wait_seconds, include_raw, max_length): List the messages held right now, oldest first, with their raw text, optionally waiting for one to arrive.\n- forward(id, all, raw, auto_fix_content_length, method, path, status_code, set_headers, remove_headers, body): Forward a held message, edited or as it is, or every held message unchanged (all=true).\n- drop(id, all): Drop a held message so it never reaches the server (request) or the browser (response), or drop every held message (all=true).\n- release(): Stop holding and forward every held message unchanged.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -3095,11 +3268,16 @@
           "action"
         ]
       },
-      "domain": "proxy"
+      "domain": "proxy",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "proxy_rule",
-      "description": "Proxy request/response rules (modify, drop, tag): set, list, remove. Pick one `action`; parameters marked * are required for that action.\n- set_request_rule(rule_id, rule_action*, match_host, match_url, match_method, match_header, match_body, modify_add_header, modify_remove_header, modify_replace_header, modify_set_header, modify_body_regex, modify_body_replacement, modify_method, modify_path, modify_path_regex, tag_comment, tag_highlight, enabled): Set a proxy request interception rule.\n- set_response_rule(rule_id, rule_action*, match_host, match_url, match_header, match_body, match_status, modify_add_header, modify_remove_header, modify_replace_header, modify_set_header, modify_body_regex, modify_body_replacement, modify_status, tag_comment, tag_highlight, enabled): Set a proxy response interception rule.\n- list(type): List all proxy interception rules.\n- remove(rule_id*): Remove a proxy interception rule by its rule ID.",
+      "description": "Proxy request/response rules (modify, drop, tag): set, list, remove.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"set_request_rule\",\"rule_action\":\"modify\"}\n- set_request_rule(rule_id, rule_action*, match_host, match_url, match_method, match_header, match_body, modify_add_header, modify_remove_header, modify_replace_header, modify_set_header, modify_body_regex, modify_body_replacement, modify_method, modify_path, modify_path_regex, tag_comment, tag_highlight, enabled): Set a proxy request interception rule.\n- set_response_rule(rule_id, rule_action*, match_host, match_url, match_header, match_body, match_status, modify_add_header, modify_remove_header, modify_replace_header, modify_set_header, modify_body_regex, modify_body_replacement, modify_status, tag_comment, tag_highlight, enabled): Set a proxy response interception rule.\n- list(type): List all proxy interception rules.\n- remove(rule_id*): Remove a proxy interception rule by its rule ID.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -3231,11 +3409,16 @@
           "action"
         ]
       },
-      "domain": "proxy"
+      "domain": "proxy",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "recon",
-      "description": "Recon: JS endpoints, content discovery, parameter mining, fingerprinting. Pick one `action`; parameters marked * are required for that action.\n- js_endpoints(max_items, host_filter, fetch_source_maps): Harvest endpoint paths and URLs from JavaScript responses already in proxy history (SPAs leak their API surface in JS).\n- content_discovery(base_url*, paths*): Brute-force a wordlist of paths under a base URL and return the ones the target treats differently from paths that do not exist.\n- param_mine(url*, candidates, mode, inject_in, method, wordlist, offset, limit, headers, cookies, body, cache_buster, bucket_size, max_requests): Probe parameter names on a URL for hidden params — IDOR/XSS/SSRF/cache-poisoning often hide there.\n- fingerprint(url*): Fingerprint server/tech/WAF/framework from a single GET (Server, X-Powered-By, Set-Cookie, WAF headers, and body markers).",
+      "description": "Recon: JS endpoints, content discovery, parameter mining, fingerprinting.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"content_discovery\",\"base_url\":\"<base_url>\",\"paths\":[\"<paths>\"]}\n- js_endpoints(max_items, host_filter, fetch_source_maps): Harvest endpoint paths and URLs from JavaScript responses already in proxy history (SPAs leak their API surface in JS).\n- content_discovery(base_url*, paths*): Brute-force a wordlist of paths under a base URL and return the ones the target treats differently from paths that do not exist.\n- param_mine(url*, candidates, mode, inject_in, method, wordlist, offset, limit, headers, cookies, body, cache_buster, bucket_size, max_requests): Probe parameter names on a URL for hidden params — IDOR/XSS/SSRF/cache-poisoning often hide there.\n- fingerprint(url*): Fingerprint server/tech/WAF/framework from a single GET (Server, X-Powered-By, Set-Cookie, WAF headers, and body markers).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -3362,11 +3545,16 @@
           "action"
         ]
       },
-      "domain": "recon"
+      "domain": "recon",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true
+      }
     },
     {
       "name": "scanner",
-      "description": "Burp Scanner: start crawls and audits, read issues, report, register checks. Pick one `action`; parameters marked * are required for that action.\n- start_crawl(urls*, max_depth, in_scope_only): Start a web crawl against one or more target URLs.\n- start_audit(urls, requests, audit_mode, crawl_first, insertion_point_types, auth_header_name, auth_header_value): Start an active audit (vulnerability scan) against target URLs or specific HTTP requests.\n- get_all_issues(url_prefix, severity, confidence, max_results): Get all scanner issues from the site map with optional filtering by URL prefix, severity, and confidence.\n- generate_report(format, output_path*, url_prefix, severity_filter): Generate a scan report in HTML or XML format.\n- create_issue(name*, detail, remediation, severity, confidence, url*, request, response): Create a custom audit issue and add it to the site map.\n- import_bcheck(script*): Import a BCheck script into the Burp Suite scanner.\n- register_check(check_name*, check_type, issue_name*, issue_severity, issue_confidence, issue_detail, issue_remediation, passive_response_match, passive_header_match, active_payloads, active_response_match, active_grep_match): Register a custom scan check (passive or active) that matches response content and reports issues.\n- unregister_check(check_name*): Deregister a custom scan check previously created with scanner_register_check, removing it from Burp's scanner.",
+      "description": "Burp Scanner: start crawls and audits, read issues, report, register checks.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"start_crawl\",\"urls\":[\"<urls>\"]}\n- start_crawl(urls*, max_depth, in_scope_only): Start a web crawl against one or more target URLs.\n- start_audit(urls, requests, audit_mode, crawl_first, insertion_point_types, auth_header_name, auth_header_value): Start an active audit (vulnerability scan) against target URLs or specific HTTP requests.\n- get_all_issues(url_prefix, severity, confidence, max_results): Get all scanner issues from the site map with optional filtering by URL prefix, severity, and confidence.\n- generate_report(format, output_path*, url_prefix, severity_filter): Generate a scan report in HTML or XML format.\n- create_issue(name*, detail, remediation, severity, confidence, url*, request, response): Create a custom audit issue and add it to the site map.\n- import_bcheck(script*): Import a BCheck script into the Burp Suite scanner.\n- register_check(check_name*, check_type, issue_name*, issue_severity, issue_confidence, issue_detail, issue_remediation, passive_response_match, passive_header_match, active_payloads, active_response_match, active_grep_match): Register a custom scan check (passive or active) that matches response content and reports issues.\n- unregister_check(check_name*): Deregister a custom scan check previously created with scanner(action=register_check), removing it from Burp's scanner.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -3588,11 +3776,16 @@
           "action"
         ]
       },
-      "domain": "scanner"
+      "domain": "scanner",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      }
     },
     {
       "name": "scanner_task",
-      "description": "Manage running Scanner tasks (status, list, delete, add requests, issues). Pick one `action`; parameters marked * are required for that action.\n- status(task_id*): Get the current status of a scanner task including request count, error count, and issue count.\n- list(status): List all scanner tasks (crawl and audit), optionally filtered by status.\n- delete(task_id*): Cancel and delete a scanner task by its task ID.\n- add_request(task_id*, request*, host, port, use_tls): Add an HTTP request to an existing audit task for scanning.\n- issues(task_id*): Get all issues found by a specific audit task.",
+      "description": "Manage running Scanner tasks (status, list, delete, add requests, issues).\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"status\",\"task_id\":\"<task_id>\"}\n- status(task_id*): Get the current status of a scanner task including request count, error count, and issue count.\n- list(status): List all scanner tasks (crawl and audit), optionally filtered by status.\n- delete(task_id*): Cancel and delete a scanner task by its task ID.\n- add_request(task_id*, request*, host, port, use_tls): Add an HTTP request to an existing audit task for scanning.\n- issues(task_id*): Get all issues found by a specific audit task.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -3638,11 +3831,16 @@
           "action"
         ]
       },
-      "domain": "scanner"
+      "domain": "scanner",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      }
     },
     {
       "name": "scope",
-      "description": "Burp target scope: check a URL, include, exclude, list and remove rules, show the configuration. Pick one `action`; parameters marked * are required for that action.\n- check(url*): Check whether a given URL is within Burp Suite's target scope.\n- include(url*): Add a URL to Burp Suite's target scope.\n- exclude(url*): Exclude a URL from Burp Suite's target scope.\n- get_config(): Retrieve the current Burp Suite target scope configuration.\n- list(): Lists Burp Suite's target scope include/exclude rules individually, with the index each needs for scope_remove.\n- remove(list*, index*): Removes one scope rule by its index in the include or exclude list (use scope_list first to find the index).",
+      "description": "Burp target scope: check a URL, include, exclude, list and remove rules, show the configuration.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"check\",\"url\":\"<url>\"}\n- check(url*): Check whether a given URL is within Burp Suite's target scope.\n- include(url*): Add a URL to Burp Suite's target scope.\n- exclude(url*): Exclude a URL from Burp Suite's target scope.\n- get_config(): Retrieve the current Burp Suite target scope configuration.\n- list(): Lists Burp Suite's target scope include/exclude rules individually, with the index each needs for scope(action=remove).\n- remove(list*, index*): Removes one scope rule by its index in the include or exclude list (use scope(action=list) first to find the index).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -3673,14 +3871,19 @@
           "index": {
             "type": "integer",
             "minimum": 0,
-            "description": "Index of the rule to remove, from scope_list [actions: remove]"
+            "description": "Index of the rule to remove, from scope(action=list) [actions: remove]"
           }
         },
         "required": [
           "action"
         ]
       },
-      "domain": "settings"
+      "domain": "settings",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "search_skills",
@@ -3699,11 +3902,17 @@
         },
         "required": []
       },
-      "domain": null
+      "domain": null,
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "send_to_tool",
-      "description": "Send a request to a Burp tool: Repeater, Intruder, Comparer or Decoder. Pick one `action`; parameters marked * are required for that action.\n- repeater(request*, host*, port*, use_tls, tab_name): Send an HTTP request to Burp Suite's Repeater tool.\n- intruder(request*, host*, port*, use_tls, tab_name): Send an HTTP request to Burp Suite's Intruder tool, ready to be configured for a payload run.\n- intruder_positions(request*, host*, port*, use_tls, positions*, tab_name): Send an HTTP request to Intruder with pre-defined payload insertion point positions.\n- comparer(data*): Send data items to Burp Suite's Comparer tool for side-by-side comparison.\n- decoder(data*): Send data to Burp Suite's Decoder tool for manual encoding, decoding, and hashing operations.",
+      "description": "Send a request to a Burp tool: Repeater, Intruder, Comparer or Decoder.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"repeater\",\"request\":\"<request>\",\"host\":\"<host>\",\"port\":1}\n- repeater(request*, host*, port*, use_tls, tab_name): Send an HTTP request to Burp Suite's Repeater tool.\n- intruder(request*, host*, port*, use_tls, tab_name): Send an HTTP request to Burp Suite's Intruder tool, ready to be configured for a payload run.\n- intruder_positions(request*, host*, port*, use_tls, positions*, tab_name): Send an HTTP request to Intruder with pre-defined payload insertion point positions.\n- comparer(data*): Send data items to Burp Suite's Comparer tool for side-by-side comparison.\n- decoder(data*): Send data to Burp Suite's Decoder tool for manual encoding, decoding, and hashing operations.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -3765,11 +3974,16 @@
           "action"
         ]
       },
-      "domain": "proxy"
+      "domain": "proxy",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
     },
     {
       "name": "sitemap",
-      "description": "Burp site map: query, issues, add requests or issues, annotate. Pick one `action`; parameters marked * are required for that action.\n- query(url_prefix, search_pattern, search_in, note_contains, max_results, include_request, include_response, only_with_response, status_code_range, mime, exclude_noise, exclude_pattern, in_scope_only): Query the Burp Suite site map for HTTP request/response entries, with enough filtering to tell crawl progress from noise.\n- get_issues(url_prefix, severity): Retrieve audit issues from the Burp Suite site map.\n- add_request(request*, response, host*, port*, use_tls): Add an HTTP request (and optional response) to the Burp Suite site map.\n- add_issue(name*, detail*, remediation, severity*, confidence*, url*, request, response): Add a custom audit issue to the Burp Suite site map.\n- annotate(url*, notes, highlight): Set notes and/or a highlight color on the site map entry with an exact URL match.",
+      "description": "Burp site map: query, issues, add requests or issues, annotate.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"add_request\",\"request\":\"<request>\",\"host\":\"<host>\",\"port\":1}\n- query(url_prefix, search_pattern, search_in, note_contains, max_results, include_request, include_response, only_with_response, status_code_range, mime, exclude_noise, exclude_pattern, in_scope_only): Query the Burp Suite site map for HTTP request/response entries, with enough filtering to tell crawl progress from noise.\n- get_issues(url_prefix, severity): Retrieve audit issues from the Burp Suite site map.\n- add_request(request*, response, host*, port*, use_tls): Add an HTTP request (and optional response) to the Burp Suite site map.\n- add_issue(name*, detail*, remediation, severity*, confidence*, url*, request, response): Add a custom audit issue to the Burp Suite site map.\n- annotate(url*, notes, highlight): Set notes and/or a highlight color on the site map entry with an exact URL match.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -3930,11 +4144,16 @@
           "action"
         ]
       },
-      "domain": "proxy"
+      "domain": "proxy",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
     },
     {
       "name": "turbo_docs",
-      "description": "Turbo documentation and example scripts. Read these before turbo_run. Pick one `action`; parameters marked * are required for that action.\n- get_docs(topic): Documentation for writing Turbo scripts.\n- list_examples(): List the example Turbo scripts (race conditions, HTTP/2, HTTP/3, desync, rate limits, ...).\n- get_example(name*): Source of an example Turbo script by name (see turbo_list_examples).",
+      "description": "Turbo documentation and example scripts. Read these before turbo_run.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"get_example\",\"name\":\"0cl-exploit\"}\n- get_docs(topic): Documentation for writing Turbo scripts.\n- list_examples(): List the example Turbo scripts (race conditions, HTTP/2, HTTP/3, desync, rate limits, ...).\n- get_example(name*): Source of an example Turbo script by name (see turbo_docs(action=list_examples)).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -4010,11 +4229,17 @@
           "action"
         ]
       },
-      "domain": "turbo"
+      "domain": "turbo",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "turbo_run",
-      "description": "Turbo runs (Python scripts on the Turbo request engine): start, poll, read, stop, delete. Pick one `action`; parameters marked * are required for that action.\n- start(script*, base_request*, endpoint*, base_input, timeout_ms, normalize_line_endings): Start a Raijin Turbo run: a Python script driving the Turbo request engine (single-packet attack, HTTP/2 + HTTP/3 gates, high-concurrency sends, desync probes).\n- stop(run_id*): Stop a Turbo run.\n- delete(run_id*): Delete a Turbo run and all its results.\n- status(run_id*, wait): Status of a Turbo run: running state, result count, fails (requests that got no response) and status message.\n- results(run_id*, sort_by, descending, limit, offset): Paginated results of a Turbo run.\n- result(run_id*, id*, body_limit, export): Full request and response of one result of a Turbo run.\n- script(run_id*): The Python script a Turbo run was started with.\n- search_responses(run_id*, query*, search_in): Search the responses (or labels) of a Turbo run for a substring; returns matching result ids.\n- save_to_organizer(run_id*, items*): Save results from a Turbo run to Burp's Organizer with notes (the run id and script are appended to the notes).\n- start_async(script*, base_request*, endpoint*, base_input, normalize_line_endings): Start a Turbo run and return immediately with a run_id, without blocking.\n- list(): List all known Turbo runs (this MCP session and the GUI), newest first, with status/result_count/fails/created_at/source.",
+      "description": "Turbo runs (Python scripts on the Turbo request engine): start, poll, read, stop, delete.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"start\",\"script\":\"<script>\",\"base_request\":\"<base_request>\",\"endpoint\":\"<endpoint>\"}\n- start(script*, base_request*, endpoint*, base_input, timeout_ms, normalize_line_endings): Start a Raijin Turbo run: a Python script driving the Turbo request engine (single-packet attack, HTTP/2 + HTTP/3 gates, high-concurrency sends, desync probes).\n- stop(run_id*): Stop a Turbo run.\n- delete(run_id*): Delete a Turbo run and all its results.\n- status(run_id*, wait): Status of a Turbo run: running state, result count, fails (requests that got no response) and status message.\n- results(run_id*, sort_by, descending, limit, offset): Paginated results of a Turbo run.\n- result(run_id*, id*, body_limit, export): Full request and response of one result of a Turbo run.\n- script(run_id*): The Python script a Turbo run was started with.\n- search_responses(run_id*, query*, search_in): Search the responses (or labels) of a Turbo run for a substring; returns matching result ids.\n- save_to_organizer(run_id*, items*): Save results from a Turbo run to Burp's Organizer with notes (the run id and script are appended to the notes).\n- start_async(script*, base_request*, endpoint*, base_input, normalize_line_endings): Start a Turbo run and return immediately with a run_id, without blocking.\n- list(): List all known Turbo runs (this MCP session and the GUI), newest first, with status/result_count/fails/created_at/source.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -4100,7 +4325,7 @@
           },
           "id": {
             "type": "integer",
-            "description": "Result id (from turbo_run_results) [actions: result]"
+            "description": "Result id (from turbo_run(action=results)) [actions: result]"
           },
           "body_limit": {
             "type": "integer",
@@ -4132,11 +4357,16 @@
           "action"
         ]
       },
-      "domain": "turbo"
+      "domain": "turbo",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      }
     },
     {
       "name": "util",
-      "description": "Encoding, decoding, hashing, compression and random-data helpers. Pick one `action`; parameters marked * are required for that action.\n- url_encode(data*, encode_all): URL-encode a string.\n- url_decode(data*): URL-decode a string.\n- base64_encode(data*, url_safe): Base64-encode a string.\n- base64_decode(data*): Base64-decode a string.\n- html_encode(data*): HTML-encode a string, escaping special characters like <, >, &, \", and '.\n- hash(data*, algorithm*): Compute a cryptographic hash of a string.\n- compress(data*, algorithm*): Compress data using the specified algorithm.\n- decompress(data*, algorithm*): Decompress data using the specified algorithm.\n- random_string(length*, charset): Generate a cryptographically random string.\n- random_bytes(length*): Generate cryptographically random bytes.\n- jwt_decode(token*, verify_signature, secret): Decode a JSON Web Token (JWT) and extract its header, payload, and signature.\n- decode_smart(data*, max_depth): Automatically detect and decode multiple layers of encoding (base64, URL encoding, hex) iteratively until stable or max depth is reached.",
+      "description": "Encoding, decoding, hashing, compression and random-data helpers.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"url_encode\",\"data\":\"<data>\"}\n- url_encode(data*, encode_all): URL-encode a string.\n- url_decode(data*): URL-decode a string.\n- base64_encode(data*, url_safe): Base64-encode a string.\n- base64_decode(data*): Base64-decode a string.\n- html_encode(data*): HTML-encode a string, escaping special characters like <, >, &, \", and '.\n- hash(data*, algorithm*): Compute a cryptographic hash of a string.\n- compress(data*, algorithm*): Compress data using the specified algorithm.\n- decompress(data*, algorithm*): Decompress data using the specified algorithm.\n- random_string(length*, charset): Generate a cryptographically random string.\n- random_bytes(length*): Generate cryptographically random bytes.\n- jwt_decode(token*, verify_signature, secret): Decode a JSON Web Token (JWT) and extract its header, payload, and signature.\n- decode_smart(data*, max_depth): Automatically detect and decode multiple layers of encoding (base64, URL encoding, hex) iteratively until stable or max depth is reached.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -4217,11 +4447,17 @@
           "action"
         ]
       },
-      "domain": "analysis"
+      "domain": "analysis",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
     },
     {
       "name": "websocket",
-      "description": "WebSockets: open connections, send, read messages, intercept rules, proxy WebSocket history. Pick one `action`; parameters marked * are required for that action.\n- create(url*, headers, subprotocol): Create a new WebSocket connection to a target URL.\n- send_text(connection_id*, message*): Send a text message on an existing WebSocket connection.\n- send_binary(connection_id*, data*): Send a binary message on an existing WebSocket connection.\n- close(connection_id*): Close an existing WebSocket connection.\n- list(): List all tracked WebSocket connections, including both programmatically created connections and those intercepted through Burp's proxy.\n- get_messages(connection_id*, direction, since_index, max_results): Retrieve messages from a specific WebSocket connection with optional filtering and pagination.\n- set_intercept_rule(rule_id, match_url, match_message, direction, rule_action*, modify_regex, modify_replacement, tag_comment, message_type, enabled): Create or update a WebSocket message interception rule.\n- wait_message(connection_id*, since_index, direction, message_type, pattern, timeout_ms): Wait for the next WebSocket frame that matches a direction, type and/or regex, instead of polling websocket_get_messages.\n- fuzz(connection_id, url, headers, subprotocol, payloads, payload_library, template, marker, payload_encoding, message_type, setup_messages, pattern, start_index, delay_ms, window_ms, idle_ms, timeout_ms, max_frame_length): Fuzz a WebSocket endpoint: send each payload as one message and get back the frames it triggered, plus clusters of similar responses.\n- list_intercept_rules(): List the WebSocket intercept rules in the order they are evaluated, each with its match criteria, action and enabled state.\n- remove_intercept_rule(rule_id*): Remove a WebSocket intercept rule by its rule ID.\n- history(start_index, count, host, direction, websocket_id, url): Get WebSocket proxy history entries with optional filtering by connection (websocket_id), upgrade URL, host and direction (client_to_server or server_to_clie...\n- history_search(pattern*, direction, max_results, websocket_id, url, start_index): Search WebSocket proxy history using a regex pattern on message payloads.",
+      "description": "WebSockets: open connections, send, read messages, intercept rules, proxy WebSocket history.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"create\",\"url\":\"<url>\"}\n- create(url*, headers, subprotocol): Create a new WebSocket connection to a target URL.\n- send_text(connection_id*, message*): Send a text message on an existing WebSocket connection.\n- send_binary(connection_id*, data*): Send a binary message on an existing WebSocket connection.\n- close(connection_id*): Close an existing WebSocket connection.\n- list(): List all tracked WebSocket connections, including both programmatically created connections and those intercepted through Burp's proxy.\n- get_messages(connection_id*, direction, since_index, max_results): Retrieve messages from a specific WebSocket connection with optional filtering and pagination.\n- set_intercept_rule(rule_id, match_url, match_message, direction, rule_action*, modify_regex, modify_replacement, tag_comment, message_type, enabled): Create or update a WebSocket message interception rule.\n- wait_message(connection_id*, since_index, direction, message_type, pattern, timeout_ms): Wait for the next WebSocket frame that matches a direction, type and/or regex, instead of polling websocket(action=get_messages).\n- fuzz(connection_id, url, headers, subprotocol, payloads, payload_library, template, marker, payload_encoding, message_type, setup_messages, pattern, start_index, delay_ms, window_ms, idle_ms, timeout_ms, max_frame_length): Fuzz a WebSocket endpoint: send each payload as one message and get back the frames it triggered, plus clusters of similar responses.\n- list_intercept_rules(): List the WebSocket intercept rules in the order they are evaluated, each with its match criteria, action and enabled state.\n- remove_intercept_rule(rule_id*): Remove a WebSocket intercept rule by its rule ID.\n- history(start_index, count, host, direction, websocket_id, url): Get WebSocket proxy history entries with optional filtering by connection (websocket_id), upgrade URL, host and direction (client_to_server or server_to_clie...\n- history_search(pattern*, direction, max_results, websocket_id, url, start_index): Search WebSocket proxy history using a regex pattern on message payloads.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -4258,7 +4494,7 @@
           },
           "connection_id": {
             "type": "string",
-            "description": "[send_text, send_binary, get_messages, wait_message] The WebSocket connection ID\n[close] The WebSocket connection ID to close\n[fuzz] Open connection to fuzz over (from websocket_create); alternative to url"
+            "description": "[send_text, send_binary, get_messages, wait_message] The WebSocket connection ID\n[close] The WebSocket connection ID to close\n[fuzz] Open connection to fuzz over (from websocket(action=create)); alternative to url"
           },
           "message": {
             "type": "string",
@@ -4411,7 +4647,7 @@
           "max_frame_length": {
             "type": "integer",
             "minimum": 0,
-            "description": "Characters kept of each returned frame and echoed payload (default 1000; 0 keeps everything). websocket_get_messages returns the frames in full [actions: fuzz]"
+            "description": "Characters kept of each returned frame and echoed payload (default 1000; 0 keeps everything). websocket(action=get_messages) returns the frames in full [actions: fuzz]"
           },
           "count": {
             "type": "integer",
@@ -4432,7 +4668,742 @@
           "action"
         ]
       },
-      "domain": "proxy"
+      "domain": "proxy",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true
+      }
     }
-  ]
+  ],
+  "aliases": {
+    "access_control_sweep": {
+      "tool": "probe",
+      "action": "access_control"
+    },
+    "ai_prompt": {
+      "tool": "ai",
+      "action": "prompt"
+    },
+    "ai_status": {
+      "tool": "ai",
+      "action": "status"
+    },
+    "analyze_diff": {
+      "tool": "analyze",
+      "action": "diff"
+    },
+    "analyze_extract_params": {
+      "tool": "analyze",
+      "action": "extract_params"
+    },
+    "analyze_find_reflected": {
+      "tool": "analyze",
+      "action": "find_reflected"
+    },
+    "analyze_insertion_points": {
+      "tool": "analyze",
+      "action": "insertion_points"
+    },
+    "analyze_request": {
+      "tool": "analyze",
+      "action": "request"
+    },
+    "analyze_response": {
+      "tool": "analyze",
+      "action": "response"
+    },
+    "analyze_response_body_search": {
+      "tool": "analyze",
+      "action": "response_body_search"
+    },
+    "autorize_clear_matches": {
+      "tool": "autorize",
+      "action": "clear_matches"
+    },
+    "autorize_list_matches": {
+      "tool": "autorize",
+      "action": "list_matches"
+    },
+    "autorize_list_rules": {
+      "tool": "autorize",
+      "action": "list_rules"
+    },
+    "autorize_remove_rule": {
+      "tool": "autorize",
+      "action": "remove_rule"
+    },
+    "autorize_set_rule": {
+      "tool": "autorize",
+      "action": "set_rule"
+    },
+    "bcheck_create": {
+      "tool": "custom_check",
+      "action": "bcheck_create"
+    },
+    "bcheck_dry_run": {
+      "tool": "custom_check",
+      "action": "bcheck_dry_run"
+    },
+    "bcheck_import": {
+      "tool": "custom_check",
+      "action": "bcheck_import"
+    },
+    "bcheck_list": {
+      "tool": "custom_check",
+      "action": "bcheck_list"
+    },
+    "bcheck_remove": {
+      "tool": "custom_check",
+      "action": "bcheck_remove"
+    },
+    "bcheck_templates": {
+      "tool": "custom_check",
+      "action": "bcheck_templates"
+    },
+    "burp_command_line_args": {
+      "tool": "burp",
+      "action": "command_line_args"
+    },
+    "burp_export_project_config": {
+      "tool": "burp",
+      "action": "export_project_config"
+    },
+    "burp_export_user_config": {
+      "tool": "burp",
+      "action": "export_user_config"
+    },
+    "burp_import_project_config": {
+      "tool": "burp",
+      "action": "import_project_config"
+    },
+    "burp_import_user_config": {
+      "tool": "burp",
+      "action": "import_user_config"
+    },
+    "burp_shutdown": {
+      "tool": "burp",
+      "action": "shutdown"
+    },
+    "burp_task_engine_set": {
+      "tool": "burp",
+      "action": "task_engine_set"
+    },
+    "burp_task_engine_state": {
+      "tool": "burp",
+      "action": "task_engine_state"
+    },
+    "burp_version": {
+      "tool": "burp",
+      "action": "version"
+    },
+    "cache_probe": {
+      "tool": "probe",
+      "action": "cache"
+    },
+    "collaborator_create_client": {
+      "tool": "collaborator",
+      "action": "create_client"
+    },
+    "collaborator_default_payload": {
+      "tool": "collaborator",
+      "action": "default_payload"
+    },
+    "collaborator_generate_payload": {
+      "tool": "collaborator",
+      "action": "generate_payload"
+    },
+    "collaborator_get_secret": {
+      "tool": "collaborator",
+      "action": "get_secret"
+    },
+    "collaborator_list_clients": {
+      "tool": "collaborator",
+      "action": "list_clients"
+    },
+    "collaborator_poll": {
+      "tool": "collaborator",
+      "action": "poll"
+    },
+    "collaborator_remove_client": {
+      "tool": "collaborator",
+      "action": "remove_client"
+    },
+    "collaborator_restore_client": {
+      "tool": "collaborator",
+      "action": "restore_client"
+    },
+    "collaborator_server_info": {
+      "tool": "collaborator",
+      "action": "server_info"
+    },
+    "comparer_send": {
+      "tool": "send_to_tool",
+      "action": "comparer"
+    },
+    "config_match_replace_add": {
+      "tool": "config",
+      "action": "match_replace_add"
+    },
+    "config_match_replace_list": {
+      "tool": "config",
+      "action": "match_replace_list"
+    },
+    "config_match_replace_remove": {
+      "tool": "config",
+      "action": "match_replace_remove"
+    },
+    "config_proxy_listener_add": {
+      "tool": "config",
+      "action": "proxy_listener_add"
+    },
+    "config_proxy_listener_remove": {
+      "tool": "config",
+      "action": "proxy_listener_remove"
+    },
+    "config_proxy_listeners_list": {
+      "tool": "config",
+      "action": "proxy_listeners_list"
+    },
+    "config_upstream_proxy_set": {
+      "tool": "config",
+      "action": "upstream_proxy_set"
+    },
+    "cors_probe": {
+      "tool": "probe",
+      "action": "cors"
+    },
+    "decoder_send": {
+      "tool": "send_to_tool",
+      "action": "decoder"
+    },
+    "events_clear": {
+      "tool": "events",
+      "action": "clear"
+    },
+    "events_get": {
+      "tool": "events",
+      "action": "get"
+    },
+    "events_get_by_type": {
+      "tool": "events",
+      "action": "get_by_type"
+    },
+    "events_subscribe": {
+      "tool": "events",
+      "action": "subscribe"
+    },
+    "events_unsubscribe": {
+      "tool": "events",
+      "action": "unsubscribe"
+    },
+    "extension_info": {
+      "tool": "burp",
+      "action": "extension_info"
+    },
+    "findings_add": {
+      "tool": "findings",
+      "action": "add"
+    },
+    "findings_list": {
+      "tool": "findings",
+      "action": "list"
+    },
+    "findings_remove": {
+      "tool": "findings",
+      "action": "remove"
+    },
+    "graphql_probe": {
+      "tool": "probe",
+      "action": "graphql"
+    },
+    "http_analyze_keywords": {
+      "tool": "analyze",
+      "action": "http_keywords"
+    },
+    "http_analyze_variations": {
+      "tool": "analyze",
+      "action": "http_variations"
+    },
+    "http_cookie_jar_delete": {
+      "tool": "http_state",
+      "action": "cookie_jar_delete"
+    },
+    "http_cookie_jar_get": {
+      "tool": "http_state",
+      "action": "cookie_jar_get"
+    },
+    "http_cookie_jar_set": {
+      "tool": "http_state",
+      "action": "cookie_jar_set"
+    },
+    "http_list_traffic_rules": {
+      "tool": "http_rule",
+      "action": "traffic_rule_list"
+    },
+    "http_pipeline_connections": {
+      "tool": "http_state",
+      "action": "pipeline_connections"
+    },
+    "http_remove_traffic_rule": {
+      "tool": "http_rule",
+      "action": "traffic_rule_remove"
+    },
+    "http_set_traffic_rule": {
+      "tool": "http_rule",
+      "action": "traffic_rule_set"
+    },
+    "idor_hunt": {
+      "tool": "probe",
+      "action": "idor"
+    },
+    "injection_probe": {
+      "tool": "probe",
+      "action": "injection"
+    },
+    "intruder_register_payload_processor": {
+      "tool": "config",
+      "action": "intruder_payload_processor_register"
+    },
+    "intruder_send": {
+      "tool": "send_to_tool",
+      "action": "intruder"
+    },
+    "intruder_send_with_positions": {
+      "tool": "send_to_tool",
+      "action": "intruder_positions"
+    },
+    "jwt_attack": {
+      "tool": "probe",
+      "action": "jwt"
+    },
+    "log_event": {
+      "tool": "log",
+      "action": "event"
+    },
+    "log_message": {
+      "tool": "log",
+      "action": "message"
+    },
+    "organizer_annotate": {
+      "tool": "organizer",
+      "action": "annotate"
+    },
+    "organizer_get_items": {
+      "tool": "organizer",
+      "action": "get_items"
+    },
+    "organizer_send": {
+      "tool": "organizer",
+      "action": "send"
+    },
+    "passive_intel": {
+      "tool": "analyze",
+      "action": "passive_intel"
+    },
+    "persistence_delete": {
+      "tool": "persistence",
+      "action": "delete"
+    },
+    "persistence_get": {
+      "tool": "persistence",
+      "action": "get"
+    },
+    "persistence_list": {
+      "tool": "persistence",
+      "action": "list"
+    },
+    "persistence_store": {
+      "tool": "persistence",
+      "action": "store"
+    },
+    "preference_delete": {
+      "tool": "persistence",
+      "action": "preference_delete"
+    },
+    "preference_get": {
+      "tool": "persistence",
+      "action": "preference_get"
+    },
+    "preference_store": {
+      "tool": "persistence",
+      "action": "preference_store"
+    },
+    "project_info": {
+      "tool": "burp",
+      "action": "project_info"
+    },
+    "proxy_intercept_disable": {
+      "tool": "proxy_intercept",
+      "action": "disable"
+    },
+    "proxy_intercept_drop": {
+      "tool": "proxy_intercept",
+      "action": "drop"
+    },
+    "proxy_intercept_enable": {
+      "tool": "proxy_intercept",
+      "action": "enable"
+    },
+    "proxy_intercept_forward": {
+      "tool": "proxy_intercept",
+      "action": "forward"
+    },
+    "proxy_intercept_hold": {
+      "tool": "proxy_intercept",
+      "action": "hold"
+    },
+    "proxy_intercept_list_held": {
+      "tool": "proxy_intercept",
+      "action": "list_held"
+    },
+    "proxy_intercept_release": {
+      "tool": "proxy_intercept",
+      "action": "release"
+    },
+    "proxy_intercept_status": {
+      "tool": "proxy_intercept",
+      "action": "status"
+    },
+    "proxy_list_rules": {
+      "tool": "proxy_rule",
+      "action": "list"
+    },
+    "proxy_remove_rule": {
+      "tool": "proxy_rule",
+      "action": "remove"
+    },
+    "proxy_set_request_rule": {
+      "tool": "proxy_rule",
+      "action": "set_request_rule"
+    },
+    "proxy_set_response_rule": {
+      "tool": "proxy_rule",
+      "action": "set_response_rule"
+    },
+    "proxy_websocket_history": {
+      "tool": "websocket",
+      "action": "history"
+    },
+    "proxy_websocket_history_search": {
+      "tool": "websocket",
+      "action": "history_search"
+    },
+    "recon_content_discovery": {
+      "tool": "recon",
+      "action": "content_discovery"
+    },
+    "recon_fingerprint": {
+      "tool": "recon",
+      "action": "fingerprint"
+    },
+    "recon_js_endpoints": {
+      "tool": "recon",
+      "action": "js_endpoints"
+    },
+    "recon_param_mine": {
+      "tool": "recon",
+      "action": "param_mine"
+    },
+    "repeater_send": {
+      "tool": "send_to_tool",
+      "action": "repeater"
+    },
+    "scancheck_create_active": {
+      "tool": "custom_check",
+      "action": "scancheck_create_active"
+    },
+    "scancheck_create_passive": {
+      "tool": "custom_check",
+      "action": "scancheck_create_passive"
+    },
+    "scancheck_dry_run": {
+      "tool": "custom_check",
+      "action": "scancheck_dry_run"
+    },
+    "scancheck_list": {
+      "tool": "custom_check",
+      "action": "scancheck_list"
+    },
+    "scancheck_remove": {
+      "tool": "custom_check",
+      "action": "scancheck_remove"
+    },
+    "scancheck_templates": {
+      "tool": "custom_check",
+      "action": "scancheck_templates"
+    },
+    "scanner_create_issue": {
+      "tool": "scanner",
+      "action": "create_issue"
+    },
+    "scanner_generate_report": {
+      "tool": "scanner",
+      "action": "generate_report"
+    },
+    "scanner_get_all_issues": {
+      "tool": "scanner",
+      "action": "get_all_issues"
+    },
+    "scanner_import_bcheck": {
+      "tool": "scanner",
+      "action": "import_bcheck"
+    },
+    "scanner_register_check": {
+      "tool": "scanner",
+      "action": "register_check"
+    },
+    "scanner_start_audit": {
+      "tool": "scanner",
+      "action": "start_audit"
+    },
+    "scanner_start_crawl": {
+      "tool": "scanner",
+      "action": "start_crawl"
+    },
+    "scanner_task_add_request": {
+      "tool": "scanner_task",
+      "action": "add_request"
+    },
+    "scanner_task_delete": {
+      "tool": "scanner_task",
+      "action": "delete"
+    },
+    "scanner_task_issues": {
+      "tool": "scanner_task",
+      "action": "issues"
+    },
+    "scanner_task_list": {
+      "tool": "scanner_task",
+      "action": "list"
+    },
+    "scanner_task_status": {
+      "tool": "scanner_task",
+      "action": "status"
+    },
+    "scanner_unregister_check": {
+      "tool": "scanner",
+      "action": "unregister_check"
+    },
+    "scope_check": {
+      "tool": "scope",
+      "action": "check"
+    },
+    "scope_exclude": {
+      "tool": "scope",
+      "action": "exclude"
+    },
+    "scope_get_config": {
+      "tool": "scope",
+      "action": "get_config"
+    },
+    "scope_include": {
+      "tool": "scope",
+      "action": "include"
+    },
+    "scope_list": {
+      "tool": "scope",
+      "action": "list"
+    },
+    "scope_remove": {
+      "tool": "scope",
+      "action": "remove"
+    },
+    "session_create_token_rule": {
+      "tool": "http_rule",
+      "action": "token_rule_create"
+    },
+    "session_list_rules": {
+      "tool": "http_rule",
+      "action": "token_rule_list"
+    },
+    "session_macro_list": {
+      "tool": "http_rule",
+      "action": "macro_list"
+    },
+    "session_macro_remove": {
+      "tool": "http_rule",
+      "action": "macro_remove"
+    },
+    "session_macro_run": {
+      "tool": "http_rule",
+      "action": "macro_run"
+    },
+    "session_macro_set": {
+      "tool": "http_rule",
+      "action": "macro_set"
+    },
+    "session_remove_rule": {
+      "tool": "http_rule",
+      "action": "token_rule_remove"
+    },
+    "sitemap_add_issue": {
+      "tool": "sitemap",
+      "action": "add_issue"
+    },
+    "sitemap_add_request": {
+      "tool": "sitemap",
+      "action": "add_request"
+    },
+    "sitemap_annotate": {
+      "tool": "sitemap",
+      "action": "annotate"
+    },
+    "sitemap_get_issues": {
+      "tool": "sitemap",
+      "action": "get_issues"
+    },
+    "sitemap_query": {
+      "tool": "sitemap",
+      "action": "query"
+    },
+    "turbo_delete_run": {
+      "tool": "turbo_run",
+      "action": "delete"
+    },
+    "turbo_get_docs": {
+      "tool": "turbo_docs",
+      "action": "get_docs"
+    },
+    "turbo_get_example": {
+      "tool": "turbo_docs",
+      "action": "get_example"
+    },
+    "turbo_list_examples": {
+      "tool": "turbo_docs",
+      "action": "list_examples"
+    },
+    "turbo_list_runs": {
+      "tool": "turbo_run",
+      "action": "list"
+    },
+    "turbo_run_result": {
+      "tool": "turbo_run",
+      "action": "result"
+    },
+    "turbo_run_results": {
+      "tool": "turbo_run",
+      "action": "results"
+    },
+    "turbo_run_script": {
+      "tool": "turbo_run",
+      "action": "script"
+    },
+    "turbo_run_status": {
+      "tool": "turbo_run",
+      "action": "status"
+    },
+    "turbo_save_to_organizer": {
+      "tool": "turbo_run",
+      "action": "save_to_organizer"
+    },
+    "turbo_search_responses": {
+      "tool": "turbo_run",
+      "action": "search_responses"
+    },
+    "turbo_start_run": {
+      "tool": "turbo_run",
+      "action": "start"
+    },
+    "turbo_start_run_async": {
+      "tool": "turbo_run",
+      "action": "start_async"
+    },
+    "turbo_stop_run": {
+      "tool": "turbo_run",
+      "action": "stop"
+    },
+    "util_base64_decode": {
+      "tool": "util",
+      "action": "base64_decode"
+    },
+    "util_base64_encode": {
+      "tool": "util",
+      "action": "base64_encode"
+    },
+    "util_compress": {
+      "tool": "util",
+      "action": "compress"
+    },
+    "util_decode_smart": {
+      "tool": "util",
+      "action": "decode_smart"
+    },
+    "util_decompress": {
+      "tool": "util",
+      "action": "decompress"
+    },
+    "util_hash": {
+      "tool": "util",
+      "action": "hash"
+    },
+    "util_html_encode": {
+      "tool": "util",
+      "action": "html_encode"
+    },
+    "util_jwt_decode": {
+      "tool": "util",
+      "action": "jwt_decode"
+    },
+    "util_random_bytes": {
+      "tool": "util",
+      "action": "random_bytes"
+    },
+    "util_random_string": {
+      "tool": "util",
+      "action": "random_string"
+    },
+    "util_url_decode": {
+      "tool": "util",
+      "action": "url_decode"
+    },
+    "util_url_encode": {
+      "tool": "util",
+      "action": "url_encode"
+    },
+    "websocket_close": {
+      "tool": "websocket",
+      "action": "close"
+    },
+    "websocket_create": {
+      "tool": "websocket",
+      "action": "create"
+    },
+    "websocket_fuzz": {
+      "tool": "websocket",
+      "action": "fuzz"
+    },
+    "websocket_get_messages": {
+      "tool": "websocket",
+      "action": "get_messages"
+    },
+    "websocket_list": {
+      "tool": "websocket",
+      "action": "list"
+    },
+    "websocket_list_intercept_rules": {
+      "tool": "websocket",
+      "action": "list_intercept_rules"
+    },
+    "websocket_remove_intercept_rule": {
+      "tool": "websocket",
+      "action": "remove_intercept_rule"
+    },
+    "websocket_send_binary": {
+      "tool": "websocket",
+      "action": "send_binary"
+    },
+    "websocket_send_text": {
+      "tool": "websocket",
+      "action": "send_text"
+    },
+    "websocket_set_intercept_rule": {
+      "tool": "websocket",
+      "action": "set_intercept_rule"
+    },
+    "websocket_wait_message": {
+      "tool": "websocket",
+      "action": "wait_message"
+    }
+  }
 }

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Tool calls
+- Every published tool rejects parameters it does not declare (`code: unknown_parameter`, with `did_you_mean`), instead of ignoring them. Argument errors carry `code`, `usage` (every accepted parameter, `*` = required) and `example` (a correct call to adapt); `missing_action`, `unknown_action` and `missing_parameter` replace the old `error`/`message` pair. `http_race` no longer accepts the retired `gate_delay`; `auth_diff` and `probe(action=idor)` declare the `tls` alias they already read.
+- Grouped tools accept the action as the old tool name (`scope_list`), in any case, or dotted (`scope.list`). A value sent as a JSON string where an object or array is declared, an object where a string is declared, or a single value where an array is declared is converted to the declared type.
+- Tool descriptions call grouped actions as `scope(action=list)` instead of old tool names and show an example call. Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`); `catalog/tools.json` adds them plus `aliases` (old tool name -> `{tool, action}`).
+
+### raijin CLI
+- `execute` accepts `name` for `tool`, `args`/`params`/`parameters`/`input` for `arguments`, `arguments` as a JSON string, and tool parameters put next to `tool`. Old tool names (`scanner_start_crawl`) and `scope.list` run the grouped tool with that action. On the lean surface, a Raijin tool called directly runs as `execute`.
+- `discover` takes a tool name as the domain (adds `matched_tool`) and shows each tool's annotations. Unknown parameters and skills get "did you mean" hints. Instructions, tool descriptions and the `raijin-gateway` skill show literal JSON calls and how to recover from each error.
+- The jar default is `raijin.jar` beside the `raijin` binary (where `install.sh` puts it) when its SHA-256 is this release's, else the download to `~/.raijin/jars/`.
+
 ## 2.3.0
 
 ### raijin CLI

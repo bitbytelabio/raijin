@@ -103,7 +103,10 @@ object ToolDomains {
 
     private val domainOf: Map<String, String> = DOMAINS.flatMap { d -> d.tools.map { it to d.name } }.toMap()
 
-    /** `catalog/tools.json`: the domains and every published tool's schema, tools sorted by name. */
+    /**
+     * `catalog/tools.json`: the domains, every published tool's schema and annotations (tools sorted
+     * by name), and `aliases`: each grouped member name mapped to its `{tool, action}`.
+     */
     fun catalogJson(tools: Collection<Tool>): JsonObject = buildJsonObject {
         put("schema_version", 1)
         putJsonArray("excluded") { EXCLUDED.sorted().forEach { add(it) } }
@@ -129,8 +132,25 @@ object ToolDomains {
                         putJsonArray("required") { tool.inputSchema.required.orEmpty().forEach { add(it) } }
                     }
                     put("domain", domainOf[tool.name])
+                    tool.annotations?.let { a ->
+                        putJsonObject("annotations") {
+                            a.readOnlyHint?.let { put("readOnlyHint", it) }
+                            a.destructiveHint?.let { put("destructiveHint", it) }
+                            a.idempotentHint?.let { put("idempotentHint", it) }
+                            a.openWorldHint?.let { put("openWorldHint", it) }
+                        }
+                    }
                 }
             }
+        }
+        putJsonObject("aliases") {
+            ToolConsolidation.GROUPS
+                .flatMap { g -> g.actions.map { (action, member) -> Triple(member, g.tool, action) } }
+                .filter { it.first != it.second }
+                .sortedBy { it.first }
+                .forEach { (member, tool, action) ->
+                    putJsonObject(member) { put("tool", tool); put("action", action) }
+                }
         }
     }
 }

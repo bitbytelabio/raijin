@@ -4,7 +4,8 @@ description: Start here: tool map, scope rules, and standard Burp testing workfl
 ---
 # Raijin overview
 
-Raijin exposes Burp Suite through MCP as about 45 tools. Most tools take an `action` parameter: call `<tool>(action=<action>, ...)`; the tool description lists every action and its parameters (`*` = required for that action).
+Raijin exposes Burp Suite through MCP as about 45 tools. Most take an `action` plus that action's parameters, all in one arguments object:
+`scope` with `{"action": "check", "url": "https://example.com"}`. The tool description lists every action and its parameters (`*` = required). Copy parameter names from the inputSchema: a name the tool does not accept is rejected.
 
 | Tool | What it does |
 |---|---|
@@ -34,5 +35,5 @@ Raijin exposes Burp Suite through MCP as about 45 tools. Most tools take an `act
 ## Rules
 - Only run against targets you are authorised to test.
 - Prefer one small request over a broad run; keep result sets small. Most tools page or cap their output; a limit above the cap is clamped and reported as `<param>_clamped_to`.
-- A result with `isError: true` says why in `error`: fix the argument instead of retrying the same call.
+- A result with `isError: true` says why in `error`; argument errors add `usage` (every accepted parameter) and `example` (a correct call to adapt). Fix the arguments from them; never resend the same call.
 - Other skills: `http-testing`, `proxy-traffic`, `scanner-audit`, `recon-probes`, `findings-reporting`, `collaborator-oob`, `turbo-scripting`. Load one with `load_skill(name="<name>")`, read its `skill://<name>/SKILL.md` resource, or run the `<name>` MCP prompt.

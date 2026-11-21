@@ -137,8 +137,6 @@ class HttpToolsTest {
         assertRejected("http_race", race.with("sync", "\"single_packet\"").with("http_mode", "\"HTTP_1\""), "last_byte")
         assertRejected("http_race", race.with("sync", "\"last_byte\"").with("http_mode", "\"HTTP_2\""), "HTTP_1")
         assertRejected("http_race", race.with("sni", "\"x\""), "last_byte")
-        val legacy = call("http_race", race.with("gate_delay", "100"))
-        assertTrue(notes(legacy).any { "gate_delay is no longer used" in it }, json(legacy).toString())
     }
 
     @Test

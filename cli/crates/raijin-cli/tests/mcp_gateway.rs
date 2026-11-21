@@ -216,3 +216,101 @@ async fn full_surface_lists_every_catalog_tool() {
     );
     client.cancel().await.expect("close");
 }
+
+fn rows(result: &CallToolResult) -> usize {
+    assert_ne!(result.is_error, Some(true), "{}", text(result));
+    json_of(result)["rows"].as_array().map_or(0, Vec::len)
+}
+
+#[tokio::test]
+async fn execute_accepts_common_wrong_shapes() {
+    let fixture = common::target("");
+    let client = connect(&fixture).await;
+
+    for shape in [
+        json!({"tool": "history_list", "arguments": "{\"limit\":2}"}),
+        json!({"tool": "history_list", "limit": 2}),
+        json!({"name": "history_list", "args": {"limit": 2}}),
+    ] {
+        assert_eq!(
+            rows(&call(&client, "execute", shape.clone()).await),
+            2,
+            "{shape}"
+        );
+    }
+    let bad = call(
+        &client,
+        "execute",
+        json!({"tool": "history_list", "arguments": "nope"}),
+    )
+    .await;
+    assert_eq!(bad.is_error, Some(true));
+    assert!(
+        text(&bad).contains("must be a JSON object"),
+        "{}",
+        text(&bad)
+    );
+
+    let typo = call(
+        &client,
+        "execute",
+        json!({"tool": "history_list", "arguments": {"limt": 1}}),
+    )
+    .await;
+    assert!(
+        text(&typo).contains("did you mean limit"),
+        "{}",
+        text(&typo)
+    );
+
+    let legacy = call(
+        &client,
+        "execute",
+        json!({"tool": "scanner_start_crawl", "arguments": {"urls": ["https://a"]}}),
+    )
+    .await;
+    assert!(
+        text(&legacy).contains("no Burp running for this target"),
+        "routed to scanner, not unknown: {}",
+        text(&legacy)
+    );
+
+    // Lean surface: a Raijin tool called directly runs as execute.
+    assert_eq!(
+        rows(&call(&client, "history_list", json!({"limit": 2})).await),
+        2
+    );
+    let nope = call(&client, "nope", json!({})).await;
+    assert_eq!(nope.is_error, Some(true));
+    assert!(
+        text(&nope).contains("Run Raijin tools through execute"),
+        "{}",
+        text(&nope)
+    );
+    client.cancel().await.expect("close");
+}
+
+#[tokio::test]
+async fn discover_takes_tool_names_and_shows_annotations() {
+    let fixture = common::target("");
+    let client = connect(&fixture).await;
+
+    let by_tool = json_of(&call(&client, "discover", json!({"domain": "history_list"})).await);
+    assert_eq!(by_tool["domain"], "history");
+    assert_eq!(by_tool["matched_tool"], "history_list");
+
+    let by_alias = json_of(&call(&client, "discover", json!({"domain": "scope_list"})).await);
+    assert_eq!(by_alias["domain"], "settings");
+    assert_eq!(by_alias["matched_tool"], "scope");
+    assert_eq!(by_alias["matched_action"], "list");
+
+    let http = json_of(&call(&client, "discover", json!({"domain": "HTTP"})).await);
+    let send = http["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|t| t["name"] == "http_send_request")
+        .expect("http_send_request");
+    assert_eq!(send["annotations"]["openWorldHint"], true);
+    client.cancel().await.expect("close");
+}

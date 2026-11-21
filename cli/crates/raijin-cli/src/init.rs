@@ -32,8 +32,9 @@ task_engine = "running"
 # Folder holding the .burp project files, relative to this file.
 projects_dir = "burp"
 
-# Raijin jar; default: the release matching this CLI, downloaded to ~/.raijin/jars/.
-# RAIJIN_JAR overrides both.
+# Raijin jar. Default: raijin.jar beside the raijin binary when it is this release's jar
+# (install.sh puts it there), else this release's jar downloaded to ~/.raijin/jars/.
+# RAIJIN_JAR overrides both this setting and the default.
 # jar = "/path/to/raijin.jar"
 
 # BApps installed in your global Burp (~/.BurpSuite) to load too, by name.

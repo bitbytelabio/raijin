@@ -19,6 +19,20 @@ import java.math.RoundingMode
 private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
 /**
+ * True when kotlinx parsed this as a real JSON literal (string, number, boolean, null). kotlinx reads
+ * an unquoted word such as `admin` in `[admin]` as a literal without checking it.
+ */
+fun JsonPrimitive.isStrictLiteral(): Boolean =
+    isString || this is JsonNull || booleanOrNull != null || content.toDoubleOrNull() != null
+
+/** True when every primitive in this element is a real JSON literal ([isStrictLiteral]). */
+fun JsonElement.isStrictJson(): Boolean = when (this) {
+    is JsonPrimitive -> isStrictLiteral()
+    is JsonArray -> all { it.isStrictJson() }
+    is JsonObject -> values.all { it.isStrictJson() }
+}
+
+/**
  * Extract a string list from a JsonElement that might be:
  * - A JsonArray of strings
  * - A JsonPrimitive containing a JSON array string
@@ -39,11 +53,7 @@ fun JsonElement?.asStringList(): List<String>? {
             if (str.trimStart().startsWith("[")) {
                 // Strict parse: "[admin]" is a value, not a lenient one-element array.
                 val parsed = try { Json.parseToJsonElement(str) } catch (_: Exception) { null }
-                // kotlinx reads an unquoted word as a literal without checking it: only real JSON
-                // literals (string, number, boolean, null) make this an array.
-                val strict = parsed is JsonArray && parsed.all {
-                    it is JsonPrimitive && (it.isString || it is JsonNull || it.booleanOrNull != null || it.content.toDoubleOrNull() != null)
-                }
+                val strict = parsed is JsonArray && parsed.all { it is JsonPrimitive && it.isStrictLiteral() }
                 if (strict) {
                     parsed.mapNotNull { if (it is JsonNull) null else it.jsonPrimitive.contentOrNull }
                 } else {

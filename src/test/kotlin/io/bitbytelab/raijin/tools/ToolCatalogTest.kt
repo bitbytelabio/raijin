@@ -35,6 +35,16 @@ class ToolCatalogTest {
         ToolDomains.DOMAINS.forEach { assertTrue(it.skill in SkillCatalog.NAMES, "${it.name}: unknown skill ${it.skill}") }
     }
 
+    @Test fun `every published tool carries annotations from consistent hint sets`() {
+        published.forEach { assertTrue(it.annotations != null, "${it.name} has no annotations") }
+        val names = published.map { it.name }.toSet()
+        for (set in listOf(ToolHints.READ_ONLY, ToolHints.DESTRUCTIVE, ToolHints.OPEN_WORLD)) {
+            assertEquals(emptySet(), set - names, "hints name unpublished tools")
+        }
+        assertEquals(emptySet(), ToolHints.READ_ONLY intersect ToolHints.DESTRUCTIVE)
+        assertEquals(emptySet(), ToolHints.READ_ONLY intersect ToolHints.OPEN_WORLD)
+    }
+
     @Test fun `the committed catalog matches the published tools`() {
         val expected = ToolDomains.catalogJson(published)
         if (System.getenv("RAIJIN_UPDATE_CATALOG") == "1") {

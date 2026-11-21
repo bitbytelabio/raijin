@@ -41,6 +41,7 @@ object IdorTools {
                         put("description", "Target port (default 443)")
                     }
                     putJsonObject("use_tls") { put("type", "boolean"); put("description", "Use HTTPS (default: port==443)") }
+                    putJsonObject("tls") { put("type", "boolean"); put("description", "Alias for use_tls") }
                     putJsonObject("identities") {
                         put("type", "array"); putJsonObject("items") { put("type", "object") }
                         put("description", "At least 2: [{name, header_name?, header_value?, headers?, remove_headers?, object_id?, canary?}]; an identity's headers replace the request's own, name none/unauth/anonymous strips every credential header. object_id = a resource that identity owns; canary = a token only in that identity's own data (enables confirmed-grade verdicts). The first identity is the primary one (it replays the id transformations).")

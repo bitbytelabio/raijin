@@ -252,9 +252,6 @@ analysis: responses clustered by status code and body similarity (cluster_simila
                 val similarity = args.clampedDouble("cluster_similarity", SIMILARITY) ?: HttpResponseClusters.DEFAULT_SIMILARITY
                 val maxResponseLength = args.clampedInt("max_response_length", HttpTools.LENGTHS)
                 val timeoutMs = args.timeoutMs("timeout_ms", HttpTools.DEFAULT_TIMEOUT_MS)
-                if (args.has("gate_delay")) {
-                    args.notes += "gate_delay is no longer used: the requests are released behind a synchronisation barrier (${sync.id})."
-                }
 
                 toolJsonResult(args.withNotes(bridge.raceCondition(
                     reqStr, host, port, useTls, count, payloads, sync, httpMode, sni, maxResponseLength, timeoutMs, similarity,

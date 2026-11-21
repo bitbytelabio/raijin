@@ -1,5 +1,7 @@
 //! Raijin's tool catalog (`catalog/tools.json` in the jar, written by `ToolDomains.catalogJson`) and skills.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -19,6 +21,16 @@ pub struct ToolSpec {
     pub description: Option<String>,
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
+    /// MCP tool annotations (`readOnlyHint`, `destructiveHint`, ...), when the catalog has them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+}
+
+/// A grouped member's old tool name: the published `tool` and the `action` that replaces it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Alias {
+    pub tool: String,
+    pub action: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -28,6 +40,9 @@ pub struct Catalog {
     pub excluded: Vec<String>,
     pub domains: Vec<Domain>,
     pub tools: Vec<ToolSpec>,
+    /// Member name (`scope_list`) -> grouped call (`scope`, action `list`).
+    #[serde(default)]
+    pub aliases: BTreeMap<String, Alias>,
 }
 
 impl Catalog {
@@ -43,6 +58,21 @@ impl Catalog {
 
     pub fn tool(&self, name: &str) -> Option<&ToolSpec> {
         self.tools.iter().find(|t| t.name == name)
+    }
+
+    /// The published tool `name` means, with the action to add for a grouped member: an exact tool
+    /// name, an alias (`scope_list` -> `scope`, `list`) or `group.action` (`scope.list`).
+    pub fn resolve(&self, name: &str) -> Option<(String, Option<String>)> {
+        let name = name.trim();
+        if self.tool(name).is_some() {
+            return Some((name.to_owned(), None));
+        }
+        if let Some(alias) = self.aliases.get(name) {
+            return Some((alias.tool.clone(), Some(alias.action.clone())));
+        }
+        let (group, action) = name.split_once('.')?;
+        self.tool(group)?;
+        Some((group.to_owned(), Some(action.to_owned())))
     }
 
     pub fn domain(&self, name: &str) -> Option<&Domain> {

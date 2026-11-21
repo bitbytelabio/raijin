@@ -18,7 +18,8 @@ const RELEASE_BASE: &str = "https://github.com/bitbytelabio/raijin/releases/down
 /// place as the jar (which proves integrity, not origin). Dev builds fall back to that file.
 const PINNED_SHA256: Option<&str> = option_env!("RAIJIN_JAR_SHA256");
 
-/// `RAIJIN_JAR`, else `jar` in raijin.toml, else the release matching this CLI under
+/// `RAIJIN_JAR`, else `jar` in raijin.toml, else `raijin.jar` beside this binary when its SHA-256
+/// is this release's pin (where install.sh puts it), else the release matching this CLI under
 /// `~/.raijin/jars/` (downloaded and checksum-verified on first use).
 pub async fn resolve(target: Option<&Target>) -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("RAIJIN_JAR").filter(|v| !v.is_empty()) {
@@ -37,6 +38,12 @@ pub async fn resolve(target: Option<&Target>) -> Result<PathBuf> {
         }
         return Ok(fs::canonicalize(&path)?);
     }
+    if let Ok(exe) = std::env::current_exe() {
+        let exe = fs::canonicalize(&exe).unwrap_or(exe);
+        if let Some(path) = installed_jar(&exe, PINNED_SHA256) {
+            return Ok(path);
+        }
+    }
     let path = user_state_dir()?
         .join("jars")
         .join(format!("raijin-{VERSION}.jar"));
@@ -44,6 +51,20 @@ pub async fn resolve(target: Option<&Target>) -> Result<PathBuf> {
         download(&path).await?;
     }
     Ok(path)
+}
+
+/// `raijin.jar` in the directory of `exe` when its SHA-256 equals `pinned`. None without a pin (dev
+/// builds) or for another release's jar, so the catalog read from the jar always matches this CLI.
+fn installed_jar(exe: &Path, pinned: Option<&str>) -> Option<PathBuf> {
+    let expected = pinned?.split_whitespace().next()?.to_ascii_lowercase();
+    let path = exe.parent()?.join("raijin.jar");
+    if !path.is_file() {
+        return None;
+    }
+    let bytes = fs::read(&path).ok()?;
+    (hex(&Sha256::digest(&bytes)) == expected)
+        .then(|| fs::canonicalize(&path).ok())
+        .flatten()
 }
 
 async fn download(dest: &Path) -> Result<()> {
@@ -132,4 +153,47 @@ pub fn read_assets(jar: &Path) -> Result<Assets> {
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Assets { catalog, skills })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exe_with_jar(jar: Option<&[u8]>) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("raijin");
+        fs::write(&exe, b"").expect("exe");
+        if let Some(bytes) = jar {
+            fs::write(dir.path().join("raijin.jar"), bytes).expect("jar");
+        }
+        (dir, exe)
+    }
+
+    #[test]
+    fn installed_jar_needs_a_matching_pin() {
+        let (dir, exe) = exe_with_jar(Some(b"jar bytes"));
+        let pin = hex(&Sha256::digest(b"jar bytes"));
+        let found = installed_jar(
+            &exe,
+            Some(&format!("{}  raijin.jar\n", pin.to_ascii_uppercase())),
+        );
+        assert_eq!(
+            found,
+            Some(fs::canonicalize(dir.path().join("raijin.jar")).expect("canonical"))
+        );
+        assert_eq!(
+            installed_jar(&exe, Some(&hex(&Sha256::digest(b"other")))),
+            None
+        );
+        assert_eq!(installed_jar(&exe, None), None);
+    }
+
+    #[test]
+    fn installed_jar_needs_the_file() {
+        let (_dir, exe) = exe_with_jar(None);
+        assert_eq!(
+            installed_jar(&exe, Some(&hex(&Sha256::digest(b"jar bytes")))),
+            None
+        );
+    }
 }

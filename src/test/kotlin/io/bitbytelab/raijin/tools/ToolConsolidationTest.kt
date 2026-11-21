@@ -46,6 +46,8 @@ class ToolConsolidationTest {
 
     private fun text(r: CallToolResult) = (r.content.first() as TextContent).text
 
+    private fun json(r: CallToolResult) = Json.parseToJsonElement(text(r)).jsonObject
+
     /** The real tools, registered on first use; see [RegisteredTools]. */
     private val real = lazy { RegisteredTools() }
 
@@ -110,17 +112,133 @@ class ToolConsolidationTest {
         val target = server()
         ToolConsolidation.apply(legacy, target)
 
-        val bad = call(target, "scope", buildJsonObject { put("action", "nope") })
+        val bad = call(target, "scope", buildJsonObject { put("action", "chek") })
         assertEquals(true, bad.isError)
-        assertTrue("unknown_action" in text(bad) && "include" in text(bad))
+        val badJson = json(bad)
+        assertEquals("unknown_action", badJson.str("code"))
+        assertTrue("Did you mean 'check'?" in badJson.str("error")!!, text(bad))
+        assertEquals("check", badJson.getValue("did_you_mean").jsonArray.first().jsonPrimitive.content)
+        assertTrue("include" in badJson.getValue("available").jsonArray.map { it.jsonPrimitive.content })
 
         val none = call(target, "scope", buildJsonObject {})
         assertEquals(true, none.isError)
+        assertEquals("missing_action", json(none).str("code"))
+        assertEquals("check", json(none).getValue("example").jsonObject.str("action"))
 
         val missing = call(target, "scope", buildJsonObject { put("action", "check") })
         assertEquals(true, missing.isError)
-        assertTrue("action 'check' requires 'url'" in text(missing), text(missing))
+        val missingJson = json(missing)
+        assertEquals("missing_parameter", missingJson.str("code"))
+        assertTrue("missing required parameter(s): 'url'" in missingJson.str("error")!!, text(missing))
+        assertEquals("""scope(action="check", url*: string)""", missingJson.str("usage"))
+        assertEquals(buildJsonObject { put("action", "check"); put("url", "<url>") }, missingJson.getValue("example"))
         assertFalse(target.tools.keys.any { it == "scope_check" })
+
+        val unknown = call(target, "scope", buildJsonObject { put("action", "check"); put("uri", "x") })
+        assertEquals(true, unknown.isError)
+        val unknownJson = json(unknown)
+        assertEquals("unknown_parameter", unknownJson.str("code"))
+        assertTrue("did you mean 'url'" in unknownJson.str("error")!!, text(unknown))
+        assertEquals(listOf("uri"), unknownJson.getValue("unknown_parameters").jsonArray.map { it.jsonPrimitive.content })
+        assertTrue(unknownJson.str("usage")!!.startsWith("scope(action=\"check\", url*"), text(unknown))
+        assertEquals(buildJsonObject { put("action", "check"); put("url", "<url>") }, unknownJson.getValue("example"))
+    }
+
+    /** Every group member and KEEP tool as a fake declaring [props]; returns the published server. */
+    private fun allFakes(vararg props: String): Server {
+        val legacy = server()
+        ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach { fake(legacy, it, emptyList(), *props) }
+        ToolConsolidation.KEEP.forEach { fake(legacy, it, emptyList(), *props) }
+        return server().also { ToolConsolidation.apply(legacy, it) }
+    }
+
+    @Test
+    fun `actions are found by member name, case and dotted form`() {
+        val target = allFakes("url")
+        for (raw in listOf("scope_list", "LIST", "scope.list", " List ")) {
+            val r = call(target, "scope", buildJsonObject { put("action", raw) })
+            assertEquals("scope_list:{}", text(r), raw)
+        }
+        val ws = call(target, "websocket", buildJsonObject { put("action", "proxy_websocket_history") })
+        assertEquals("proxy_websocket_history:{}", text(ws))
+        assertEquals("scope_list", ToolConsolidation.legacyName("scope", "scope_list"))
+        assertEquals("scope_list", ToolConsolidation.legacyName("scope", "Scope.List"))
+    }
+
+    @Test
+    fun `kept tools reject undeclared parameters and coerce declared types`() {
+        val legacy = server()
+        ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach { fake(legacy, it) }
+        ToolConsolidation.KEEP.filter { it != "http_fuzz" }.forEach { fake(legacy, it, emptyList(), "url") }
+        legacy.addTool(
+            name = "http_fuzz",
+            description = "Fuzz.",
+            inputSchema = ToolSchema(properties = buildJsonObject {
+                putJsonObject("s") { put("type", "string") }
+                putJsonObject("o") { put("type", "object") }
+                putJsonObject("a") { put("type", "array") }
+                putJsonObject("n") { put("type", "integer") }
+            }),
+        ) { req -> CallToolResult(content = listOf(TextContent(req.params.arguments.toString()))) }
+        val target = server()
+        ToolConsolidation.apply(legacy, target)
+
+        val bad = call(target, "proxy_history", buildJsonObject { put("ulr", "x") })
+        assertEquals(true, bad.isError)
+        assertEquals("unknown_parameter", json(bad).str("code"))
+        assertTrue("did you mean 'url'" in json(bad).str("error")!!, text(bad))
+        assertEquals("proxy_history(url: string)", json(bad).str("usage"))
+
+        val coerced = call(target, "http_fuzz", buildJsonObject {
+            putJsonObject("s") { put("a", 1) }
+            put("o", "{\"a\":1}")
+            put("a", "x")
+            put("n", "7")
+        })
+        assertEquals(
+            buildJsonObject {
+                put("s", "{\"a\":1}")
+                putJsonObject("o") { put("a", 1) }
+                putJsonArray("a") { add("x") }
+                put("n", "7")
+            },
+            Json.parseToJsonElement(text(coerced)),
+        )
+        val parsedArray = call(target, "http_fuzz", buildJsonObject { put("a", "[\"x\",\"y\"]"); put("o", "not json") })
+        assertEquals(
+            buildJsonObject { putJsonArray("a") { add("x"); add("y") }; put("o", "not json") },
+            Json.parseToJsonElement(text(parsedArray)),
+        )
+        // kotlinx would read unquoted words as literals: these stay the values sent.
+        val words = call(target, "http_fuzz", buildJsonObject { put("a", "[admin]"); put("o", "{a:b}") })
+        assertEquals(
+            buildJsonObject { putJsonArray("a") { add("[admin]") }; put("o", "{a:b}") },
+            Json.parseToJsonElement(text(words)),
+        )
+    }
+
+    @Test
+    fun `argument errors from a handler gain usage and example`() {
+        val legacy = server()
+        ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach { fake(legacy, it) }
+        ToolConsolidation.KEEP.filter { it != "proxy_history" }.forEach { fake(legacy, it) }
+        legacy.addTool(
+            name = "proxy_history",
+            description = "History.",
+            inputSchema = ToolSchema(properties = buildJsonObject { putJsonObject("count") { put("type", "integer") } }, required = listOf("count")),
+        ) { req ->
+            if (req.params.arguments?.get("count")?.jsonPrimitive?.content == "0") toolError("Parameter 'count' must be positive")
+            else toolError("Burp is busy")
+        }
+        val target = server()
+        ToolConsolidation.apply(legacy, target)
+
+        val argError = json(call(target, "proxy_history", buildJsonObject { put("count", 0) }))
+        assertEquals("proxy_history(count*: integer)", argError.str("usage"))
+        assertEquals(buildJsonObject { put("count", 1) }, argError.getValue("example"))
+
+        val other = json(call(target, "proxy_history", buildJsonObject { put("count", 2) }))
+        assertEquals(buildJsonObject { put("error", "Burp is busy") }, other)
     }
 
     @Test
@@ -211,6 +329,18 @@ class ToolConsolidationTest {
     }
 
     @Test
+    fun `published descriptions use grouped calls, not member names, and show an example`() {
+        val (_, target) = consolidatedWithRealTools()
+        val scope = target.tools.getValue("scope").tool
+        val desc = scope.description!!
+        assertTrue("scope(action=list)" in desc, desc)
+        assertFalse(Regex("\\bscope_list\\b").containsMatchIn(desc), desc)
+        assertTrue("Example: {\"action\":" in desc, desc)
+        val index = scope.inputSchema.properties!!.getValue("index").jsonObject.str("description")!!
+        assertFalse("scope_list" in index, index)
+    }
+
+    @Test
     fun `legacyName maps tool and action back to the member`() {
         assertEquals("burp_shutdown", ToolConsolidation.legacyName("burp", "shutdown"))
         assertEquals(null, ToolConsolidation.legacyName("http_fuzz", null))
@@ -237,7 +367,7 @@ class ToolConsolidationTest {
                     val def = rawDef.jsonObject
                     val merged = props.getValue(pub).jsonObject
                     val desc = merged.str("description").orEmpty()
-                    val own = def.str("description").orEmpty().trim()
+                    val own = ToolConsolidation.modernize(def.str("description").orEmpty().trim())
                     assertTrue(own in desc, "${g.tool}.$pub lost $action's description '$own': $desc")
                     val mergedEnum = merged["enum"]?.jsonArray
                     def["enum"]?.jsonArray?.forEach { v ->
