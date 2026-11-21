@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.3.1
 
 ### Tool calls
 - Every published tool rejects parameters it does not declare (`code: unknown_parameter`, with `did_you_mean`), instead of ignoring them. Argument errors carry `code`, `usage` (every accepted parameter, `*` = required) and `example` (a correct call to adapt); `missing_action`, `unknown_action` and `missing_parameter` replace the old `error`/`message` pair. `http_race` no longer accepts the retired `gate_delay`; `auth_diff` and `probe(action=idor)` declare the `tls` alias they already read.
