@@ -1,11 +1,13 @@
 # Changelog
 
-## Unreleased
+## 2.3.0
 
 ### raijin CLI
 - New Rust CLI `raijin` (`cli/`), released per platform as `raijin-cli-<version>-<target>.tar.gz`. `raijin init` makes a folder a target (`raijin.toml`, `burp/`, `.raijin/`) and registers `raijin mcp` in `.mcp.json` and `.omp/mcp.json`. With no `raijin.toml` in the folder or above it, every other command (and `raijin mcp`) creates the default one (project `main`) in the current folder and continues; it does not touch the agent MCP files.
 - `raijin up [project] [--ui]` starts Burp with Raijin for a named `.burp` project, headless by default, detached, on free ports, under an isolated profile (`~/.raijin/burp-profile`, seeded once from your Burp user config without its extensions); several projects run at once. `raijin down`, `raijin status`. On macOS Burp is started through its app launcher: PortSwigger's bundled `java` refuses other parents.
 - `raijin mcp`: a stdio MCP gateway with three tools (`discover`, `execute`, `skill`), so an agent loads tool schemas per domain instead of all 45 up front. `execute` also runs `burp_up` / `burp_down` / `burp_status` and the history tools; results over `[mcp] inline_limit_kb` are saved to `.raijin/tool-results/` and returned as `{saved_to, preview}`. `--surface full` also lists every Raijin tool; `--remote <url>` drives an already-running Raijin.
+- `theme = "dark" | "light"` in `raijin.toml` (default `dark`) sets Burp's look and feel on every `raijin up`.
+- `install.sh`, attached to each release: `curl -LsSf https://github.com/bitbytelabio/raijin/releases/latest/download/install.sh | sh` installs the CLI for the current platform and the extension as `raijin.jar` into `~/.local/bin` after checking their `.sha256` (`RAIJIN_VERSION`, `RAIJIN_INSTALL_DIR` override).
 - `raijin history list|show|search|endpoints|diff|export` (and the matching `history_*` tools) read every `.burp` project of a target in parallel without Burp, through a vendored copy of amber (see NOTICE), together with Raijin's archive of tool-sent traffic and scanner issues.
 
 ### CLI support in the extension
