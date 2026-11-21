@@ -261,7 +261,7 @@ pub struct Gateway {
 
 pub async fn serve(surface: Surface, remote_flag: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let (target, target_error) = match Target::discover(&cwd) {
+    let (target, target_error) = match Target::discover_or_init(&cwd) {
         Ok(t) => (Some(Arc::new(t)), None),
         Err(e) => (None, Some(format!("{e:#}"))),
     };

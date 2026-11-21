@@ -146,21 +146,19 @@ impl Target {
     /// Walks up from `cwd` to the first directory with a `raijin.toml`. That file decides which
     /// programs run and where tool calls go, so it must be ours: owned by the current user, and
     /// neither it nor its folder writable by others (like git's `safe.directory`).
-    pub fn discover(cwd: &Path) -> Result<Self> {
-        let mut dir = Some(cwd);
-        while let Some(current) = dir {
-            let file = current.join(CONFIG_FILE);
-            if file.is_file() {
-                check_owned(&file)?;
-                check_owned(current)?;
-                return Self::load(current);
-            }
-            dir = current.parent();
+    /// When there is none anywhere above `cwd`, scaffolds a default target (project "main") in
+    /// `cwd`. Ownership errors still fail: a foreign config is never shadowed.
+    pub fn discover_or_init(cwd: &Path) -> Result<Self> {
+        if let Some(root) = find_root(cwd)? {
+            return Self::load(&root);
         }
-        bail!(
-            "no {CONFIG_FILE} found from {}; run raijin init",
-            cwd.display()
-        )
+        let path = crate::init::scaffold(cwd, "main")?;
+        // stderr only: stdout is the MCP stdio channel under `raijin mcp`.
+        eprintln!(
+            "raijin: created default {} (no {CONFIG_FILE} found)",
+            path.display()
+        );
+        Self::load(cwd)
     }
 
     pub fn load(root: &Path) -> Result<Self> {
@@ -250,6 +248,22 @@ impl Target {
     }
 }
 
+/// The nearest directory at or above `cwd` holding a `raijin.toml`, after its ownership checks;
+/// `None` when there is none.
+fn find_root(cwd: &Path) -> Result<Option<PathBuf>> {
+    let mut dir = Some(cwd);
+    while let Some(current) = dir {
+        let file = current.join(CONFIG_FILE);
+        if file.is_file() {
+            check_owned(&file)?;
+            check_owned(current)?;
+            return Ok(Some(current.to_path_buf()));
+        }
+        dir = current.parent();
+    }
+    Ok(None)
+}
+
 /// Refuses `path` unless the current user owns it and others cannot write it.
 fn check_owned(path: &Path) -> Result<()> {
     let meta = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
@@ -333,10 +347,28 @@ mod tests {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         let nested = dir.path().join("sub");
         std::fs::create_dir(&nested).expect("sub");
-        assert!(Target::discover(&nested).is_ok());
+        assert!(Target::discover_or_init(&nested).is_ok());
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).expect("chmod");
-        let err = Target::discover(&nested).expect_err("world-writable config");
+        let err = Target::discover_or_init(&nested).expect_err("world-writable config");
+        assert!(
+            !nested.join(CONFIG_FILE).exists(),
+            "a refused config must not be shadowed by a scaffolded one"
+        );
         assert!(format!("{err:#}").contains("writable by others"), "{err:#}");
+    }
+
+    #[test]
+    fn a_missing_config_is_scaffolded_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonical");
+        let target = Target::discover_or_init(&root).expect("auto init");
+        assert_eq!(target.root, root);
+        assert!(root.join(CONFIG_FILE).is_file());
+        assert!(root.join(STATE_DIR).is_dir());
+        assert!(!root.join(".mcp.json").exists());
+        assert_eq!(target.config.default_project, "main");
+        let again = Target::discover_or_init(&root).expect("reload");
+        assert_eq!(again.root, root);
     }
 
     #[test]

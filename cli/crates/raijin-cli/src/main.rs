@@ -170,7 +170,7 @@ fn main() -> ExitCode {
 }
 
 fn target() -> Result<Target> {
-    Target::discover(&std::env::current_dir()?)
+    Target::discover_or_init(&std::env::current_dir()?)
 }
 
 async fn run(cli: Cli) -> Result<()> {

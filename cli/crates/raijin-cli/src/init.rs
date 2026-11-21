@@ -1,7 +1,7 @@
 //! `raijin init`: makes the current directory a target folder and registers `raijin mcp` with the agents.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
@@ -59,7 +59,9 @@ inline_limit_kb = 24
     )
 }
 
-pub fn run(root: &Path, project: &str, register_mcp: bool) -> Result<()> {
+/// Writes the default `raijin.toml`, `burp/.gitignore` and the private state folder into `root`.
+/// Prints nothing (stdout may be the MCP stdio channel); returns the config path.
+pub fn scaffold(root: &Path, project: &str) -> Result<PathBuf> {
     validate_project_name(project)?;
     let config = root.join(CONFIG_FILE);
     if config.exists() {
@@ -67,11 +69,16 @@ pub fn run(root: &Path, project: &str, register_mcp: bool) -> Result<()> {
     }
     fs::write(&config, template(project))
         .with_context(|| format!("writing {}", config.display()))?;
-    println!("wrote {}", config.display());
 
     write_if_missing(&root.join("burp").join(".gitignore"), "*.burp\n")?;
     crate::util::private_dir(&root.join(STATE_DIR))?;
     write_if_missing(&root.join(STATE_DIR).join(".gitignore"), "*\n")?;
+    Ok(config)
+}
+
+pub fn run(root: &Path, project: &str, register_mcp: bool) -> Result<()> {
+    let config = scaffold(root, project)?;
+    println!("wrote {}", config.display());
 
     if register_mcp {
         for file in MCP_FILES {
