@@ -238,7 +238,6 @@ fn tag_from_url(url: &str) -> Option<String> {
 fn release_target(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("macos", "aarch64") => Some("aarch64-apple-darwin"),
-        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
         ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
         ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
         _ => None,
