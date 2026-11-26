@@ -120,7 +120,10 @@ raijin init              # raijin.toml, burp/, .raijin/; registers `raijin mcp` 
 raijin up                # headless Burp for the default project; `raijin up <project> --ui` for a window
 raijin status
 raijin down
+raijin update            # latest CLI + raijin.jar; `--check` only reports, `raijin update 2.3.0` pins a release
 ```
+
+`raijin update` replaces the `raijin` binary and the `raijin.jar` beside it with a GitHub release (checksum-verified, renamed into place, so a running Burp keeps its loaded jar). Burp projects of the current target that are still running keep the old jar until restarted; `raijin update --force` reinstalls even when up to date and restarts them. `raijin up` prints a note when a newer release exists (checked at most once a day; `RAIJIN_NO_UPDATE_CHECK=1` turns it off).
 
 `raijin mcp` serves MCP 2026-07-28 (`server/discover`) and the older `initialize` handshake. It has two tools: `guide` (running Burp instances, every tool by domain, one tool's `inputSchema`, a playbook) and `run` (`{"do":"scope.check","url":"https://example.com"}`, or a `batch` of such steps). The playbooks ship in the binary and are served as prompts, Skills-extension entries and `skill://<name>/SKILL.md` resources.
 

@@ -180,8 +180,8 @@ impl Target {
     /// When there is none anywhere above `cwd`, scaffolds a default target (project "main") in
     /// `cwd`. Ownership errors still fail: a foreign config is never shadowed.
     pub fn discover_or_init(cwd: &Path) -> Result<Self> {
-        if let Some(root) = find_root(cwd)? {
-            return Self::load(&root);
+        if let Some(target) = Self::discover(cwd)? {
+            return Ok(target);
         }
         let path = crate::init::scaffold(cwd, "main")?;
         // stderr only: stdout is the MCP stdio channel under `raijin mcp`.
@@ -190,6 +190,11 @@ impl Target {
             path.display()
         );
         Self::load(cwd)
+    }
+
+    /// The target at or above `cwd`, like `discover_or_init`, but `None` instead of scaffolding one.
+    pub fn discover(cwd: &Path) -> Result<Option<Self>> {
+        find_root(cwd)?.map(|root| Self::load(&root)).transpose()
     }
 
     pub fn load(root: &Path) -> Result<Self> {

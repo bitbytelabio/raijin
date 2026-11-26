@@ -7,6 +7,7 @@
 - Skills are gone from the extension's MCP server: no prompts, no `skill://` resources, no `burp://skills/manifest`, no `search_skills` / `load_skill` (43 tools remain). The playbooks ship with the `raijin` CLI. A client pointed at `:9876/mcp` directly no longer gets them.
 
 ### raijin CLI
+- `raijin update` installs the latest release of the CLI and of `raijin.jar` beside it (`--check` only reports; `raijin update <version>` installs that release, older ones included; `--force` reinstalls and restarts the current target's running Burp projects). `raijin up` notes when a newer release exists (checked at most once a day, off with `RAIJIN_NO_UPDATE_CHECK=1`).
 - `raijin mcp` speaks MCP 2026-07-28 (`server/discover`, stateless `_meta`) and the legacy `initialize` handshake. Two tools replace `discover` / `execute` / `skill`: `guide` (no topic: running Burp instances, every tool by domain with its actions, the playbooks; with a topic: one tool's `inputSchema`, a domain's tools, a playbook or a playbook file) and `run` (`{"do":"scope.check","url":"..."}`, `project` to pick the Burp, `batch` with `bail` for several steps).
 - Burp tools go through the extension's `/api/v1` tool API instead of an MCP client session.
 - The nine playbooks (`overview` now includes the old `raijin-gateway`) are rewritten as `SKILL.md` + `references/*.md`, with every call in `run {"do":...}` form, and served as prompts, Skills-extension entries (`io.modelcontextprotocol/skills`) and `skill://` resources.

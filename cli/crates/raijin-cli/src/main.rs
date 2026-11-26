@@ -8,6 +8,7 @@ mod history;
 mod init;
 mod jar;
 mod mcp;
+mod update;
 mod util;
 
 use std::io::{IsTerminal, Write};
@@ -76,6 +77,8 @@ enum Command {
         #[arg(long)]
         remote: Option<String>,
     },
+    /// Update the raijin CLI and the Raijin Burp extension (raijin.jar beside it) from GitHub releases.
+    Update(update::Options),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -192,11 +195,18 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 target.config.mode
             };
-            let report =
-                burp::launch::up(&target, &project, mode, Duration::from_secs(180)).await?;
+            // The update check (at most once a day, 3 s timeout) runs alongside the launch.
+            let (report, hint) = tokio::join!(
+                burp::launch::up(&target, &project, mode, Duration::from_secs(180)),
+                update::hint()
+            );
+            let report = report?;
             print_status(&report.status);
             for warning in &report.warnings {
                 eprintln!("warning: {warning}");
+            }
+            if let Some(hint) = hint {
+                eprintln!("note: {hint}");
             }
             Ok(())
         }
@@ -256,6 +266,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::History(command) => history_command(command).await,
         Command::Mcp { surface, remote } => mcp::server::serve(surface, remote).await,
+        Command::Update(options) => update::run(options).await,
     }
 }
 

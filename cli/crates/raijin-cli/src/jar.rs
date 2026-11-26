@@ -72,14 +72,30 @@ async fn download(dest: &Path) -> Result<()> {
     let url = format!("{RELEASE_BASE}/v{VERSION}/{name}");
     eprintln!("downloading {url}");
     let client = reqwest::Client::builder().build()?;
-    let expected = match PINNED_SHA256 {
+    let bytes = fetch_checked(&client, &url, PINNED_SHA256).await?;
+
+    let dir = dest.parent().context("jar path has no parent")?;
+    private_dir(dir)?;
+    let tmp = dir.join(format!(".{name}.part-{}", std::process::id()));
+    fs::write(&tmp, &bytes)?;
+    fs::rename(&tmp, dest)?;
+    Ok(())
+}
+
+/// Downloads `url` and checks its SHA-256 against `pinned`, else against `{url}.sha256`.
+pub(crate) async fn fetch_checked(
+    client: &reqwest::Client,
+    url: &str,
+    pinned: Option<&str>,
+) -> Result<Vec<u8>> {
+    let expected = match pinned {
         Some(pinned) => pinned.to_owned(),
         None => {
             client
                 .get(format!("{url}.sha256"))
                 .send()
-                .await?
-                .error_for_status()
+                .await
+                .and_then(reqwest::Response::error_for_status)
                 .with_context(|| format!("fetching {url}.sha256"))?
                 .text()
                 .await?
@@ -90,26 +106,20 @@ async fn download(dest: &Path) -> Result<()> {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let bytes = client
-        .get(&url)
+    let bytes: Vec<u8> = client
+        .get(url)
         .send()
-        .await?
-        .error_for_status()
+        .await
+        .and_then(reqwest::Response::error_for_status)
         .with_context(|| format!("fetching {url}"))?
         .bytes()
-        .await?;
-
-    let dir = dest.parent().context("jar path has no parent")?;
-    private_dir(dir)?;
-    let tmp = dir.join(format!(".{name}.part-{}", std::process::id()));
-    fs::write(&tmp, &bytes)?;
+        .await?
+        .into();
     let actual = hex(&Sha256::digest(&bytes));
     if actual != expected {
-        let _ = fs::remove_file(&tmp);
         bail!("checksum mismatch for {url}: expected {expected}, got {actual}");
     }
-    fs::rename(&tmp, dest)?;
-    Ok(())
+    Ok(bytes)
 }
 
 /// What the CLI reads out of the jar.
