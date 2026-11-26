@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Tool calls
+- Every error is one JSON object: `error`, `code`, and when they help `param`, `got`, `allowed`, `did_you_mean`, `usage`, `example`, `retry` (a complete corrected call, given only when the fix is certain), `retryable` and `see`. A handler error about a value outside its enum becomes `invalid_enum` with `allowed`; other argument errors get `code: invalid_arguments`.
+- Strings that clearly mean a number or boolean (`"20"`, `"true"`), whole floats for integers (`5.0`) and enum values in another case or spelling (`sha256` for `SHA_256`) are read as the declared type; the result says so in `notes`. A misnamed parameter from another tool's vocabulary (`limit`, `offset`, `uri`, ...) suggests the right one with a ready `retry`.
+- Tool names are resolved forgivingly: case and `-`/`.`/space separators (`Burp.Version`), old member names, `group.action`, and `util.sha256` / `sha256` as `util.hash` with that algorithm. A destructive tool never runs from an inexact name; it comes back as `unknown_tool` with the exact call in `retry`.
+
+### Extension
+- Tool API: `GET /api/v1/info` carries the server instructions; `GET /api/v1/resources` and `GET /api/v1/resources/read?uri=` expose the MCP resources. `POST /api/v1/tools/<name>` answers an unknown name with an `unknown_tool` result (suggestions, `retry`) instead of a 404, and gives error `example`/`retry` as `run` calls (`{"do":"tool.action",...}`).
+
+### raijin CLI
+- `run` and `guide` errors use the same envelope: `run {}` shows a working example, a `batch` sent as a JSON string is parsed, a bailed batch says which step failed and which did not run, an unknown `guide` topic lists suggestions instead of the whole overview, and `guide` matches topics without case (`HTTP_SEND_REQUEST`).
+- The CLI's own tools (`burp_*`, `history_*`) read `"1"` as `1`, match enum values without case, accept their names in any case (`History.List`), and refuse wrong types, enum values, negative counts and missing parameters with `param`, `usage` and `example`.
+- Names the CLI does not own go to the extension as given; it resolves them. `raijin mcp` lists and reads the running Burp's `burp://` resources next to the playbooks.
+
 ## 2.4.0
 
 ### Extension

@@ -1,6 +1,9 @@
 package io.bitbytelab.raijin.transport
 
 import io.bitbytelab.raijin.core.BuildInfo
+import io.bitbytelab.raijin.tools.ToolArgs
+import io.bitbytelab.raijin.tools.ToolConsolidation
+import io.bitbytelab.raijin.tools.ToolNames
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
@@ -32,7 +35,11 @@ import io.modelcontextprotocol.kotlin.sdk.types.ListRootsResult
 import io.modelcontextprotocol.kotlin.sdk.types.LoggingMessageNotification
 import io.modelcontextprotocol.kotlin.sdk.types.McpJson
 import io.modelcontextprotocol.kotlin.sdk.types.PingRequest
+import io.modelcontextprotocol.kotlin.sdk.types.ReadResourceRequest
+import io.modelcontextprotocol.kotlin.sdk.types.ReadResourceRequestParams
+import io.modelcontextprotocol.kotlin.sdk.types.ReadResourceResult
 import io.modelcontextprotocol.kotlin.sdk.types.RequestId
+import io.modelcontextprotocol.kotlin.sdk.types.Resource
 import io.modelcontextprotocol.kotlin.sdk.types.ResourceUpdatedNotification
 import io.modelcontextprotocol.kotlin.sdk.types.ServerNotification
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
@@ -43,17 +50,22 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 
 /**
  * Plain JSON tool API on the MCP listeners, for the `raijin` CLI: list the tools and call one
  * without an MCP session. [installLocalhostSecurity] guards it like `/mcp`.
  *
- * - `GET  /api/v1/info`          → `{"name","version","api"}`
+ * - `GET  /api/v1/info`          → `{"name","version","api","instructions"}`
  * - `GET  /api/v1/tools`         → `{"tools":[Tool...]}` (MCP `Tool` JSON)
+ * - `GET  /api/v1/resources`     → `{"resources":[Resource...]}` (MCP `Resource` JSON)
+ * - `GET  /api/v1/resources/read?uri=<uri>` → MCP `ReadResourceResult`
  * - `POST /api/v1/tools/{name}`  → body = the tool's arguments object (`application/json`; empty = `{}`);
- *   answers an MCP `CallToolResult`
+ *   answers an MCP `CallToolResult`. [name] is resolved leniently ([ToolNames.resolve]); an unknown
+ *   name is an `unknown_tool` error result, and error envelopes come in the CLI's `run` form ([runForm]).
  */
 internal object ToolApi {
     const val BASE = "/api/v1"
@@ -70,6 +82,7 @@ internal fun Application.installToolApi(server: Server) {
                         put("name", "burpsuite")
                         put("version", BuildInfo.VERSION)
                         put("api", ToolApi.VERSION)
+                        put("instructions", McpServerManager.SERVER_INSTRUCTIONS)
                     }
                 )
             }
@@ -77,10 +90,26 @@ internal fun Application.installToolApi(server: Server) {
                 val tools = server.tools.values.map { McpJson.encodeToJsonElement(Tool.serializer(), it.tool) }
                 call.respondJson(HttpStatusCode.OK, JsonObject(mapOf("tools" to JsonArray(tools))))
             }
+            get("resources") {
+                val resources = server.resources.values.map { McpJson.encodeToJsonElement(Resource.serializer(), it.resource) }
+                call.respondJson(HttpStatusCode.OK, JsonObject(mapOf("resources" to JsonArray(resources))))
+            }
+            get("resources/read") {
+                val uri = call.request.queryParameters["uri"]
+                    ?: return@get call.respondError(HttpStatusCode.BadRequest, "uri query parameter is required")
+                val registered = server.resources[uri]
+                    ?: return@get call.respondError(HttpStatusCode.NotFound, "unknown resource $uri")
+                val result = try {
+                    registered.readHandler(ApiConnection, ReadResourceRequest(ReadResourceRequestParams(uri = uri)))
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    return@get call.respondError(HttpStatusCode.InternalServerError, "reading $uri failed: ${e.message}")
+                }
+                call.respondJson(HttpStatusCode.OK, McpJson.encodeToJsonElement(ReadResourceResult.serializer(), result))
+            }
             post("tools/{name}") {
                 val name = call.parameters["name"].orEmpty()
-                val registered = server.tools[name]
-                    ?: return@post call.respondError(HttpStatusCode.NotFound, "unknown tool $name")
                 val body = call.readBounded()
                     ?: return@post call.respondError(
                         HttpStatusCode.PayloadTooLarge,
@@ -98,17 +127,67 @@ internal fun Application.installToolApi(server: Server) {
                         HttpStatusCode.BadRequest,
                         "body must be a JSON object of the tool's arguments"
                     )
+                val found = when (val r = ToolNames.resolve(name, server.tools.mapValues { it.value.tool })) {
+                    is ToolNames.Found -> r
+                    is ToolNames.NotFound -> {
+                        val result = unknownTool(name, r, arguments)
+                        return@post call.respondJson(HttpStatusCode.OK, McpJson.encodeToJsonElement(CallToolResult.serializer(), result))
+                    }
+                }
+                val args = JsonObject(
+                    found.extra + (found.action?.let { mapOf("action" to JsonPrimitive(it)) } ?: emptyMap()) + arguments
+                )
                 val result = try {
-                    registered.handler(ApiConnection, CallToolRequest(CallToolRequestParams(name = name, arguments = arguments)))
+                    server.tools.getValue(found.tool)
+                        .handler(ApiConnection, CallToolRequest(CallToolRequestParams(name = found.tool, arguments = args)))
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    CallToolResult(content = listOf(TextContent("Error executing tool $name: ${e.message}")), isError = true)
+                    CallToolResult(content = listOf(TextContent("Error executing tool ${found.tool}: ${e.message}")), isError = true)
                 }
-                call.respondJson(HttpStatusCode.OK, McpJson.encodeToJsonElement(CallToolResult.serializer(), result))
+                val shaped = ToolArgs.withNotes(runForm(result, found.tool, actionOf(args)), listOfNotNull(found.note))
+                call.respondJson(HttpStatusCode.OK, McpJson.encodeToJsonElement(CallToolResult.serializer(), shaped))
             }
         }
     }
+}
+
+private fun actionOf(args: JsonObject): String? = (args["action"] as? JsonPrimitive)?.takeIf { it.isString }?.content
+
+private fun unknownTool(name: String, r: ToolNames.NotFound, arguments: JsonObject): CallToolResult {
+    val message = r.didYouMean.firstOrNull()?.let { "Unknown tool '$name'. Did you mean '$it'?" }
+        ?: "Unknown tool '$name'; guide {} lists every tool."
+    return ToolArgs.error("unknown_tool", message) {
+        putJsonArray("did_you_mean") { r.didYouMean.forEach { add(it) } }
+        r.retry?.let { retry -> put("retry", JsonObject(mapOf("do" to JsonPrimitive(retry)) + (arguments - "do"))) }
+        put("see", "guide {}")
+    }
+}
+
+/**
+ * [result] in the `run` form the `raijin` CLI takes: an error envelope (one JSON object with a string
+ * `code`) gets its `example` and `retry` as `{"do":"tool[.action]", ...}` calls and a `see` pointing at
+ * the tool's guide topic. Any other result is returned as is; MCP `/mcp` callers never see this form.
+ */
+internal fun runForm(result: CallToolResult, tool: String, action: String?): CallToolResult {
+    if (result.isError != true) return result
+    val content = result.content.singleOrNull() as? TextContent ?: return result
+    val json = runCatching { McpJson.parseToJsonElement(content.text) }.getOrNull() as? JsonObject ?: return result
+    if ((json["code"] as? JsonPrimitive)?.isString != true) return result
+    fun doForm(call: JsonObject): JsonObject {
+        val a = actionOf(call)
+        val target = if (a != null) "$tool.$a" else tool
+        return JsonObject(mapOf("do" to JsonPrimitive(target)) + (if (a != null) call - "action" else call))
+    }
+    val fields = LinkedHashMap<String, JsonElement>(json)
+    listOf("example", "retry").forEach { key -> (json[key] as? JsonObject)?.let { fields[key] = doForm(it) } }
+    if ("see" !in fields) {
+        // An action the group does not have (a typo, `sha256`) has no topic of its own: point at the tool.
+        val known = action?.let { ToolConsolidation.resolveAction(tool, it) }
+        val topic = if (known != null) "$tool.$known" else tool
+        fields["see"] = JsonPrimitive("guide {\"topic\":\"$topic\"}")
+    }
+    return result.copy(content = listOf(content.copy(text = JsonObject(fields).toString())))
 }
 
 /** The body, or null when it is over [McpServerManager.MAX_REQUEST_BODY_BYTES]. */

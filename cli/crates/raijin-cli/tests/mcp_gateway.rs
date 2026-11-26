@@ -105,7 +105,8 @@ async fn lean_surface_lists_guide_and_run() {
 
     let bad = call(&client, "guide", json!({"topic": "nope"})).await;
     assert_eq!(bad.is_error, Some(true));
-    assert!(text(&bad).contains("closest: "), "{}", text(&bad));
+    assert_eq!(json_of(&bad)["code"], "unknown_topic", "{}", text(&bad));
+    assert!(!text(&bad).contains("Tools by domain"), "{}", text(&bad));
     client.cancel().await.expect("close");
 }
 
@@ -140,10 +141,12 @@ async fn run_runs_local_tools_and_reports_routing_errors() {
         text(&proxy)
     );
 
+    // Names Raijin does not know are resolved (or refused) by the extension, so they need Burp.
     let unknown = call(&client, "run", json!({"do": "proxy_histroy"})).await;
     assert_eq!(unknown.is_error, Some(true));
-    assert!(
-        text(&unknown).contains("closest: proxy_history"),
+    assert_eq!(
+        json_of(&unknown)["code"],
+        "burp_not_running",
         "{}",
         text(&unknown)
     );
@@ -154,8 +157,9 @@ async fn run_runs_local_tools_and_reports_routing_errors() {
         json!({"do": "history_list", "hostname": "x"}),
     )
     .await;
-    assert!(
-        text(&wrong_param).contains("unknown parameter(s) hostname"),
+    assert_eq!(
+        json_of(&wrong_param)["code"],
+        "unknown_parameter",
         "{}",
         text(&wrong_param)
     );
@@ -270,8 +274,9 @@ async fn run_accepts_common_wrong_shapes() {
     );
 
     let typo = call(&client, "run", json!({"do": "history_list", "limt": 1})).await;
-    assert!(
-        text(&typo).contains("did you mean limit"),
+    assert_eq!(
+        json_of(&typo)["retry"],
+        json!({"do": "history_list", "limit": 1}),
         "{}",
         text(&typo)
     );
@@ -379,6 +384,98 @@ async fn batch_runs_steps_in_order_and_bails() {
         "{}",
         text(&both)
     );
+    client.cancel().await.expect("close");
+}
+
+/// An error result: JSON with a string `code` and a boolean `retryable`.
+fn envelope(result: &CallToolResult) -> Value {
+    assert_eq!(result.is_error, Some(true), "{}", text(result));
+    let value = json_of(result);
+    assert!(value["code"].is_string(), "{value}");
+    assert!(value["retryable"].is_boolean(), "{value}");
+    value
+}
+
+fn notes(result: &CallToolResult) -> Vec<String> {
+    serde_json::from_value(json_of(result)["notes"].clone()).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn weak_model_calls_get_json_errors_or_run() {
+    let fixture = common::target("");
+    let client = connect(&fixture).await;
+
+    let stringly = call(&client, "run", json!({"do": "history_list", "limit": "1"})).await;
+    assert_eq!(rows(&stringly), 1);
+    assert_eq!(
+        notes(&stringly),
+        ["coerced 'limit' from string \"1\" to integer"]
+    );
+
+    let no_do = envelope(&call(&client, "run", json!({})).await);
+    assert_eq!(no_do["code"], "missing_parameter");
+    assert!(no_do["example"]["count"].is_number(), "{no_do}");
+
+    let maybe = envelope(&call(&client, "run", json!({"do": "burp_down", "all": "maybe"})).await);
+    assert_eq!(maybe["code"], "invalid_type");
+
+    let show = envelope(&call(&client, "run", json!({"do": "history_show"})).await);
+    assert_eq!(show["code"], "missing_parameter");
+
+    let stringly_batch = call(
+        &client,
+        "run",
+        json!({"batch": "[{\"do\":\"history_list\",\"limit\":1}]"}),
+    )
+    .await;
+    let out = json_of(&stringly_batch);
+    assert_eq!(out["steps"][0]["ok"], true, "{out}");
+    assert_eq!(
+        notes(&stringly_batch),
+        ["parsed 'batch' from a JSON string"]
+    );
+
+    let cased = call(&client, "run", json!({"do": "History.List", "limit": 1})).await;
+    assert_eq!(rows(&cased), 1);
+    assert_eq!(notes(&cased), ["ran 'History.List' as history_list"]);
+
+    let down = envelope(&call(&client, "run", json!({"do": "Burp-Down", "project": "p2"})).await);
+    assert_eq!(down["code"], "unknown_tool");
+    assert_eq!(down["retry"], json!({"do": "burp_down", "project": "p2"}));
+
+    let filled = call(
+        &client,
+        "run",
+        json!({"do": "history_list", "project": null, "limit": 1}),
+    )
+    .await;
+    assert_eq!(
+        rows(&filled),
+        1,
+        "a null optional parameter counts as unset"
+    );
+    assert!(
+        down.get("stopped").is_none(),
+        "burp_down did not run: {down}"
+    );
+
+    let topic = json_of(&call(&client, "guide", json!({"topic": "HTTP_SEND_REQUEST"})).await);
+    assert_eq!(topic["do"], "http_send_request", "{topic}");
+
+    let steps = json!([
+        {"do": "history_list", "limit": 1},
+        {"do": "history_show"},
+        {"do": "history_list", "limit": 2}
+    ]);
+    let bailed = envelope(&call(&client, "run", json!({"batch": steps, "bail": true})).await);
+    assert_eq!(bailed["not_run"], json!([3]));
+    assert!(
+        bailed["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("step 2 of 3 failed")),
+        "{bailed}"
+    );
+    assert_eq!(bailed["code"], "missing_parameter");
     client.cancel().await.expect("close");
 }
 

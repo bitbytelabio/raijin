@@ -201,7 +201,7 @@ object ToolConsolidation {
             ),
         ),
         Group(
-            "analyze", "Offline analysis of requests, responses and traffic (no new traffic is sent unless stated).",
+            "analyze", "Local analysis of requests, responses and traffic in the running Burp (sends no traffic unless stated).",
             prefixed(
                 "analyze_", "analyze_request", "analyze_response", "analyze_find_reflected",
                 "analyze_extract_params", "analyze_insertion_points", "analyze_diff",
@@ -375,21 +375,14 @@ object ToolConsolidation {
         )
         target.addTool(tool) { request ->
             val args = request.params.arguments ?: JsonObject(emptyMap())
-            val unknown = ToolArgs.unknownParams(props, args, emptySet())
-            if (unknown.isNotEmpty()) {
-                return@addTool ToolArgs.error(
-                    "unknown_parameter",
-                    "Parameter(s) not accepted by $name: ${ToolArgs.unknownList(unknown, props.keys)}. " +
-                        "Remove or rename them; 'usage' lists every accepted parameter.",
-                ) {
-                    putJsonArray("unknown_parameters") { unknown.forEach { add(it) } }
-                    put("usage", usage)
-                    put("example", example)
-                }
+            if (ToolArgs.unknownParams(props, args, emptySet()).isNotEmpty()) {
+                return@addTool ToolArgs.unknownParameterError(
+                    name, props, args, emptySet(), usage, example, destructive = tool.annotations?.destructiveHint == true,
+                )
             }
-            val coerced = ToolArgs.coerce(props, args)
-            val forwarded = if (coerced === args) request else CallToolRequest(request.params.copy(arguments = coerced))
-            ToolArgs.enrich(rt.handler(this, forwarded), usage, example)
+            val c = ToolArgs.coerce(props, args)
+            val forwarded = if (c.args === args) request else CallToolRequest(request.params.copy(arguments = c.args))
+            ToolArgs.withNotes(ToolArgs.enrich(rt.handler(this, forwarded), usage, example, props, c.args), c.notes)
         }
     }
 
@@ -542,7 +535,7 @@ object ToolConsolidation {
         specs: Map<String, ActionSpec>,
         request: CallToolRequest,
     ): CallToolResult {
-        val args = request.params.arguments ?: JsonObject(emptyMap())
+        var args = request.params.arguments ?: JsonObject(emptyMap())
         val raw = (args["action"] as? JsonPrimitive)?.contentOrNull
         val available = g.actions.keys.joinToString(", ")
         if (raw == null) {
@@ -555,32 +548,40 @@ object ToolConsolidation {
                 put("example", shown.example)
             }
         }
-        val action = resolveAction(g.tool, raw)
+        val notes = mutableListOf<String>()
+        var action = resolveAction(g.tool, raw)
         if (action == null) {
+            ToolNames.semanticAction(g.tool, raw)?.let { (semantic, extra) ->
+                action = semantic
+                args = JsonObject(extra + args + ("action" to JsonPrimitive(semantic)))
+                notes += "ran action '$raw' as '$semantic' with $extra"
+            }
+        }
+        val resolved = action
+        if (resolved == null) {
             val hints = ToolArgs.closest(raw, g.actions.keys)
             val hint = hints.firstOrNull()?.let { " Did you mean '$it'?" }.orEmpty()
             return ToolArgs.error(
                 "unknown_action",
                 "Unknown action '$raw' for tool '${g.tool}'.$hint Valid actions: $available.",
             ) {
+                put("param", "action")
+                put("got", raw)
                 putJsonArray("did_you_mean") { hints.forEach { add(it) } }
+                if (hints.size == 1 && !ToolNames.destructive(g.tool, hints[0], null)) {
+                    put("retry", JsonObject(args + ("action" to JsonPrimitive(hints[0]))))
+                }
                 putJsonArray("available") { g.actions.keys.forEach { add(it) } }
             }
         }
-        val spec = specs.getValue(action)
-        val call = "${g.tool}(action='$action')"
+        val spec = specs.getValue(resolved)
+        val call = "${g.tool}(action='$resolved')"
 
-        val unknown = ToolArgs.unknownParams(spec.props, args, setOf("action"))
-        if (unknown.isNotEmpty()) {
-            return ToolArgs.error(
-                "unknown_parameter",
-                "Parameter(s) not accepted by $call: ${ToolArgs.unknownList(unknown, spec.props.keys)}. " +
-                    "Remove or rename them; 'usage' lists every accepted parameter.",
-            ) {
-                putJsonArray("unknown_parameters") { unknown.forEach { add(it) } }
-                put("usage", spec.usage)
-                put("example", spec.example)
-            }
+        if (ToolArgs.unknownParams(spec.props, args, setOf("action")).isNotEmpty()) {
+            return ToolArgs.unknownParameterError(
+                call, spec.props, args, setOf("action"), spec.usage, spec.example,
+                ToolNames.destructive(g.tool, resolved, null),
+            )
         }
 
         val missing = spec.required.filter { args[it] == null || args[it] is JsonNull }
@@ -590,13 +591,16 @@ object ToolConsolidation {
                 "$call is missing required parameter(s): ${missing.joinToString(", ") { "'$it'" }}. " +
                     "Retry with every required parameter set, as in 'example'.",
             ) {
+                put("param", missing.first())
                 put("usage", spec.usage)
                 put("example", spec.example)
             }
         }
 
+        val c = ToolArgs.coerce(spec.props, args)
+        notes += c.notes
         val forwarded = buildJsonObject {
-            args.forEach { (k, v) -> if (k != "action") put(spec.toMember[k] ?: k, v) }
+            c.args.forEach { (k, v) -> if (k != "action") put(spec.toMember[k] ?: k, v) }
         }
         val member = spec.member
         val result = member.handler(
@@ -604,11 +608,11 @@ object ToolConsolidation {
             CallToolRequest(
                 CallToolRequestParams(
                     name = member.tool.name,
-                    arguments = ToolArgs.coerce(member.tool.inputSchema.properties, forwarded),
+                    arguments = forwarded,
                     meta = request.params.meta,
                 )
             )
         )
-        return ToolArgs.enrich(result, spec.usage, spec.example)
+        return ToolArgs.withNotes(ToolArgs.enrich(result, spec.usage, spec.example, spec.props, c.args), notes)
     }
 }

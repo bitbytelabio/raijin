@@ -2,10 +2,11 @@
 //! extension): list the tools and call one with plain HTTP, no MCP session.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 
 use reqwest::{RequestBuilder, StatusCode};
-use rmcp::model::{CallToolResult, JsonObject, Tool};
+use rmcp::model::{CallToolResult, JsonObject, ReadResourceResult, Resource, Tool};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -29,6 +30,28 @@ struct ToolList {
 #[derive(Deserialize)]
 struct Info {
     version: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ResourceList {
+    resources: Vec<Resource>,
+}
+
+/// Why a tool call did not return a result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiError {
+    /// No connection to Raijin (Burp down or a wrong URL).
+    Unreachable(String),
+    /// Raijin answered, but not with a result.
+    Other(String),
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unreachable(msg) | Self::Other(msg) => f.write_str(msg),
+        }
+    }
 }
 
 /// Bytes of an error body quoted in a message.
@@ -85,7 +108,7 @@ impl ToolApi {
         endpoint: &Endpoint,
         base: &str,
         request: RequestBuilder,
-    ) -> Result<(StatusCode, Vec<u8>), String> {
+    ) -> Result<(StatusCode, Vec<u8>), ApiError> {
         let request = match &endpoint.token {
             Some(token) => request.bearer_auth(token),
             None => request,
@@ -100,7 +123,9 @@ impl ToolApi {
             Ok(answer) => Ok(answer),
             Err(e) => {
                 self.tools.lock().await.remove(base);
-                Err(format!("cannot reach Raijin at {base}: {e}"))
+                Err(ApiError::Unreachable(format!(
+                    "cannot reach Raijin at {base}: {e}"
+                )))
             }
         }
     }
@@ -112,37 +137,79 @@ impl ToolApi {
             return Ok(tools.clone());
         }
         let request = self.client.get(format!("{base}/tools"));
-        let (status, body) = self.send(endpoint, &base, request).await?;
+        let (status, body) = self
+            .send(endpoint, &base, request)
+            .await
+            .map_err(|e| e.to_string())?;
         let list: ToolList = decode(&base, "the tool list", status, &body)?;
         self.tools.lock().await.insert(base, list.tools.clone());
         Ok(list.tools)
     }
 
-    /// Runs tool `name` with `arguments` (`{}` when none).
+    /// Runs tool `name` with `arguments` (`{}` when none); the extension resolves the name.
     pub async fn call(
         &self,
         endpoint: &Endpoint,
         name: &str,
         arguments: Option<JsonObject>,
-    ) -> Result<CallToolResult, String> {
-        let base = api_base(&endpoint.url)?;
-        let mut url = url::Url::parse(&base).map_err(|e| e.to_string())?;
+    ) -> Result<CallToolResult, ApiError> {
+        let base = api_base(&endpoint.url).map_err(ApiError::Other)?;
+        let mut url = url::Url::parse(&base).map_err(|e| ApiError::Other(e.to_string()))?;
         url.path_segments_mut()
-            .map_err(|()| format!("bad Raijin URL {base}"))?
+            .map_err(|()| ApiError::Other(format!("bad Raijin URL {base}")))?
             .extend(["tools", name]);
         let request = self.client.post(url).json(&arguments.unwrap_or_default());
         let (status, body) = self.send(endpoint, &base, request).await?;
+        // An older extension answers an unknown name with a 404 instead of an `unknown_tool` result.
         if status == StatusCode::NOT_FOUND && unknown_tool(&body) {
-            return Err(format!("Raijin has no tool {name}"));
+            return Err(ApiError::Other(format!("Raijin has no tool {name}")));
         }
-        decode(&base, name, status, &body)
+        decode(&base, name, status, &body).map_err(ApiError::Other)
+    }
+
+    /// The running Raijin's MCP resources (`burp://...`), from `GET /api/v1/resources`.
+    pub async fn resources(&self, endpoint: &Endpoint) -> Result<Vec<Resource>, String> {
+        let base = api_base(&endpoint.url)?;
+        let request = self.client.get(format!("{base}/resources"));
+        let (status, body) = self
+            .send(endpoint, &base, request)
+            .await
+            .map_err(|e| e.to_string())?;
+        let list: ResourceList = decode(&base, "the resource list", status, &body)?;
+        Ok(list.resources)
+    }
+
+    /// One resource of the running Raijin, from `GET /api/v1/resources/read?uri=<uri>`.
+    pub async fn read_resource(
+        &self,
+        endpoint: &Endpoint,
+        uri: &str,
+    ) -> Result<ReadResourceResult, String> {
+        let base = api_base(&endpoint.url)?;
+        let mut url =
+            url::Url::parse(&format!("{base}/resources/read")).map_err(|e| e.to_string())?;
+        url.query_pairs_mut().append_pair("uri", uri);
+        let (status, body) = self
+            .send(endpoint, &base, self.client.get(url))
+            .await
+            .map_err(|e| e.to_string())?;
+        if status == StatusCode::NOT_FOUND
+            && let Ok(Value::Object(answer)) = serde_json::from_slice::<Value>(&body)
+            && let Some(Value::String(error)) = answer.get("error")
+        {
+            return Err(error.clone());
+        }
+        decode(&base, uri, status, &body)
     }
 
     /// The extension's version, from `GET /api/v1/info`.
     pub async fn server_version(&self, endpoint: &Endpoint) -> Result<Option<String>, String> {
         let base = api_base(&endpoint.url)?;
         let request = self.client.get(format!("{base}/info"));
-        let (status, body) = self.send(endpoint, &base, request).await?;
+        let (status, body) = self
+            .send(endpoint, &base, request)
+            .await
+            .map_err(|e| e.to_string())?;
         let info: Info = decode(&base, "info", status, &body)?;
         Ok(info.version)
     }
@@ -255,6 +322,14 @@ mod tests {
                     ["POST", path] if path.starts_with("/api/v1/tools/") => {
                         ("404 Not Found", r#"{"error":"unknown tool nope"}"#)
                     }
+                    ["GET", "/api/v1/resources"] => (
+                        "200 OK",
+                        r#"{"resources":[{"uri":"burp://scope","name":"scope","mimeType":"application/json"}]}"#,
+                    ),
+                    ["GET", "/api/v1/resources/read?uri=burp%3A%2F%2Fscope"] => (
+                        "200 OK",
+                        r#"{"contents":[{"uri":"burp://scope","mimeType":"application/json","text":"{}"}]}"#,
+                    ),
                     // A route Ktor does not have: an extension without the tool API.
                     _ => ("404 Not Found", "Not Found"),
                 };
@@ -284,7 +359,28 @@ mod tests {
         assert_eq!(text, "ok");
 
         let missing = api.call(&endpoint, "nope", None).await.expect_err("404");
-        assert!(missing.contains("has no tool nope"), "{missing}");
+        assert!(
+            missing.to_string().contains("has no tool nope"),
+            "{missing}"
+        );
+
+        let resources = api.resources(&endpoint).await.expect("resources");
+        assert_eq!(resources[0].uri, "burp://scope");
+        let read = api
+            .read_resource(&endpoint, "burp://scope")
+            .await
+            .expect("read");
+        assert_eq!(read.contents.len(), 1, "{read:?}");
+
+        let down = Endpoint {
+            url: "http://127.0.0.1:9/mcp".to_owned(),
+            token: None,
+        };
+        let unreachable = api.call(&down, "t", None).await.expect_err("no listener");
+        assert!(
+            matches!(unreachable, ApiError::Unreachable(_)),
+            "{unreachable:?}"
+        );
 
         let old = Endpoint {
             url: format!("http://127.0.0.1:{port}/old/mcp"),

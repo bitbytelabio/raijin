@@ -77,7 +77,7 @@ object ToolDomains {
         ),
         Domain(
             "analysis",
-            "Offline analysis of requests, responses and traffic (no new traffic is sent unless stated), plus encode/decode/hash/compress helpers.",
+            "Local analysis of requests, responses and traffic in the running Burp (sends no traffic unless stated), plus encode/decode/hash/compress helpers.",
             ".burp files without Burp are history.",
             "http-testing",
             listOf("analyze", "util"),

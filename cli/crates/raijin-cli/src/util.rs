@@ -65,15 +65,28 @@ pub fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// The `n` names closest to `wanted` by edit distance.
-pub fn closest<'a>(
+/// Up to `n` of `names` close to `wanted`, closest first: within edit distance
+/// `max(2, len / 3)` or containing / contained in it, compared in [`norm`](crate::mcp::error::norm)
+/// form (case and `-`/`.`/space separators ignored). Same rule as the extension's `ToolArgs.closest`.
+pub fn suggest<'a>(
     wanted: &str,
     names: impl IntoIterator<Item = &'a str>,
     n: usize,
 ) -> Vec<&'a str> {
+    let w = crate::mcp::error::norm(wanted);
+    if w.is_empty() {
+        return Vec::new();
+    }
+    let limit = (w.chars().count() / 3).max(2);
     let mut scored: Vec<(usize, &str)> = names
         .into_iter()
-        .map(|name| (edit_distance(wanted, name), name))
+        .filter_map(|name| {
+            let normed = crate::mcp::error::norm(name);
+            let d = edit_distance(&w, &normed);
+            let near =
+                d <= limit || (!normed.is_empty() && (normed.contains(&w) || w.contains(&normed)));
+            near.then_some((d, name))
+        })
         .collect();
     scored.sort_unstable();
     scored.dedup_by(|a, b| a.1 == b.1);
@@ -172,11 +185,20 @@ mod tests {
     }
 
     #[test]
-    fn closest_ranks_by_edit_distance() {
-        let names = ["proxy_history", "proxy_rule", "http_send_request"];
+    fn suggest_keeps_only_near_names() {
+        let none: Vec<&str> = suggest("nope_tool", ["scope_list", "send_to_tool", "burp_down"], 3);
+        assert_eq!(none, Vec::<&str>::new());
         assert_eq!(
-            closest("proxy_histry", names, 2),
-            ["proxy_history", "proxy_rule"]
+            suggest(
+                "proxy_histroy",
+                ["proxy_history", "proxy_rule", "http_send_request"],
+                3
+            ),
+            ["proxy_history"]
+        );
+        assert_eq!(
+            suggest("History.List", ["history_list"], 1),
+            ["history_list"]
         );
     }
 

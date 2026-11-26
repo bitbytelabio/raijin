@@ -57,12 +57,16 @@ description lists every action and its parameters (`*` = required). Copy paramet
   vulnerability class (CORS, JWT, IDOR, injection, cache poisoning) is `recon` (`probe`), not `scanner`, which
   is a full Burp Scanner crawl/audit. Comparing one request across privilege levels is `authz` (`auth_diff`,
   `autorize`). Check scope (`settings`, tool `scope`) before sending traffic.
-- Errors: a result with `isError: true` says why in `error`; argument errors add `usage` (every accepted
-  parameter) and `example` (a correct call to adapt). `unknown_parameter`: use `did_you_mean` or a name from
-  `usage`. `missing_parameter`: add every parameter marked `*` in `usage`. `unknown_action` /
-  `missing_action`: pick one of `available`. `no Burp running for this target`: `run {"do":"burp_up"}`, then
-  retry. `several projects running`: add `"project":"<name>"` next to `do`. Never resend an identical call
-  after an error; change the arguments first.
+- Errors: an error result is JSON: `error` (what is wrong and what to do), `code`, and when they help `param`,
+  `got`, `allowed`, `did_you_mean`, `usage` (every accepted parameter), `example` and `retry` (a complete
+  corrected call: resend `retry` as it is), `retryable` and `see`. `unknown_tool` / `unknown_action` /
+  `unknown_topic`: use `retry` or a name from `did_you_mean`, else `guide {}`. `unknown_parameter`,
+  `missing_parameter`, `invalid_type`, `invalid_enum`, `out_of_range`, `invalid_arguments`: fix the arguments
+  from `retry`, `usage` and `example`. `burp_not_running`: `run {"do":"burp_up"}`, then resend.
+  `project_not_running`: start that project as `example` shows. `project_required`: add `"project":"<name>"`
+  next to `do`. `retryable: false` (`raijin_unreachable`, `tool_failed`, `config_error`, `not_supported`,
+  `internal`): never resend the same call; change it or tell the user. A result may carry `notes`: what the
+  server changed in your call (a string read as a number, a name matched without case); use that form next time.
 - Several projects: each project is its own Burp with its own `.burp` file. With more than one running, pass
   `project`; with one running, or the default project running, leave it out.
 - Large results come back as `{"saved_to":"...","bytes":N,"preview":"...","hint":"..."}`; the preview is the

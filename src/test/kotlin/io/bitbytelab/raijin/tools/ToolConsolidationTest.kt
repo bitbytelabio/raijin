@@ -119,6 +119,8 @@ class ToolConsolidationTest {
         assertTrue("Did you mean 'check'?" in badJson.str("error")!!, text(bad))
         assertEquals("check", badJson.getValue("did_you_mean").jsonArray.first().jsonPrimitive.content)
         assertTrue("include" in badJson.getValue("available").jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(buildJsonObject { put("action", "check") }, badJson.getValue("retry"))
+        assertEquals(true, badJson.getValue("retryable").jsonPrimitive.boolean)
 
         val none = call(target, "scope", buildJsonObject {})
         assertEquals(true, none.isError)
@@ -130,6 +132,7 @@ class ToolConsolidationTest {
         val missingJson = json(missing)
         assertEquals("missing_parameter", missingJson.str("code"))
         assertTrue("missing required parameter(s): 'url'" in missingJson.str("error")!!, text(missing))
+        assertEquals("url", missingJson.str("param"))
         assertEquals("""scope(action="check", url*: string)""", missingJson.str("usage"))
         assertEquals(buildJsonObject { put("action", "check"); put("url", "<url>") }, missingJson.getValue("example"))
         assertFalse(target.tools.keys.any { it == "scope_check" })
@@ -142,6 +145,74 @@ class ToolConsolidationTest {
         assertEquals(listOf("uri"), unknownJson.getValue("unknown_parameters").jsonArray.map { it.jsonPrimitive.content })
         assertTrue(unknownJson.str("usage")!!.startsWith("scope(action=\"check\", url*"), text(unknown))
         assertEquals(buildJsonObject { put("action", "check"); put("url", "<url>") }, unknownJson.getValue("example"))
+        assertEquals(buildJsonObject { put("action", "check"); put("url", "x") }, unknownJson.getValue("retry"))
+    }
+
+    /** Every member and KEEP tool as a fake, except [name], published with [props] and [handler]. */
+    private fun withKept(name: String, props: JsonObject, handler: (JsonObject) -> CallToolResult): Server {
+        val legacy = server()
+        ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach { fake(legacy, it) }
+        ToolConsolidation.KEEP.filter { it != name }.forEach { fake(legacy, it) }
+        legacy.addTool(name = name, description = "Kept.", inputSchema = ToolSchema(properties = props)) { req ->
+            handler(req.params.arguments ?: JsonObject(emptyMap()))
+        }
+        return server().also { ToolConsolidation.apply(legacy, it) }
+    }
+
+    @Test
+    fun `strings become integers and booleans and enum values match their canonical spelling, with notes`() {
+        val seen = mutableListOf<JsonObject>()
+        val target = withKept("http_fuzz", buildJsonObject {
+            putJsonObject("n") { put("type", "integer") }
+            putJsonObject("b") { put("type", "boolean") }
+            putJsonObject("algorithm") { put("type", "string"); putJsonArray("enum") { add("MD5"); add("SHA_256") } }
+        }) { args -> seen += args; toolJsonResult(buildJsonObject { put("ok", true) }) }
+
+        val r = json(call(target, "http_fuzz", buildJsonObject { put("n", "7"); put("b", "TRUE"); put("algorithm", "sha256") }))
+        assertEquals(buildJsonObject { put("n", 7); put("b", true); put("algorithm", "SHA_256") }, seen.single())
+        assertEquals(
+            listOf(
+                "coerced 'n' from string \"7\" to integer",
+                "coerced 'b' from string \"TRUE\" to boolean",
+                "matched 'algorithm' \"sha256\" to \"SHA_256\"",
+            ),
+            r.getValue("notes").jsonArray.map { it.jsonPrimitive.content },
+        )
+    }
+
+    @Test
+    fun `a parameter alias gets a ready retry`() {
+        val target = withKept("proxy_history", buildJsonObject { putJsonObject("count") { put("type", "integer") } }) {
+            toolJsonResult(buildJsonObject { put("ok", true) })
+        }
+        val r = json(call(target, "proxy_history", buildJsonObject { put("limit", 5) }))
+        assertEquals("unknown_parameter", r.str("code"))
+        assertEquals("limit", r.str("param"))
+        assertEquals(listOf("count"), r.getValue("did_you_mean").jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(buildJsonObject { put("count", 5) }, r.getValue("retry"))
+    }
+
+    @Test
+    fun `a hash name as util action runs hash with that algorithm`() {
+        val target = allFakes("data", "algorithm")
+        val r = call(target, "util", buildJsonObject { put("action", "sha256"); put("data", "x") })
+        assertEquals("""util_hash:{"algorithm":"SHA_256","data":"x"}""", text(r))
+    }
+
+    @Test
+    fun `a handler error about an argument outside its enum becomes invalid_enum`() {
+        val target = withKept("http_fuzz", buildJsonObject {
+            putJsonObject("algorithm") { put("type", "string"); putJsonArray("enum") { add("MD5"); add("SHA_256") } }
+        }) { args -> toolError("Unsupported hash algorithm: '${args["algorithm"]?.jsonPrimitive?.content}'") }
+
+        val r = json(call(target, "http_fuzz", buildJsonObject { put("algorithm", "SHA_999") }))
+        assertEquals("invalid_enum", r.str("code"))
+        assertEquals("algorithm", r.str("param"))
+        assertEquals("SHA_999", r.str("got"))
+        assertEquals(listOf("MD5", "SHA_256"), r.getValue("allowed").jsonArray.map { it.jsonPrimitive.content })
+        assertEquals("http_fuzz(algorithm: \"MD5\"|\"SHA_256\")", r.str("usage"))
+        assertEquals(buildJsonObject {}, r.getValue("example"))
+        assertEquals(true, r.getValue("retryable").jsonPrimitive.boolean)
     }
 
     /** Every group member and KEEP tool as a fake declaring [props]; returns the published server. */
@@ -200,7 +271,8 @@ class ToolConsolidationTest {
                 put("s", "{\"a\":1}")
                 putJsonObject("o") { put("a", 1) }
                 putJsonArray("a") { add("x") }
-                put("n", "7")
+                put("n", 7)
+                putJsonArray("notes") { add("coerced 'n' from string \"7\" to integer") }
             },
             Json.parseToJsonElement(text(coerced)),
         )
