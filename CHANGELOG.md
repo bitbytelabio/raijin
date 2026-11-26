@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.4.0
 
 ### Extension
 - New JSON tool API on both MCP listeners: `GET /api/v1/info`, `GET /api/v1/tools`, `POST /api/v1/tools/<name>` (body = the tool's arguments). It sits behind the same Host/Origin, source-IP and bearer checks as `/mcp`, and its calls show up in activity and the audit log.

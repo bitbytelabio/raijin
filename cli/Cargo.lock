@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "amber"
-version = "2.3.1"
+version = "2.4.0"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -1237,7 +1237,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "raijin-cli"
-version = "2.3.1"
+version = "2.4.0"
 dependencies = [
  "amber",
  "anyhow",
@@ -1251,6 +1251,7 @@ dependencies = [
  "reqwest",
  "rmcp",
  "schemars",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
