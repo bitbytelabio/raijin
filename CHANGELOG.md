@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.4.1
 
 ### Tool calls
 - Every error is one JSON object: `error`, `code`, and when they help `param`, `got`, `allowed`, `did_you_mean`, `usage`, `example`, `retry` (a complete corrected call, given only when the fix is certain), `retryable` and `see`. A handler error about a value outside its enum becomes `invalid_enum` with `allowed`; other argument errors get `code: invalid_arguments`.
