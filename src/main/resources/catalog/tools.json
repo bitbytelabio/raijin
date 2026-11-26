@@ -1,9 +1,5 @@
 {
   "schema_version": 1,
-  "excluded": [
-    "load_skill",
-    "search_skills"
-  ],
   "domains": [
     {
       "name": "http",
@@ -2346,31 +2342,6 @@
       }
     },
     {
-      "name": "load_skill",
-      "description": "Load a Raijin skill's full markdown guide by skill name (e.g. 'overview') or skill://<name>/SKILL.md URI.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "Skill name, e.g. 'overview' or 'http-testing'"
-          },
-          "uri": {
-            "type": "string",
-            "description": "Skill URI, e.g. 'skill://overview/SKILL.md'"
-          }
-        },
-        "required": []
-      },
-      "domain": null,
-      "annotations": {
-        "readOnlyHint": true,
-        "destructiveHint": false,
-        "idempotentHint": true,
-        "openWorldHint": false
-      }
-    },
-    {
       "name": "log",
       "description": "Write to the Raijin log and activity feed.\nCall with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: {\"action\":\"message\",\"message\":\"<message>\"}\n- message(message*, level): Write a message to Burp Suite's extension output or error log stream.\n- event(message*, level): Raise an event in Burp Suite's event log panel at a specified severity level.",
       "inputSchema": {
@@ -3882,31 +3853,6 @@
       "annotations": {
         "readOnlyHint": false,
         "destructiveHint": true,
-        "openWorldHint": false
-      }
-    },
-    {
-      "name": "search_skills",
-      "description": "List or search Raijin's built-in Burp Suite guides by name or description. Returns name, description, and skill:// URI; use load_skill for the full guide.",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "query": {
-            "type": "string",
-            "description": "Case-insensitive substring match against name/description; omit to list every skill"
-          },
-          "limit": {
-            "type": "integer",
-            "description": "Maximum results, default 20"
-          }
-        },
-        "required": []
-      },
-      "domain": null,
-      "annotations": {
-        "readOnlyHint": true,
-        "destructiveHint": false,
-        "idempotentHint": true,
         "openWorldHint": false
       }
     },

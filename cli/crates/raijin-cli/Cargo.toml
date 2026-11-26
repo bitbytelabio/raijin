@@ -19,7 +19,7 @@ glob = "0.3"
 nix = { version = "0.32", features = ["signal", "process", "user", "fs"] }
 regex = "1.13"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-rmcp = { version = "3.11", features = ["server", "client", "transport-io", "transport-streamable-http-client-reqwest", "schemars"] }
+rmcp = { version = "3.11", features = ["server", "transport-io", "schemars"] }
 schemars = "1.2"
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }

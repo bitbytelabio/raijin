@@ -1,4 +1,5 @@
-//! Raijin's tool catalog (`catalog/tools.json` in the jar, written by `ToolDomains.catalogJson`) and skills.
+//! Raijin's tool catalog (`catalog/tools.json` in the jar, written by `ToolDomains.catalogJson`) and the
+//! playbooks (skills) bundled in this binary: `src/skills/<name>/SKILL.md` plus `references/*.md`.
 
 use std::collections::BTreeMap;
 
@@ -36,8 +37,6 @@ pub struct Alias {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Catalog {
     pub schema_version: u32,
-    #[serde(default)]
-    pub excluded: Vec<String>,
     pub domains: Vec<Domain>,
     pub tools: Vec<ToolSpec>,
     /// Member name (`scope_list`) -> grouped call (`scope`, action `list`).
@@ -87,86 +86,245 @@ impl Catalog {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// File name of a skill's entry point inside its folder.
+pub const SKILL_FILE: &str = "SKILL.md";
+
+/// The bundled skills, in the order every listing uses (prompts, skills, resources, `guide`).
+const BUNDLED: &[(&str, &str)] = &[
+    ("overview", include_str!("skills/overview/SKILL.md")),
+    ("http-testing", include_str!("skills/http-testing/SKILL.md")),
+    (
+        "proxy-traffic",
+        include_str!("skills/proxy-traffic/SKILL.md"),
+    ),
+    ("recon-probes", include_str!("skills/recon-probes/SKILL.md")),
+    (
+        "scanner-audit",
+        include_str!("skills/scanner-audit/SKILL.md"),
+    ),
+    (
+        "turbo-scripting",
+        include_str!("skills/turbo-scripting/SKILL.md"),
+    ),
+    (
+        "collaborator-oob",
+        include_str!("skills/collaborator-oob/SKILL.md"),
+    ),
+    (
+        "findings-reporting",
+        include_str!("skills/findings-reporting/SKILL.md"),
+    ),
+    (
+        "offline-history",
+        include_str!("skills/offline-history/SKILL.md"),
+    ),
+];
+
+/// The other files of bundled skills: (skill, path inside its folder, body).
+const BUNDLED_FILES: &[(&str, &str, &str)] = &[
+    (
+        "overview",
+        "references/tool-map.md",
+        include_str!("skills/overview/references/tool-map.md"),
+    ),
+    (
+        "http-testing",
+        "references/sending.md",
+        include_str!("skills/http-testing/references/sending.md"),
+    ),
+    (
+        "http-testing",
+        "references/pipeline.md",
+        include_str!("skills/http-testing/references/pipeline.md"),
+    ),
+    (
+        "http-testing",
+        "references/fuzz-race.md",
+        include_str!("skills/http-testing/references/fuzz-race.md"),
+    ),
+    (
+        "http-testing",
+        "references/rules-sessions.md",
+        include_str!("skills/http-testing/references/rules-sessions.md"),
+    ),
+    (
+        "proxy-traffic",
+        "references/intercept-rules.md",
+        include_str!("skills/proxy-traffic/references/intercept-rules.md"),
+    ),
+    (
+        "proxy-traffic",
+        "references/websocket.md",
+        include_str!("skills/proxy-traffic/references/websocket.md"),
+    ),
+    (
+        "recon-probes",
+        "references/recon.md",
+        include_str!("skills/recon-probes/references/recon.md"),
+    ),
+    (
+        "recon-probes",
+        "references/probes.md",
+        include_str!("skills/recon-probes/references/probes.md"),
+    ),
+    (
+        "recon-probes",
+        "references/authz.md",
+        include_str!("skills/recon-probes/references/authz.md"),
+    ),
+    (
+        "recon-probes",
+        "references/jwt.md",
+        include_str!("skills/recon-probes/references/jwt.md"),
+    ),
+    (
+        "scanner-audit",
+        "references/custom-checks.md",
+        include_str!("skills/scanner-audit/references/custom-checks.md"),
+    ),
+];
+
+/// One bundled skill: `files[0]` is (`SKILL.md`, its text with front matter), then its references.
+#[derive(Debug, Clone)]
 pub struct Skill {
-    pub name: String,
+    pub name: &'static str,
+    /// The front matter's `description`.
     pub description: String,
-    /// `raijin` (shipped in the jar) or `cli` (embedded in this binary).
-    pub source: &'static str,
-    #[serde(skip)]
-    pub body: String,
+    pub files: Vec<(&'static str, &'static str)>,
 }
 
 impl Skill {
-    /// Parses `---\nname: …\ndescription: …\n---` front matter; the name falls back to `fallback`.
-    pub fn parse(markdown: &str, fallback: &str, source: &'static str) -> Self {
-        let mut name = fallback.to_owned();
-        let mut description = String::new();
-        if let Some(rest) = markdown.strip_prefix("---\n")
-            && let Some(end) = rest.find("\n---")
-        {
-            for line in rest[..end].lines() {
-                if let Some((key, value)) = line.split_once(':') {
-                    match key.trim() {
-                        "name" => value.trim().clone_into(&mut name),
-                        "description" => value.trim().clone_into(&mut description),
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Self {
-            name,
-            description,
-            source,
-            body: markdown.to_owned(),
-        }
+    /// `SKILL.md` as shipped, front matter included.
+    pub fn raw(&self) -> &'static str {
+        self.files[0].1
+    }
+
+    /// `SKILL.md` without its front matter.
+    pub fn body(&self) -> &'static str {
+        front_matter(self.raw()).2
+    }
+
+    /// `skill://<name>/<path>`.
+    pub fn uri(&self, path: &str) -> String {
+        format!("skill://{}/{path}", self.name)
+    }
+
+    /// The body of the file at `path` inside the skill's folder (`SKILL.md`, `references/x.md`).
+    pub fn file(&self, path: &str) -> Option<&'static str> {
+        self.files.iter().find(|(p, _)| *p == path).map(|(_, b)| *b)
     }
 }
 
-/// Skills embedded in the CLI: the gateway loop and the offline review playbook.
-pub fn cli_skills() -> Vec<Skill> {
-    vec![
-        Skill::parse(
-            include_str!("skills/raijin-gateway.md"),
-            "raijin-gateway",
-            "cli",
-        ),
-        Skill::parse(
-            include_str!("skills/offline-history.md"),
-            "offline-history",
-            "cli",
-        ),
-    ]
+/// Every bundled skill, in [`BUNDLED`] order.
+pub fn skills() -> Vec<Skill> {
+    BUNDLED
+        .iter()
+        .map(|&(name, raw)| {
+            let mut files = vec![(SKILL_FILE, raw)];
+            files.extend(
+                BUNDLED_FILES
+                    .iter()
+                    .filter(|(skill, ..)| *skill == name)
+                    .map(|&(_, path, body)| (path, body)),
+            );
+            Skill {
+                name,
+                description: front_matter(raw).1,
+                files,
+            }
+        })
+        .collect()
+}
+
+/// Splits `---\nname: …\ndescription: …\n---` front matter off `raw`: (name, description, body).
+/// Without front matter the name is `None`, the description empty and the body all of `raw`.
+fn front_matter(raw: &str) -> (Option<&str>, String, &str) {
+    let Some(rest) = raw.strip_prefix("---\n") else {
+        return (None, String::new(), raw);
+    };
+    let Some(end) = rest.find("\n---") else {
+        return (None, String::new(), raw);
+    };
+    let mut name = None;
+    let mut description = String::new();
+    for line in rest[..end].lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            match key.trim() {
+                "name" => name = Some(value.trim()),
+                "description" => value.trim().clone_into(&mut description),
+                _ => {}
+            }
+        }
+    }
+    let after = &rest[end + "\n---".len()..];
+    let body = after.strip_prefix('\n').unwrap_or(after);
+    (name, description, body)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
     use super::*;
 
     #[test]
     fn front_matter_gives_name_and_description() {
-        let skill = Skill::parse(
-            "---\nname: overview\ndescription: Start here: map.\n---\n# x\n",
-            "f",
-            "raijin",
+        let (name, description, body) =
+            front_matter("---\nname: overview\ndescription: Start here: map.\n---\n# x\n");
+        assert_eq!(name, Some("overview"));
+        assert_eq!(description, "Start here: map.");
+        assert_eq!(body, "# x\n");
+        assert_eq!(
+            front_matter("# no front matter"),
+            (None, String::new(), "# no front matter")
         );
-        assert_eq!(skill.name, "overview");
-        assert_eq!(skill.description, "Start here: map.");
     }
 
     #[test]
     fn embedded_skills_have_front_matter() {
-        let names: Vec<_> = cli_skills()
-            .into_iter()
-            .map(|s| (s.name, s.description.is_empty()))
+        for (dir, raw) in BUNDLED {
+            let (name, description, _) = front_matter(raw);
+            assert_eq!(name, Some(*dir), "{dir}: front matter name");
+            assert!(!description.is_empty(), "{dir}: empty description");
+            assert!(
+                description.len() <= 200,
+                "{dir}: description over 200 chars"
+            );
+        }
+        assert_eq!(skills()[0].name, "overview");
+        assert!(skills()[0].body().starts_with("# "));
+    }
+
+    fn markdown_under(dir: &Path, root: &Path, out: &mut BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).expect("skills dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                markdown_under(&path, root, out);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                let rel = path.strip_prefix(root).expect("under root");
+                out.insert(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+
+    #[test]
+    fn every_bundled_file_is_listed() {
+        let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/skills"));
+        let mut on_disk = BTreeSet::new();
+        markdown_under(root, root, &mut on_disk);
+        let listed: BTreeSet<String> = BUNDLED
+            .iter()
+            .map(|(name, _)| format!("{name}/{SKILL_FILE}"))
+            .chain(
+                BUNDLED_FILES
+                    .iter()
+                    .map(|(name, path, _)| format!("{name}/{path}")),
+            )
             .collect();
         assert_eq!(
-            names,
-            [
-                ("raijin-gateway".to_owned(), false),
-                ("offline-history".to_owned(), false)
-            ]
+            on_disk, listed,
+            "src/skills and BUNDLED/BUNDLED_FILES differ"
         );
     }
 
@@ -180,5 +338,13 @@ mod tests {
             catalog.domain_of("collaborator").map(|d| d.name.as_str()),
             Some("oob")
         );
+        for domain in &catalog.domains {
+            assert!(
+                skills().iter().any(|s| s.name == domain.skill),
+                "{}: no bundled skill {}",
+                domain.name,
+                domain.skill
+            );
+        }
     }
 }

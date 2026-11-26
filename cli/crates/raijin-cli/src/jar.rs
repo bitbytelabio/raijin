@@ -1,4 +1,4 @@
-//! The Raijin jar: which one to load into Burp, and the catalog and skills packaged in it.
+//! The Raijin jar: which one to load into Burp, and the tool catalog packaged in it.
 
 use std::fs;
 use std::io::Read;
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-use crate::catalog::{Catalog, Skill};
+use crate::catalog::Catalog;
 use crate::config::{Target, user_state_dir};
 use crate::util::{hex, private_dir};
 
@@ -116,7 +116,6 @@ async fn download(dest: &Path) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct Assets {
     pub catalog: Catalog,
-    pub skills: Vec<Skill>,
 }
 
 pub fn read_assets(jar: &Path) -> Result<Assets> {
@@ -136,23 +135,7 @@ pub fn read_assets(jar: &Path) -> Result<Assets> {
         ),
         Err(e) => return Err(e.into()),
     };
-    let names: Vec<String> = archive
-        .file_names()
-        .filter_map(Result::ok)
-        .filter(|n| {
-            n.starts_with("skills/") && n.ends_with(".md") && !n["skills/".len()..].contains('/')
-        })
-        .map(std::borrow::Cow::into_owned)
-        .collect();
-    let mut skills = Vec::with_capacity(names.len());
-    for name in names {
-        let mut text = String::new();
-        archive.by_name(&name)?.read_to_string(&mut text)?;
-        let stem = name.trim_start_matches("skills/").trim_end_matches(".md");
-        skills.push(Skill::parse(&text, stem, "raijin"));
-    }
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(Assets { catalog, skills })
+    Ok(Assets { catalog })
 }
 
 #[cfg(test)]

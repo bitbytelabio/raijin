@@ -8,7 +8,6 @@ import io.bitbytelab.raijin.bridge.BridgeFactory
 import io.bitbytelab.raijin.core.BuildInfo
 import io.bitbytelab.raijin.core.ConnectionInfo
 import io.bitbytelab.raijin.events.EventBus
-import io.bitbytelab.raijin.skills.SkillCatalog
 import io.bitbytelab.raijin.state.StateManager
 import io.github.oshai.kotlinlogging.DirectLoggerFactory
 import io.github.oshai.kotlinlogging.KotlinLoggingConfiguration
@@ -141,26 +140,23 @@ class McpServerManager(
 
         /**
          * Sent to every client on initialize. Keep it short (omp keeps only the first 4000
-         * characters) and point at the skills; the skills themselves carry the detail.
+         * characters); the playbooks shipped with the raijin CLI carry the detail.
          */
-        internal val SERVER_INSTRUCTIONS: String =
+        internal const val SERVER_INSTRUCTIONS: String =
             "Raijin drives Burp Suite (proxy, scanner, Repeater, Turbo scripting, recon). " +
                 "Grouped tools take an \"action\" argument plus that action's parameters, e.g. " +
                 "scope {\"action\": \"check\", \"url\": \"https://example.com\"}; the tool description lists each action " +
                 "and marks required parameters with *. Use only parameter names from the inputSchema: unknown names are rejected. " +
                 "An error result says what to fix and usually carries 'usage' and 'example': correct the arguments from them " +
                 "instead of resending the same call. " +
-                "New here? Load the `${SkillCatalog.ENTRY_SKILL}` skill first " +
-                "(resource `${SkillCatalog.uri(SkillCatalog.ENTRY_SKILL)}`, `load_skill`, or prompt `${SkillCatalog.ENTRY_SKILL}`). " +
-                "Skills: ${SkillCatalog.NAMES.joinToString(", ")}. " +
+                "Playbooks ship with the raijin CLI (raijin mcp: guide and run tools). " +
                 "Check scope first (scope with action=get_config / check). Outbound requests are checked " +
                 "against Burp's scope per the operator's mcp_scope_mode: warn (default) sends and adds scope_warning; " +
                 "enforce refuses (out_of_scope=true). Turbo, Scanner and WebSocket are advisory only."
 
         /**
-         * What the server advertises on initialize. Clients only ask for tools, resources or
-         * prompts that are declared here: without `prompts`, Claude Code and omp never call
-         * `prompts/list`, so no skill shows up (and the SDK refuses to register one).
+         * What the server advertises on initialize: tools and resources. No prompts: the
+         * playbooks ship with the raijin CLI.
          */
         internal fun serverCapabilities() = ServerCapabilities(
             tools = ServerCapabilities.Tools(listChanged = true),
@@ -168,8 +164,6 @@ class McpServerManager(
                 subscribe = false,
                 listChanged = false
             ),
-            // Skills are static, so the list never changes while a session is open.
-            prompts = ServerCapabilities.Prompts(listChanged = false)
         )
     }
 
@@ -191,10 +185,9 @@ class McpServerManager(
             instructions = SERVER_INSTRUCTIONS
         )
 
-        // Register all tools, resources and prompts on this server instance
+        // Register all tools and resources on this server instance
         ToolRegistry.registerAll(server, bridges, eventBus, stateManager)
         ResourceRegistry.registerAll(server, bridges, eventBus, stateManager)
-        PromptRegistry.registerAll(server)
 
         // Wrap all tools to emit tool.called events for dashboard + native UI visibility
         ToolCallTracker.wrapAll(server, eventBus, stateManager)
@@ -291,6 +284,7 @@ class McpServerManager(
                     // Accept the URL with or without a trailing slash.
                     install(IgnoreTrailingSlash)
                     installStreamableHttp(mcpServer)
+                    installToolApi(mcpServer)
                     routing {
                         // NOTE: every SSE mount is wrapped in an explicit GET selector. Ktor's
                         // no-path `sse { }` overload registers a bare handler with NO HttpMethod

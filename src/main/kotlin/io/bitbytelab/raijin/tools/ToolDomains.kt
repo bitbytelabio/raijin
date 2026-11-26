@@ -11,16 +11,13 @@ import kotlinx.serialization.json.putJsonObject
 
 /**
  * Raijin's published tools grouped by what an agent wants to do, for the `raijin mcp` gateway
- * (`discover`). Shipped in the jar as `catalog/tools.json` ([catalogJson]), so the CLI can describe
+ * (`guide`). Shipped in the jar as `catalog/tools.json` ([catalogJson]), so the CLI can describe
  * every tool while Burp is down. `ToolCatalogTest` keeps the domains, the published tools and the
  * committed file in step.
  */
 object ToolDomains {
 
     data class Domain(val name: String, val description: String, val notes: String, val skill: String, val tools: List<String>)
-
-    /** Published tools the gateway replaces with its own `skill` tool. */
-    val EXCLUDED: Set<String> = setOf("search_skills", "load_skill")
 
     val DOMAINS: List<Domain> = listOf(
         Domain(
@@ -109,7 +106,6 @@ object ToolDomains {
      */
     fun catalogJson(tools: Collection<Tool>): JsonObject = buildJsonObject {
         put("schema_version", 1)
-        putJsonArray("excluded") { EXCLUDED.sorted().forEach { add(it) } }
         putJsonArray("domains") {
             DOMAINS.forEach { d ->
                 addJsonObject {

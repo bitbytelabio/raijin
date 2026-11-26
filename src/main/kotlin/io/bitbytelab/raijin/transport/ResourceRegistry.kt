@@ -2,7 +2,6 @@ package io.bitbytelab.raijin.transport
 
 import io.bitbytelab.raijin.bridge.BridgeFactory
 import io.bitbytelab.raijin.events.EventBus
-import io.bitbytelab.raijin.skills.SkillCatalog
 import io.bitbytelab.raijin.state.StateManager
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.types.ReadResourceResult
@@ -34,7 +33,6 @@ import kotlinx.serialization.json.*
 object ResourceRegistry {
 
     private const val JSON_MIME = "application/json"
-    private const val MARKDOWN_MIME = "text/markdown"
 
     /** Default page size for the proxy history snapshot resource. */
     private const val PROXY_HISTORY_COUNT = 100
@@ -188,52 +186,6 @@ object ResourceRegistry {
             description = "Items stored in Burp Suite's Organizer (bookmarked requests/notes)."
         ) {
             bridges.organizer.getItems(null, ORGANIZER_MAX_RESULTS).toString()
-        }
-
-        // ---------------------------------------------------------------
-        // skill://<name>/SKILL.md  (text/markdown)
-        // Usage guides, read by clients that load skills from MCP resources. Served as the
-        // skill's original file text (frontmatter included) — SkillCatalog.raw, not .body,
-        // which is reserved for the MCP *prompt* form (PromptRegistry) where frontmatter
-        // noise is undesirable in an instructions message.
-        // ---------------------------------------------------------------
-        SkillCatalog.list().forEach { skill ->
-            registerResource(
-                server,
-                uri = SkillCatalog.uri(skill.name),
-                name = skill.name,
-                description = skill.description,
-                mime = MARKDOWN_MIME
-            ) { SkillCatalog.raw(skill.name) ?: skill.body }
-        }
-
-        // ---------------------------------------------------------------
-        // burp://skills/manifest  (application/json)
-        // Per-skill name/description/uri/sha256/byte_size, for a client that wants to detect
-        // skill changes without re-reading every SKILL.md. `files` is empty today — every
-        // shipped skill is a single markdown file — but gives room to grow into real
-        // supporting-file manifests later without a shape change.
-        // ---------------------------------------------------------------
-        registerJsonResource(
-            server,
-            uri = "burp://skills/manifest",
-            name = "Skills Manifest",
-            description = "Name, description, URI, SHA-256 digest and byte size of every skill, for change detection without re-reading each SKILL.md."
-        ) {
-            buildJsonObject {
-                put("skills", buildJsonArray {
-                    SkillCatalog.list().forEach { skill ->
-                        add(buildJsonObject {
-                            put("name", skill.name)
-                            put("description", skill.description)
-                            put("uri", SkillCatalog.uri(skill.name))
-                            put("sha256", SkillCatalog.sha256(skill.name) ?: "")
-                            put("byte_size", SkillCatalog.byteSize(skill.name) ?: 0)
-                            put("files", buildJsonArray { })
-                        })
-                    }
-                })
-            }.toString()
         }
     }
 

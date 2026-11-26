@@ -67,9 +67,9 @@ enum Command {
     /// Offline review of the target's .burp projects and the Raijin archive; Burp need not run.
     #[command(subcommand)]
     History(HistoryCommand),
-    /// stdio MCP server for coding agents (discover / execute / skill).
+    /// stdio MCP server for coding agents (guide / run).
     Mcp {
-        /// lean: the 3 gateway tools; full: also every Raijin tool directly.
+        /// lean: guide and run; full: also every Raijin tool directly.
         #[arg(long, value_enum, default_value_t = mcp::server::Surface::Lean)]
         surface: mcp::server::Surface,
         /// Use an already-running Raijin at this MCP URL (overrides [remote] url).

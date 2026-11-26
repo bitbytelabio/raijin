@@ -38,7 +38,7 @@ for high-speed work: single-packet race conditions, HTTP/2 and HTTP/3 gates, req
 | 🕸️ **GraphQL toolkit** | Ported from InQL: query templates per field, points-of-interest and cycle scans, batched alias queries for brute force and rate-limit testing; plus engine fingerprinting, schema brute force without introspection and a subscription probe over WebSocket. |
 | 🧬 **Request smuggling** | HTTP Request Smuggler's desync technique catalog, probe payloads and canaries for Turbo scripts, and `http_send_pipeline` for raw requests over one socket (mid-request pauses, the raw response bytes, timing per response). |
 | 🔑 **JWT toolkit** | Key ring (RSA, EC, OKP, oct, password), sign, verify, JWE encrypt/decrypt, and the usual JWT test cases (`alg:none`, algorithm confusion, embedded JWK, psychic signatures, `jku`/`x5u` with the document to host, secret cracking). |
-| 📚 **Built-in skills** | Eight usage guides served as MCP prompts and resources, so an agent learns the tools and workflows on its own. |
+| 📚 **Built-in skills** | Nine playbooks shipped with the `raijin` CLI and served by `raijin mcp` as prompts, skills and resources, so an agent learns the tools and workflows on its own. |
 | 🖥️ **Native UI** | A **Raijin** tab that follows Burp's theme (dark or light): MCP activity, proxy explorer, scanner, findings, Autorize, Collaborator, rules (traffic, WebSocket, scope), JWT, Turbo runs, server settings with remote access. |
 | 🔒 **No token on loopback** | Loopback bind plus Host and Origin checks. Remote/VM mode adds a bearer token and source-IP and host allowlists. |
 
@@ -122,6 +122,8 @@ raijin status
 raijin down
 ```
 
+`raijin mcp` serves MCP 2026-07-28 (`server/discover`) and the older `initialize` handshake. It has two tools: `guide` (running Burp instances, every tool by domain, one tool's `inputSchema`, a playbook) and `run` (`{"do":"scope.check","url":"https://example.com"}`, or a `batch` of such steps). The playbooks ship in the binary and are served as prompts, Skills-extension entries and `skill://<name>/SKILL.md` resources.
+
 `raijin up` loads `raijin.jar` from beside the `raijin` binary when it is the jar of the same release (what the install script installs), else the matching release jar downloaded once to `~/.raijin/jars/` (`RAIJIN_JAR` or `jar` in `raijin.toml` overrides it). Settings in `raijin.toml` include `mode` (`headless` / `ui`), `theme` (`dark` / `light`, default `dark`) and `task_engine` (`running` / `paused`, default `running`: Burp pauses its tasks when it reopens a project, `running` resumes them so proxy traffic keeps reaching the site map).
 
 ### Endpoints
@@ -130,6 +132,7 @@ raijin down
 |---|---|---|
 | MCP, Streamable HTTP | `http://127.0.0.1:9876/mcp` | **Use this.** Also served on `9877`. |
 | MCP, legacy SSE | `http://127.0.0.1:9876/` | Root path, not `/sse`. Deprecated by the MCP spec; kept for old `"type": "sse"` configs. |
+| Tool API (JSON) | `http://127.0.0.1:9876/api/v1` | What `raijin mcp` calls: `GET /tools`, `POST /tools/<name>` with the arguments object, `GET /info`. Same security as `/mcp`. |
 | Dashboard | `http://127.0.0.1:9878/` | Live web view of activity, stats, proxy traffic and rules. |
 
 With remote access on, every endpoint needs the bearer token; see [Security model](#-security-model).
@@ -213,14 +216,13 @@ Raijin exposes about **45 MCP tools** over 200+ operations. Frequently used tool
 </details>
 
 <details>
-<summary><b>Turbo, JWT and skills</b></summary>
+<summary><b>Turbo and JWT</b></summary>
 
 | Tool | What it does |
 |---|---|
 | `turbo_run` | Start (blocking or `start_async`), list, poll, read, stop and delete Turbo runs; search responses; save to Organizer. |
 | `turbo_docs` | Turbo documentation (12 topics) and example scripts. Read before `turbo_run`. |
 | `jwt_keys` | JWK key ring: generate, import, list, export, delete. |
-| `search_skills`, `load_skill` | Find and read the built-in skills from a tool call. |
 
 </details>
 
@@ -237,43 +239,26 @@ Read-only snapshots for clients that browse MCP resources:
 | `burp://scope` | Target scope |
 | `burp://config/project`, `burp://config/user` | Burp configuration |
 | `burp://organizer/items` | Organizer items |
-| `burp://skills/manifest` | Skill names, descriptions, URIs and hashes |
-| `skill://<name>/SKILL.md` | One skill as markdown |
 
 ---
 
 ## 📚 Skills
 
-The server ships short usage guides so an agent can learn the tool groups and workflows by itself.
+The `raijin` CLI ships playbooks so an agent can learn the tool groups and workflows by itself. They live in the binary (`cli/crates/raijin-cli/src/skills/<name>/SKILL.md` plus `references/*.md`); the extension's own MCP server serves none.
 
 | Skill | Covers |
 |---|---|
-| `overview` | **Start here.** Tool map, scope rules, standard Burp testing workflow. |
+| `overview` | **Start here.** The guide/run loop, Burp lifecycle, scope rules, routing, errors; tool map. |
 | `http-testing` | Send, chain, pipeline, fuzz, and race HTTP requests; rules and macros. |
 | `proxy-traffic` | Proxy history, intercept/hold, rewrite rules, Autorize, and WebSockets. |
+| `recon-probes` | Recon, param mining, OpenAPI, and CORS/cache/GraphQL/injection/IDOR/JWT probes. |
 | `scanner-audit` | Crawls, audits, scan tasks, BChecks, custom scan checks, and Bambdas. |
-| `recon-probes` | Recon, param mining, OpenAPI, and CORS/cache/GraphQL/SQLi/IDOR/JWT probes. |
-| `findings-reporting` | Record findings, create Burp issues, export reports, and Organizer notes. |
-| `collaborator-oob` | Out-of-band DNS/HTTP/SMTP payloads and polling with Burp Collaborator. |
 | `turbo-scripting` | High-volume, race, and smuggling runs with Python Turbo scripts. |
+| `collaborator-oob` | Out-of-band DNS/HTTP/SMTP payloads and polling with Burp Collaborator. |
+| `findings-reporting` | Record findings, create Burp issues, export reports, and Organizer notes. |
+| `offline-history` | Review a target's `.burp` projects without Burp: API map, filters, search, diffs. |
 
-Each skill is served three ways:
-
-- **MCP prompts** (no arguments). Clients list them as slash commands: `/mcp__burpsuite__http-testing` in Claude Code, `/burpsuite:http-testing` in omp (type `/burpsuite` to filter them).
-- **MCP resources** at `skill://<name>/SKILL.md` (`text/markdown`), readable through the client's resource reader (`ReadMcpResourceTool` in Claude Code).
-- **Tools**: `search_skills` and `load_skill` (accepts `name` or `uri`), for clients that only call tools.
-
-The server `instructions` sent on connect point the agent at `overview` and list every skill.
-
-<details>
-<summary><b>No skills show up?</b></summary>
-
-- Clients read prompts when they connect. After reloading the extension, reconnect the server (`/mcp` in Claude Code; omp reconnects by itself).
-- Check that Burp runs the new jar: the extension output prints `MCP Prompts: 8`.
-- In Claude Code's MCP log for `burpsuite`, look for `"hasPrompts":true`.
-- omp's `/skill:<name>` entries are its own local skills, not MCP prompts. Type `/burpsuite` to narrow the list.
-
-</details>
+`raijin mcp` serves each one as an MCP prompt (`/overview`), a Skills-extension entry, `skill://<name>/SKILL.md` resources (references at `skill://<name>/references/<file>.md`), and through `guide {"topic":"<name>"}`. Every tool call in them is written as `run {"do":...}` and checked against the published schemas by `SkillToolContractTest` and the CLI's own tests.
 
 ---
 
@@ -425,7 +410,7 @@ All source is Kotlin, Montoya API only (`compileOnly`), namespace `io.bitbytelab
 ```text
 src/main/kotlin/io/bitbytelab/raijin/
 ├── core/        shared helpers (JSON arguments and truncation, payload libraries, wordlists, similarity)
-├── transport/   MCP server, Streamable HTTP + SSE, security and remote access, prompts, resources, dashboard, JSONL stores
+├── transport/   MCP server, Streamable HTTP + SSE, JSON tool API, security and remote access, resources, dashboard, JSONL stores
 ├── safety/      scope gate, request hygiene (wire encoding, Content-Length), regex and send time limits
 ├── bridge/      *Bridge.kt wrappers over Burp APIs
 ├── recon/       param mining, content discovery, JS endpoints and source maps
@@ -436,7 +421,6 @@ src/main/kotlin/io/bitbytelab/raijin/
 ├── events/      event bus behind the event feed and the dashboard
 ├── state/       shared state (rules, Autorize matches, WebSocket connections)
 ├── tools/       <area>/*Tools.kt MCP tools; ToolConsolidation.kt groups them into action tools
-├── skills/      SkillCatalog (skill markdown lives in src/main/resources/skills/)
 ├── jwt/         JOSE operations and the key ring
 ├── ui/          the Raijin tab (colours from RaijinTheme, never hardcoded)
 └── turbo/       the Turbo engine and Jython bridge
@@ -446,7 +430,7 @@ src/main/kotlin/io/bitbytelab/raijin/
 <summary><b>Adding things</b></summary>
 
 - **A tool:** register it in `tools/<area>/*Tools.kt`, then add it to `ToolConsolidation.GROUPS` (as an action) or `KEEP` (as its own tool). A test fails if you forget.
-- **A skill:** add `src/main/resources/skills/<name>.md` with `name` and `description` frontmatter and list it in `SkillCatalog.NAMES`.
+- **A skill:** add `cli/crates/raijin-cli/src/skills/<name>/SKILL.md` (front matter `name`, `description`) and any `references/*.md`, and list them in `BUNDLED` / `BUNDLED_FILES` in `cli/crates/raijin-cli/src/catalog.rs`. Write tool calls as `run {"do":...}`; tests fail on a file left out of the tables or a call that does not fit.
 - **Turbo docs or examples:** add the file under `src/main/resources/turbo-docs/` or `src/main/resources/examples/`, and list it in `McpResourceHandlers` (`docTopics`, or the example set the MCP tools serve). A test fails when a doc file and the topic list differ.
 
 MCP SDK: `io.modelcontextprotocol:kotlin-sdk-server` 0.16, which pins Kotlin 2.4 and Ktor 3.5; bump them together. Developer notes are in [`docs/dev/`](docs/dev/).

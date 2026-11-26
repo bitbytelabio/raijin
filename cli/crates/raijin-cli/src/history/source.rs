@@ -199,7 +199,7 @@ pub fn par_map<T: Send>(
                 project: source.project.clone(),
                 error: if source.live {
                     format!(
-                        "project {} is running and could not be read: {e:#}; use execute('proxy_history', …)",
+                        "project {} is running and could not be read: {e:#}; use run {{\"do\":\"proxy_history\"}}",
                         source.project
                     )
                 } else {

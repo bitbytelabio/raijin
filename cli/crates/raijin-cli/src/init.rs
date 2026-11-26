@@ -53,7 +53,7 @@ include = []
 # Tool results larger than this many KiB are saved to .raijin/tool-results/ instead of returned inline.
 inline_limit_kb = 24
 
-# Drive an already-running Raijin instead of a CLI-managed Burp.
+# Drive an already-running Raijin instead of a CLI-managed Burp (its MCP URL; the CLI calls /api/v1 on the same host and port).
 # [remote]
 # url = "http://127.0.0.1:9876/mcp"
 # token_env = "RAIJIN_TOKEN"   # only when that Raijin requires a bearer token

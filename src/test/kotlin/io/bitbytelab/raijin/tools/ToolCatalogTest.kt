@@ -1,6 +1,5 @@
 package io.bitbytelab.raijin.tools
 
-import io.bitbytelab.raijin.skills.SkillCatalog
 import kotlinx.serialization.json.Json
 import java.io.File
 import kotlin.test.Test
@@ -13,15 +12,11 @@ class ToolCatalogTest {
     private val catalogFile = File("src/main/resources/catalog/tools.json")
     private val prettyJson = Json { prettyPrint = true; prettyPrintIndent = "  " }
 
-    @Test fun `every published tool is in exactly one domain or excluded`() {
+    @Test fun `every published tool is in exactly one domain`() {
         val names = published.map { it.name }
         for (name in names) {
             val owners = ToolDomains.DOMAINS.filter { name in it.tools }.map { it.name }
-            if (name in ToolDomains.EXCLUDED) {
-                assertTrue(owners.isEmpty(), "$name is excluded but listed in $owners")
-            } else {
-                assertEquals(1, owners.size, "$name must be in exactly one domain, is in $owners")
-            }
+            assertEquals(1, owners.size, "$name must be in exactly one domain, is in $owners")
         }
     }
 
@@ -32,7 +27,9 @@ class ToolCatalogTest {
     }
 
     @Test fun `every domain skill ships`() {
-        ToolDomains.DOMAINS.forEach { assertTrue(it.skill in SkillCatalog.NAMES, "${it.name}: unknown skill ${it.skill}") }
+        ToolDomains.DOMAINS.forEach {
+            assertTrue(File("cli/crates/raijin-cli/src/skills/${it.skill}/SKILL.md").isFile, "${it.name}: unknown skill ${it.skill}")
+        }
     }
 
     @Test fun `every published tool carries annotations from consistent hint sets`() {

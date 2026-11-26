@@ -12,7 +12,6 @@ internal object ToolHints {
     /** Never change Burp state or send traffic. */
     val READ_ONLY: Set<String> = setOf(
         "proxy_history", "proxy_history_search", "bambda_templates", "turbo_docs", "util", "analyze",
-        "search_skills", "load_skill",
     )
 
     /** At least one action removes, overwrites or shuts down something. */

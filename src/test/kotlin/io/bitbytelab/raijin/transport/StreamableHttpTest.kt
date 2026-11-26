@@ -1,6 +1,5 @@
 package io.bitbytelab.raijin.transport
 
-import io.bitbytelab.raijin.skills.SkillCatalog
 import io.ktor.client.request.header
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
@@ -13,7 +12,10 @@ import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import io.modelcontextprotocol.kotlin.sdk.server.ServerOptions
+import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.Implementation
+import io.modelcontextprotocol.kotlin.sdk.types.TextContent
+import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
@@ -24,21 +26,21 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
-/** Skills reach clients over the Streamable HTTP endpoint the way Claude Code and omp connect to it. */
+/** Tools reach clients over the Streamable HTTP endpoint the way Claude Code and omp connect to it. */
 class StreamableHttpTest {
 
     private val port = 9876
     private val path = McpServerManager.STREAMABLE_HTTP_PATH
 
-    private fun skillServer(): Server {
+    private fun toolServer(): Server {
         val server = Server(Implementation("burpsuite", "test"), ServerOptions(McpServerManager.serverCapabilities()))
-        PromptRegistry.registerAll(server)
+        server.addTool("ok_tool", "returns", ToolSchema()) { _ -> CallToolResult(content = listOf(TextContent("ok"))) }
         return server
     }
 
     private fun ApplicationTestBuilder.mount() = application {
         installLocalhostSecurity(listOf(port))
-        installStreamableHttp(skillServer())
+        installStreamableHttp(toolServer())
     }
 
     private suspend fun ApplicationTestBuilder.rpc(body: String, sessionId: String? = null): HttpResponse =
@@ -57,7 +59,7 @@ class StreamableHttpTest {
         )
         assertEquals(HttpStatusCode.OK, init.status, init.bodyAsText())
         val result = Json.parseToJsonElement(init.bodyAsText()).jsonObject.getValue("result").jsonObject
-        assertNotNull(result.getValue("capabilities").jsonObject["prompts"], "server must advertise prompts")
+        assertNotNull(result.getValue("capabilities").jsonObject["tools"], "server must advertise tools")
         val sessionId = assertNotNull(init.headers["Mcp-Session-Id"], "initialize must open a session")
         rpc("""{"jsonrpc":"2.0","method":"notifications/initialized"}""", sessionId)
         return sessionId
@@ -70,23 +72,12 @@ class StreamableHttpTest {
     }
 
     @Test
-    fun `prompts list returns every skill prompt`() = testApplication {
+    fun `tools list over streamable http returns the registered tools`() = testApplication {
         mount()
         val sessionId = initialize()
-        val prompts = result("""{"jsonrpc":"2.0","id":2,"method":"prompts/list","params":{}}""", sessionId)
-        val names = prompts.getValue("prompts").jsonArray.map { it.jsonObject.getValue("name").jsonPrimitive.content }
-        assertEquals(SkillCatalog.NAMES, names)
-    }
-
-    @Test
-    fun `prompts get returns the skill body`() = testApplication {
-        mount()
-        val sessionId = initialize()
-        val name = SkillCatalog.ENTRY_SKILL
-        val prompt = result("""{"jsonrpc":"2.0","id":3,"method":"prompts/get","params":{"name":"$name"}}""", sessionId)
-        val text = prompt.getValue("messages").jsonArray.single().jsonObject
-            .getValue("content").jsonObject.getValue("text").jsonPrimitive.content
-        assertEquals(SkillCatalog.get(SkillCatalog.ENTRY_SKILL)!!.body, text)
+        val tools = result("""{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}""", sessionId)
+        val names = tools.getValue("tools").jsonArray.map { it.jsonObject.getValue("name").jsonPrimitive.content }
+        assertEquals(listOf("ok_tool"), names)
     }
 
     @Test

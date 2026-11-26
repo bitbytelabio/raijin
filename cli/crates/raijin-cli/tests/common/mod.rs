@@ -134,10 +134,6 @@ pub fn target(raijin_toml: &str) -> Fixture {
         "../../../../../src/main/resources/catalog/tools.json"
     ))
     .expect("catalog");
-    zip.start_file("skills/overview.md", options)
-        .expect("entry");
-    zip.write_all(b"---\nname: overview\ndescription: Start here.\n---\n# Overview\n")
-        .expect("skill");
     zip.finish().expect("zip");
     Fixture { dir, jar }
 }
