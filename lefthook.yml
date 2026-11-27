@@ -1,0 +1,33 @@
+pre-commit:
+  parallel: true
+  commands:
+    kotlin-fmt:
+      glob: "*.{kt,kts}"
+      run: ktfmt --kotlinlang-style {staged_files}
+      stage_fixed: true
+    rust-fmt:
+      root: cli/
+      glob: "*.rs"
+      run: cargo fmt --all
+      stage_fixed: true
+    shellcheck:
+      glob: "*.{sh,bash}"
+      run: shellcheck {staged_files}
+    gitleaks:
+      run: gitleaks git --staged --no-banner --redact
+    conflict-markers:
+      run: "! git diff --cached -U0 | grep -nE '^\\+(<<<<<<< |=======$|>>>>>>> )'"
+    large-files:
+      run: |
+        for f in {staged_files}; do
+          [ -f "$f" ] && [ "$(wc -c < "$f")" -gt 5242880 ] && { echo "too large: $f"; exit 1; }
+        done; exit 0
+
+pre-push:
+  parallel: true
+  commands:
+    rust-check:
+      root: cli/
+      run: cargo clippy --locked -- -D warnings && cargo test --locked
+    gradle-test:
+      run: ./gradlew test
