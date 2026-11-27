@@ -11,7 +11,9 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
@@ -152,6 +154,66 @@ class ToolArgsTest {
                 required = setOf("port", "host"),
             )
         assertEquals(emptyList<String>(), required.notes)
+    }
+
+    @Test
+    fun `false and 0 of another action's parameters are filler, the action's own are values`() {
+        val hashProps = buildJsonObject {
+            put("data", buildJsonObject { put("type", "string") })
+            put("algorithm", buildJsonObject { put("type", "string") })
+            put("upper", buildJsonObject { put("type", "boolean") })
+            put("rounds", buildJsonObject { put("type", "integer") })
+        }
+        val c =
+            ToolArgs.dropEmptyUnknown(
+                hashProps,
+                buildJsonObject {
+                    put("data", "x")
+                    put("algorithm", "MD5")
+                    put("upper", false)
+                    put("rounds", 0)
+                    put("encode_all", false)
+                    put("length", 0)
+                    put("other", true)
+                },
+                emptySet(),
+                destructive = false,
+            )
+        assertEquals(
+            listOf("data", "algorithm", "upper", "rounds", "other"),
+            c.args.keys.toList(),
+        )
+        assertEquals(listOf("ignored 2 empty parameters of other actions"), c.notes)
+    }
+
+    @Test
+    fun `an unknown parameter whose value only one enum holds is renamed to it`() {
+        val body =
+            json(
+                ToolArgs.unknownParameterError(
+                    "util.hash",
+                    props,
+                    buildJsonObject {
+                        put("type", "md5")
+                        put("data", "x")
+                    },
+                    setOf("action"),
+                    "util.hash(...)",
+                    JsonObject(emptyMap()),
+                    destructive = false,
+                ),
+            )
+        assertEquals(
+            listOf("algorithm"),
+            body.getValue("did_you_mean").jsonArray.map { it.jsonPrimitive.content },
+        )
+        assertEquals(
+            buildJsonObject {
+                put("algorithm", "MD5")
+                put("data", "x")
+            },
+            body["retry"],
+        )
     }
 
     @Test

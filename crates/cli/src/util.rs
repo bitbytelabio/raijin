@@ -189,36 +189,99 @@ pub fn suggest_call<'a>(
 
 /// Verbs that name an action of their own: a name holding one is not a lookup ([`intent_call`]).
 const ACTION_VERBS: &[&str] = &[
-    "send", "fuzz", "scan", "remove", "delete", "clear", "drop", "import", "add",
+    "send", "fuzz", "scan", "remove", "delete", "clear", "drop", "import", "add", "forward",
+    "enable", "disable",
 ];
 
+/// Words of a wanted name and the name tokens they stand for (`drop_request` drops an intercepted
+/// request).
+const NOUN_ALIASES: &[(&str, &[&str])] =
+    &[("request", &["intercept"]), ("intercepted", &["intercept"])];
+
+/// The call a verb means first (`send_payload` -> `http_send_request`).
+const VERB_PREFERRED: &[(&str, &str)] = &[
+    ("send", "http_send_request"),
+    ("scan", "scanner.start_audit"),
+];
+
+/// Whether the wanted word `noun` names the name token `token`: the same word, one starting the
+/// other (both at least 4 chars), or a [`NOUN_ALIASES`] alias.
+fn noun_matches(noun: &str, token: &str) -> bool {
+    noun == token
+        || (noun.len() >= 4
+            && token.len() >= 4
+            && (noun.starts_with(token) || token.starts_with(noun)))
+        || NOUN_ALIASES
+            .iter()
+            .any(|(n, aliases)| *n == noun && aliases.contains(&token))
+}
+
 /// Up to `n` call names of `names` that do what the action verb of `wanted` says (`send_payload`
-/// -> the `send` calls), fewest other words first; empty when `wanted` holds no [`ACTION_VERBS`].
+/// -> the `send` calls; `on`/`off` read as `enable`/`disable`); empty when `wanted` holds no
+/// [`ACTION_VERBS`]. A remove verb with other words keeps only the names one of those words
+/// names (`drop_request` -> `proxy_intercept.drop`, `clear_history` -> no removal of something
+/// else). Order: the [`VERB_PREFERRED`] call, then names holding the verb as written (`drop`
+/// before `remove`), then fewest other words.
 pub fn verb_calls<'a>(
     wanted: &str,
     names: impl IntoIterator<Item = &'a str>,
     n: usize,
 ) -> Vec<&'a str> {
-    let want = intent_tokens(wanted);
-    let verbs: BTreeSet<String> = ACTION_VERBS
+    let canonical: BTreeSet<String> = ACTION_VERBS
         .iter()
         .map(|v| intent_tokens(v).into_iter().next().unwrap_or_default())
-        .filter(|v| want.contains(v))
         .collect();
+    let mut verbs = BTreeSet::new();
+    let mut literal = Vec::new();
+    for raw in crate::mcp::error::norm(wanted).split('_') {
+        let word = match raw {
+            "on" => "enable",
+            "off" => "disable",
+            other => other,
+        };
+        if let Some(verb) = intent_tokens(word).into_iter().next()
+            && canonical.contains(&verb)
+        {
+            verbs.insert(verb);
+            literal.push(word.to_owned());
+        }
+    }
     if verbs.is_empty() {
         return Vec::new();
     }
-    let mut ranked: Vec<(usize, &str)> = names
+    let nouns: BTreeSet<String> = intent_tokens(wanted).difference(&verbs).cloned().collect();
+    let want: BTreeSet<String> = nouns.union(&verbs).cloned().collect();
+    let noun_needed = verbs.contains("remove") && !nouns.is_empty();
+    let mut ranked: Vec<(u8, u8, usize, &str)> = names
         .into_iter()
         .filter_map(|name| {
             let have = intent_tokens(name);
-            (!have.is_disjoint(&verbs))
-                .then(|| (have.len() - have.intersection(&want).count(), name))
+            if have.is_disjoint(&verbs) {
+                return None;
+            }
+            if noun_needed
+                && !nouns
+                    .iter()
+                    .any(|noun| have.iter().any(|t| noun_matches(noun, t)))
+            {
+                return None;
+            }
+            let normed = crate::mcp::error::norm(name);
+            let preferred = VERB_PREFERRED.iter().any(|(verb, call)| {
+                verbs.contains(*verb) && crate::mcp::error::norm(call) == normed
+            });
+            let written = normed.split('_').any(|t| literal.iter().any(|l| l == t));
+            Some((
+                u8::from(!preferred),
+                u8::from(!written),
+                have.len() - have.intersection(&want).count(),
+                name,
+            ))
         })
         .collect();
     ranked.sort_unstable();
-    ranked.dedup_by(|a, b| a.1 == b.1);
-    ranked.into_iter().take(n).map(|(_, name)| name).collect()
+    ranked.dedup_by(|a, b| a.3 == b.3);
+    ranked.into_iter().take(n).map(|(.., name)| name).collect()
 }
 
 /// The call an invented name means by its words ([`intent_call`]).

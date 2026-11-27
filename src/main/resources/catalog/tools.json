@@ -3446,6 +3446,8 @@
           },
           "port": {
             "type": "integer",
+            "minimum": 1,
+            "maximum": 65535,
             "description": "Target port number (1-65535, default 443, or 80 with use_tls=false)"
           },
           "use_tls": {
@@ -3598,7 +3600,7 @@
           },
           "timeout_ms": {
             "type": "number",
-            "description": "Hard timeout per request in milliseconds (0 = no hard timeout, max 600000, default 25000)"
+            "description": "Hard timeout per request in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)"
           }
         },
         "required": [
@@ -3638,6 +3640,8 @@
           },
           "port": {
             "type": "integer",
+            "minimum": 1,
+            "maximum": 65535,
             "description": "Target port number (1-65535, default 443, or 80 with use_tls=false)"
           },
           "use_tls": {
@@ -3699,7 +3703,7 @@
           },
           "timeout_ms": {
             "type": "number",
-            "description": "Hard timeout for the whole batch in milliseconds (0 = no hard timeout, max 600000, default 25000)"
+            "description": "Hard timeout for the whole batch in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)"
           }
         },
         "required": [
@@ -4397,6 +4401,8 @@
           },
           "port": {
             "type": "integer",
+            "minimum": 1,
+            "maximum": 65535,
             "description": "Target port number (1-65535, default 443, or 80 with use_tls=false)"
           },
           "use_tls": {
@@ -4543,6 +4549,8 @@
           },
           "port": {
             "type": "integer",
+            "minimum": 1,
+            "maximum": 65535,
             "description": "Target port number (1-65535, default 443, or 80 with use_tls=false)"
           },
           "use_tls": {
@@ -4573,7 +4581,7 @@
           },
           "timeout_ms": {
             "type": "number",
-            "description": "Hard timeout in milliseconds (0 = no hard timeout, max 600000, default 25000)"
+            "description": "Hard timeout in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)"
           }
         },
         "required": [
@@ -4594,7 +4602,7 @@
     },
     {
       "name": "http_send_request",
-      "description": "Send an HTTP request through Burp Suite. Build from URL + method + headers + body, from a raw HTTP request string, or as a native HTTP/2 request with full control of its header list (pseudo-headers included). Supports HTTP/1.1, HTTP/2, connection reuse and Burp's request options.\n\nParameters:\n- url (string): target URL (use this OR raw_request)\n- method (string): HTTP method (default GET)\n- headers (object): map of header name → value. Caller-supplied headers are preserved byte-exact (Burp's default User-Agent/Accept etc. are NOT injected when headers are provided).\n- body (string OR object/array): request body. If object/array, it is serialized to compact JSON automatically.\n- raw_request (string): raw HTTP request text. When supplied without explicit port/use_tls, defaults to TLS:443 (modern web default). Bare LF line endings in the request line and headers become CRLF; the body is sent as typed. Content-Length is auto-recomputed if it does not match body bytes.\n- http2_headers (array of {name, value} or [name, value]): a native HTTP/2 request whose header list is sent as given, pseudo-headers included (\":method\", \":path\", \":authority\", \":scheme\"): repeat, reorder, omit or malform them; CR/LF and uppercase names reach the wire. When the list has no pseudo-header, the four are derived from url/method and put first. Use with url (or host/port/use_tls) and body, not with raw_request or headers; sent with http_mode HTTP_2 (default) or HTTP_2_IGNORE_ALPN. No Content-Length is added: include a \"content-length\" field to send one.\n- host, port (int, 1-65535), use_tls (bool): explicit service overrides\n- http_mode (string): \"AUTO\" | \"HTTP_1\" | \"HTTP_2\" | \"HTTP_2_IGNORE_ALPN\". HTTP/3 is not available here or anywhere through Montoya — use Turbo (turbo_run.start with Engine.HTTP3) for HTTP/3.\n- connection_id (string): pins/reuses one Montoya connection, but the request still fully completes (response received) before this call returns — no pipelining. For multi-request-per-socket pipelining use http_send_pipeline.\n- follow_redirects (string): \"never\" | \"always\" | \"same_host\" | \"in_scope\" — Burp follows redirects and returns the final exchange (default: Burp's default, which does not follow).\n- sni (string): TLS server name to send instead of the host.\n- response_timeout_ms (int, 0 = none): Burp's own timeout for reading the response; on expiry Burp gives up and has_response is false.\n- verify_tls (bool, default false): make Burp verify the target's TLS certificate.\n- max_response_length (int): truncate response body in result\n- timeout_ms (number, 0 = no hard timeout, max 600000, default 25000): hard timeout. Returns is_timeout=true and close_reason=\"timeout\" on expiry. Montoya has no partial-read API, so a failed/timed-out send cannot report bytes_received or distinguish fin/rst — use http_send_pipeline when that detail matters.\n- preserve_headers (bool, default true): when false, falls back to Burp's httpRequestFromUrl which adds default headers\n- auto_fix_content_length (bool, default true): when false, uses raw_request CL as-is. When true and the declared Content-Length didn't match the body, the result includes content_length_rewritten:{from,to}.\n\nOut-of-range numbers are clamped and reported in notes. Returns full response with headers, body, status code, and timing; reauthenticated:<macro> when a session login macro re-established the session and sent the request again.\n\nScope: checked against Burp's target scope per the operator's mcp_scope_mode: warn (default) sends and adds scope_warning; enforce refuses (out_of_scope=true, nothing sent); off skips the check. A followed redirect that lands outside scope is flagged (scope_warning), never blocked.",
+      "description": "Send an HTTP request through Burp Suite. Build from URL + method + headers + body, from a raw HTTP request string, or as a native HTTP/2 request with full control of its header list (pseudo-headers included). Supports HTTP/1.1, HTTP/2, connection reuse and Burp's request options.\n\nParameters:\n- url (string): target URL (use this OR raw_request)\n- method (string): HTTP method (default GET)\n- headers (object): map of header name → value. Caller-supplied headers are preserved byte-exact (Burp's default User-Agent/Accept etc. are NOT injected when headers are provided).\n- body (string OR object/array): request body. If object/array, it is serialized to compact JSON automatically.\n- raw_request (string): raw HTTP request text. When supplied without explicit port/use_tls, defaults to TLS:443 (modern web default). Bare LF line endings in the request line and headers become CRLF; the body is sent as typed. Content-Length is auto-recomputed if it does not match body bytes.\n- http2_headers (array of {name, value} or [name, value]): a native HTTP/2 request whose header list is sent as given, pseudo-headers included (\":method\", \":path\", \":authority\", \":scheme\"): repeat, reorder, omit or malform them; CR/LF and uppercase names reach the wire. When the list has no pseudo-header, the four are derived from url/method and put first. Use with url (or host/port/use_tls) and body, not with raw_request or headers; sent with http_mode HTTP_2 (default) or HTTP_2_IGNORE_ALPN. No Content-Length is added: include a \"content-length\" field to send one.\n- host, port (int, 1-65535), use_tls (bool): explicit service overrides\n- http_mode (string): \"AUTO\" | \"HTTP_1\" | \"HTTP_2\" | \"HTTP_2_IGNORE_ALPN\". HTTP/3 is not available here or anywhere through Montoya — use Turbo (turbo_run.start with Engine.HTTP3) for HTTP/3.\n- connection_id (string): pins/reuses one Montoya connection, but the request still fully completes (response received) before this call returns — no pipelining. For multi-request-per-socket pipelining use http_send_pipeline.\n- follow_redirects (string): \"never\" | \"always\" | \"same_host\" | \"in_scope\" — Burp follows redirects and returns the final exchange (default: Burp's default, which does not follow).\n- sni (string): TLS server name to send instead of the host.\n- response_timeout_ms (int, 0 = Burp's default, -1 = none): Burp's own timeout for reading the response; on expiry Burp gives up and has_response is false.\n- verify_tls (bool, default false): make Burp verify the target's TLS certificate.\n- max_response_length (int): truncate response body in result\n- timeout_ms (number, 0 = default, -1 = no hard timeout, max 600000, default 25000): hard timeout. Returns is_timeout=true and close_reason=\"timeout\" on expiry. Montoya has no partial-read API, so a failed/timed-out send cannot report bytes_received or distinguish fin/rst — use http_send_pipeline when that detail matters.\n- preserve_headers (bool, default true): when false, falls back to Burp's httpRequestFromUrl which adds default headers\n- auto_fix_content_length (bool, default true): when false, uses raw_request CL as-is. When true and the declared Content-Length didn't match the body, the result includes content_length_rewritten:{from,to}.\n\nOut-of-range numbers are clamped and reported in notes. Returns full response with headers, body, status code, and timing; reauthenticated:<macro> when a session login macro re-established the session and sent the request again.\n\nScope: checked against Burp's target scope per the operator's mcp_scope_mode: warn (default) sends and adds scope_warning; enforce refuses (out_of_scope=true, nothing sent); off skips the check. A followed redirect that lands outside scope is flagged (scope_warning), never blocked.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -4628,6 +4636,8 @@
           },
           "port": {
             "type": "integer",
+            "minimum": 1,
+            "maximum": 65535,
             "description": "Explicit target port override (1-65535)"
           },
           "use_tls": {
@@ -4664,7 +4674,7 @@
           },
           "response_timeout_ms": {
             "type": "integer",
-            "description": "Burp's own response read timeout (0 = none)"
+            "description": "Burp's own response read timeout (0 = Burp's default, -1 = none)"
           },
           "verify_tls": {
             "type": "boolean",
@@ -4676,7 +4686,7 @@
           },
           "timeout_ms": {
             "type": "number",
-            "description": "Hard timeout in milliseconds (0 = no hard timeout, max 600000, default 25000)"
+            "description": "Hard timeout in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)"
           },
           "preserve_headers": {
             "type": "boolean",
@@ -4733,7 +4743,7 @@
           },
           "timeout_ms": {
             "type": "number",
-            "description": "Hard timeout per step in milliseconds (0 = no hard timeout, max 600000, default 25000)"
+            "description": "Hard timeout per step in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)"
           }
         },
         "required": [
@@ -4760,7 +4770,7 @@
     },
     {
       "name": "http_send_requests_parallel",
-      "description": "Send multiple HTTP requests in parallel through Burp Suite. Each request in the array can specify url, method, headers, body (string or object), or raw_request.\n\nMixed hosts are supported: requests are grouped by HTTP service (host+port+tls) and dispatched per-group, then merged back into the original input order. Per-group dispatch failures do not abort the batch — failed slots come back with error/phase fields.\n\nParameters:\n- requests (array, required): per-request objects with url, method, headers, body, raw_request, host, port, use_tls, auto_fix_content_length and preserve_headers (both default true). http2_headers, follow_redirects, sni, verify_tls and response_timeout_ms are http_send_request only: an item carrying one fails to build. Each item reports its own content_length_rewritten, headers_warning and warnings (raw CR/LF removed). A group that times out or fails marks only its own items; groups not started before timeout_ms ran out come back not_sent.\n- http_mode (string): \"AUTO\" | \"HTTP_1\" | \"HTTP_2\" | \"HTTP_2_IGNORE_ALPN\"\n- max_response_length (int): truncate response bodies\n- timeout_ms (number, 0 = no hard timeout, max 600000, default 25000): hard timeout for the entire batch\n\nReturns array of results in original order, plus group_timings_ms and groups_dispatched.\n\nScope: checked against Burp's target scope per the operator's mcp_scope_mode: warn (default) sends and adds scope_warning; enforce refuses (out_of_scope=true, nothing sent); off skips the check. Checked per item: a refused item carries out_of_scope and is not sent, the others go out.",
+      "description": "Send multiple HTTP requests in parallel through Burp Suite. Each request in the array can specify url, method, headers, body (string or object), or raw_request.\n\nMixed hosts are supported: requests are grouped by HTTP service (host+port+tls) and dispatched per-group, then merged back into the original input order. Per-group dispatch failures do not abort the batch — failed slots come back with error/phase fields.\n\nParameters:\n- requests (array, required): per-request objects with url, method, headers, body, raw_request, host, port, use_tls, auto_fix_content_length and preserve_headers (both default true). http2_headers, follow_redirects, sni, verify_tls and response_timeout_ms are http_send_request only: an item carrying one fails to build. Each item reports its own content_length_rewritten, headers_warning and warnings (raw CR/LF removed). A group that times out or fails marks only its own items; groups not started before timeout_ms ran out come back not_sent.\n- http_mode (string): \"AUTO\" | \"HTTP_1\" | \"HTTP_2\" | \"HTTP_2_IGNORE_ALPN\"\n- max_response_length (int): truncate response bodies\n- timeout_ms (number, 0 = default, -1 = no hard timeout, max 600000, default 25000): hard timeout for the entire batch\n\nReturns array of results in original order, plus group_timings_ms and groups_dispatched.\n\nScope: checked against Burp's target scope per the operator's mcp_scope_mode: warn (default) sends and adds scope_warning; enforce refuses (out_of_scope=true, nothing sent); off skips the check. Checked per item: a refused item carries out_of_scope and is not sent, the others go out.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -4787,7 +4797,7 @@
           },
           "timeout_ms": {
             "type": "number",
-            "description": "Hard timeout for the entire batch in milliseconds (0 = no hard timeout, max 600000, default 25000)"
+            "description": "Hard timeout for the entire batch in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)"
           }
         },
         "required": [

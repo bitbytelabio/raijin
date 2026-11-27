@@ -88,17 +88,32 @@ internal class ToolArgs(private val args: Map<String, JsonElement>) {
     }
 
     /**
-     * A hard timeout in milliseconds: [default] when absent, and `0` for no hard timeout (the send
-     * waits for Burp, as `timeout_ms: 0` always meant). A negative value is read as 0 and a value
-     * above [max] as [max], each with a note.
+     * A hard timeout in milliseconds: [default] when absent or `0` (a strict client's filler,
+     * noted), a negative value for no hard timeout (returned as 0: the send waits for Burp), and a
+     * value above [max] as [max] with a note.
      */
     fun timeoutMs(name: String, default: Long, max: Long = MAX_TIMEOUT_MS): Long {
         val value = integer(name) ?: return default
-        if (value < 0) {
-            notes += "Parameter '$name' = $value is negative; 0 (no hard timeout) was used."
-            return 0
+        if (value == 0L) {
+            notes += "0 '$name' read as the default ($default ms); pass -1 for no hard timeout"
+            return default
         }
-        return clamp(name, value, 0, max)
+        if (value < 0) return 0
+        return clamp(name, value, 1, max)
+    }
+
+    /**
+     * Burp's own response read timeout: null (Burp's default) when absent or `0` (noted), 0 (none)
+     * for a negative value, else clamped to [max].
+     */
+    fun responseTimeoutMs(name: String, max: Long = MAX_TIMEOUT_MS): Long? {
+        val value = integer(name) ?: return null
+        if (value == 0L) {
+            notes += "0 '$name' read as unset; pass -1 for none"
+            return null
+        }
+        if (value < 0) return 0
+        return clamp(name, value, 1, max)
     }
 
     /**
@@ -196,10 +211,20 @@ internal fun JsonObjectBuilder.enumProperty(
     }
 }
 
-/** Adds a property of JSON type [type] with [description]. */
-internal fun JsonObjectBuilder.property(name: String, type: String, description: String) {
+/**
+ * Adds a property of JSON type [type] with [description], and its [minimum]/[maximum] when given.
+ */
+internal fun JsonObjectBuilder.property(
+    name: String,
+    type: String,
+    description: String,
+    minimum: Int? = null,
+    maximum: Int? = null,
+) {
     putJsonObject(name) {
         put("type", type)
+        if (minimum != null) put("minimum", minimum)
+        if (maximum != null) put("maximum", maximum)
         put("description", description)
     }
 }

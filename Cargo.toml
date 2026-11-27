@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/bproj", "crates/cli"]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 # Equals `version` in build.gradle.kts (the release workflow checks it).

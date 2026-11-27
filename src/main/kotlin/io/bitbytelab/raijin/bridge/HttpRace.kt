@@ -208,8 +208,8 @@ internal class HttpRace(
         }
         val summary = clusters.build()
         val notes = ArrayList<String>()
-        // A request that reached the target has a response or a time to the start of one; Burp
-        // gives timing data even to a request refused at connect, so its presence says nothing.
+        // A request that reached the target has a response or a positive time to the start of
+        // one; Burp gives timing data, with a zero duration, even to a request refused at connect.
         // Only a connected target's silence can come from it not speaking HTTP/2.
         val connected = exchanges.any { ex ->
             ex != null &&
@@ -217,7 +217,8 @@ internal class HttpRace(
                     runCatching {
                             ex.timingData()
                                 .orElse(null)
-                                ?.timeBetweenRequestSentAndStartOfResponse() != null
+                                ?.timeBetweenRequestSentAndStartOfResponse()
+                                ?.let { !it.isZero && !it.isNegative } == true
                         }
                         .getOrDefault(false))
         }

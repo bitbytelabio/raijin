@@ -50,7 +50,8 @@ object HttpTools {
     internal val PORTS = 1..65_535
     internal val LENGTHS = 0..Int.MAX_VALUE
 
-    private const val TIMEOUT_DESCRIPTION = "0 = no hard timeout, max 600000, default 25000"
+    private const val TIMEOUT_DESCRIPTION =
+        "0 = default, -1 = no hard timeout, max 600000, default 25000"
 
     private const val URL_NOT_ABSOLUTE = HttpRequestBuilder.URL_NOT_ABSOLUTE
 
@@ -96,7 +97,7 @@ Parameters:
 - connection_id (string): pins/reuses one Montoya connection, but the request still fully completes (response received) before this call returns — no pipelining. For multi-request-per-socket pipelining use http_send_pipeline.
 - follow_redirects (string): "never" | "always" | "same_host" | "in_scope" — Burp follows redirects and returns the final exchange (default: Burp's default, which does not follow).
 - sni (string): TLS server name to send instead of the host.
-- response_timeout_ms (int, 0 = none): Burp's own timeout for reading the response; on expiry Burp gives up and has_response is false.
+- response_timeout_ms (int, 0 = Burp's default, -1 = none): Burp's own timeout for reading the response; on expiry Burp gives up and has_response is false.
 - verify_tls (bool, default false): make Burp verify the target's TLS certificate.
 - max_response_length (int): truncate response body in result
 - timeout_ms (number, $TIMEOUT_DESCRIPTION): hard timeout. Returns is_timeout=true and close_reason="timeout" on expiry. Montoya has no partial-read API, so a failed/timed-out send cannot report bytes_received or distinguish fin/rst — use http_send_pipeline when that detail matters.
@@ -128,7 +129,13 @@ Out-of-range numbers are clamped and reported in notes. Returns full response wi
                                 )
                             }
                             property("host", "string", "Explicit target hostname override")
-                            property("port", "integer", "Explicit target port override (1-65535)")
+                            property(
+                                "port",
+                                "integer",
+                                "Explicit target port override (1-65535)",
+                                minimum = 1,
+                                maximum = 65535,
+                            )
                             property("use_tls", "boolean", "Whether to use HTTPS (TLS)")
                             enumProperty(
                                 "http_mode",
@@ -145,7 +152,7 @@ Out-of-range numbers are clamped and reported in notes. Returns full response wi
                             property(
                                 "response_timeout_ms",
                                 "integer",
-                                "Burp's own response read timeout (0 = none)",
+                                "Burp's own response read timeout (0 = Burp's default, -1 = none)",
                             )
                             property(
                                 "verify_tls",
@@ -213,8 +220,7 @@ Out-of-range numbers are clamped and reported in notes. Returns full response wi
                                 )
                                 ?.let { HttpSendOptions.REDIRECTS.getValue(it) },
                         sni = args.string("sni"),
-                        responseTimeoutMs =
-                            args.clampedLong("response_timeout_ms", 0L..ToolArgs.MAX_TIMEOUT_MS),
+                        responseTimeoutMs = args.responseTimeoutMs("response_timeout_ms"),
                         verifyTls = args.bool("verify_tls") ?: false,
                     )
 
@@ -980,6 +986,8 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                                 "port",
                                 "integer",
                                 "Target port number (1-65535, default 443, or 80 with use_tls=false)",
+                                minimum = 1,
+                                maximum = 65535,
                             )
                             property("use_tls", "boolean", "Whether to use HTTPS (TLS)")
                             property("tls", "boolean", "Alias for use_tls")

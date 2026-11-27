@@ -53,7 +53,7 @@ scripted high-volume runs are `turbo-scripting`; one vulnerability class end to 
 - Fuzz or race: `http_fuzz` walks payloads through positions and clusters the responses; `http_race` releases
   identical (or `FUZZ`-varied) requests together. For HTTP/3, several endpoints at once or a scripted
   sequence, use `turbo_run`.
-- `timeout_ms` (0 = no hard timeout, at most 600000, default 25000) bounds one request, each chain step or
+- `timeout_ms` (0 = default, -1 = no hard timeout, at most 600000, default 25000) bounds one request, each chain step or
   fuzz request, a whole parallel batch or race; a timed-out send returns `is_timeout: true`. A number out of
   range (`count`, `concurrency`, `max_responses`, ...) is clamped and reported in `notes`, not refused.
 

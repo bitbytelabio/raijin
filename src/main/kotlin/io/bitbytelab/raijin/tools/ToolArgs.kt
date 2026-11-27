@@ -483,7 +483,8 @@ internal object ToolArgs {
                 notes += "ignored 0 '$k': below its minimum $min"
                 continue
             }
-            if (!isEmptyValue(v)) continue
+            val foreignKey = props != null && k !in props
+            if (!isEmptyValue(v) && !(foreignKey && isZeroValue(v))) continue
             val emptyString = v is JsonPrimitive && v.isString
             if (
                 emptyString && k in EMPTY_IS_UNSET && props != null && k in props && k !in required
@@ -517,7 +518,15 @@ internal object ToolArgs {
      * Optional parameters whose `""` can only mean "not set" (no such host, method or connection):
      * [dropEmptyUnknown] drops them, unlike a free-form string's `""`.
      */
-    private val EMPTY_IS_UNSET = setOf("host", "sni", "connection_id", "method")
+    private val EMPTY_IS_UNSET =
+        setOf("host", "sni", "connection_id", "method", "subscription_id", "status_code_range")
+
+    /**
+     * `false` or the number 0: a strict client's filler for another action's boolean or number
+     * parameter, dropped like an empty value when the key is not the action's own.
+     */
+    private fun isZeroValue(v: JsonElement): Boolean =
+        v is JsonPrimitive && !v.isString && (v.booleanOrNull == false || v.doubleOrNull == 0.0)
 
     /**
      * The schema `minimum` of [def] (as written) when [value] is the number 0 below it, for a
@@ -938,9 +947,16 @@ internal object ToolArgs {
         destructive: Boolean,
     ): CallToolResult {
         val unknown = unknownParams(props, args, ignore)
+        // Values rewritten to the enum spelling of the parameter they were matched to by value.
+        val respelled = mutableMapOf<String, JsonPrimitive>()
         val targets = unknown.associateWith { key ->
             val c = canonicalParam(key)
-            synonym(c, props) ?: closest(c, props.keys, 1).firstOrNull()
+            synonym(c, props)
+                ?: closest(c, props.keys, 1).firstOrNull()
+                ?: byEnumValue(props, args, args[key])?.let { (name, spelling) ->
+                    respelled[key] = JsonPrimitive(spelling)
+                    name
+                }
         }
         val list =
             unknown.joinToString(", ") { key ->
@@ -963,11 +979,38 @@ internal object ToolArgs {
             if (certain)
                 put(
                     "retry",
-                    JsonObject(args.entries.associate { (k, v) -> (targets[k] ?: k) to v }),
+                    JsonObject(
+                        args.entries.associate { (k, v) ->
+                            (targets[k] ?: k) to (respelled[k] ?: v)
+                        },
+                    ),
                 )
             put("example", example)
             put("usage", usage)
         }
+    }
+
+    /**
+     * The one parameter of [props] not set in [args] whose string `enum` holds [value] (by
+     * [enumKey]), with the enum's spelling: `{"type":"md5"}` for `algorithm` (`MD5`). Null when
+     * [value] is not a string or no parameter, or more than one, takes it.
+     */
+    private fun byEnumValue(
+        props: JsonObject,
+        args: JsonObject,
+        value: JsonElement?,
+    ): Pair<String, String>? {
+        val p = value as? JsonPrimitive ?: return null
+        if (!p.isString) return null
+        val key = enumKey(p.content)
+        val hits =
+            props.entries.mapNotNull { (name, def) ->
+                if (name in args) return@mapNotNull null
+                val spelling =
+                    (def as? JsonObject)?.let(::stringEnum)?.firstOrNull { enumKey(it) == key }
+                spelling?.let { name to it }
+            }
+        return hits.singleOrNull()
     }
 
     private val ARGUMENT_ERROR =

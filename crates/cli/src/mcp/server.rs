@@ -1510,7 +1510,7 @@ fn unknown_tool_error(catalog: &Catalog, tool: &str, arguments: &JsonObject) -> 
     // The calls doing what the name's verb says (`remove_bcheck`) lead.
     let by_verb = verb_calls(tool, hits.iter().map(String::as_str), hits.len());
     let by_verb: Vec<String> = by_verb.into_iter().map(str::to_owned).collect();
-    hits.sort_by_key(|h| !by_verb.contains(h));
+    hits.sort_by_key(|h| by_verb.iter().position(|v| v == h).unwrap_or(usize::MAX));
     let w = error::norm(tool);
     let near = match found.as_slice() {
         [only] => {
@@ -4670,12 +4670,30 @@ mod weak_model {
         assert_eq!(first("remove_bcheck"), "custom_check.bcheck_remove");
         assert_eq!(first("delete_scope"), "scope.remove");
         assert_eq!(first("delete_finding"), "findings.remove");
-        assert!(
-            first("send_payload").contains("send"),
-            "{}",
-            first("send_payload")
-        );
+        assert_eq!(first("send_payload"), "http_send_request");
+        assert_eq!(first("scan_xss"), "scanner.start_audit");
+        assert_eq!(first("forward_request"), "proxy_intercept.forward");
+        assert_eq!(first("intercept_on"), "proxy_intercept.enable");
         assert!(first("fuzz_xss").contains("fuzz"), "{}", first("fuzz_xss"));
+        // A remove verb suggests only the removal of what the other words name.
+        for name in ["clear_history", "delete_all", "remove_all"] {
+            let e = unknown_tool_error(&catalog, name, &JsonObject::new());
+            assert!(
+                e.did_you_mean
+                    .iter()
+                    .all(|h| !["remove", "clear", "delete", "drop"]
+                        .iter()
+                        .any(|v| h.contains(v))),
+                "{name}: {:?}",
+                e.did_you_mean
+            );
+        }
+        let drop = unknown_tool_error(&catalog, "drop_request", &JsonObject::new());
+        assert_eq!(
+            drop.did_you_mean.first().map(String::as_str),
+            Some("proxy_intercept.drop")
+        );
+        assert_eq!(drop.retry, None);
         let scope = unknown_tool_error(&catalog, "delete_scope", &JsonObject::new());
         assert_eq!(scope.retry, None);
 

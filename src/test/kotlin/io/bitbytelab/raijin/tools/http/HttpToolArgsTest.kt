@@ -1,20 +1,20 @@
 package io.bitbytelab.raijin.tools.http
 
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
-import kotlinx.serialization.json.add
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
-import kotlin.test.assertNull
-import kotlin.test.assertTrue
 
 class HttpToolArgsTest {
 
@@ -29,29 +29,69 @@ class HttpToolArgsTest {
         assertEquals(7, a.clampedInt("inside", 1..10))
         assertNull(a.clampedInt("absent", 1..10))
         assertEquals(3, a.notes.size, a.notes.toString())
-        assertTrue(a.notes[0].contains("'count' = 5000") && a.notes[0].contains("1000 was used"), a.notes[0])
-        assertTrue(a.notes[2].contains("'rate' = -3.5") && a.notes[2].contains("0 was used"), a.notes[2])
+        assertTrue(
+            a.notes[0].contains("'count' = 5000") && a.notes[0].contains("1000 was used"),
+            a.notes[0],
+        )
+        assertTrue(
+            a.notes[2].contains("'rate' = -3.5") && a.notes[2].contains("0 was used"),
+            a.notes[2],
+        )
     }
 
     @Test
-    fun `timeout_ms 0 means no hard timeout, negative reads as 0 and too large is capped`() {
+    fun `timeout_ms 0 is the default, negative means no hard timeout and too large is capped`() {
         val a = args("""{"zero": 0, "negative": -1, "huge": 9000000, "normal": 1500}""")
-        assertEquals(0, a.timeoutMs("zero", 25_000))
+        assertEquals(25_000, a.timeoutMs("zero", 25_000))
         assertEquals(0, a.timeoutMs("negative", 25_000))
         assertEquals(ToolArgs.MAX_TIMEOUT_MS, a.timeoutMs("huge", 25_000))
         assertEquals(1500, a.timeoutMs("normal", 25_000))
         assertEquals(25_000, a.timeoutMs("absent", 25_000))
         assertEquals(2, a.notes.size, a.notes.toString())
+        assertEquals(
+            "0 'zero' read as the default (25000 ms); pass -1 for no hard timeout",
+            a.notes[0],
+        )
+    }
+
+    @Test
+    fun `response_timeout_ms 0 is unset and negative means none`() {
+        val a = args("""{"zero": 0, "negative": -1, "normal": 1500}""")
+        assertNull(a.responseTimeoutMs("zero"))
+        assertEquals(0, a.responseTimeoutMs("negative"))
+        assertEquals(1500, a.responseTimeoutMs("normal"))
+        assertNull(a.responseTimeoutMs("absent"))
+        assertEquals(listOf("0 'zero' read as unset; pass -1 for none"), a.notes)
     }
 
     @Test
     fun `malformed values and strict ranges are errors`() {
-        val a = args("""{"port": 70000, "count": "many", "mode": "burst", "flag": "yes", "obj": {}}""")
-        assertTrue("1 and 65535" in assertFailsWith<IllegalArgumentException> { a.int("port", 1..65535) }.message!!)
-        assertTrue("must be an integer" in assertFailsWith<IllegalArgumentException> { a.clampedInt("count", 1..10) }.message!!)
-        assertTrue("concat, single_write" in assertFailsWith<IllegalArgumentException> { a.enum("mode", listOf("concat", "single_write")) }.message!!)
-        assertTrue("true or false" in assertFailsWith<IllegalArgumentException> { a.bool("flag") }.message!!)
-        assertTrue("must be a string" in assertFailsWith<IllegalArgumentException> { a.string("obj") }.message!!)
+        val a =
+            args("""{"port": 70000, "count": "many", "mode": "burst", "flag": "yes", "obj": {}}""")
+        assertTrue(
+            "1 and 65535" in
+                assertFailsWith<IllegalArgumentException> { a.int("port", 1..65535) }.message!!,
+        )
+        assertTrue(
+            "must be an integer" in
+                assertFailsWith<IllegalArgumentException> { a.clampedInt("count", 1..10) }
+                    .message!!,
+        )
+        assertTrue(
+            "concat, single_write" in
+                assertFailsWith<IllegalArgumentException> {
+                        a.enum("mode", listOf("concat", "single_write"))
+                    }
+                    .message!!,
+        )
+        assertTrue(
+            "true or false" in
+                assertFailsWith<IllegalArgumentException> { a.bool("flag") }.message!!,
+        )
+        assertTrue(
+            "must be a string" in
+                assertFailsWith<IllegalArgumentException> { a.string("obj") }.message!!,
+        )
     }
 
     @Test
@@ -73,7 +113,10 @@ class HttpToolArgsTest {
             putJsonArray("notes") { add("from the bridge") }
         }
         val merged = a.withNotes(result)
-        assertEquals(listOf("from the bridge", a.notes.single()), merged.getValue("notes").jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(
+            listOf("from the bridge", a.notes.single()),
+            merged.getValue("notes").jsonArray.map { it.jsonPrimitive.content },
+        )
         val untouched: JsonElement = ToolArgs(emptyMap()).withNotes(result)
         assertEquals(result, untouched)
     }

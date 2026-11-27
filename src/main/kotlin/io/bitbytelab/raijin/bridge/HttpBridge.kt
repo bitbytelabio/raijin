@@ -84,6 +84,7 @@ class HttpBridge(
         options: HttpSendOptions = HttpSendOptions(),
     ): JsonObject {
         var scope: ScopeGate.Check? = null
+        var target: String? = null
         return try {
             val fixReport = mutableMapOf<String, JsonElement>()
             var mode = HttpModes.resolve(httpMode)
@@ -119,6 +120,9 @@ class HttpBridge(
                 } catch (_: Exception) {
                     url ?: ""
                 }
+            target =
+                runCatching { httpRequest.httpService().let { "${it.host()}:${it.port()}" } }
+                    .getOrNull()
             // Where the bytes go (service + path), not what url() reads off the Host header.
             val check = scopeGate.checkHttpRequest(httpRequest, url)
             if (check.blocked) return check.denyJson()
@@ -164,13 +168,31 @@ class HttpBridge(
             }
             json
         } catch (e: Exception) {
-            val error = buildJsonObject {
-                put("error", "Failed to send request: ${e.message}")
-                put("is_timeout", e is HttpRequestTimeoutException)
-                put("close_reason", if (e is HttpRequestTimeoutException) "timeout" else "error")
-            }
+            val error = sendError(e, "http_send_request", "Failed to send request", target)
             scope?.annotate(error) ?: error
         }
+    }
+
+    /**
+     * The error of a failed send. A hard timeout is `no_response` and retryable, naming [call],
+     * [target] (`host:port`, when known) and the timeout; anything else is "[failure]: message".
+     */
+    private fun sendError(
+        e: Exception,
+        call: String,
+        failure: String,
+        target: String?,
+    ): JsonObject = buildJsonObject {
+        if (e is HttpRequestTimeoutException) {
+            val from = if (target != null) " from $target" else ""
+            put("error", "$call: no response$from in ${e.timeoutMs} ms (timed out).")
+            put("code", "no_response")
+            put("retryable", true)
+        } else {
+            put("error", "$failure: ${e.message}")
+        }
+        put("is_timeout", e is HttpRequestTimeoutException)
+        put("close_reason", if (e is HttpRequestTimeoutException) "timeout" else "error")
     }
 
     /** Sends through Montoya's `RequestOptions`, which an older Burp does not have. */
@@ -363,11 +385,12 @@ class HttpBridge(
                 put("results", JsonArray(items))
             }
         } catch (e: Exception) {
-            buildJsonObject {
-                put("error", "Failed to send parallel requests: ${e.message}")
-                put("is_timeout", e is HttpRequestTimeoutException)
-                put("close_reason", if (e is HttpRequestTimeoutException) "timeout" else "error")
-            }
+            sendError(
+                e,
+                "http_send_requests_parallel",
+                "Failed to send parallel requests",
+                null,
+            )
         }
     }
 
@@ -879,11 +902,8 @@ class HttpBridge(
             }
             check.annotate(json)
         } catch (e: Exception) {
-            val error = buildJsonObject {
-                put("error", "Failed to send raw bytes: ${e.message}")
-                put("is_timeout", e is HttpRequestTimeoutException)
-                put("close_reason", if (e is HttpRequestTimeoutException) "timeout" else "error")
-            }
+            val error =
+                sendError(e, "http_send_raw_bytes", "Failed to send raw bytes", "$host:$port")
             scope?.annotate(error) ?: error
         }
     }

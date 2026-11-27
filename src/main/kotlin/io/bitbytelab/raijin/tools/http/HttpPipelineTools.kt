@@ -90,6 +90,8 @@ All *_ms are milliseconds with microsecond precision, counted from the first req
                                 "port",
                                 "integer",
                                 "Target port number (1-65535, default 443, or 80 with use_tls=false)",
+                                minimum = 1,
+                                maximum = 65535,
                             )
                             property("use_tls", "boolean", "Whether to use HTTPS (TLS)")
                             property("tls", "boolean", "Alias for use_tls")

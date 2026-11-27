@@ -60,7 +60,7 @@ Several raw requests over one socket are `http_send_pipeline`
   only move the connection.
 
 ## Timeouts and limits
-- `timeout_ms` (0 = no hard timeout, at most 600000, default 25000) bounds one request, each chain step or
+- `timeout_ms` (0 = default, -1 = no hard timeout, at most 600000, default 25000) bounds one request, each chain step or
   fuzz request, a whole parallel batch or race. A timed-out send returns `is_timeout: true`.
 - A number out of range (`count`, `concurrency`, `max_responses`, ...) is clamped and reported in `notes`
   instead of being refused.

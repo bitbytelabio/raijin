@@ -22,12 +22,18 @@
 - Call-name suggestions follow the words of the name: `http_request` suggests `http_send_request`, `add_to_scope` `scope.include`, `list_findings` `findings.list` (with `retry`); a grouped tool is never suggested without its action, and `ai.*` ranks last.
 - One `notes` field: the scope-mode change of `persistence.preference_*` and `http_state.cookie_jar_delete` are `notes` arrays, `http_race`'s analysis `note` is `verdict` and a cluster's overflow `note` is `overflow_detail`. A plain-text result gets its notes as a leading `note:` line.
 - `unregister` actions (`scanner.unregister_check`, ...) count as destructive.
+- A strict client's `false` and `0` for another action's parameters are dropped like its empty values (`ignored N empty parameters of other actions`); the action's own `false`/`0` stay. `""` for `subscription_id` and `status_code_range` is unset.
+- An unknown parameter whose value only one enum takes is suggested by it: `util.hash {"type":"md5"}` gets `did_you_mean:["algorithm"]` and a `retry` with `algorithm:"MD5"`.
+- Verb suggestions: a remove verb (`clear`, `delete`, `drop`, `remove`) with other words suggests only the removal those words name (`drop_request` -> `proxy_intercept.drop`; `clear_history`, `delete_all` suggest no removal), `forward`, `enable`, `disable` and `on`/`off` are verbs (`intercept_on` -> `proxy_intercept.enable`), and `send_payload` leads with `http_send_request`, `scan_xss` with `scanner.start_audit`.
 
 ### Extension
 - `http_send_request`: `headers` takes `["X-A: 1"]`; a header entry it cannot read refuses the call and sends nothing (also per item in `http_send_requests_parallel` and `http_send_request_chain`). A raw request without a Host header and without `host` says so. A request with no response carries `no_response` with the target, and `time_request_sent` is null instead of the epoch.
 - `proxy_history` returns 20 items by default and leaves out `request_headers` unless `include_headers` is set.
 - `util.random_string`/`random_bytes` clamp `length` and report `length_clamped_to`; `util.base64_decode` names the bad character; `analyze.request` says when `request` is not a raw HTTP request.
 - Tool API: HTTP 400/415 answers and a throwing tool carry `code` and `retryable`. An `action` argument that differs from the one in the name is noted.
+- `timeout_ms: 0` is the default timeout (noted) and `-1` means no hard timeout; `response_timeout_ms: 0` is Burp's default and `-1` none. A send that hits its hard timeout is `code: "no_response"`, `retryable: true`, naming the target and the timeout.
+- `port` declares `minimum: 1, maximum: 65535`, so an optional `port: 0` is unset.
+- `http_race` no longer says the target may not speak HTTP/2 when every connection was refused.
 - `http_send_request_chain` and `http_send_requests_parallel` where nothing got a response are errors (`no_response`) naming the first reason. `http_send_request` notes TLS chosen for a raw request, `url` ignored next to `raw_request`, and non-string header values sent as text.
 - `util.compress`/`util.decompress` refuse `data` that is not base64 like `util.base64_decode`; `probe.access_control` says which of `requests`/`identities` is missing or short; `scope.remove` out of range is `out_of_range` with the list size.
 - `http_send_request` without a response is an error (`code: no_response`) that keeps every request field. A `url` without a scheme is `invalid_arguments` with both schemes in `did_you_mean` (no `retry`: the scheme is the caller's choice); `scope.check`/`include`/`exclude` do the same, `scope.check` with the `https` guess in `retry`.
