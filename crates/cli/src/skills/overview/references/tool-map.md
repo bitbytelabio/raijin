@@ -71,3 +71,4 @@ Every published Raijin tool, the actions of the grouped ones and what it is for.
 |---|---|---|
 | `burp_up`, `burp_down`, `burp_status` | `lifecycle` | Start, stop and inspect this target's CLI-managed Burp instances |
 | `history_list`, `history_show`, `history_search`, `history_endpoints`, `history_diff`, `history_export` | `history` | Offline review of the `.burp` projects (`guide {"topic":"offline-history"}`) |
+| `data_list`, `data_search`, `data_get`, `data_payloads`, `data_add`, `data_import`, `data_update` | `data` | PortSwigger cheat sheets, BChecks, Bambdas and this target's own data (`guide {"topic":"data-library"}`) |

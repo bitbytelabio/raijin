@@ -53,9 +53,16 @@ include = []
 # Tool results larger than this many KiB are saved to .raijin/tool-results/ instead of returned inline.
 inline_limit_kb = 24
 
-# Drive an already-running Raijin instead of a CLI-managed Burp (its MCP URL; the CLI calls /api/v1 on the same host and port).
+[data]
+# This target's own payloads, BChecks and Bambdas (tracked by git, unlike .raijin/):
+# <dir>/payloads/<category>.json, <dir>/bchecks/**/*.bcheck, <dir>/bambdas/**/*.bambda.
+# PortSwigger's cheat sheets, BChecks and Bambdas are cached once per machine in ~/.raijin/data/.
+dir = "data"
+
+# Drive an already-running Raijin instead of a CLI-managed Burp. The CLI calls its JSON tool API
+# (<url>/api/v1); a URL ending in /mcp or /api/v1 works too, and a path is kept as a proxy prefix.
 # [remote]
-# url = "http://127.0.0.1:9876/mcp"
+# url = "http://127.0.0.1:9876"
 # token_env = "RAIJIN_TOKEN"   # only when that Raijin requires a bearer token
 
 # Burp install; found automatically in the usual places.

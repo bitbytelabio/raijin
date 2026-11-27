@@ -139,6 +139,13 @@ private val CLI_TOOLS =
         "history_endpoints",
         "history_diff",
         "history_export",
+        "data_list",
+        "data_search",
+        "data_get",
+        "data_payloads",
+        "data_add",
+        "data_import",
+        "data_update",
     )
 
 /**

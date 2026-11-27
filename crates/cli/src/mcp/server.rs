@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::future::{self, Future};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +31,7 @@ use super::{spill, stdin};
 use crate::burp::{instance, launch};
 use crate::catalog::{self, ActionSpec, Catalog, SKILL_FILE, ToolSpec};
 use crate::config::{Mode, Remote, Target, user_state_dir};
+use crate::data::{self, store};
 use crate::history;
 use crate::jar::{self, Assets};
 use crate::util::{contains_near, edit_distance, suggest, suggest_call, truncate_utf8};
@@ -90,6 +91,12 @@ const LIFECYCLE_NOTES: &str = "Remote mode: only burp_status.";
 const HISTORY_DESCRIPTION: &str = "Offline review of this target's .burp projects plus the Raijin archive, \
 without starting Burp; reads all projects in parallel.";
 const HISTORY_NOTES: &str = "Live data of a running Burp is proxy.";
+const DATA: &str = "data";
+const DATA_DESCRIPTION: &str = "PortSwigger's XSS and URL-bypass cheat sheets, BChecks and Bambdas (cached in \
+~/.raijin/data) plus this target's own payloads and checks (data/): known vectors and checks to start from.";
+const DATA_NOTES: &str = "Starting points, not limits: adapt a vector to the context you see and craft new ones \
+when none fits. Upstream data downloads on first use and refreshes when older than 7 days; data_update forces it. \
+Save what worked with data_add.";
 const OTHER_DESCRIPTION: &str =
     "Tools the running Raijin has that this CLI's catalog does not list.";
 const OTHER_NOTES: &str = "";
@@ -99,10 +106,10 @@ const SUMMARY_BYTES: usize = 200;
 
 /// The playbook of a domain the CLI owns.
 fn local_playbook(domain: &str) -> &'static str {
-    if domain == HISTORY {
-        "offline-history"
-    } else {
-        "overview"
+    match domain {
+        HISTORY => "offline-history",
+        DATA => "data-library",
+        _ => "overview",
     }
 }
 
@@ -244,6 +251,69 @@ const LOCAL_TOOLS: &[LocalTool] = &[
         description: "bproj JSON export of each project (plus the archive files) under .raijin/exports/.",
         schema: schema_of::<history::export::ExportParams>,
         example: r#"{"do":"history_export"}"#,
+        read_only: false,
+        destructive: false,
+    },
+    LocalTool {
+        name: "data_list",
+        domain: DATA,
+        description: "Data sources: PortSwigger cache state (commit, age, entries per category) and this target's own data.",
+        schema: schema_of::<data::tools::ListArgs>,
+        example: r#"{"do":"data_list"}"#,
+        read_only: true,
+        destructive: false,
+    },
+    LocalTool {
+        name: "data_search",
+        domain: DATA,
+        description: "Search cheat sheet vectors, BChecks and Bambdas by words and filters; payload rows show the vector, scripts come whole from data_get.",
+        schema: schema_of::<data::tools::SearchArgs>,
+        example: r#"{"do":"data_search","query":"svg onload","source":"xss","limit":10}"#,
+        read_only: true,
+        destructive: false,
+    },
+    LocalTool {
+        name: "data_get",
+        domain: DATA,
+        description: "One entry by id, whole: the vector or the BCheck/Bambda script, and every upstream field.",
+        schema: schema_of::<data::tools::GetArgs>,
+        example: r#"{"do":"data_get","id":"xss:events/onload/svg"}"#,
+        read_only: true,
+        destructive: false,
+    },
+    LocalTool {
+        name: "data_payloads",
+        domain: DATA,
+        description: "Payload strings matching the filters, <attacker>/<allowed> filled in, ready for http_fuzz payloads.",
+        schema: schema_of::<data::tools::PayloadsArgs>,
+        example: r#"{"do":"data_payloads","source":"url","category":"loopback","limit":50}"#,
+        read_only: true,
+        destructive: false,
+    },
+    LocalTool {
+        name: "data_add",
+        domain: DATA,
+        description: "Save a payload (data/payloads/<category>.json), BCheck or Bambda to this target's data folder, tracked by git.",
+        schema: schema_of::<data::tools::AddArgs>,
+        example: r#"{"do":"data_add","category":"waf-bypass","payload":"<svg/onload=alert(1)>","description":"passes the WAF on /search"}"#,
+        read_only: false,
+        destructive: false,
+    },
+    LocalTool {
+        name: "data_import",
+        domain: DATA,
+        description: "Import a BCheck (custom_check.bcheck_import) or Bambda (bambda_import) into the running Burp by id.",
+        schema: schema_of::<data::tools::ImportArgs>,
+        example: r#"{"do":"data_import","id":"bchecks:examples/blind-ssrf"}"#,
+        read_only: false,
+        destructive: false,
+    },
+    LocalTool {
+        name: "data_update",
+        domain: DATA,
+        description: "Download PortSwigger's data now (all sources or one) into ~/.raijin/data.",
+        schema: schema_of::<data::tools::UpdateArgs>,
+        example: r#"{"do":"data_update"}"#,
         read_only: false,
         destructive: false,
     },
@@ -1215,7 +1285,18 @@ pub struct Gateway {
     api: ToolApi,
     /// Projects whose "is running; data may be incomplete" warning this session already gave.
     warned_live: std::sync::Mutex<BTreeSet<String>>,
+    /// `~/.raijin/data`: `PortSwigger`'s data, shared by every target.
+    data_root: Option<PathBuf>,
+    /// Whether data calls download missing and stale sources ([`store::AUTO_UPDATE_ENV`]).
+    data_auto_update: bool,
+    /// Whether this session already checked for missing and stale sources.
+    data_checked: tokio::sync::Mutex<bool>,
+    /// The parsed upstream data, with the manifest stamps it was read at.
+    data_cache: std::sync::Mutex<Option<DataCache>>,
 }
+
+/// Parsed upstream data and the [`store::stamp`] it was read at.
+type DataCache = (Vec<(data::Source, u64)>, Arc<data::Library>);
 
 /// `value`'s `warnings` without the live-project warning ([`history::source::LIVE_INCOMPLETE`]) of
 /// a project already in `seen`; a project whose warning is kept is added to `seen`. Other warnings
@@ -1264,6 +1345,10 @@ pub async fn serve(surface: Surface, remote_flag: Option<String>) -> Result<()> 
         assets: OnceCell::new(),
         api: ToolApi::new(),
         warned_live: std::sync::Mutex::default(),
+        data_root: crate::config::user_data_dir().ok(),
+        data_auto_update: store::auto_update(),
+        data_checked: tokio::sync::Mutex::new(false),
+        data_cache: std::sync::Mutex::default(),
     };
     let service = gateway
         .serve((stdin::repaired_stdin(), tokio::io::stdout()))
@@ -1738,10 +1823,10 @@ impl Gateway {
                 .entry("project")
                 .or_insert_with(|| json!(project));
         }
-        let result = if local.domain == LIFECYCLE {
-            self.lifecycle(local, arguments).await
-        } else {
-            self.history(local, arguments).await
+        let result = match local.domain {
+            LIFECYCLE => self.lifecycle(local, arguments).await,
+            DATA => self.data(local, arguments).await,
+            _ => self.history(local, arguments).await,
         };
         let notes: Vec<String> = note.into_iter().collect();
         let result = error::mirror_warnings(error::with_notes(result, &notes));
@@ -2084,6 +2169,12 @@ impl Gateway {
             HISTORY_DESCRIPTION,
             &history_tools.join(", "),
         ));
+        let data_tools: Vec<&str> = LOCAL_TOOLS
+            .iter()
+            .filter(|t| t.domain == DATA)
+            .map(|t| t.name)
+            .collect();
+        lines.push(domain_line(DATA, DATA_DESCRIPTION, &data_tools.join(", ")));
 
         lines.push(String::new());
         lines.push("Playbooks (guide {\"topic\":\"<name>\"}):".to_owned());
@@ -2129,54 +2220,54 @@ impl Gateway {
                 .filter_map(|(name, view)| view.map(|v| v.listing(name)))
                 .collect()
         };
-        let (description, notes, playbook, tools) = if domain == LIFECYCLE || domain == HISTORY {
-            let (tools, description, notes): (Vec<&LocalTool>, _, _) = if domain == LIFECYCLE {
+        let (description, notes, playbook, tools) =
+            if domain == LIFECYCLE || domain == HISTORY || domain == DATA {
+                let of = |d: &str| -> Vec<&LocalTool> {
+                    LOCAL_TOOLS.iter().filter(|t| t.domain == d).collect()
+                };
+                let (tools, description, notes): (Vec<&LocalTool>, _, _) = match domain.as_str() {
+                    LIFECYCLE => (
+                        self.lifecycle_tools(),
+                        LIFECYCLE_DESCRIPTION,
+                        LIFECYCLE_NOTES,
+                    ),
+                    HISTORY => (of(HISTORY), HISTORY_DESCRIPTION, HISTORY_NOTES),
+                    _ => (of(DATA), DATA_DESCRIPTION, DATA_NOTES),
+                };
                 (
-                    self.lifecycle_tools(),
-                    LIFECYCLE_DESCRIPTION,
-                    LIFECYCLE_NOTES,
+                    description.to_owned(),
+                    notes.to_owned(),
+                    local_playbook(&domain).to_owned(),
+                    listing(&mut tools.iter().map(|t| (t.name, Some(ToolView::local(t))))),
+                )
+            } else if domain == OTHER && !other.is_empty() {
+                (
+                    OTHER_DESCRIPTION.to_owned(),
+                    OTHER_NOTES.to_owned(),
+                    local_playbook(OTHER).to_owned(),
+                    listing(
+                        &mut other
+                            .iter()
+                            .map(|t| (t.as_str(), tool_view(t, catalog, live))),
+                    ),
                 )
             } else {
+                let d = catalog?.domain(&domain)?;
+                let live_names: Option<BTreeSet<&str>> =
+                    live.map(|l| l.iter().map(|t| t.name.as_ref()).collect());
                 (
-                    LOCAL_TOOLS.iter().filter(|t| t.domain == HISTORY).collect(),
-                    HISTORY_DESCRIPTION,
-                    HISTORY_NOTES,
+                    d.description.clone(),
+                    d.notes.clone(),
+                    d.skill.clone(),
+                    listing(
+                        &mut d
+                            .tools
+                            .iter()
+                            .filter(|t| live_names.as_ref().is_none_or(|n| n.contains(t.as_str())))
+                            .map(|t| (t.as_str(), tool_view(t, catalog, live))),
+                    ),
                 )
             };
-            (
-                description.to_owned(),
-                notes.to_owned(),
-                local_playbook(&domain).to_owned(),
-                listing(&mut tools.iter().map(|t| (t.name, Some(ToolView::local(t))))),
-            )
-        } else if domain == OTHER && !other.is_empty() {
-            (
-                OTHER_DESCRIPTION.to_owned(),
-                OTHER_NOTES.to_owned(),
-                local_playbook(OTHER).to_owned(),
-                listing(
-                    &mut other
-                        .iter()
-                        .map(|t| (t.as_str(), tool_view(t, catalog, live))),
-                ),
-            )
-        } else {
-            let d = catalog?.domain(&domain)?;
-            let live_names: Option<BTreeSet<&str>> =
-                live.map(|l| l.iter().map(|t| t.name.as_ref()).collect());
-            (
-                d.description.clone(),
-                d.notes.clone(),
-                d.skill.clone(),
-                listing(
-                    &mut d
-                        .tools
-                        .iter()
-                        .filter(|t| live_names.as_ref().is_none_or(|n| n.contains(t.as_str())))
-                        .map(|t| (t.as_str(), tool_view(t, catalog, live))),
-                ),
-            )
-        };
         // `notes` is an array, as in every result, so the call's own notes join it.
         let notes: Vec<String> = if notes.is_empty() {
             Vec::new()
@@ -2281,6 +2372,274 @@ impl Gateway {
         }
     }
 
+    async fn data(&self, local: &LocalTool, arguments: Option<JsonObject>) -> CallToolResult {
+        let result = if local.name == "data_import" {
+            self.data_import(local, arguments).await
+        } else {
+            self.data_inner(local, arguments).await
+        };
+        match result {
+            Ok((value, notes)) => error::with_notes(value, &notes),
+            Err(e) => e.into_result(),
+        }
+    }
+
+    fn data_root(&self) -> Result<&Path, ToolError> {
+        self.data_root.as_deref().ok_or_else(|| {
+            ToolError::new(Code::ConfigError, "no home directory for ~/.raijin/data")
+        })
+    }
+
+    /// Downloads missing and stale sources, once per session and only when automatic updates are
+    /// on; a note per source says what happened.
+    async fn data_refresh(&self, root: &Path) -> Vec<String> {
+        let mut checked = self.data_checked.lock().await;
+        if *checked || !self.data_auto_update {
+            return Vec::new();
+        }
+        *checked = true;
+        let due = store::due(root, crate::util::now_ms());
+        if due.is_empty() {
+            return Vec::new();
+        }
+        let results =
+            futures::future::join_all(due.iter().map(|(up, _)| store::fetch(root, up))).await;
+        let mut notes = Vec::new();
+        for ((up, old), result) in due.iter().zip(results) {
+            let name = up.source.as_str();
+            notes.push(match (result, old) {
+                (Ok(m), old) => format!(
+                    "{} {name} ({})",
+                    if old.is_some() {
+                        "refreshed"
+                    } else {
+                        "downloaded"
+                    },
+                    store::short_commit(m.commit.as_deref())
+                ),
+                (Err(e), Some(old)) => format!(
+                    "could not refresh {name}: {e:#}; using data from {}",
+                    day_of(old.fetched_at_ms)
+                ),
+                (Err(e), None) => format!(
+                    "{name} not downloaded: {e:#}; run {{\"do\":\"data_update\"}} when online"
+                ),
+            });
+        }
+        if let Ok(mut cache) = self.data_cache.lock() {
+            *cache = None;
+        }
+        notes
+    }
+
+    /// The upstream library (reparsed only when a manifest changed) and this target's own data.
+    async fn data_libraries(
+        &self,
+        root: &Path,
+    ) -> Result<(Arc<data::Library>, data::Library), ToolError> {
+        let internal = |e: tokio::task::JoinError| ToolError::new(Code::Internal, e.to_string());
+        let stamp = store::stamp(root);
+        let cached = self.data_cache.lock().ok().and_then(|c| {
+            c.as_ref()
+                .filter(|(s, _)| *s == stamp)
+                .map(|(_, lib)| lib.clone())
+        });
+        let upstream = if let Some(lib) = cached {
+            lib
+        } else {
+            let dir = root.to_path_buf();
+            let lib = Arc::new(
+                tokio::task::spawn_blocking(move || store::load_upstream(&dir))
+                    .await
+                    .map_err(internal)?,
+            );
+            if let Ok(mut cache) = self.data_cache.lock() {
+                *cache = Some((stamp, lib.clone()));
+            }
+            lib
+        };
+        let custom = match &self.target {
+            Some(t) => {
+                let dir = t.data_dir();
+                tokio::task::spawn_blocking(move || data::custom::load_custom(&dir))
+                    .await
+                    .map_err(internal)?
+            }
+            None => data::Library::default(),
+        };
+        Ok((upstream, custom))
+    }
+
+    async fn data_inner(
+        &self,
+        local: &LocalTool,
+        arguments: Option<JsonObject>,
+    ) -> Result<(CallToolResult, Vec<String>), ToolError> {
+        use data::tools;
+        let root = self.data_root()?;
+        let value = match local.name {
+            "data_add" => {
+                let (args, notes): (tools::AddArgs, _) = local_args(local, arguments)?;
+                let dir = self.target_or_error()?.data_dir();
+                let value = tokio::task::spawn_blocking(move || data::custom::add(&dir, &args))
+                    .await
+                    .map_err(|e| ToolError::new(Code::Internal, e.to_string()))??;
+                return Ok((text(&value), notes));
+            }
+            "data_update" => {
+                let (args, notes): (tools::UpdateArgs, _) = local_args(local, arguments)?;
+                return Ok((text(&self.data_update(root, args.source).await?), notes));
+            }
+            "data_list" => {
+                let (args, mut notes): (tools::ListArgs, _) = local_args(local, arguments)?;
+                notes.extend(self.data_refresh(root).await);
+                let (upstream, custom) = self.data_libraries(root).await?;
+                let custom_dir = self.target.as_ref().map(|t| t.data_dir());
+                let value = tools::list(
+                    root,
+                    custom_dir.as_deref(),
+                    &upstream,
+                    &custom,
+                    crate::util::now_ms(),
+                    args.source,
+                );
+                (value, notes)
+            }
+            "data_search" => {
+                let (args, mut notes): (tools::SearchArgs, _) = local_args(local, arguments)?;
+                notes.extend(self.data_refresh(root).await);
+                let (upstream, custom) = self.data_libraries(root).await?;
+                let entries = data_view(&upstream, &custom);
+                let mut value = tools::search(&entries, &args);
+                if let Some(source) = args.filters.source
+                    && source != data::Source::Custom
+                    && store::manifest(root, source).is_none()
+                {
+                    value["missing"] = json!([source]);
+                }
+                (value, notes)
+            }
+            "data_get" => {
+                let (args, mut notes): (tools::GetArgs, _) = local_args(local, arguments)?;
+                notes.extend(self.data_refresh(root).await);
+                let (upstream, custom) = self.data_libraries(root).await?;
+                (tools::get(&data_view(&upstream, &custom), &args.id)?, notes)
+            }
+            _ => {
+                let (args, mut notes): (tools::PayloadsArgs, _) = local_args(local, arguments)?;
+                notes.extend(self.data_refresh(root).await);
+                let (upstream, custom) = self.data_libraries(root).await?;
+                let (value, more) = tools::payloads(&data_view(&upstream, &custom), &args)?;
+                notes.extend(more);
+                (value, notes)
+            }
+        };
+        Ok((text(&value.0), value.1))
+    }
+
+    /// `data_import`: a `BCheck` or Bambda of the library sent to the running Burp.
+    async fn data_import(
+        &self,
+        local: &LocalTool,
+        arguments: Option<JsonObject>,
+    ) -> Result<(CallToolResult, Vec<String>), ToolError> {
+        let root = self.data_root()?;
+        let (args, mut notes): (data::tools::ImportArgs, _) = local_args(local, arguments)?;
+        notes.extend(self.data_refresh(root).await);
+        let (upstream, custom) = self.data_libraries(root).await?;
+        let entries = data_view(&upstream, &custom);
+        let entry = data::tools::find(&entries, &args.id)?;
+        let tool = match entry.kind {
+            data::Kind::Bcheck => "custom_check.bcheck_import",
+            data::Kind::Bambda => "bambda_import",
+            data::Kind::Payload => {
+                return Err(ToolError::new(
+                    Code::InvalidArguments,
+                    format!(
+                        "{} is a payload, not a script; use data_payloads or data_get",
+                        entry.id
+                    ),
+                )
+                .param("id")
+                .see(json!({"do": "data_get", "id": entry.id})));
+            }
+        };
+        let mut call = JsonObject::new();
+        call.insert("script".to_owned(), json!(entry.payload));
+        let result = self
+            .forward(tool, Some(call), args.project.as_deref())
+            .await;
+        if result.is_error != Some(true) {
+            notes.push(format!("imported {}", entry.id));
+        }
+        Ok((result, notes))
+    }
+
+    /// `data_update`: downloads `source`, or every upstream source, now.
+    async fn data_update(
+        &self,
+        root: &Path,
+        source: Option<data::Source>,
+    ) -> Result<Value, ToolError> {
+        let ups: Vec<&'static store::Upstream> = match source {
+            None => store::UPSTREAM.iter().collect(),
+            Some(s) => vec![store::upstream(s).ok_or_else(|| {
+                ToolError::new(
+                    Code::InvalidEnum,
+                    "custom is this target's own data; nothing to download",
+                )
+                .param("source")
+                .got(json!(s))
+                .allowed(store::UPSTREAM.iter().map(|u| json!(u.source)).collect())
+            })?],
+        };
+        // Held across the downloads, so an automatic refresh never installs the same source at once.
+        let mut checked = self.data_checked.lock().await;
+        let previous: Vec<Option<store::Manifest>> = ups
+            .iter()
+            .map(|u| store::manifest(root, u.source))
+            .collect();
+        let results = futures::future::join_all(ups.iter().map(|u| store::fetch(root, u))).await;
+        let mut updated = Vec::new();
+        let mut failed = Vec::new();
+        for ((up, before), result) in ups.iter().zip(previous).zip(results) {
+            match result {
+                Ok(m) => updated.push(json!({
+                    "source": up.source,
+                    "commit": m.commit,
+                    "previous_commit": before.and_then(|b| b.commit),
+                    "files": m.files,
+                })),
+                Err(e) => failed.push(json!({"source": up.source, "error": format!("{e:#}")})),
+            }
+        }
+        if let Ok(mut cache) = self.data_cache.lock() {
+            *cache = None;
+        }
+        // One source updated leaves the others to the automatic check.
+        if source.is_none() {
+            *checked = true;
+        }
+        drop(checked);
+        if updated.is_empty() {
+            let errors: Vec<String> = failed
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{}: {}",
+                        f["source"].as_str().unwrap_or_default(),
+                        f["error"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect();
+            return Err(ToolError::new(
+                Code::ToolFailed,
+                format!("no data source downloaded ({})", errors.join("; ")),
+            ));
+        }
+        Ok(json!({"updated": updated, "failed": failed}))
+    }
+
     async fn history(
         &self,
         local: &'static LocalTool,
@@ -2372,6 +2731,17 @@ impl Gateway {
             ),
         ]
     }
+}
+
+/// The entries data tools see: this target's own first, then `PortSwigger`'s.
+fn data_view<'a>(upstream: &'a data::Library, custom: &'a data::Library) -> Vec<&'a data::Entry> {
+    custom.entries.iter().chain(&upstream.entries).collect()
+}
+
+/// `yyyy-mm-dd` (UTC) of a time in epoch milliseconds.
+fn day_of(ms: u64) -> String {
+    let stamp = crate::util::utc_stamp_at(ms / 1000);
+    format!("{}-{}-{}", &stamp[..4], &stamp[4..6], &stamp[6..8])
 }
 
 /// One `guide()` overview line: `<domain> — <description>: <tools>`.
@@ -2670,7 +3040,7 @@ fn normalized_topic<'a>(
 /// playbook files.
 fn topic_names(catalog: Option<&Catalog>, live: Option<&[Tool]>, other: &[String]) -> Vec<String> {
     let mut names: Vec<String> = LOCAL_TOOLS.iter().map(|t| t.name.to_owned()).collect();
-    names.extend([LIFECYCLE.to_owned(), HISTORY.to_owned()]);
+    names.extend([LIFECYCLE.to_owned(), HISTORY.to_owned(), DATA.to_owned()]);
     if !other.is_empty() {
         names.push(OTHER.to_owned());
     }
@@ -3090,6 +3460,13 @@ mod tests {
             "history_export" => {
                 local_args::<history::export::ExportParams>(local, arguments).map(drop)
             }
+            "data_list" => local_args::<data::tools::ListArgs>(local, arguments).map(drop),
+            "data_search" => local_args::<data::tools::SearchArgs>(local, arguments).map(drop),
+            "data_get" => local_args::<data::tools::GetArgs>(local, arguments).map(drop),
+            "data_payloads" => local_args::<data::tools::PayloadsArgs>(local, arguments).map(drop),
+            "data_add" => local_args::<data::tools::AddArgs>(local, arguments).map(drop),
+            "data_import" => local_args::<data::tools::ImportArgs>(local, arguments).map(drop),
+            "data_update" => local_args::<data::tools::UpdateArgs>(local, arguments).map(drop),
             other => panic!("no parser for local tool {other}"),
         }
     }
@@ -3253,6 +3630,10 @@ mod weak_model {
             assets: OnceCell::new(),
             api: ToolApi::new(),
             warned_live: std::sync::Mutex::default(),
+            data_root: Some(dir.join("cache")),
+            data_auto_update: false,
+            data_checked: tokio::sync::Mutex::new(false),
+            data_cache: std::sync::Mutex::default(),
         }
     }
 
@@ -3417,6 +3798,72 @@ mod weak_model {
         let notes = bare_refs(target, local("history_show"), Some(&mut args));
         assert_eq!(args["ref"], json!("main:1"));
         assert_eq!(notes, ["read ref \"1\" as \"main:1\""]);
+    }
+
+    #[tokio::test]
+    async fn data_tools_search_and_save_without_network() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let gateway = gateway(dir.path());
+        let xss = dir.path().join("cache/xss");
+        std::fs::create_dir_all(xss.join("json")).expect("xss dir");
+        let manifest = store::Manifest {
+            source: data::Source::Xss,
+            repo: "PortSwigger/xss-cheatsheet-data".into(),
+            branch: "master".into(),
+            commit: None,
+            fetched_at_ms: crate::util::now_ms(),
+            files: 1,
+        };
+        std::fs::write(
+            xss.join("manifest.json"),
+            serde_json::to_vec(&manifest).expect("manifest"),
+        )
+        .expect("write manifest");
+        std::fs::write(
+            xss.join("json/events.json"),
+            r#"{"onload":{"description":"Fires on load","tags":[{"tag":"svg","code":"<svg onload=alert(1)>","browsers":["chrome"],"interaction":false}]}}"#,
+        )
+        .expect("events");
+        // run_resolved, not run: run reads the jar's catalog, which may need the network.
+        let call = |v: Value| {
+            let gateway = &gateway;
+            async move {
+                let mut arguments = object(v);
+                let tool = arguments
+                    .remove("do")
+                    .and_then(|t| t.as_str().map(str::to_owned))
+                    .expect("do");
+                let call = Call {
+                    tool,
+                    arguments: Some(arguments),
+                    project: None,
+                    notes: Vec::new(),
+                };
+                let (_, result) = gateway.run_resolved(call).await;
+                (result.is_error == Some(true), result_value(&result))
+            }
+        };
+
+        let (failed, found) = call(json!({"do": "data_search", "query": "svg onload"})).await;
+        assert!(!failed, "{found}");
+        assert_eq!(found["total"], 1, "{found}");
+        assert_eq!(found["rows"][0]["id"], "xss:events/onload/svg");
+
+        let (failed, added) =
+            call(json!({"do": "data_add", "category": "waf", "payload": "<x>"})).await;
+        assert!(!failed, "{added}");
+        assert_eq!(added["added"], true);
+        assert!(dir.path().join("data/payloads/waf.json").is_file());
+        let (_, again) = call(json!({"do": "data_add", "category": "waf", "payload": "<x>"})).await;
+        assert_eq!(again["added"], false, "{again}");
+
+        let (_, payloads) = call(json!({"do": "data_payloads", "source": "custom"})).await;
+        assert_eq!(payloads["payloads"], json!(["<x>"]), "{payloads}");
+
+        let (failed, refused) =
+            call(json!({"do": "data_import", "id": "xss:events/onload/svg"})).await;
+        assert!(failed);
+        assert_eq!(refused["code"], "invalid_arguments", "{refused}");
     }
 
     #[test]

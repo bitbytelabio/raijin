@@ -11,7 +11,10 @@ Burp Intruder's attack types:
   walks one payload set per position in step; `cluster_bomb` sends every combination.
 - Payloads come from `payloads` and/or a built-in `payload_library` (`xss`, `sqli`, `traversal`, `ssti`,
   `cmdi`, `ssrf`, `xxe`, `crlf`, `nosqli`, `open_redirect`, `prototype_pollution`), or one set per position
-  from `payload_sets` (each an array, a library name or `{payloads, library}`).
+  from `payload_sets` (each an array, a library name or `{payloads, library}`). Larger, context-specific
+  sets come from PortSwigger's cheat sheets:
+  `run {"do":"data_payloads","source":"xss","category":"restricted_characters","limit":50}` gives a
+  `payloads` array.
 - `encoders` (`url`, `url_all`, `double_url`, `json`, `base64`, `base64url`, `html`, `hex`, `raw`) run on
   each payload in order.
 

@@ -162,10 +162,10 @@ async fn run_runs_local_tools_and_reports_routing_errors() {
     );
 
     let prompts = client.list_all_prompts().await.expect("prompts/list");
-    assert_eq!(prompts.len(), 9);
+    assert_eq!(prompts.len(), 10);
 
     let skills = client.list_all_skills().await.expect("skills/list");
-    assert_eq!(skills.len(), 9);
+    assert_eq!(skills.len(), 10);
     assert_eq!(skills[0].uri, "skill://overview/SKILL.md");
     assert!(
         skills.iter().all(|s| s.uri.ends_with("/SKILL.md")),

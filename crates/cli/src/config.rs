@@ -104,6 +104,26 @@ impl Default for Mcp {
     }
 }
 
+/// `[data]`: this target's own payloads, `BChecks` and Bambdas.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Data {
+    #[serde(default = "default_data_dir")]
+    pub dir: PathBuf,
+}
+
+impl Default for Data {
+    fn default() -> Self {
+        Self {
+            dir: default_data_dir(),
+        }
+    }
+}
+
+fn default_data_dir() -> PathBuf {
+    PathBuf::from("data")
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Remote {
@@ -141,6 +161,8 @@ pub struct Config {
     pub history: History,
     #[serde(default)]
     pub mcp: Mcp,
+    #[serde(default)]
+    pub data: Data,
     pub remote: Option<Remote>,
     #[serde(default)]
     pub burp: Burp,
@@ -227,6 +249,11 @@ impl Target {
 
     pub fn state_dir(&self) -> PathBuf {
         self.root.join(STATE_DIR)
+    }
+
+    /// `[data] dir`: this target's own payloads, `BChecks` and Bambdas, tracked by git.
+    pub fn data_dir(&self) -> PathBuf {
+        self.resolve(&self.config.data.dir)
     }
 
     pub fn run_dir(&self, project: &str) -> PathBuf {
@@ -347,6 +374,11 @@ pub fn user_state_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(".raijin"))
 }
 
+/// `~/.raijin/data`: `PortSwigger`'s cheat sheets, `BChecks` and Bambdas, shared by every target.
+pub fn user_data_dir() -> Result<PathBuf> {
+    Ok(user_state_dir()?.join("data"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +403,7 @@ mod tests {
         assert_eq!(config.task_engine, TaskEngine::Running);
         assert_eq!(config.projects_dir, PathBuf::from("burp"));
         assert_eq!(config.mcp.inline_limit_kb, 24);
+        assert_eq!(config.data.dir, PathBuf::from("data"));
         assert!(config.remote.is_none());
     }
 

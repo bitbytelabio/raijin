@@ -10,6 +10,9 @@ Read `run {"do":"custom_check.bcheck_templates"}` first, then create one:
 - `run {"do":"custom_check.bcheck_import","script":"<bcheck>"}` imports a hand-written script;
   `run {"do":"custom_check.bcheck_list"}` and `run {"do":"custom_check.bcheck_remove","id":"<id>"}`
   manage them.
+- PortSwigger's published BChecks and Bambdas are searchable:
+  `run {"do":"data_search","source":"bchecks","query":"<words>"}`, then
+  `run {"do":"data_import","id":"<id>"}`.
 
 ## Script-mode scan checks
 Read `run {"do":"custom_check.scancheck_templates"}` first.

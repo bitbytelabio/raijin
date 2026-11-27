@@ -302,6 +302,7 @@ const BUNDLED: &[(&str, &str)] = &[
         "offline-history",
         include_str!("skills/offline-history/SKILL.md"),
     ),
+    ("data-library", include_str!("skills/data-library/SKILL.md")),
 ];
 
 /// The other files of bundled skills: (skill, path inside its folder, body).

@@ -86,7 +86,7 @@ A result is confirmed by a minimal request you sent and its response, then recor
 Read one with `guide {"topic":"<playbook>"}`. Domain → playbook: `http`, `analysis` → `http-testing`;
 `proxy` → `proxy-traffic`; `recon`, `authz` → `recon-probes`; `scanner` → `scanner-audit`; `turbo` →
 `turbo-scripting`; `oob` → `collaborator-oob`; `findings` → `findings-reporting`; `history` →
-`offline-history`; `settings`, `lifecycle` → this playbook (`overview`).
+`offline-history`; `data` → `data-library`; `settings`, `lifecycle` → this playbook (`overview`).
 
 ## References
 - `guide {"topic":"overview/references/tool-map.md"}`: every published tool, its actions and what it does.

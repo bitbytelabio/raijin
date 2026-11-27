@@ -14,8 +14,8 @@ use tokio::sync::Mutex;
 
 use crate::util::truncate_utf8;
 
-/// Where to send a forwarded call: Raijin's MCP URL (`http://127.0.0.1:9876/mcp`, `[remote] url`);
-/// the API lives at `/api/v1` on the same host and port.
+/// Where to send a forwarded call: Raijin's URL (`[remote] url`, or a running instance's MCP URL);
+/// [`api_base`] turns it into the tool API base (`/api/v1`).
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub url: String,
@@ -57,19 +57,20 @@ impl fmt::Display for ApiError {
 /// Bytes of an error body quoted in a message.
 const ERROR_BODY_BYTES: usize = 500;
 
-/// The tool API base for the MCP URL `mcp_url`: its trailing `/mcp` segment becomes `/api/v1`, so a
-/// reverse-proxy prefix survives (`https://h/raijin/mcp` → `https://h/raijin/api/v1`); a URL without
-/// it gets `/api/v1` at the root.
-fn api_base(mcp_url: &str) -> Result<String, String> {
-    let mut url = url::Url::parse(mcp_url).map_err(|e| format!("bad Raijin URL {mcp_url}: {e}"))?;
+/// The tool API base for the Raijin URL `raw`: an `/api/v1` URL as is, a trailing `/mcp` segment
+/// replaced by `/api/v1`, and any other path kept as a reverse-proxy prefix (`https://h/raijin/mcp`
+/// and `https://h/raijin` → `https://h/raijin/api/v1`; `http://127.0.0.1:9876` →
+/// `http://127.0.0.1:9876/api/v1`).
+fn api_base(raw: &str) -> Result<String, String> {
+    let mut url = url::Url::parse(raw).map_err(|e| format!("bad Raijin URL {raw}: {e}"))?;
     if url.cannot_be_a_base() {
-        return Err(format!("bad Raijin URL {mcp_url}: not an http(s) URL"));
+        return Err(format!("bad Raijin URL {raw}: not an http(s) URL"));
     }
-    let prefix = url
-        .path()
-        .trim_end_matches('/')
-        .strip_suffix("/mcp")
-        .unwrap_or_default()
+    let path = url.path().trim_end_matches('/');
+    let prefix = path
+        .strip_suffix("/api/v1")
+        .or_else(|| path.strip_suffix("/mcp"))
+        .unwrap_or(path)
         .to_owned();
     url.set_path(&format!("{prefix}/api/v1"));
     url.set_query(None);
@@ -269,6 +270,21 @@ mod tests {
         );
         assert_eq!(
             api_base("https://burp.lan/raijin/mcp").as_deref(),
+            Ok("https://burp.lan/raijin/api/v1")
+        );
+        for base in [
+            "http://127.0.0.1:9876",
+            "http://127.0.0.1:9876/",
+            "http://127.0.0.1:9876/api/v1/",
+        ] {
+            assert_eq!(
+                api_base(base).as_deref(),
+                Ok("http://127.0.0.1:9876/api/v1"),
+                "{base}"
+            );
+        }
+        assert_eq!(
+            api_base("https://burp.lan/raijin").as_deref(),
             Ok("https://burp.lan/raijin/api/v1")
         );
         assert!(api_base("not a url").is_err());

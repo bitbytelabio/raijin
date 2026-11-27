@@ -4,6 +4,7 @@
 mod burp;
 mod catalog;
 mod config;
+mod data;
 mod history;
 mod init;
 mod jar;
@@ -73,12 +74,29 @@ enum Command {
         /// lean: guide and run; full: also every Raijin tool directly.
         #[arg(long, value_enum, default_value_t = mcp::server::Surface::Lean)]
         surface: mcp::server::Surface,
-        /// Use an already-running Raijin at this MCP URL (overrides [remote] url).
+        /// Use an already-running Raijin at this URL, e.g. `http://127.0.0.1:9876`; the CLI calls its tool API at /api/v1 (overrides [remote] url).
         #[arg(long)]
         remote: Option<String>,
     },
     /// Update the raijin CLI and the Raijin Burp extension (raijin.jar beside it) from GitHub releases.
     Update(update::Options),
+    /// `PortSwigger` data (cheat sheets, `BChecks`, Bambdas) cached in ~/.raijin/data, plus this target's own data.
+    #[command(subcommand)]
+    Data(DataCommand),
+}
+
+#[derive(Subcommand)]
+enum DataCommand {
+    /// Download now (all sources, or the ones named).
+    Update {
+        #[arg(value_enum)]
+        sources: Vec<data::Source>,
+    },
+    /// Sources, their age and entry counts.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -264,6 +282,96 @@ async fn run(cli: Cli) -> Result<()> {
         Command::History(command) => history_command(command).await,
         Command::Mcp { surface, remote } => mcp::server::serve(surface, remote).await,
         Command::Update(options) => update::run(options).await,
+        Command::Data(command) => data_command(command).await,
+    }
+}
+
+async fn data_command(command: DataCommand) -> Result<()> {
+    use data::store;
+    let root = config::user_data_dir()?;
+    match command {
+        DataCommand::Update { sources } => {
+            let ups: Vec<&'static store::Upstream> = if sources.is_empty() {
+                store::UPSTREAM.iter().collect()
+            } else {
+                sources
+                    .iter()
+                    .map(|s| {
+                        store::upstream(*s)
+                            .context("custom is this target's own data; nothing to download")
+                    })
+                    .collect::<Result<_>>()?
+            };
+            let mut failed = 0;
+            for up in ups {
+                let name = up.source.as_str();
+                match store::fetch(&root, up).await {
+                    Ok(m) => println!(
+                        "{name}: {} ({} files)",
+                        store::short_commit(m.commit.as_deref()),
+                        m.files
+                    ),
+                    Err(e) => {
+                        failed += 1;
+                        println!("{name}: failed: {e:#}");
+                    }
+                }
+            }
+            if failed > 0 {
+                anyhow::bail!("{failed} source(s) failed");
+            }
+            Ok(())
+        }
+        DataCommand::List { json } => {
+            let target = Target::discover(&std::env::current_dir()?)?;
+            let custom_dir = target.as_ref().map(Target::data_dir);
+            let (dir, upstream_root) = (custom_dir.clone(), root.clone());
+            let (upstream, custom) = blocking(move || {
+                Ok((
+                    store::load_upstream(&upstream_root),
+                    dir.as_deref().map_or_default(data::custom::load_custom),
+                ))
+            })
+            .await?;
+            let value = data::tools::list(
+                &root,
+                custom_dir.as_deref(),
+                &upstream,
+                &custom,
+                util::now_ms(),
+                None,
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
+            for s in value["sources"].as_array().into_iter().flatten() {
+                let name = str_at(s, "source");
+                if s["missing"].as_bool() == Some(true) {
+                    println!("{name:<8} missing  (raijin data update)");
+                } else {
+                    println!(
+                        "{name:<8} {:<12}  {}d  {} entries",
+                        store::short_commit(s["commit"].as_str()),
+                        s["age_days"],
+                        s["entries"]
+                    );
+                }
+            }
+            match &custom_dir {
+                Some(dir) => println!(
+                    "{:<8} {}  {} entries",
+                    "custom",
+                    dir.display(),
+                    value["custom"]["entries"]
+                ),
+                None => println!("{:<8} (no target here)", "custom"),
+            }
+            for w in value["warnings"].as_array().into_iter().flatten() {
+                eprintln!("warning: {}: {}", str_at(w, "file"), str_at(w, "error"));
+            }
+            Ok(())
+        }
     }
 }
 

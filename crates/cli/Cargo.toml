@@ -17,6 +17,7 @@ bproj.workspace = true
 clap.workspace = true
 futures.workspace = true
 getrandom.workspace = true
+gix = { workspace = true, features = ["blocking-http-transport-reqwest-rust-tls", "sha1"] }
 glob.workspace = true
 nix = { workspace = true, features = ["signal", "process", "user", "fs"] }
 regex.workspace = true
