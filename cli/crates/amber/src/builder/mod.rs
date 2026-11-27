@@ -298,7 +298,10 @@ fn write_url_cache(
         let units = u32::try_from(fields::utf16_count(value)).map_err(|_| Error::OffsetOverflow)?;
         let mut wrapper = standard(
             &layout::TEXT_WRAPPER,
-            &[Field::new(0, 0, 8), Field::new(1, 8 + u64::from(units) * 2, 8)],
+            &[
+                Field::new(0, 0, 8),
+                Field::new(1, 8 + u64::from(units) * 2, 8),
+            ],
         )?;
         let frame_offset = writer.mark() + wrapper.len() as u64 - 4;
         wrapper[10..18].copy_from_slice(&frame_offset.to_be_bytes());
@@ -381,10 +384,7 @@ pub fn write_entry(writer: &mut Writer<'_>, entry: &Entry, entry_id: u64) -> Res
     };
     let extension_name = fields::url_extension(path);
     let extension = write_text_record(writer, extension_name)?;
-    let cookie_name: &[u8] = entry
-        .response
-        .as_deref()
-        .map_or(&[], fields::cookie_value);
+    let cookie_name: &[u8] = entry.response.as_deref().map_or(&[], fields::cookie_value);
     let cookies = write_text_record(writer, cookie_name)?;
     let url_cache = write_url_cache(
         writer,

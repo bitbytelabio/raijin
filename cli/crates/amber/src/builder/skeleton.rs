@@ -61,10 +61,7 @@ fn entry_bytes(entry: &Entry) -> u64 {
         path
     };
     let extension_name = fields::url_extension(path);
-    let cookie_text: &[u8] = entry
-        .response
-        .as_deref()
-        .map_or(&[], fields::cookie_value);
+    let cookie_text: &[u8] = entry.response.as_deref().map_or(&[], fields::cookie_value);
     let extension = if extension_name.is_empty() {
         0
     } else {
