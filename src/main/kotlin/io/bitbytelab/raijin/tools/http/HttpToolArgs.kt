@@ -1,5 +1,6 @@
 package io.bitbytelab.raijin.tools.http
 
+import io.bitbytelab.raijin.bridge.HttpRequestBuilder
 import io.bitbytelab.raijin.core.EnumValidation
 import io.bitbytelab.raijin.core.asBooleanSafe
 import io.bitbytelab.raijin.core.asJsonObjectList
@@ -89,8 +90,8 @@ internal class ToolArgs(private val args: Map<String, JsonElement>) {
 
     /**
      * A hard timeout in milliseconds: [default] when absent or `0` (a strict client's filler,
-     * noted), a negative value for no hard timeout (returned as 0: the send waits for Burp), and a
-     * value above [max] as [max] with a note.
+     * noted), `-1` for no hard timeout (returned as 0: the send waits for Burp), and a value above
+     * [max] as [max] with a note. Any other negative value is an error.
      */
     fun timeoutMs(name: String, default: Long, max: Long = MAX_TIMEOUT_MS): Long {
         val value = integer(name) ?: return default
@@ -98,13 +99,13 @@ internal class ToolArgs(private val args: Map<String, JsonElement>) {
             notes += "0 '$name' read as the default ($default ms); pass -1 for no hard timeout"
             return default
         }
-        if (value < 0) return 0
+        if (value < 0) return noLimit(name, value, "no hard timeout")
         return clamp(name, value, 1, max)
     }
 
     /**
      * Burp's own response read timeout: null (Burp's default) when absent or `0` (noted), 0 (none)
-     * for a negative value, else clamped to [max].
+     * for `-1`, else clamped to [max]. Any other negative value is an error.
      */
     fun responseTimeoutMs(name: String, max: Long = MAX_TIMEOUT_MS): Long? {
         val value = integer(name) ?: return null
@@ -112,8 +113,17 @@ internal class ToolArgs(private val args: Map<String, JsonElement>) {
             notes += "0 '$name' read as unset; pass -1 for none"
             return null
         }
-        if (value < 0) return 0
+        if (value < 0) return noLimit(name, value, "none")
         return clamp(name, value, 1, max)
+    }
+
+    /** 0 (no limit) for `-1`; any other negative [value] of [name] is an error. */
+    private fun noLimit(name: String, value: Long, meaning: String): Long {
+        require(value == -1L) {
+            "Parameter '$name' must be -1 ($meaning), 0 (the default) or a positive number of " +
+                "milliseconds (got $value)"
+        }
+        return 0
     }
 
     /**
@@ -147,9 +157,31 @@ internal class ToolArgs(private val args: Map<String, JsonElement>) {
     /** use_tls (or its aliases tls / https) when the caller gave one. */
     fun explicitTls(): Boolean? = bool("use_tls") ?: bool("tls") ?: bool("https")
 
-    /** The `port` argument, else 80 when TLS is explicitly off and 443 otherwise. */
-    fun portOrDefault(ports: IntRange): Int =
-        int("port", ports) ?: if (explicitTls() == false) 80 else 443
+    /**
+     * The port to send to [host]: the `port` argument, else the port of [request]'s Host header
+     * when that header names [host] (the rule of `http_send_request`), else 80 when TLS is
+     * explicitly off and 443 otherwise. A port taken from the Host header, and a `port` that
+     * differs from it, are noted: neither is changed silently, since a Host header that differs
+     * from the target can be the test.
+     */
+    fun targetPort(ports: IntRange, host: String, request: String?): Int {
+        val given = int("port", ports)
+        val header =
+            request
+                ?.let(HttpRequestBuilder::parseHostHeader)
+                ?.takeIf { (name, _) -> name.equals(host.trim().removeSurrounding("[", "]"), true) }
+                ?.second
+        if (given != null) {
+            if (header != null && header != given)
+                notes += "port $given differs from the Host header's $header; sent to $host:$given"
+            return given
+        }
+        if (header != null) {
+            notes += "port unset: sent to $host:$header (from the Host header)"
+            return header
+        }
+        return if (explicitTls() == false) 80 else 443
+    }
 
     /** Non-empty list of objects under [name]; null when absent. Every item must be an object. */
     fun objectList(name: String, what: String): List<JsonObject>? {

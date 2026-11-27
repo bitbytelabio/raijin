@@ -65,6 +65,33 @@ class HttpToolArgsTest {
     }
 
     @Test
+    fun `a timeout below -1 is an error, not a second spelling of none`() {
+        val a = args("""{"t": -5}""")
+        assertFailsWith<IllegalArgumentException> { a.timeoutMs("t", 25_000) }
+        assertFailsWith<IllegalArgumentException> { a.responseTimeoutMs("t") }
+    }
+
+    @Test
+    fun `without a port the Host header's port of the target is used, and a differing port is noted`() {
+        val raw = "GET / HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n"
+        val unset = args("""{"use_tls": false}""")
+        assertEquals(1, unset.targetPort(1..65535, "127.0.0.1", raw))
+        assertEquals(listOf("port unset: sent to 127.0.0.1:1 (from the Host header)"), unset.notes)
+
+        val given = args("""{"port": 8080}""")
+        assertEquals(8080, given.targetPort(1..65535, "127.0.0.1", raw))
+        assertTrue(
+            "differs from the Host header's 1" in given.notes.single(),
+            given.notes.toString(),
+        )
+
+        // A Host header naming another host (a spoofing test) does not pick the port.
+        val other = args("""{"use_tls": false}""")
+        assertEquals(80, other.targetPort(1..65535, "10.0.0.1", raw))
+        assertEquals(emptyList(), other.notes)
+    }
+
+    @Test
     fun `malformed values and strict ranges are errors`() {
         val a =
             args("""{"port": 70000, "count": "many", "mode": "burst", "flag": "yes", "obj": {}}""")

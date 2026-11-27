@@ -104,7 +104,7 @@ class ToolArgsTest {
                 destructive = false,
             )
         assertEquals(buildJsonObject { put("modify_body_replacement", "") }, c.args)
-        assertEquals(listOf("ignored empty optional 'mode', 'tags'"), c.notes)
+        assertEquals(listOf("ignored empty or zero 'mode', 'tags'"), c.notes)
     }
 
     @Test
@@ -136,12 +136,19 @@ class ToolArgsTest {
         assertEquals(buildJsonObject { put("body", "") }, c.args)
         assertEquals(
             listOf(
-                "ignored 0 'port': below its minimum 1",
-                "empty 'method' read as unset; send an empty method with raw_request",
-                "ignored empty 'host'",
+                "ignored empty or zero 'port', 'method', 'host'; " +
+                    "an empty method is sent only inside raw_request",
             ),
             c.notes,
         )
+        val text =
+            ToolArgs.dropEmptyUnknown(
+                sendProps,
+                buildJsonObject { put("port", "0") },
+                emptySet(),
+                false,
+            )
+        assertEquals(JsonObject(emptyMap()), text.args)
         val required =
             ToolArgs.dropEmptyUnknown(
                 sendProps,
@@ -184,6 +191,120 @@ class ToolArgsTest {
             c.args.keys.toList(),
         )
         assertEquals(listOf("ignored 2 empty parameters of other actions"), c.notes)
+    }
+
+    @Test
+    fun `a destructive call drops other actions' filler but keeps its own values`() {
+        val removeProps = buildJsonObject {
+            putJsonObject("list") { put("type", "string") }
+            putJsonObject("index") { put("type", "integer") }
+            putJsonObject("comment") { put("type", "string") }
+        }
+        val c =
+            ToolArgs.dropEmptyUnknown(
+                removeProps,
+                buildJsonObject {
+                    put("list", "include")
+                    put("index", 0)
+                    put("comment", "")
+                    put("url", "")
+                    put("enabled", false)
+                },
+                emptySet(),
+                destructive = true,
+            )
+        assertEquals(listOf("list", "index", "comment"), c.args.keys.toList())
+        assertEquals(listOf("ignored 2 empty parameters of other actions"), c.notes)
+        val real =
+            ToolArgs.dropEmptyUnknown(
+                removeProps,
+                buildJsonObject { put("url", "https://x") },
+                emptySet(),
+                destructive = true,
+            )
+        assertEquals(listOf("url"), ToolArgs.unknownParams(removeProps, real.args, emptySet()))
+    }
+
+    @Test
+    fun `an empty optional id and a 0 timeout are unset`() {
+        val p = buildJsonObject {
+            putJsonObject("rule_id") { put("type", "string") }
+            putJsonObject("timeout_ms") {
+                put("type", "number")
+                put("minimum", -1)
+            }
+            putJsonObject("count") { put("type", "integer") }
+            putJsonObject("since_index") {
+                put("type", "integer")
+                put("minimum", -1)
+            }
+        }
+        val c =
+            ToolArgs.dropEmptyUnknown(
+                p,
+                buildJsonObject {
+                    put("rule_id", "")
+                    put("timeout_ms", 0)
+                    put("count", 0)
+                    put("since_index", 0)
+                },
+                emptySet(),
+                destructive = false,
+            )
+        // since_index 0 is a real index, not the -1/0 convention of a timeout.
+        assertEquals(
+            buildJsonObject {
+                put("count", 0)
+                put("since_index", 0)
+            },
+            c.args,
+        )
+        assertEquals(
+            null,
+            ToolArgs.rangeCheck(
+                "t",
+                p,
+                buildJsonObject { put("since_index", -5) },
+                "t()",
+                JsonObject(emptyMap()),
+                destructive = false,
+            ),
+        )
+        assertEquals(
+            listOf(
+                "ignored empty or zero 'rule_id', 'timeout_ms'; a 0 timeout is the default, -1 is none",
+            ),
+            c.notes,
+        )
+    }
+
+    @Test
+    fun `a value below a negative minimum or a port above its maximum is out of range`() {
+        val p = buildJsonObject {
+            putJsonObject("timeout_ms") {
+                put("type", "number")
+                put("minimum", -1)
+            }
+            putJsonObject("port") {
+                put("type", "integer")
+                put("minimum", 1)
+                put("maximum", 65535)
+            }
+            putJsonObject("count") {
+                put("type", "integer")
+                put("minimum", 1)
+                put("maximum", 10)
+            }
+        }
+        fun check(args: JsonObject) =
+            ToolArgs.rangeCheck("t", p, args, "t()", JsonObject(emptyMap()), destructive = false)
+        val timeout = json(assertNotNull(check(buildJsonObject { put("timeout_ms", -5) })))
+        assertEquals("out_of_range", timeout["code"]!!.jsonPrimitive.content)
+        assertEquals(JsonObject(emptyMap()), timeout["retry"])
+        assertEquals(null, check(buildJsonObject { put("timeout_ms", -1) }))
+        val port = json(assertNotNull(check(buildJsonObject { put("port", 70000) })))
+        assertEquals("port", port["param"]!!.jsonPrimitive.content)
+        assertEquals(null, check(buildJsonObject { put("count", 50) }))
     }
 
     @Test

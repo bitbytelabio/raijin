@@ -348,7 +348,13 @@ internal object HttpRequestBuilder {
 
         val hostMatch = parseHostHeader(cleaned)
         val resolvedHost = host ?: hostMatch?.first ?: return HttpRequest.httpRequest(bytes)
-        val hostHeaderPort = if (host == null) hostMatch?.second else null
+        // The Host header's port counts when the header names the target (as for http_race).
+        val hostHeaderPort =
+            hostMatch
+                ?.takeIf { (name, _) ->
+                    host == null || name.equals(host.trim().removeSurrounding("[", "]"), true)
+                }
+                ?.second
 
         // Modern web default: TLS:443 unless the caller says otherwise.
         val effectivePort = port ?: hostHeaderPort ?: if (useTls == false) 80 else 443

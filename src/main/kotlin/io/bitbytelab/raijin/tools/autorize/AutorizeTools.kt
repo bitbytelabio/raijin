@@ -225,6 +225,7 @@ object AutorizeTools {
                             }
                             putJsonObject("match_id") {
                                 put("type", "integer")
+                                put("minimum", 1)
                                 put(
                                     "description",
                                     "Return only this match, with the original and every identity's replayed request and response at length",

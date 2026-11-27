@@ -153,6 +153,7 @@ Out-of-range numbers are clamped and reported in notes. Returns full response wi
                                 "response_timeout_ms",
                                 "integer",
                                 "Burp's own response read timeout (0 = Burp's default, -1 = none)",
+                                minimum = -1,
                             )
                             property(
                                 "verify_tls",
@@ -168,6 +169,7 @@ Out-of-range numbers are clamped and reported in notes. Returns full response wi
                                 "timeout_ms",
                                 "number",
                                 "Hard timeout in milliseconds ($TIMEOUT_DESCRIPTION)",
+                                minimum = -1,
                             )
                             property(
                                 "preserve_headers",
@@ -419,6 +421,7 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                                 "timeout_ms",
                                 "number",
                                 "Hard timeout for the entire batch in milliseconds ($TIMEOUT_DESCRIPTION)",
+                                minimum = -1,
                             )
                         },
                     required = listOf("requests"),
@@ -491,6 +494,7 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                                 "timeout_ms",
                                 "number",
                                 "Hard timeout per step in milliseconds ($TIMEOUT_DESCRIPTION)",
+                                minimum = -1,
                             )
                         },
                     required = listOf("steps"),
@@ -985,7 +989,7 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                             property(
                                 "port",
                                 "integer",
-                                "Target port number (1-65535, default 443, or 80 with use_tls=false)",
+                                "Target port number (1-65535; default: raw_request's Host header port when it names host, else 443, or 80 with use_tls=false)",
                                 minimum = 1,
                                 maximum = 65535,
                             )
@@ -1006,6 +1010,7 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                                 "timeout_ms",
                                 "number",
                                 "Hard timeout in milliseconds ($TIMEOUT_DESCRIPTION)",
+                                minimum = -1,
                             )
                         },
                     required = listOf("host"),
@@ -1023,7 +1028,7 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
                         "Either 'raw_request_hex' or 'raw_request' must be provided",
                     )
                 }
-                val port = args.portOrDefault(PORTS)
+                val port = args.targetPort(PORTS, host, rawString)
                 val useTls = args.tls(port)
                 val httpMode = args.enum("http_mode", HTTP_MODES)
                 val maxResponseLength = args.clampedInt("max_response_length", LENGTHS)

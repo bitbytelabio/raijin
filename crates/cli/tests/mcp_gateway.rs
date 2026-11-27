@@ -231,7 +231,17 @@ async fn full_surface_lists_every_catalog_tool() {
         .await
         .expect("initialize");
     let tools = client.list_all_tools().await.expect("tools/list");
-    assert_eq!(tools.len(), 2 + 43);
+    // guide + run, the 43 catalog tools, and the CLI's own (history_*, data_*, burp_*).
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    let local = names
+        .iter()
+        .filter(|n| n.starts_with("history_") || n.starts_with("data_") || n.starts_with("burp_"))
+        .count();
+    assert!(
+        local > 0 && names.contains(&"history_list") && names.contains(&"data_search"),
+        "a full-surface client must see the CLI's own tools: {names:?}"
+    );
+    assert_eq!(tools.len(), 2 + 43 + local, "{names:?}");
     let direct = call(&client, "proxy_history", json!({})).await;
     assert!(
         text(&direct).contains("no Burp running for this target"),

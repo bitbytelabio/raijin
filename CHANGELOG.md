@@ -25,6 +25,11 @@
 - A strict client's `false` and `0` for another action's parameters are dropped like its empty values (`ignored N empty parameters of other actions`); the action's own `false`/`0` stay. `""` for `subscription_id` and `status_code_range` is unset.
 - An unknown parameter whose value only one enum takes is suggested by it: `util.hash {"type":"md5"}` gets `did_you_mean:["algorithm"]` and a `retry` with `algorithm:"MD5"`.
 - Verb suggestions: a remove verb (`clear`, `delete`, `drop`, `remove`) with other words suggests only the removal those words name (`drop_request` -> `proxy_intercept.drop`; `clear_history`, `delete_all` suggest no removal), `forward`, `enable`, `disable` and `on`/`off` are verbs (`intercept_on` -> `proxy_intercept.enable`), and `send_payload` leads with `http_send_request`, `scan_xss` with `scanner.start_audit`.
+- A destructive call drops a strict client's filler for another action's parameters too (`scope.remove` with `url:""` runs); its own parameters still go through untouched, and a real value for an unknown parameter is still `unknown_parameter`.
+- The strict-fill drops of one call are one note: `ignored empty or zero 'host', 'port', 'method' and 12 empty parameters of other actions; ...`.
+- An optional id sent as `""` (`rule_id`, `connection_id`, ...) is unset; a required one (`scanner_task.status task_id:""`) is `missing_parameter` with "First list them with ..." and `see`, like a missing one. `autorize.list_matches match_id: 0` is unset.
+- A value below a negative schema minimum (`timeout_ms: -5` where `-1` means none) and `port` above 65535 or as `"0"` follow the schema like `port: -1`: `out_of_range` with a `retry` without it, or unset for `"0"`.
+- `custom_check.scancheck_dry_run` without `conditions` and `steps` is `missing_parameter`; `bcheck_dry_run` with an empty `match_pattern` is `invalid_arguments` with `param`, not `tool_failed`.
 
 ### Extension
 - `http_send_request`: `headers` takes `["X-A: 1"]`; a header entry it cannot read refuses the call and sends nothing (also per item in `http_send_requests_parallel` and `http_send_request_chain`). A raw request without a Host header and without `host` says so. A request with no response carries `no_response` with the target, and `time_request_sent` is null instead of the epoch.
@@ -34,6 +39,8 @@
 - `timeout_ms: 0` is the default timeout (noted) and `-1` means no hard timeout; `response_timeout_ms: 0` is Burp's default and `-1` none. A send that hits its hard timeout is `code: "no_response"`, `retryable: true`, naming the target and the timeout.
 - `port` declares `minimum: 1, maximum: 65535`, so an optional `port: 0` is unset.
 - `http_race` no longer says the target may not speak HTTP/2 when every connection was refused.
+- `http_race`, `http_fuzz`, `http_send_pipeline` and `http_send_raw_bytes` without `port` send to the port of the request's Host header when that header names `host` (noted: `port unset: sent to 127.0.0.1:1 (from the Host header)`), like `http_send_request`, instead of 80/443; a `port` that differs from it is sent as given and noted. `http_send_request` with `host` takes the Host header's port the same way.
+- `timeout_ms` and `response_timeout_ms` declare `minimum: -1`; `0` is dropped as unset with the strict-fill note. A timed-out `http_fuzz` request reads `no response from <host>:<port> in 25000 ms (timed out)`.
 - `http_send_request_chain` and `http_send_requests_parallel` where nothing got a response are errors (`no_response`) naming the first reason. `http_send_request` notes TLS chosen for a raw request, `url` ignored next to `raw_request`, and non-string header values sent as text.
 - `util.compress`/`util.decompress` refuse `data` that is not base64 like `util.base64_decode`; `probe.access_control` says which of `requests`/`identities` is missing or short; `scope.remove` out of range is `out_of_range` with the list size.
 - `http_send_request` without a response is an error (`code: no_response`) that keeps every request field. A `url` without a scheme is `invalid_arguments` with both schemes in `did_you_mean` (no `retry`: the scheme is the caller's choice); `scope.check`/`include`/`exclude` do the same, `scope.check` with the `https` guess in `retry`.
@@ -54,6 +61,12 @@
 - `delete`/`clear`/`drop` read as `remove` when suggesting call names. `proxy_history` points at `history_list` for `.burp` files and history without Burp.
 
 ### raijin CLI
+- An `unknown_tool` error that has a suggestion leads with it: `unknown tool "drop_request"; did you mean proxy_intercept.drop? It is destructive, so it runs only under its exact name.`
+- An unknown `category` in `data_search`/`data_payloads` gets `did_you_mean` from every source's categories, ranked by shared words and prefix; `allowed` puts the nearest first, and `retry` comes when one category is clearly meant (`waf` -> `waf_bypass_global_obj`, `url-validation-allow-list-bypass` -> `domain_allow_list_bypass` with `source:"url"`). `category:"bcheck"`/`"bambda"` is read as `source`, and a dropped trailing `/` is noted.
+- `tools/call` `arguments` encoded as JSON inside a JSON string (up to 3 layers) is decoded with a note instead of `unknown_tool`.
+- A result saved to a file keeps its `notes` in the summary, ahead of `preview`.
+- `--surface full` `tools/list` includes the CLI's own tools (`history_*`, `data_*`, `burp_status`/`burp_up`/`burp_down`).
+- A grouped tool named without its action but with `"action"` in the arguments is judged destructive per action, not by the group's `destructiveHint`.
 - With Burp down, a name the catalog does not know is `unknown_tool` with suggestions right away; a known one gets `retry`: `{"batch":[{"do":"burp_up"},<the call>],"bail":true}` (none for a destructive call).
 - `bail` as `"true"`/`"false"` is read as a boolean (noted); any other non-boolean is refused. `steps` is read as `batch`, a step given as a name runs as `{"do":name}`, a non-string `do` is `invalid_type`, and `input` holding a value is a parameter, not a wrapper. `run {"do":"guide"}` and `{"do":"run"}` explain themselves.
 - History errors: a bad ref is `invalid_arguments`, a missing entry `not_found`, an unknown project `invalid_enum` with `allowed` (and `retry` when the target has one project).

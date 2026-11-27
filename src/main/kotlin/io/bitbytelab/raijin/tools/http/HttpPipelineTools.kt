@@ -89,7 +89,7 @@ All *_ms are milliseconds with microsecond precision, counted from the first req
                             property(
                                 "port",
                                 "integer",
-                                "Target port number (1-65535, default 443, or 80 with use_tls=false)",
+                                "Target port number (1-65535; default: the first request's Host header port when it names host, else 443, or 80 with use_tls=false)",
                                 minimum = 1,
                                 maximum = 65535,
                             )
@@ -210,7 +210,12 @@ All *_ms are milliseconds with microsecond precision, counted from the first req
                         ?: return@addTool toolError(
                             "Parameter 'requests' is required (array of {raw_request} or {raw_request_hex} objects)",
                         )
-                val port = args.portOrDefault(PORTS)
+                val port =
+                    args.targetPort(
+                        PORTS,
+                        host,
+                        String(requests.first().bytes, Charsets.ISO_8859_1),
+                    )
                 val useTls = args.tls(port)
                 val httpMode = args.enum("http_mode", PIPELINE_HTTP_MODES)
                 val writeMode = args.enum("write_mode", WRITE_MODES) ?: "concat"

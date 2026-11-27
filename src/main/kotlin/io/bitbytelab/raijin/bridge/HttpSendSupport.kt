@@ -81,7 +81,7 @@ internal class HttpTimeouts {
             future.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
             future.cancel(true)
-            throw HttpRequestTimeoutException("Request timed out after ${timeoutMs}ms", timeoutMs)
+            throw HttpRequestTimeoutException("no response in $timeoutMs ms (timed out)", timeoutMs)
         } catch (e: java.util.concurrent.ExecutionException) {
             throw (e.cause as? Exception) ?: e
         }

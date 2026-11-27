@@ -457,11 +457,16 @@ internal object ToolArgs {
         (def as? JsonObject)?.containsKey("enum") == true
 
     /**
-     * [args] without the empty values (`""`, `[]`, `{}`, `null`) a strict client fills in for every
-     * property of the schema: those of keys outside [props] and [ignore] (another action's
-     * parameters in a grouped tool), and those of optional keys of [props] that are not payloads
-     * ([EMPTY_KEPT]): `[]`, `{}`, `null`, and `""` for an enum ([emptyStringIsUnset]). Each kind
-     * gets one note. A [destructive] call keeps everything, so its checks see what was sent.
+     * [args] without the filler a strict client sends for every property of the schema, in one
+     * note:
+     * - keys outside [props] and [ignore] (another action's parameters in a grouped tool) holding
+     *   an empty value (`""`, `[]`, `{}`, `null`), `false` or 0: they cannot change what the action
+     *   does, so they are dropped from a [destructive] call too;
+     * - optional keys of [props] (not in [required]), never in a [destructive] call, whose checks
+     *   see what was sent: `[]`, `{}` and `null` (not for payloads, [EMPTY_KEPT]), `""` for an enum
+     *   ([emptyStringIsUnset]), an id ([isIdParam]) or one of [EMPTY_IS_UNSET], 0 below a
+     *   `minimum` >= 1, and 0 where the schema's `minimum` is -1 (`timeout_ms`: 0 is the default,
+     *   -1 none).
      */
     fun dropEmptyUnknown(
         props: JsonObject?,
@@ -470,56 +475,79 @@ internal object ToolArgs {
         destructive: Boolean,
         required: Set<String> = emptySet(),
     ): Coerced {
-        if (destructive || args.isEmpty()) return Coerced(args, emptyList())
+        if (args.isEmpty() || (destructive && props == null)) return Coerced(args, emptyList())
         val foreign = mutableListOf<String>()
-        val optional = mutableListOf<String>()
-        val unset = mutableListOf<String>()
-        val notes = mutableListOf<String>()
+        val own = mutableListOf<String>()
+        var zeroDefault = false
         for ((k, v) in args) {
             if (k in ignore) continue
-            val min = if (props != null && k !in required) belowMinimum(props[k], v) else null
-            if (min != null) {
-                unset += k
-                notes += "ignored 0 '$k': below its minimum $min"
+            if (props == null || k !in props) {
+                if (isEmptyValue(v) || isZeroValue(v)) foreign += k
                 continue
             }
-            val foreignKey = props != null && k !in props
-            if (!isEmptyValue(v) && !(foreignKey && isZeroValue(v))) continue
+            if (destructive || k in required) continue
+            val def = props[k]
+            if (belowMinimum(def, v) != null) {
+                own += k
+                continue
+            }
+            if (zeroIsDefault(k, def, v)) {
+                own += k
+                zeroDefault = true
+                continue
+            }
+            if (!isEmptyValue(v)) continue
             val emptyString = v is JsonPrimitive && v.isString
-            if (
-                emptyString && k in EMPTY_IS_UNSET && props != null && k in props && k !in required
-            ) {
-                unset += k
-                notes +=
-                    if (k == "method")
-                        "empty 'method' read as unset; send an empty method with raw_request"
-                    else "ignored empty '$k'"
-                continue
-            }
-            val freeString = emptyString && !emptyStringIsUnset(props?.get(k))
-            when {
-                props == null || k !in props -> foreign += k
-                k !in required && k !in EMPTY_KEPT && !freeString -> optional += k
+            if (!emptyString || k in EMPTY_IS_UNSET || isIdParam(k) || emptyStringIsUnset(def)) {
+                if (k !in EMPTY_KEPT) own += k
             }
         }
-        if (foreign.isEmpty() && optional.isEmpty() && unset.isEmpty())
-            return Coerced(args, emptyList())
-        if (foreign.isNotEmpty())
-            notes +=
-                "ignored ${foreign.size} empty parameter${if (foreign.size == 1) "" else "s"} " +
-                    "of other actions"
-        if (optional.isNotEmpty())
-            notes += "ignored empty optional ${optional.joinToString(", ") { "'$it'" }}"
-        val dropped = (foreign + optional + unset).toSet()
-        return Coerced(JsonObject(args.filterKeys { it !in dropped }), notes)
+        if (foreign.isEmpty() && own.isEmpty()) return Coerced(args, emptyList())
+        val others =
+            "${foreign.size} empty parameter${if (foreign.size == 1) "" else "s"} of other actions"
+        val note =
+            if (own.isEmpty()) "ignored $others"
+            else
+                buildString {
+                    append("ignored empty or zero ")
+                    append(own.joinToString(", ") { "'$it'" })
+                    if (foreign.isNotEmpty()) append(" and $others")
+                    if ("method" in own) append("; an empty method is sent only inside raw_request")
+                    if (zeroDefault) append("; a 0 timeout is the default, -1 is none")
+                }
+        val dropped = (foreign + own).toSet()
+        return Coerced(JsonObject(args.filterKeys { it !in dropped }), listOf(note))
     }
 
     /**
-     * Optional parameters whose `""` can only mean "not set" (no such host, method or connection):
+     * Optional parameters whose `""` can only mean "not set" (no such host, method or filter):
      * [dropEmptyUnknown] drops them, unlike a free-form string's `""`.
      */
-    private val EMPTY_IS_UNSET =
-        setOf("host", "sni", "connection_id", "method", "subscription_id", "status_code_range")
+    private val EMPTY_IS_UNSET = setOf("host", "sni", "method", "status_code_range")
+
+    /** An id parameter (`id`, `run_id`, ...): `""` names nothing, so it is unset or missing. */
+    internal fun isIdParam(name: String): Boolean = name == "id" || name.endsWith("_id")
+
+    /**
+     * A timeout whose schema `minimum` -1 means "none" and 0 the default (`timeout_ms`,
+     * `response_timeout_ms`). Other parameters with `minimum: -1` (`since_index`) give 0 and values
+     * below -1 their own meaning.
+     */
+    private fun isTimeoutParam(name: String): Boolean =
+        name == "timeout_ms" || name.endsWith("_timeout_ms")
+
+    /**
+     * Whether [value] is 0 for a timeout ([isTimeoutParam]) whose schema `minimum` is -1, so 0
+     * means the same as leaving it out.
+     */
+    private fun zeroIsDefault(name: String, def: JsonElement?, value: JsonElement): Boolean {
+        if (!isTimeoutParam(name)) return false
+        val d = def as? JsonObject ?: return false
+        val type = d.typeName()
+        if (type != "integer" && type != "number") return false
+        val min = (d["minimum"] as? JsonPrimitive)?.takeIf { !it.isString }?.doubleOrNull
+        return min == -1.0 && isZeroValue(value)
+    }
 
     /**
      * `false` or the number 0: a strict client's filler for another action's boolean or number
@@ -529,8 +557,9 @@ internal object ToolArgs {
         v is JsonPrimitive && !v.isString && (v.booleanOrNull == false || v.doubleOrNull == 0.0)
 
     /**
-     * The schema `minimum` of [def] (as written) when [value] is the number 0 below it, for a
-     * minimum >= 1: a strict client's filler, read as unset. Null otherwise.
+     * The schema `minimum` of [def] (as written) when [value] is 0 (or the text `"0"`, which
+     * [coerce] would read as 0 later) below it, for a minimum >= 1: a strict client's filler, read
+     * as unset. Null otherwise.
      */
     private fun belowMinimum(def: JsonElement?, value: JsonElement): String? {
         val d = def as? JsonObject ?: return null
@@ -538,7 +567,9 @@ internal object ToolArgs {
         if (type != "integer" && type != "number") return null
         val min = (d["minimum"] as? JsonPrimitive)?.takeIf { !it.isString } ?: return null
         val minValue = min.doubleOrNull ?: return null
-        val v = (value as? JsonPrimitive)?.takeIf { !it.isString }?.doubleOrNull ?: return null
+        val p = value as? JsonPrimitive ?: return null
+        val v =
+            (if (p.isString) p.content.trim().toDoubleOrNull() else p.doubleOrNull) ?: return null
         return if (v == 0.0 && minValue >= 1) min.content else null
     }
 
@@ -635,9 +666,18 @@ internal object ToolArgs {
     }
 
     /**
-     * `out_of_range` for the first integer/number argument below 0 whose schema `minimum` is >= 0;
-     * `retry` drops it (default applies) unless [destructive]. Values below a minimum >= 1 but not
-     * negative are left to the handlers, which clamp them.
+     * Parameters whose schema `maximum` is a hard bound (a port number), not a limit the handler
+     * clamps: [rangeCheck] refuses a value above it.
+     */
+    private val HARD_MAXIMUM = setOf("port")
+
+    /**
+     * `out_of_range` for the first integer/number argument out of its schema range: negative with a
+     * `minimum` >= 0, a timeout ([isTimeoutParam]) below its `minimum` -1 (`-1` means "none": any
+     * other negative value is not a second spelling of it), or above the `maximum` of a
+     * [HARD_MAXIMUM] parameter. `retry` drops it (default applies) unless [destructive]. Values
+     * below a minimum >= 1 but not negative, and other values above a maximum, are left to the
+     * handlers, which clamp them.
      */
     fun rangeCheck(
         call: String,
@@ -652,14 +692,28 @@ internal object ToolArgs {
             val def = props[param] as? JsonObject ?: continue
             val type = def.typeName()
             if (type != "integer" && type != "number") continue
-            val min = (def["minimum"] as? JsonPrimitive)?.takeIf { !it.isString } ?: continue
-            val minValue = min.doubleOrNull ?: continue
             val v = (value as? JsonPrimitive)?.takeIf { !it.isString }?.doubleOrNull ?: continue
-            if (minValue < 0 || v >= 0) continue
+            fun bound(key: String) =
+                (def[key] as? JsonPrimitive)?.takeIf { !it.isString && it.doubleOrNull != null }
+            val min = bound("minimum")
+            val max = bound("maximum")?.takeIf { param in HARD_MAXIMUM }
+            val minValue = min?.doubleOrNull
+            // Below a negative minimum only for a timeout, whose -1 is "none"; others clamp.
+            val below =
+                minValue != null &&
+                    (if (minValue < 0) isTimeoutParam(param) && v < minValue else v < 0)
+            val above = max != null && v > max.doubleOrNull!!
+            if (!below && !above) continue
             val kind = if (type == "integer") "an integer" else "a number"
+            val range =
+                when {
+                    min != null && max != null -> "from ${min.content} to ${max.content}"
+                    below -> "≥ ${min?.content}"
+                    else -> "≤ ${max!!.content}"
+                }
             return error(
                 "out_of_range",
-                "$call: '$param' must be $kind ≥ ${min.content}, got ${value.jsonPrimitive.content}.",
+                "$call: '$param' must be $kind $range, got ${value.jsonPrimitive.content}.",
             ) {
                 put("param", param)
                 put("got", value)
@@ -1015,7 +1069,7 @@ internal object ToolArgs {
 
     private val ARGUMENT_ERROR =
         Regex(
-            "(?i)\\b(required|missing|invalid|must|unknown|expected|allowed|not a valid|cannot be empty|parameter|JsonPrimitive|JsonObject|JsonArray)\\b",
+            "(?i)\\b(required|missing|invalid|must|unknown|expected|allowed|not a valid|cannot be empty|non-empty|parameter|JsonPrimitive|JsonObject|JsonArray)\\b",
         )
     private val NOT_FOUND =
         Regex(

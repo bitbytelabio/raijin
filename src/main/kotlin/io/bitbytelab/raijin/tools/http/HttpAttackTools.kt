@@ -92,7 +92,7 @@ Every response is clustered (summary: same status and bodies at least cluster_si
                             property(
                                 "port",
                                 "integer",
-                                "Target port number (1-65535, default 443, or 80 with use_tls=false)",
+                                "Target port number (1-65535; default: the Host header's port when it names host, else 443, or 80 with use_tls=false)",
                                 minimum = 1,
                                 maximum = 65535,
                             )
@@ -215,6 +215,7 @@ Every response is clustered (summary: same status and bodies at least cluster_si
                                 "timeout_ms",
                                 "number",
                                 "Hard timeout per request in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)",
+                                minimum = -1,
                             )
                         },
                     required = listOf("request", "host"),
@@ -228,7 +229,7 @@ Every response is clustered (summary: same status and bodies at least cluster_si
                         ?: return@addTool toolError("Parameter 'request' is required")
                 val host =
                     args.string("host") ?: return@addTool toolError("Parameter 'host' is required")
-                val port = args.portOrDefault(HttpTools.PORTS)
+                val port = args.targetPort(HttpTools.PORTS, host, reqStr)
                 val useTls = args.tls(port)
                 val httpMode = args.enum("http_mode", HttpTools.HTTP_MODES)
                 val attackMode =
@@ -366,7 +367,7 @@ analysis: responses clustered by status code and body similarity (cluster_simila
                             property(
                                 "port",
                                 "integer",
-                                "Target port number (1-65535, default 443, or 80 with use_tls=false)",
+                                "Target port number (1-65535; default: the Host header's port when it names host, else 443, or 80 with use_tls=false)",
                                 minimum = 1,
                                 maximum = 65535,
                             )
@@ -413,6 +414,7 @@ analysis: responses clustered by status code and body similarity (cluster_simila
                                 "timeout_ms",
                                 "number",
                                 "Hard timeout for the whole batch in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)",
+                                minimum = -1,
                             )
                         },
                     required = listOf("request", "host"),
@@ -425,7 +427,7 @@ analysis: responses clustered by status code and body similarity (cluster_simila
                         ?: return@addTool toolError("Parameter 'request' is required")
                 val host =
                     args.string("host") ?: return@addTool toolError("Parameter 'host' is required")
-                val port = args.portOrDefault(HttpTools.PORTS)
+                val port = args.targetPort(HttpTools.PORTS, host, reqStr)
                 val useTls = args.tls(port)
                 val count = args.clampedInt("count", RACE_COUNTS) ?: 10
                 val payloads =

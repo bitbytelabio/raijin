@@ -916,6 +916,25 @@ class ToolConsolidationTest {
     }
 
     @Test
+    fun `an empty required id is missing and points at the list call`() {
+        val (_, target) = consolidatedWithRealTools()
+        val r =
+            json(
+                call(
+                    target,
+                    "turbo_run",
+                    buildJsonObject {
+                        put("action", "status")
+                        put("run_id", "")
+                    },
+                ),
+            )
+        assertEquals("missing_parameter", r.str("code"), r.toString())
+        assertEquals("run_id", r.str("param"), r.toString())
+        assertEquals(buildJsonObject { put("do", "turbo_run.list") }, r.getValue("see"))
+    }
+
+    @Test
     fun `an enum error lists only the values of the action called`() {
         val (_, target) = consolidatedWithRealTools()
         val r =

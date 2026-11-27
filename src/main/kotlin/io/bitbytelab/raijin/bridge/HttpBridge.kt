@@ -303,7 +303,7 @@ class HttpBridge(
                 } catch (e: Exception) {
                     val failure = buildJsonObject {
                         if (e is HttpRequestTimeoutException) {
-                            put("error", "group send timed out: ${e.message}")
+                            put("error", "group send: ${e.message}")
                             put("is_timeout", true)
                         } else {
                             put("error", "group send failed: ${e.message}")
@@ -1021,7 +1021,9 @@ class HttpBridge(
                 timeouts.run(timeoutMs) { api.http().sendRequest(httpRequest, mode) }
             } catch (e: Exception) {
                 return HttpFuzzRunner.Sent.Failed(
-                    e.message ?: "send failed",
+                    if (e is HttpRequestTimeoutException)
+                        "no response from ${service.host()}:${service.port()} in ${e.timeoutMs} ms (timed out)"
+                    else e.message ?: "send failed",
                     e is HttpRequestTimeoutException,
                 )
             }

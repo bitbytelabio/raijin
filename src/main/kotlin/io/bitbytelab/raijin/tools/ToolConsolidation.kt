@@ -990,7 +990,17 @@ object ToolConsolidation {
             )
         }
 
-        val missing = spec.required.filter { args[it] == null || args[it] is JsonNull }
+        // `""` names no id: a required id sent empty is as missing as one left out.
+        val missing =
+            spec.required.filter {
+                val v = args[it]
+                v == null ||
+                    v is JsonNull ||
+                    (ToolArgs.isIdParam(it) &&
+                        v is JsonPrimitive &&
+                        v.isString &&
+                        v.content.isBlank())
+            }
         val idMissing = missing.filter { ToolExamples.idSource(g.tool, resolved, it) != null }
         if (missing.isNotEmpty() && idMissing.size == missing.size) {
             // Only ids are missing: the example cannot hold them, so point at the list call.

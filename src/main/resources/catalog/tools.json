@@ -853,6 +853,7 @@
           },
           "match_id": {
             "type": "integer",
+            "minimum": 1,
             "description": "Return only this match, with the original and every identity's replayed request and response at length [actions: list_matches]"
           },
           "include_replays": {
@@ -1006,6 +1007,7 @@
             },
             "match_id": {
               "type": "integer",
+              "minimum": 1,
               "description": "Return only this match, with the original and every identity's replayed request and response at length"
             },
             "include_replays": {
@@ -3448,7 +3450,7 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 65535,
-            "description": "Target port number (1-65535, default 443, or 80 with use_tls=false)"
+            "description": "Target port number (1-65535; default: the Host header's port when it names host, else 443, or 80 with use_tls=false)"
           },
           "use_tls": {
             "type": "boolean",
@@ -3600,6 +3602,7 @@
           },
           "timeout_ms": {
             "type": "number",
+            "minimum": -1,
             "description": "Hard timeout per request in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)"
           }
         },
@@ -3642,7 +3645,7 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 65535,
-            "description": "Target port number (1-65535, default 443, or 80 with use_tls=false)"
+            "description": "Target port number (1-65535; default: the Host header's port when it names host, else 443, or 80 with use_tls=false)"
           },
           "use_tls": {
             "type": "boolean",
@@ -3703,6 +3706,7 @@
           },
           "timeout_ms": {
             "type": "number",
+            "minimum": -1,
             "description": "Hard timeout for the whole batch in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)"
           }
         },
@@ -4403,7 +4407,7 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 65535,
-            "description": "Target port number (1-65535, default 443, or 80 with use_tls=false)"
+            "description": "Target port number (1-65535; default: the first request's Host header port when it names host, else 443, or 80 with use_tls=false)"
           },
           "use_tls": {
             "type": "boolean",
@@ -4551,7 +4555,7 @@
             "type": "integer",
             "minimum": 1,
             "maximum": 65535,
-            "description": "Target port number (1-65535, default 443, or 80 with use_tls=false)"
+            "description": "Target port number (1-65535; default: raw_request's Host header port when it names host, else 443, or 80 with use_tls=false)"
           },
           "use_tls": {
             "type": "boolean",
@@ -4581,6 +4585,7 @@
           },
           "timeout_ms": {
             "type": "number",
+            "minimum": -1,
             "description": "Hard timeout in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)"
           }
         },
@@ -4674,6 +4679,7 @@
           },
           "response_timeout_ms": {
             "type": "integer",
+            "minimum": -1,
             "description": "Burp's own response read timeout (0 = Burp's default, -1 = none)"
           },
           "verify_tls": {
@@ -4686,6 +4692,7 @@
           },
           "timeout_ms": {
             "type": "number",
+            "minimum": -1,
             "description": "Hard timeout in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)"
           },
           "preserve_headers": {
@@ -4743,6 +4750,7 @@
           },
           "timeout_ms": {
             "type": "number",
+            "minimum": -1,
             "description": "Hard timeout per step in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)"
           }
         },
@@ -4797,6 +4805,7 @@
           },
           "timeout_ms": {
             "type": "number",
+            "minimum": -1,
             "description": "Hard timeout for the entire batch in milliseconds (0 = default, -1 = no hard timeout, max 600000, default 25000)"
           }
         },
