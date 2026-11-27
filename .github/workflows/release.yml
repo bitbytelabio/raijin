@@ -127,10 +127,10 @@ jobs:
 
       - name: Check tag matches the CLI version
         run: |
-          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' cli/Cargo.toml)
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
           echo "CLI version: $version, tag: $TAG"
           if [ "v$version" != "$TAG" ]; then
-            echo "::error::Tag $TAG does not match [workspace.package] version $version in cli/Cargo.toml"
+            echo "::error::Tag $TAG does not match [workspace.package] version $version in Cargo.toml"
             exit 1
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
@@ -142,7 +142,6 @@ jobs:
 
       # The CLI checks the jar it downloads against this digest of the jar the release job built.
       - name: Build
-        working-directory: cli
         env:
           RAIJIN_JAR_SHA256: ${{ needs.release.outputs.jar_sha256 }}
         run: |
@@ -150,12 +149,12 @@ jobs:
             echo "::error::the release job did not report the jar digest"
             exit 1
           fi
-          cargo build --release --locked -p raijin-cli --target ${{ matrix.target }}
+          cargo build --release --locked -p cli --target ${{ matrix.target }}
 
       - name: Package
         run: |
           name="raijin-cli-$VERSION-${{ matrix.target }}.tar.gz"
-          tar -czf "$name" -C "cli/target/${{ matrix.target }}/release" raijin
+          tar -czf "$name" -C "target/${{ matrix.target }}/release" raijin
           shasum -a 256 "$name" > "$name.sha256"
           echo "ASSET=$name" >> "$GITHUB_ENV"
 

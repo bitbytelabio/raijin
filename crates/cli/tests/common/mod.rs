@@ -1,4 +1,4 @@
-//! A target folder with two `.burp` projects (built with vendored amber), a Raijin archive for
+//! A target folder with two `.burp` projects (built with vendored bproj), a Raijin archive for
 //! project p1, and a small Raijin jar holding the tool catalog.
 
 #![allow(dead_code)]
@@ -28,16 +28,16 @@ fn write_project(dir: &Path, name: &str, entries: &[serde_json::Value]) {
         serde_json::to_vec(&json!({"schema_version": 1, "entries": entries})).expect("json"),
     )
     .expect("input");
-    let loaded = amber::load(&input).expect("amber input loads");
-    amber::create(
+    let loaded = bproj::load(&input).expect("bproj input loads");
+    bproj::create(
         &dir.join("burp").join(format!("{name}.burp")),
         &loaded,
-        &amber::WriteOptions {
+        &bproj::WriteOptions {
             force: true,
             name: None,
         },
     )
-    .expect("amber creates the project");
+    .expect("bproj creates the project");
     fs::remove_file(input).expect("cleanup");
 }
 
@@ -131,7 +131,7 @@ pub fn target(raijin_toml: &str) -> Fixture {
     zip.start_file("catalog/tools.json", options)
         .expect("entry");
     zip.write_all(include_bytes!(
-        "../../../../../src/main/resources/catalog/tools.json"
+        "../../../../src/main/resources/catalog/tools.json"
     ))
     .expect("catalog");
     zip.finish().expect("zip");

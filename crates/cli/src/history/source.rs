@@ -1,4 +1,4 @@
-//! Which files a history call reads, and reading them: Proxy rows through amber, archive rows and
+//! Which files a history call reads, and reading them: Proxy rows through bproj, archive rows and
 //! issues from Raijin's JSONL files. Files are read in parallel, one thread per project.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -8,10 +8,10 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use amber::{HistoryEntry, Project};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use bproj::{HistoryEntry, Project};
 use serde::Deserialize;
 
 use super::{Filters, IssueRow, Problem, Row, RowSource, Selection, Warning, header_value};
@@ -246,7 +246,7 @@ impl Kinds {
 }
 
 /// Every exchange of `source` that passes `filters`, Proxy rows first, then archive rows. Rows
-/// amber could not decode (a project damaged by a crash) are reported in `notes`.
+/// bproj could not decode (a project damaged by a crash) are reported in `notes`.
 pub fn for_each_exchange(
     source: &Source,
     filters: &Filters,
@@ -259,7 +259,7 @@ pub fn for_each_exchange(
         && let Some(burp) = &source.burp
     {
         let project = Project::open(burp).with_context(|| format!("reading {}", burp.display()))?;
-        let summary = project.for_each(&filters.amber()?, |entry| {
+        let summary = project.for_each(&filters.bproj()?, |entry| {
             let request = if load.request {
                 Some(message_bytes(&project, &entry.request)?)
             } else {
@@ -274,7 +274,7 @@ pub fn for_each_exchange(
                 request,
                 response,
             })
-            .map_err(|e| amber::Error::Malformed(format!("{e:#}")))
+            .map_err(|e| bproj::Error::Malformed(format!("{e:#}")))
         })?;
         if !summary.complete {
             notes.push(format!(
@@ -313,8 +313,8 @@ pub fn for_each_exchange(
 
 pub fn message_bytes(
     project: &Project,
-    message: &amber::model::history::Message,
-) -> amber::Result<Vec<u8>> {
+    message: &bproj::model::history::Message,
+) -> bproj::Result<Vec<u8>> {
     project
         .source()
         .bytes(message.payload_offset, message.length)
@@ -511,9 +511,9 @@ pub fn proxy_entry(source: &Source, entry_id: u64) -> Result<(Row, Vec<u8>, Opti
         .with_context(|| format!("project {} has no .burp file", source.project))?;
     let project = Project::open(burp).with_context(|| format!("reading {}", burp.display()))?;
     // Project::entry reports a missing id as a malformed project; look it up here instead.
-    let filter = amber::HistoryFilter {
+    let filter = bproj::HistoryFilter {
         entry_id: Some(entry_id),
-        ..amber::HistoryFilter::default()
+        ..bproj::HistoryFilter::default()
     };
     let mut found = None;
     project.for_each(&filter, |entry| {

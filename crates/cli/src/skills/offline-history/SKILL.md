@@ -40,7 +40,7 @@ and the scanner issues Burp reported. Live data of a running Burp is `proxy-traf
    responses; `run {"do":"history_diff","a":"day1:42","b":"day2:17","part":"request"}` diffs the requests.
 5. Issues: `history_list` with `"source":"issues"`, then `history_show` on an `i…` ref for detail and
    evidence: `run {"do":"history_show","ref":"day1:i3"}`.
-6. Hand off: `history_export` writes amber's JSON export per project (plus the archive files) under
+6. Hand off: `history_export` writes bproj's JSON export per project (plus the archive files) under
    `.raijin/exports/`; parse it with jq.
 
 ## Pitfalls

@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn the_parameter_synonyms_match_the_extension() {
-        let text = include_str!("../../../../src/main/resources/catalog/tools.json");
+        let text = include_str!("../../../src/main/resources/catalog/tools.json");
         let catalog: Value = serde_json::from_str(text).expect("catalog json");
         let shipped: Vec<Vec<String>> =
             serde_json::from_value(catalog["param_synonyms"].clone()).expect("param_synonyms");
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn the_boolean_words_match_the_extension() {
-        let text = include_str!("../../../../src/main/resources/catalog/tools.json");
+        let text = include_str!("../../../src/main/resources/catalog/tools.json");
         let catalog: Value = serde_json::from_str(text).expect("catalog json");
         let shipped: BTreeMap<String, Vec<String>> =
             serde_json::from_value(catalog["boolean_words"].clone()).expect("boolean_words");
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn calls_resolve_as_the_extension_resolves_them() {
-        let text = include_str!("../../../../src/main/resources/catalog/tools.json");
+        let text = include_str!("../../../src/main/resources/catalog/tools.json");
         let catalog = Catalog::parse(text).expect("catalog parses");
         let found = |name: &str| match catalog.resolve_call(name) {
             Resolved::Found { tool, action, .. } => Some((tool, action)),
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn the_repo_catalog_parses() {
-        let text = include_str!("../../../../src/main/resources/catalog/tools.json");
+        let text = include_str!("../../../src/main/resources/catalog/tools.json");
         let catalog = Catalog::parse(text).expect("catalog parses");
         assert_eq!(catalog.domains.len(), 10);
         assert!(catalog.tool("http_send_request").is_some());

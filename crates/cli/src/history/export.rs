@@ -1,4 +1,4 @@
-//! `history export` / `history_export`: amber's JSON export per project, plus the archive files.
+//! `history export` / `history_export`: bproj's JSON export per project, plus the archive files.
 
 use std::fs;
 use std::path::PathBuf;
@@ -33,18 +33,18 @@ pub fn run(target: &Target, params: &ExportParams) -> Result<Value> {
         || target.state_dir().join("exports").join(utc_stamp()),
         |p| target.resolve(p),
     );
-    let filter = params.filters.amber()?;
+    let filter = params.filters.bproj()?;
     let sources = source::discover(target, &params.selection)?;
     let (projects, warnings) = source::par_map(&sources, |s, _notes| {
         let dest = out_dir.join(&s.project);
         let mut entry = json!({"project": s.project, "dir": dest.display().to_string()});
         if let Some(burp) = &s.burp {
-            let options = amber::ExportOptions {
+            let options = bproj::ExportOptions {
                 write_blobs: !params.no_blobs,
                 force: false,
                 filter: filter.clone(),
             };
-            let summary = amber::export(burp, &dest, &options)
+            let summary = bproj::export(burp, &dest, &options)
                 .with_context(|| format!("exporting {}", burp.display()))?;
             entry["entries"] = json!(summary.entry_count);
             entry["complete"] = json!(summary.complete);

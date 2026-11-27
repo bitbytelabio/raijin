@@ -119,8 +119,8 @@ amber
   Commit e52bfd3b8ac0b7d9e6c3b518054ef9f0ad8a50c5 (tag v0.2.0).
   No upstream license; vendored by maintainer decision, unlike the
   Apache-2.0 components above.
-  Vendored: cli/crates/amber/ (the `amber` library crate, copied verbatim;
-            only its Cargo.toml gained a provenance header). The raijin CLI
+  Vendored: crates/bproj/ (the `amber` library crate, renamed to `bproj`; its
+            Cargo.toml gained a provenance header). The raijin CLI
             uses it to read .burp project files offline.
 
 Autorize

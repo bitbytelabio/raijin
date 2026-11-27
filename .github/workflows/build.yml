@@ -48,9 +48,6 @@ jobs:
 
   cli:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: cli
     steps:
       - uses: actions/checkout@v4
 
@@ -60,16 +57,14 @@ jobs:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: cli
 
       - name: Test
         run: cargo test --locked
 
-      # --no-deps -p raijin-cli: crates/amber is vendored verbatim (see NOTICE) and is not held
+      # --no-deps -p cli: crates/bproj is vendored from amber (see NOTICE) and is not held
       # to clippy lints newer than its upstream.
       - name: Clippy
-        run: cargo clippy --locked -p raijin-cli --no-deps --all-targets -- -D warnings
+        run: cargo clippy --locked -p cli --no-deps --all-targets -- -D warnings
 
   # install.sh runs under any POSIX sh (`curl ... | sh`). The download path is smoke-tested by
   # release.yml against the published assets: releases up to 2.2.1 carry no CLI archives.

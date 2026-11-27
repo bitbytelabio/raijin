@@ -1,6 +1,6 @@
 # Build
 build/
-cli/target/
+/target/
 .gradle/
 .kotlin/
 out/

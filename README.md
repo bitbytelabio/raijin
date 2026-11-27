@@ -247,7 +247,7 @@ Read-only snapshots for clients that browse MCP resources:
 
 ## 📚 Skills
 
-The `raijin` CLI ships playbooks so an agent can learn the tool groups and workflows by itself. They live in the binary (`cli/crates/raijin-cli/src/skills/<name>/SKILL.md` plus `references/*.md`); the extension's own MCP server serves none.
+The `raijin` CLI ships playbooks so an agent can learn the tool groups and workflows by itself. They live in the binary (`crates/cli/src/skills/<name>/SKILL.md` plus `references/*.md`); the extension's own MCP server serves none.
 
 | Skill | Covers |
 |---|---|
@@ -433,7 +433,7 @@ src/main/kotlin/io/bitbytelab/raijin/
 <summary><b>Adding things</b></summary>
 
 - **A tool:** register it in `tools/<area>/*Tools.kt`, then add it to `ToolConsolidation.GROUPS` (as an action) or `KEEP` (as its own tool). A test fails if you forget.
-- **A skill:** add `cli/crates/raijin-cli/src/skills/<name>/SKILL.md` (front matter `name`, `description`) and any `references/*.md`, and list them in `BUNDLED` / `BUNDLED_FILES` in `cli/crates/raijin-cli/src/catalog.rs`. Write tool calls as `run {"do":...}`; tests fail on a file left out of the tables or a call that does not fit.
+- **A skill:** add `crates/cli/src/skills/<name>/SKILL.md` (front matter `name`, `description`) and any `references/*.md`, and list them in `BUNDLED` / `BUNDLED_FILES` in `crates/cli/src/catalog.rs`. Write tool calls as `run {"do":...}`; tests fail on a file left out of the tables or a call that does not fit.
 - **Turbo docs or examples:** add the file under `src/main/resources/turbo-docs/` or `src/main/resources/examples/`, and list it in `McpResourceHandlers` (`docTopics`, or the example set the MCP tools serve). A test fails when a doc file and the topic list differ.
 
 MCP SDK: `io.modelcontextprotocol:kotlin-sdk-server` 0.16, which pins Kotlin 2.4 and Ktor 3.5; bump them together. Developer notes are in [`docs/dev/`](docs/dev/).

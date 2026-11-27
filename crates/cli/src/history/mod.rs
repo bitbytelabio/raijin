@@ -1,4 +1,4 @@
-//! Offline review of a target's `.burp` projects (vendored amber) and the Raijin exchange archive.
+//! Offline review of a target's `.burp` projects (vendored bproj) and the Raijin exchange archive.
 //!
 //! Every operation is a CLI subcommand (`raijin history …`) and an MCP tool (`history_…`) with the
 //! same parameters: the parameter structs derive both `clap::Args` and `Deserialize`/`JsonSchema`.
@@ -11,8 +11,8 @@ pub mod search;
 pub mod show;
 pub mod source;
 
-use amber::HistoryFilter;
 use anyhow::{Result, bail};
+use bproj::HistoryFilter;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// A history failure the caller fixes by changing the call; `raijin mcp` gives each its own error
@@ -86,7 +86,7 @@ fn one_or_many<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error>
     })
 }
 
-/// amber's history filters. On archive rows the same predicates run in Rust; a comment or
+/// bproj's history filters. On archive rows the same predicates run in Rust; a comment or
 /// highlight filter excludes archive rows (they have neither).
 #[derive(Debug, Clone, Default, clap::Args, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -124,7 +124,7 @@ pub struct Filters {
 }
 
 impl Filters {
-    pub fn amber(&self) -> Result<HistoryFilter> {
+    pub fn bproj(&self) -> Result<HistoryFilter> {
         let filter = HistoryFilter {
             host: self.host.clone(),
             url_contains: self.url.clone(),
@@ -142,7 +142,7 @@ impl Filters {
         Ok(filter)
     }
 
-    /// The amber predicates applied to an archive row.
+    /// The bproj predicates applied to an archive row.
     pub fn accepts_archive(&self, row: &Row) -> bool {
         if self.comment.is_some() || self.highlight.is_some() {
             return false;
@@ -199,7 +199,7 @@ pub enum RowSource {
     Archive,
 }
 
-/// One exchange, from Proxy history (amber) or the Raijin archive.
+/// One exchange, from Proxy history (bproj) or the Raijin archive.
 #[derive(Debug, Clone, Serialize)]
 pub struct Row {
     #[serde(rename = "ref")]

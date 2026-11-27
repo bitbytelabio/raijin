@@ -3,7 +3,7 @@
 # No upstream license; vendored by maintainer decision (see NOTICE).
 
 [package]
-name = "amber"
+name = "bproj"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

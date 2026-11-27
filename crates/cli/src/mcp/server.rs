@@ -241,7 +241,7 @@ const LOCAL_TOOLS: &[LocalTool] = &[
     LocalTool {
         name: "history_export",
         domain: HISTORY,
-        description: "amber JSON export of each project (plus the archive files) under .raijin/exports/.",
+        description: "bproj JSON export of each project (plus the archive files) under .raijin/exports/.",
         schema: schema_of::<history::export::ExportParams>,
         example: r#"{"do":"history_export"}"#,
         read_only: false,
@@ -2828,7 +2828,7 @@ mod tests {
     #[test]
     fn every_example_in_the_gateway_text_runs() {
         let catalog = Catalog::parse(include_str!(
-            "../../../../../src/main/resources/catalog/tools.json"
+            "../../../../src/main/resources/catalog/tools.json"
         ))
         .expect("repo catalog");
         let mut texts: Vec<String> = [
@@ -2957,7 +2957,7 @@ mod weak_model {
 
     fn catalog() -> Catalog {
         Catalog::parse(include_str!(
-            "../../../../../src/main/resources/catalog/tools.json"
+            "../../../../src/main/resources/catalog/tools.json"
         ))
         .expect("repo catalog")
     }

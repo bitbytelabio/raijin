@@ -6,7 +6,6 @@ pre-commit:
       run: ktfmt --kotlinlang-style {staged_files}
       stage_fixed: true
     rust-fmt:
-      root: cli/
       glob: "*.rs"
       run: cargo fmt --all
       stage_fixed: true
@@ -25,7 +24,6 @@ pre-push:
   parallel: true
   commands:
     rust-check:
-      root: cli/
       run: cargo clippy --locked -- -D warnings && cargo test --locked
     gradle-test:
       run: ./gradlew test

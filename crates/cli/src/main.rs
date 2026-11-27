@@ -142,7 +142,7 @@ enum HistoryCommand {
         #[command(flatten)]
         output: Output,
     },
-    /// amber JSON export per project, plus the archive files.
+    /// bproj JSON export per project, plus the archive files.
     Export {
         #[command(flatten)]
         params: history::export::ExportParams,
