@@ -131,7 +131,7 @@ impl Library {
 }
 
 /// Filters shared by `data_search` and `data_payloads`; every one given must match.
-#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Filters {
     /// Words (space-separated), all of which must appear, in any case, in the title, description, payload, category or tags.
     pub query: Option<String>,

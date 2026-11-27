@@ -29,18 +29,27 @@ pub fn repair(line: &[u8]) -> Option<Vec<u8>> {
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let (arguments, note) = match serde_json::from_str::<Map<String, Value>>(s) {
-        Ok(object) => (object, Some("parsed 'arguments' from a JSON string")),
-        Err(_) => match error::norm(error::strip_server_prefix(name).unwrap_or(name)).as_str() {
+    let (arguments, note) = match json_object(s) {
+        Some((object, 1)) => (
+            object,
+            Some("parsed 'arguments' from a JSON string".to_owned()),
+        ),
+        Some((object, layers)) => (
+            object,
+            Some(format!(
+                "parsed 'arguments' from JSON encoded {layers} times (a JSON string inside a JSON string)"
+            )),
+        ),
+        None => match error::norm(error::strip_server_prefix(name).unwrap_or(name)).as_str() {
             "guide" => (
                 one("topic", s.trim()),
-                Some("read string 'arguments' as guide's topic"),
+                Some("read string 'arguments' as guide's topic".to_owned()),
             ),
             // Broken JSON stays `arguments`, so `run` says where it breaks.
             "run" if s.trim_start().starts_with(['{', '[']) => (one("arguments", s), None),
             "run" => (
                 one("do", s.trim()),
-                Some("read string 'arguments' as \"do\""),
+                Some("read string 'arguments' as \"do\"".to_owned()),
             ),
             _ => (one("arguments", s), None),
         },
@@ -63,6 +72,24 @@ pub fn repair(line: &[u8]) -> Option<Vec<u8>> {
     let mut out = serde_json::to_vec(&Value::Object(request)).ok()?;
     out.push(b'\n');
     Some(out)
+}
+
+/// Most parses [`json_object`] makes: an object inside up to two JSON strings.
+const MAX_LAYERS: usize = 3;
+
+/// `s` parsed as a JSON object, also when it is a JSON string holding one, encoded again up to
+/// [`MAX_LAYERS`] in all (`"\"{\\\"a\\\":1}\""` takes 2): the object and the parses it took. Each
+/// layer must be a string until the object; anything else is None.
+pub fn json_object(s: &str) -> Option<(Map<String, Value>, usize)> {
+    let mut text = s.to_owned();
+    for layer in 1..=MAX_LAYERS {
+        match serde_json::from_str::<Value>(&text).ok()? {
+            Value::Object(object) => return Some((object, layer)),
+            Value::String(inner) => text = inner,
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn one(key: &str, value: &str) -> Map<String, Value> {
@@ -121,6 +148,25 @@ mod tests {
             json!(["parsed 'arguments' from a JSON string"])
         );
         assert_eq!(v["id"], json!(3));
+    }
+
+    #[test]
+    fn arguments_encoded_twice_are_decoded_whole() {
+        let v = repaired(
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"run","arguments":"\"{\\\"do\\\":\\\"burp_status\\\"}\""}}"#,
+        )
+        .expect("repaired");
+        assert_eq!(v["params"]["arguments"], json!({"do": "burp_status"}));
+        assert_eq!(
+            v["params"]["_meta"][NOTES_META_KEY],
+            json!([
+                "parsed 'arguments' from JSON encoded 2 times (a JSON string inside a JSON string)"
+            ])
+        );
+        let thrice = json!(json!(json!({"a": 1}).to_string()).to_string()).to_string();
+        assert_eq!(json_object(&thrice).map(|(_, n)| n), Some(3));
+        let four = json!(thrice).to_string();
+        assert_eq!(json_object(&four), None, "at most 3 parses");
     }
 
     #[test]

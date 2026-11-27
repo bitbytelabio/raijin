@@ -68,6 +68,19 @@ one with \"guide\" holds guide's arguments.";
 /// Why a destructive tool named in another form is not run.
 const DESTRUCTIVE_EXACT: &str = "It is destructive, so it runs only under its exact name.";
 
+/// The `error` of an `unknown_tool` that has a suggestion: it leads, as `unknown tool "<tool>"; did
+/// you mean <hit>?`, then [`DESTRUCTIVE_EXACT`] when `hit` removes or stops something, then `rest`.
+fn did_you_mean_error(tool: &str, hit: &str, destructive: bool, rest: &str) -> String {
+    let mut error = format!("unknown tool \"{tool}\"; did you mean {hit}?");
+    for sentence in [if destructive { DESTRUCTIVE_EXACT } else { "" }, rest] {
+        if !sentence.is_empty() {
+            error.push(' ');
+            error.push_str(sentence);
+        }
+    }
+    error
+}
+
 const GUIDE_HEAD: &str = "Run a tool: run {\"do\":\"<tool>\", ...its parameters}. Grouped tool: run \
 {\"do\":\"<tool>.<action>\", ...} e.g. {\"do\":\"scope.check\",\"url\":\"https://example.com\"}. Several in order: \
 run {\"batch\":[{\"do\":...},...],\"bail\":true}. One tool's parameters, a domain's tools or a playbook: guide \
@@ -526,16 +539,10 @@ fn unwrap_call(raw: &mut JsonObject, notes: &mut Vec<String>) {
 /// The note for parameters sent as JSON encoded twice (`"\"{\\\"a\\\":1}\""`).
 const DOUBLE_ENCODED: &str = "read 'arguments' as JSON inside a JSON string";
 
-/// `s` parsed as a JSON object, also when it is a JSON string holding one (encoded twice); the
-/// flag says the second parse was needed.
+/// `s` parsed as a JSON object, also when JSON strings hold it ([`stdin::json_object`]); the flag
+/// says it was encoded more than once.
 fn json_object(s: &str) -> Option<(JsonObject, bool)> {
-    match serde_json::from_str::<Value>(s).ok()? {
-        Value::Object(o) => Some((o, false)),
-        Value::String(inner) => serde_json::from_str::<JsonObject>(&inner)
-            .ok()
-            .map(|o| (o, true)),
-        _ => None,
-    }
+    stdin::json_object(s).map(|(o, layers)| (o, layers > 1))
 }
 
 /// The call one `tool_calls`/`tool_uses` item holds (`{"function":{"name":...,"arguments":...}}`,
@@ -1526,12 +1533,9 @@ fn unknown_tool_error(catalog: &Catalog, tool: &str, arguments: &JsonObject) -> 
         && hit != tool.trim()
         && is_destructive(catalog, hit)
     {
-        return ToolError::new(
-            Code::UnknownTool,
-            format!("unknown tool \"{tool}\"; did you mean {hit}? {DESTRUCTIVE_EXACT}"),
-        )
-        .did_you_mean(hits)
-        .see(guide_call(Some(hit)));
+        return ToolError::new(Code::UnknownTool, did_you_mean_error(tool, hit, true, ""))
+            .did_you_mean(hits)
+            .see(guide_call(Some(hit)));
     }
     // Words that say what the model wants (`xss.find`, `burp_start`), when no tool is near.
     if certain.is_none()
@@ -1542,11 +1546,19 @@ fn unknown_tool_error(catalog: &Catalog, tool: &str, arguments: &JsonObject) -> 
     if hits.is_empty() {
         return no_tool_error(catalog, tool);
     }
-    let mut err = ToolError::new(
-        Code::UnknownTool,
-        format!("unknown tool \"{tool}\"; guide {{}} lists every tool."),
-    )
-    .see(guide_call(None));
+    let first = &hits[0];
+    // The same name (an extension older than the catalog lacks it) is no suggestion.
+    let message = if error::norm(first) == w {
+        format!("unknown tool \"{tool}\"; {LISTS_EVERY_TOOL}")
+    } else {
+        did_you_mean_error(
+            tool,
+            first,
+            is_destructive(catalog, first),
+            LISTS_EVERY_TOOL,
+        )
+    };
+    let mut err = ToolError::new(Code::UnknownTool, message).see(guide_call(None));
     // The same name (an extension older than the catalog lacks it) would only fail again.
     if let Some(hit) = certain
         && error::norm(hit) != w
@@ -1564,6 +1576,25 @@ fn unknown_tool_error(catalog: &Catalog, tool: &str, arguments: &JsonObject) -> 
 
 /// Most names an `unknown_tool` error suggests.
 const MAX_SUGGESTED: usize = 5;
+
+/// Ends an `unknown_tool` error that names no domain.
+const LISTS_EVERY_TOOL: &str = "guide {} lists every tool.";
+
+/// The tool and action a call of `name` with `arguments` runs: a grouped tool named without its
+/// action (`{"do":"proxy_intercept","action":"status"}`) takes the `action` argument, so whether it
+/// removes or stops something is judged per action, never by the group's `destructiveHint`.
+fn resolve_with_action(
+    catalog: &Catalog,
+    name: &str,
+    arguments: Option<&JsonObject>,
+) -> Option<(String, Option<String>)> {
+    let (tool, action) = catalog.resolve(name)?;
+    let action = action.or_else(|| {
+        catalog.tool(&tool).filter(|t| !t.actions.is_empty())?;
+        arguments?.get("action")?.as_str().map(str::to_owned)
+    });
+    Some((tool, action))
+}
 
 /// Whether `name` (a local tool, catalog tool or `tool.action`) removes or stops something.
 fn is_destructive(catalog: &Catalog, name: &str) -> bool {
@@ -1611,7 +1642,12 @@ fn intent_error(
     };
     let mut err = ToolError::new(
         Code::UnknownTool,
-        format!("unknown tool \"{tool}\". Did you mean {first}{with}?"),
+        did_you_mean_error(
+            tool,
+            &format!("{first}{with}"),
+            is_destructive(catalog, first),
+            "",
+        ),
     )
     .did_you_mean(names);
     let domain = domain_of_call(catalog, first);
@@ -1699,20 +1735,28 @@ fn no_tool_error(catalog: &Catalog, tool: &str) -> ToolError {
                 .into_iter()
                 .map(|s| s.name.to_owned())
                 .collect();
+        let lists_its_tools = format!(
+            "domain {domain} has no such tool; guide {{\"topic\":\"{domain}\"}} lists its tools."
+        );
+        // Only a near name leads; the domain's other tools follow it in `did_you_mean`.
+        let message = match names.first() {
+            Some(hit) => did_you_mean_error(
+                tool,
+                hit,
+                is_destructive(catalog, hit),
+                &format!("The {lists_its_tools}"),
+            ),
+            None => format!("unknown tool \"{tool}\": the {lists_its_tools}"),
+        };
         for t in &tools {
             if !names.contains(t) {
                 names.push(t.clone());
             }
         }
         names.truncate(MAX_SUGGESTED);
-        return ToolError::new(
-            Code::UnknownTool,
-            format!(
-                "unknown tool \"{tool}\": the domain {domain} has no such tool; guide {{\"topic\":\"{domain}\"}} lists its tools."
-            ),
-        )
-        .did_you_mean(names)
-        .see(guide_call(Some(&domain)));
+        return ToolError::new(Code::UnknownTool, message)
+            .did_you_mean(names)
+            .see(guide_call(Some(&domain)));
     }
     let tokens: Vec<String> = error::norm(tool)
         .split('_')
@@ -1746,15 +1790,17 @@ fn no_tool_error(catalog: &Catalog, tool: &str) -> ToolError {
             }
         })
         .collect();
-    ToolError::new(
-        Code::UnknownTool,
-        format!(
-            "unknown tool \"{tool}\". Domains: {}; call guide {{\"topic\":\"<domain>\"}}.",
-            listed.join(", ")
-        ),
-    )
-    .did_you_mean(by_verb)
-    .see(guide_call(nearest.as_deref()))
+    let domains_sentence = format!(
+        "Domains: {}; call guide {{\"topic\":\"<domain>\"}}.",
+        listed.join(", ")
+    );
+    let message = match by_verb.first() {
+        Some(hit) => did_you_mean_error(tool, hit, is_destructive(catalog, hit), &domains_sentence),
+        None => format!("unknown tool \"{tool}\". {domains_sentence}"),
+    };
+    ToolError::new(Code::UnknownTool, message)
+        .did_you_mean(by_verb)
+        .see(guide_call(nearest.as_deref()))
 }
 
 /// `inputSchema.properties.action.enum` of a schema: a grouped tool's actions.
@@ -1963,6 +2009,24 @@ impl Gateway {
         format!("{INSTRUCTIONS_HEAD}{middle}{INSTRUCTIONS_TAIL}")
     }
 
+    /// The CLI's own tools as `--surface full` lists them, the ones `tools/call` runs here: every
+    /// history and data tool, and the lifecycle tools of this mode ([`Self::lifecycle_tools`]).
+    fn local_tool_listing(&self) -> Vec<Tool> {
+        let lifecycle = self.lifecycle_tools();
+        LOCAL_TOOLS
+            .iter()
+            .filter(|t| t.domain != LIFECYCLE || lifecycle.iter().any(|l| l.name == t.name))
+            .map(|t| {
+                let tool =
+                    Tool::new_with_raw(t.name, Some(Cow::Borrowed(t.description)), (t.schema)());
+                match serde_json::from_value::<ToolAnnotations>(t.annotations()) {
+                    Ok(annotations) => tool.with_annotations(annotations),
+                    Err(_) => tool,
+                }
+            })
+            .collect()
+    }
+
     fn lifecycle_tools(&self) -> Vec<&'static LocalTool> {
         LOCAL_TOOLS
             .iter()
@@ -2141,15 +2205,19 @@ impl Gateway {
                 .map(str::to_owned);
             return self.batch(steps, bail, bail_given, project, &notes).await;
         }
-        let result = match normalize_run(
+        match normalize_run(
             raw,
             |tool, key| tool_declares(catalog, tool, key),
             |name| names_a_tool(catalog, name),
         ) {
-            Ok(call) => self.run_one(call).await,
-            Err(e) => e.into_result(),
-        };
-        error::with_notes(result, &notes)
+            // The notes go in before a large result is saved to a file, so the summary keeps them.
+            Ok(mut call) => {
+                notes.append(&mut call.notes);
+                call.notes = notes;
+                self.run_one(call).await
+            }
+            Err(e) => error::with_notes(e.into_result(), &notes),
+        }
     }
 
     /// Steps in order; each result inline (no per-step spill), the whole batch spilled once. A
@@ -2355,7 +2423,7 @@ impl Gateway {
         if let Some(result) = gateway_tool_as_do(&tool, arguments.as_ref()) {
             return (tool, result);
         }
-        if !dropped.is_empty() && !self.reads_only(&tool).await {
+        if !dropped.is_empty() && !self.reads_only(&tool, arguments.as_ref()).await {
             let listed: Vec<String> = dropped.iter().map(|d| format!("'{d}'")).collect();
             let result = ToolError::new(
                 Code::InvalidArguments,
@@ -2375,10 +2443,7 @@ impl Gateway {
                 Some(local) if local.destructive => {
                     let result = ToolError::new(
                         Code::UnknownTool,
-                        format!(
-                            "unknown tool \"{tool}\"; did you mean {}? {DESTRUCTIVE_EXACT}",
-                            local.name
-                        ),
+                        did_you_mean_error(&tool, local.name, true, ""),
                     )
                     .did_you_mean(vec![local.name.to_owned()])
                     .into_result();
@@ -2419,9 +2484,9 @@ impl Gateway {
         (local.name.to_owned(), result)
     }
 
-    /// Whether a call of `name` only reads: a read-only local tool, or a catalog call marked
-    /// `readOnlyHint` that removes or stops nothing. Unknown names count as writes.
-    async fn reads_only(&self, name: &str) -> bool {
+    /// Whether a call of `name` with `arguments` only reads: a read-only local tool, or a catalog
+    /// call marked `readOnlyHint` that removes or stops nothing. Unknown names count as writes.
+    async fn reads_only(&self, name: &str, arguments: Option<&JsonObject>) -> bool {
         if let Some(local) = local_tool(name.trim()).or_else(|| local_tool(&error::norm(name))) {
             return local.read_only;
         }
@@ -2429,7 +2494,7 @@ impl Gateway {
             return false;
         };
         let catalog = &assets.catalog;
-        catalog.resolve(name).is_some_and(|(tool, action)| {
+        resolve_with_action(catalog, name, arguments).is_some_and(|(tool, action)| {
             !catalog.destructive(&tool, action.as_deref())
                 && catalog.tool(&tool).is_some_and(|spec| {
                     spec.annotations
@@ -2517,9 +2582,9 @@ impl Gateway {
                 }
                 Err(mut e) => {
                     let safe = self.assets().await.is_ok_and(|a| {
-                        a.catalog.resolve(tool).is_some_and(|(name, action)| {
-                            !a.catalog.destructive(&name, action.as_deref())
-                        })
+                        resolve_with_action(&a.catalog, tool, arguments.as_ref()).is_some_and(
+                            |(name, action)| !a.catalog.destructive(&name, action.as_deref()),
+                        )
                     });
                     if let [only] = e.allowed.as_slice()
                         && safe
@@ -2590,6 +2655,10 @@ impl Gateway {
             catalog::Resolved::Found {
                 tool: name, action, ..
             } => {
+                let action = action.or_else(|| {
+                    catalog.tool(&name).filter(|t| !t.actions.is_empty())?;
+                    arguments.get("action")?.as_str().map(str::to_owned)
+                });
                 if catalog.destructive(&name, action.as_deref()) {
                     return error.into_result();
                 }
@@ -3831,6 +3900,9 @@ impl ServerHandler for Gateway {
                 tools.push(tool);
             }
         }
+        if self.surface == Surface::Full {
+            tools.extend(self.local_tool_listing());
+        }
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -4786,6 +4858,25 @@ mod weak_model {
         assert_eq!(hit, "scope.remove");
         assert_eq!(remove.retry, None);
         assert!(remove.error.contains(DESTRUCTIVE_EXACT), "{}", remove.error);
+        // A suggestion, when there is one, leads the error sentence.
+        let (hit, drop) = first("drop_request");
+        assert_eq!(hit, "proxy_intercept.drop");
+        assert!(
+            drop.error.starts_with(&format!(
+                "unknown tool \"drop_request\"; did you mean proxy_intercept.drop? {DESTRUCTIVE_EXACT}"
+            )),
+            "{}",
+            drop.error
+        );
+        assert_eq!(drop.retry, None);
+        let (hit, typo) = first("proxy_histroy");
+        assert!(
+            typo.error.starts_with(&format!(
+                "unknown tool \"proxy_histroy\"; did you mean {hit}?"
+            )),
+            "{}",
+            typo.error
+        );
     }
 
     #[test]
@@ -4968,5 +5059,47 @@ mod weak_model {
         let topic = tool_topic("util.hash", Some(&catalog), None).expect("util.hash");
         let usage = topic["usage"].as_str().expect("usage");
         assert!(!usage.contains("GZIP"), "{usage}");
+    }
+}
+#[cfg(test)]
+mod see_notes {
+    use super::*;
+
+    /// A result saved to a file (`{"see":"history_list"}` without `limit` is a large page) keeps
+    /// the note saying how the call was read.
+    #[tokio::test]
+    async fn a_pasted_see_is_noted_also_when_the_result_is_saved() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = Target::discover_or_init(dir.path()).expect("target");
+        std::fs::create_dir_all(target.projects_dir()).expect("projects dir");
+        let gateway = Gateway {
+            target: Some(Arc::new(target)),
+            target_error: None,
+            remote: None,
+            surface: Surface::Lean,
+            inline_limit: 10,
+            assets: OnceCell::new(),
+            api: ToolApi::new(),
+            warned_live: std::sync::Mutex::default(),
+            data_root: Some(dir.path().join("cache")),
+            data_auto_update: false,
+            data_checked: tokio::sync::Mutex::new(false),
+            data_cache: std::sync::Mutex::default(),
+        };
+        for raw in [
+            json!({"see": "history_list"}),
+            json!({"see": "history_list", "limit": 1}),
+        ] {
+            let result = gateway
+                .run(Some(serde_json::from_value(raw.clone()).expect("object")))
+                .await;
+            let value = result_value(&result);
+            assert!(value.get("saved_to").is_some(), "{raw}: {value}");
+            assert_eq!(
+                value["notes"],
+                json!(["read 'see' as the call"]),
+                "{raw}: {value}"
+            );
+        }
     }
 }

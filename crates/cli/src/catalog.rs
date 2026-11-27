@@ -226,7 +226,9 @@ impl Catalog {
         ];
         match action {
             Some(action) if self.tool(tool).is_some_and(|t| !t.actions.is_empty()) => {
-                action.split('_').any(|w| WORDS.contains(&w))
+                crate::mcp::error::norm(action)
+                    .split('_')
+                    .any(|w| WORDS.contains(&w))
             }
             _ => self.tool(tool).is_some_and(|t| {
                 t.annotations

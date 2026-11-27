@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use super::store::{UPSTREAM, manifest};
 use super::{
     Entry, Filters, Kind, Library, Source, browser_name, category_matches, haystack, matches,
-    query_words,
+    norm_term, query_words,
 };
 use crate::mcp::error::{Code, ToolError};
 use crate::util::{suggest, truncate_utf8};
@@ -252,22 +252,23 @@ fn checked_filters(
     entries: &[&Entry],
     filters: &Filters,
 ) -> Result<(Filters, Vec<String>), ToolError> {
-    // `category:"xss"`: a source name given as category.
-    if filters.source.is_none()
-        && let Some(c) = filters.category.as_deref()
-        && let Some(source) = Source::value_variants()
-            .iter()
-            .copied()
-            .find(|s| s.as_str() == c.trim().to_lowercase())
-        && !entries.iter().any(|e| category_matches(&e.category, c))
-    {
+    if let Some((c, source)) = source_as_category(entries, filters) {
         let as_source = Filters {
             source: Some(source),
             category: None,
             ..filters.clone()
         };
         let (f, mut notes) = checked_filters(tool, entries, &as_source)?;
-        notes.insert(0, format!("read 'category' \"{}\" as 'source'", c.trim()));
+        let c = c.trim();
+        let note = if c.eq_ignore_ascii_case(source.as_str()) {
+            format!("read 'category' \"{c}\" as 'source'")
+        } else {
+            format!(
+                "read 'category' \"{c}\" as 'source' \"{}\"",
+                source.as_str()
+            )
+        };
+        notes.insert(0, note);
         return Ok((f, notes));
     }
     let mut f = filters.clone();
@@ -298,10 +299,14 @@ fn checked_filters(
                 .join("/");
             if !actual.eq_ignore_ascii_case(&c) {
                 notes.push(format!("matched 'category' \"{raw}\" to \"{actual}\""));
+            } else if c != raw.trim() {
+                notes.push(format!(
+                    "dropped the trailing '/' of 'category' \"{raw}\": read as \"{actual}\""
+                ));
             }
             f.category = Some(actual);
         } else {
-            let (category, tag) = category_and_tag(tool, entries, &pool, &raw, &c, see())?;
+            let (category, tag) = category_and_tag(tool, entries, &pool, &f, &c, see())?;
             notes.push(format!(
                 "read 'category' \"{raw}\" as category \"{category}\" + tag \"{tag}\""
             ));
@@ -349,18 +354,36 @@ fn checked_filters(
     Ok((f, notes))
 }
 
-/// A category `c` (`raw` as given) no entry of `pool` has, for `tool`: `<category>/.../<tag>` whose
-/// last segment is a tag of an entry in that category is read as both. An entry id
-/// (`events/onload/svg`) is `invalid_arguments` with a `data_get` retry; anything else
-/// `invalid_enum` listing the categories of `pool`, each source's together, with `see`.
+/// The category of `filters` and the source it names (`category:"xss"`, `"bcheck"`: a source name,
+/// singular or plural), when no source is given and no entry has that category.
+fn source_as_category<'a>(entries: &[&Entry], filters: &'a Filters) -> Option<(&'a str, Source)> {
+    if filters.source.is_some() {
+        return None;
+    }
+    let c = filters.category.as_deref()?;
+    let source = Source::value_variants()
+        .iter()
+        .copied()
+        .find(|s| norm_term(s.as_str()) == norm_term(c))?;
+    (!entries.iter().any(|e| category_matches(&e.category, c))).then_some((c, source))
+}
+
+/// A category `c` (`f.category` as given) no entry of `pool` has, for `tool`:
+/// `<category>/.../<tag>` whose last segment is a tag of an entry in that category is read as
+/// both. An entry id (`events/onload/svg`) is `invalid_arguments` with a `data_get` retry; anything
+/// else `invalid_enum` with `did_you_mean` the nearest categories of every source
+/// ([`nearest_categories`]), `allowed` the categories of `pool` (each source's together, the
+/// nearest first), `see`, and `retry` when one category is clearly meant and the call runs with
+/// it ([`category_retry`]).
 fn category_and_tag(
     tool: &str,
     entries: &[&Entry],
     pool: &[&Entry],
-    raw: &str,
+    f: &Filters,
     c: &str,
     see: Value,
 ) -> Result<(String, String), ToolError> {
+    let raw = f.category.as_deref().unwrap_or(c);
     if let Ok((e, _)) = find(entries, c, "data_get") {
         return Err(ToolError::new(
             Code::InvalidArguments,
@@ -381,8 +404,38 @@ fn category_and_tag(
             return Ok((category.to_owned(), tag.to_owned()));
         }
     }
+    let every = source_categories(entries);
+    let (near, clear) = nearest_categories(c, &every, 3);
+    let mut cats: Vec<String> = near
+        .iter()
+        .filter(|n| pool.iter().any(|e| e.category == **n))
+        .cloned()
+        .collect();
+    for cat in source_categories(pool) {
+        if !cats.contains(&cat) {
+            cats.push(cat);
+        }
+    }
+    cats.truncate(MAX_ALLOWED);
+    let mut error = ToolError::new(
+        Code::InvalidEnum,
+        format!(
+            "{tool}: no entry has category \"{c}\"; 'allowed' lists categories of the selected data."
+        ),
+    )
+    .param("category")
+    .got(json!(c))
+    .allowed(cats.into_iter().map(Value::String).collect());
+    if clear && let Some(call) = category_retry(tool, entries, f, &near[0]) {
+        error = error.retry(call);
+    }
+    Err(error.did_you_mean(near).see(see))
+}
+
+/// The categories of `entries` without duplicates, each source's together in [`Source`] order.
+fn source_categories(entries: &[&Entry]) -> Vec<String> {
     let order = |s: Source| Source::value_variants().iter().position(|v| *v == s);
-    let by_source: BTreeSet<(Option<usize>, &str)> = pool
+    let by_source: BTreeSet<(Option<usize>, &str)> = entries
         .iter()
         .map(|e| (order(e.source), e.category.as_str()))
         .collect();
@@ -392,18 +445,105 @@ fn category_and_tag(
             cats.push(cat.to_owned());
         }
     }
-    let (allowed, near) = allowed_and_near(c, &cats);
-    Err(ToolError::new(
-        Code::InvalidEnum,
-        format!(
-            "{tool}: no entry has category \"{c}\"; 'allowed' lists categories of the selected data."
-        ),
-    )
-    .param("category")
-    .got(json!(c))
-    .allowed(allowed)
-    .did_you_mean(near)
-    .see(see))
+    cats
+}
+
+/// The words of a category or a value given for one: each piece between `-`, `_`, `/` and spaces
+/// in [`norm_term`] form (`url-validation-allow-list-bypass` -> url, validation, allow, list, bypass).
+fn category_words(s: &str) -> BTreeSet<String> {
+    s.split(['-', '_', '/', ' '])
+        .filter(|w| !w.trim().is_empty())
+        .map(norm_term)
+        .collect()
+}
+
+/// Up to `n` of `categories` nearest `got`, nearest first, and whether the first is clearly the one
+/// meant. Ranked by the words shared with `got` ([`category_words`]) plus one when the category (or
+/// its last `/` segment) starts with `got` (`waf` -> `waf_bypass_global_obj`), then by edit
+/// distance ([`suggest`]'s rule, which also admits a category sharing no word). Clear: the first
+/// ranks above every other and shares two points with `got` or is near it by edit distance.
+fn nearest_categories(got: &str, categories: &[String], n: usize) -> (Vec<String>, bool) {
+    let want = category_words(got);
+    let g = crate::mcp::error::norm(got);
+    let by_edit = suggest(got, categories.iter().map(String::as_str), categories.len());
+    let mut ranked: Vec<(Reverse<usize>, usize, &str)> = categories
+        .iter()
+        .filter_map(|cat| {
+            let shared = category_words(cat).intersection(&want).count();
+            let normed = crate::mcp::error::norm(cat);
+            let last = normed.rsplit('/').next().unwrap_or_default();
+            let prefix = g.chars().count() >= 3
+                && normed != g
+                && (normed.starts_with(&g) || last.starts_with(&g));
+            let score = shared + usize::from(prefix);
+            let edit = by_edit.iter().position(|e| *e == cat.as_str());
+            (score > 0 || edit.is_some())
+                .then(|| (Reverse(score), edit.unwrap_or(usize::MAX), cat.as_str()))
+        })
+        .collect();
+    ranked.sort_unstable();
+    ranked.dedup_by(|a, b| a.2 == b.2);
+    let clear = match ranked.as_slice() {
+        [] => false,
+        [(Reverse(score), edit, _), rest @ ..] => {
+            let above = rest
+                .first()
+                .is_none_or(|(Reverse(next), _, _)| next < score);
+            above && (*score >= 2 || *edit != usize::MAX)
+        }
+    };
+    let near = ranked
+        .into_iter()
+        .take(n)
+        .map(|(_, _, cat)| cat.to_owned())
+        .collect();
+    (near, clear)
+}
+
+/// `tool`'s call with filters `f` and `category`, its source set to the category's when `f` names
+/// another; None unless that call selects entries in `category` and its filters check.
+fn category_retry(tool: &str, entries: &[&Entry], f: &Filters, category: &str) -> Option<Value> {
+    let home = entries.iter().find(|e| e.category == category)?.source;
+    let fixed = Filters {
+        category: Some(category.to_owned()),
+        source: f.source.map(|_| home),
+        ..f.clone()
+    };
+    // Checked only once the category is known to select entries, so this never recurses here.
+    let selects = entries.iter().any(|e| {
+        fixed.source.is_none_or(|s| s == e.source)
+            && fixed.kind.is_none_or(|k| k == e.kind)
+            && e.category == category
+    });
+    if !selects {
+        return None;
+    }
+    checked_filters(tool, entries, &fixed).ok()?;
+    let mut call = serde_json::Map::new();
+    call.insert("do".to_owned(), json!(tool));
+    if let Ok(Value::Object(filters)) = serde_json::to_value(&fixed) {
+        call.extend(
+            filters
+                .into_iter()
+                .filter(|(_, v)| !v.is_null() && v.as_str().is_none_or(|s| !s.is_empty())),
+        );
+    }
+    Some(Value::Object(call))
+}
+
+/// `e` with `extra` (the call's arguments besides its filters) added to its `retry` call.
+fn retry_with(e: ToolError, extra: &[(&str, Option<Value>)]) -> ToolError {
+    let Some(Value::Object(mut call)) = e.retry.clone() else {
+        return e;
+    };
+    if call.get("do").and_then(Value::as_str) == Some("data_get") {
+        return e;
+    }
+    let given = extra.iter().filter_map(|(k, v)| Some((*k, v.as_ref()?)));
+    for (k, v) in given {
+        call.insert(k.to_owned(), v.clone());
+    }
+    e.retry(Value::Object(call))
 }
 
 /// Why `f` matched nothing, as notes: a tag no entry of the selected source and kind has (with the
@@ -464,7 +604,16 @@ fn zero_notes(entries: &[&Entry], f: &Filters) -> Vec<String> {
 /// the title holds, most first, else in entry order; notes say how filters were read and, without
 /// hits, why.
 pub fn search(entries: &[&Entry], args: &SearchArgs) -> Result<(Value, Vec<String>), ToolError> {
-    let (filters, mut notes) = checked_filters("data_search", entries, &args.filters)?;
+    let (filters, mut notes) =
+        checked_filters("data_search", entries, &args.filters).map_err(|e| {
+            retry_with(
+                e,
+                &[
+                    ("limit", args.limit.map(|v| json!(v))),
+                    ("offset", args.offset.map(|v| json!(v))),
+                ],
+            )
+        })?;
     let (limit, clamped) = clamp(args.limit, SEARCH_LIMIT, SEARCH_MAX);
     let offset = args.offset.unwrap_or(0);
     let mut hits: Vec<&&Entry> = entries.iter().filter(|e| matches(e, &filters)).collect();
@@ -629,7 +778,17 @@ pub fn payloads(
         .allowed(vec![json!("xss"), json!("url"), json!("custom")])
         .see(json!({"do": "data_search", "source": source})));
     }
-    let (filters, mut notes) = checked_filters("data_payloads", entries, &args.filters)?;
+    let (filters, mut notes) =
+        checked_filters("data_payloads", entries, &args.filters).map_err(|e| {
+            retry_with(
+                e,
+                &[
+                    ("attacker", args.attacker.as_ref().map(|v| json!(v))),
+                    ("allowed", args.allowed.as_ref().map(|v| json!(v))),
+                    ("limit", args.limit.map(|v| json!(v))),
+                ],
+            )
+        })?;
     // A strict-mode client sends "" for a host it has none for: filling it in would cut payloads.
     let host = |name: &str, value: Option<&str>, notes: &mut Vec<String>| {
         let value = value.map(str::trim).filter(|v| !v.is_empty())?;
@@ -904,6 +1063,68 @@ mod tests {
                     .to_owned()
             ),
             "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn an_invented_category_gets_the_nearest_of_every_source() {
+        let mut xss_cats: Vec<Entry> = (0..21)
+            .map(|i| xss(&format!("xss:c{i:02}/a"), &format!("c{i:02}"), "t", &[]))
+            .collect();
+        xss_cats.push(xss("xss:waf/a", "waf_bypass_global_obj", "t", &[]));
+        let mut allow = payload("url:allow", "x");
+        allow.category = "domain_allow_list_bypass".into();
+        let mut split = payload("url:split", "x");
+        split.category = "url-spliting_unicode_characters".into();
+        let mut refs: Vec<&Entry> = xss_cats.iter().collect();
+        refs.extend([&allow, &split]);
+
+        let waf = search_of(&refs, json!({"category": "waf", "limit": 5})).expect_err("waf");
+        assert_eq!(waf.code, Code::InvalidEnum);
+        assert_eq!(waf.did_you_mean[0], "waf_bypass_global_obj", "{waf:?}");
+        assert_eq!(waf.allowed[0], json!("waf_bypass_global_obj"), "{waf:?}");
+        assert_eq!(
+            waf.retry,
+            Some(json!({"do": "data_search", "category": "waf_bypass_global_obj", "limit": 5}))
+        );
+
+        // The source in context holds no such category: every source's categories are offered.
+        let long = search_of(
+            &refs,
+            json!({"category": "url-validation-allow-list-bypass", "source": "xss"}),
+        )
+        .expect_err("long");
+        assert_eq!(long.did_you_mean[0], "domain_allow_list_bypass", "{long:?}");
+        assert_eq!(
+            long.retry,
+            Some(
+                json!({"do": "data_search", "source": "url", "category": "domain_allow_list_bypass"})
+            )
+        );
+
+        let vague = search_of(&refs, json!({"category": "unicode_bypass"})).expect_err("a tie");
+        assert_eq!(vague.did_you_mean.len(), 3, "{vague:?}");
+        assert_eq!(vague.retry, None, "one shared word each is no clear hit");
+    }
+
+    #[test]
+    fn a_source_name_in_another_number_or_a_trailing_slash_is_noted() {
+        let a = xss("xss:events/a", "events", "t", &[]);
+        let mut check = xss("bchecks:x", "examples", "t", &[]);
+        check.source = Source::Bchecks;
+        check.kind = Kind::Bcheck;
+        let refs = [&a, &check];
+        let (v, notes) = search_of(&refs, json!({"category": "bcheck"})).expect("bcheck");
+        assert_eq!(v["total"], 1);
+        assert_eq!(
+            notes,
+            ["read 'category' \"bcheck\" as 'source' \"bchecks\""]
+        );
+        let (v, notes) = search_of(&refs, json!({"category": "events/"})).expect("slash");
+        assert_eq!(v["total"], 1);
+        assert_eq!(
+            notes,
+            ["dropped the trailing '/' of 'category' \"events/\": read as \"events\""]
         );
     }
 
