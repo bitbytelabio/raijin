@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.0.0
 
 ### Tool calls
 - Every error result now carries `code` and `retryable`, handler errors included: "not found" is `not_found` (retryable) with `see` pointing at the action that lists the ids (`turbo_run.list`, `collaborator.list_clients`, `findings.list`, ...), "must be an integer" is `invalid_type` with `expected`, an error that names one parameter gets `param`/`got`, anything else is `tool_failed`. `error` always ends as a sentence.

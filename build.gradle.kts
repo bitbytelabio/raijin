@@ -5,7 +5,8 @@ plugins {
 }
 
 group = "io.bitbytelab"
-version = "2.4.1"
+
+version = "3.0.0"
 
 // Build JDK: gradle/gradle-daemon-jvm.properties pins the Gradle daemon to JDK 25. The
 // toolchain compiles and tests on JDK 25 and emits Java 25 bytecode, so the jar needs a Burp
@@ -83,28 +84,33 @@ tasks.test {
 // BuildInfo.VERSION is generated from the Gradle project `version`, so the UI tab,
 // dashboard and MCP server identity can never drift from build.gradle.kts.
 val generatedVersionDir = layout.buildDirectory.dir("generated/version/kotlin")
-val generateBuildInfo = tasks.register("generateBuildInfo") {
-    val outDir = generatedVersionDir
-    val ver = project.version.toString()
-    inputs.property("version", ver)
-    outputs.dir(outDir)
-    doLast {
-        val f = outDir.get().file("io/bitbytelab/raijin/core/BuildInfo.kt").asFile
-        f.parentFile.mkdirs()
-        f.writeText(
-            """
+val generateBuildInfo =
+    tasks.register("generateBuildInfo") {
+        val outDir = generatedVersionDir
+        val ver = project.version.toString()
+        inputs.property("version", ver)
+        outputs.dir(outDir)
+        doLast {
+            val f = outDir.get().file("io/bitbytelab/raijin/core/BuildInfo.kt").asFile
+            f.parentFile.mkdirs()
+            f.writeText(
+                """
             |package io.bitbytelab.raijin.core
             |
             |/** Generated from the Gradle project version — do not edit by hand. */
             |object BuildInfo {
             |    const val VERSION: String = "$ver"
             |}
-            |""".trimMargin()
-        )
+            |"""
+                    .trimMargin(),
+            )
+        }
     }
-}
+
 kotlin.sourceSets["main"].kotlin.srcDir(generatedVersionDir)
+
 tasks.named("compileKotlin") { dependsOn(generateBuildInfo) }
+
 tasks.named("compileTestKotlin") { dependsOn(generateBuildInfo) }
 
 tasks.shadowJar {

@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "bproj"
-version = "2.4.1"
+version = "3.0.0"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -283,7 +283,7 @@ checksum = "e0921b3876b3a1df8a1c9f912e7f94342458022c2e84288015893d83c4d62a79"
 
 [[package]]
 name = "cli"
-version = "2.4.1"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
