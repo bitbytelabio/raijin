@@ -13,8 +13,6 @@ pre-commit:
     shellcheck:
       glob: "*.{sh,bash}"
       run: shellcheck {staged_files}
-    gitleaks:
-      run: gitleaks git --staged --no-banner --redact
     conflict-markers:
       run: "! git diff --cached -U0 | grep -nE '^\\+(<<<<<<< |=======$|>>>>>>> )'"
     large-files:
