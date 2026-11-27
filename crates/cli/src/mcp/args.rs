@@ -133,6 +133,22 @@ fn is_number_text(s: &str) -> bool {
     mantissa_ok && exponent_ok
 }
 
+/// The scalar of a one-item array `v` when `s` takes a scalar and no array (noted), else `v`.
+fn unwrap_single(name: &str, s: &Shape<'_>, mut v: Value, notes: &mut Vec<String>) -> Value {
+    if let Value::Array(items) = &mut v
+        && let [item @ (Value::String(_) | Value::Number(_) | Value::Bool(_))] =
+            items.as_mut_slice()
+        && !s.has("array")
+        && ["string", "integer", "number", "boolean"]
+            .iter()
+            .any(|t| s.has(t))
+    {
+        notes.push(format!("read '{name}' from a one-item array"));
+        return item.take();
+    }
+    v
+}
+
 /// `v` moved toward `s` where the meaning is clear; each noted change goes to `notes`.
 fn coerce(
     name: &str,
@@ -141,7 +157,7 @@ fn coerce(
     v: Value,
     notes: &mut Vec<String>,
 ) -> Value {
-    let mut v = v;
+    let mut v = unwrap_single(name, s, v, notes);
     if let Value::String(text) = &v
         && !s.has("string")
     {
@@ -214,9 +230,18 @@ fn coerce(
         && s.closed_enum()
         && !s.enums.iter().any(|e| e == text)
     {
-        let key = enum_key(text);
-        let hits: Vec<&String> = s.enums.iter().filter(|e| enum_key(e) == key).collect();
-        if let [hit] = hits[..] {
+        let hit_of = |t: &str| -> Option<&String> {
+            if let Some(exact) = s.enums.iter().find(|e| *e == t) {
+                return Some(exact);
+            }
+            let key = enum_key(t);
+            let hits: Vec<&String> = s.enums.iter().filter(|e| enum_key(e) == key).collect();
+            match hits[..] {
+                [hit] => Some(hit),
+                _ => None,
+            }
+        };
+        if let Some(hit) = hit_of(text).or_else(|| super::error::unquote(text).and_then(hit_of)) {
             notes.push(format!("matched '{name}' \"{text}\" to \"{hit}\""));
             v = json!(hit);
         }
@@ -604,14 +629,9 @@ fn check(
         && !s.enums.contains(text)
     {
         let (shown_values, cut) = capped_allowed(text, &s.enums);
-        let more = if cut {
-            format!(", ... ({} values; guide lists all)", s.enums.len())
-        } else {
-            String::new()
-        };
         let message = format!(
-            "{tool}: '{key}' must be one of {}{more}, got \"{text}\".",
-            quoted(&shown_values)
+            "{tool}: '{key}' is not one of the {} allowed values (see 'allowed'), got \"{text}\".",
+            s.enums.len()
         );
         let mut error = ToolError::new(Code::InvalidEnum, message)
             .param(key)

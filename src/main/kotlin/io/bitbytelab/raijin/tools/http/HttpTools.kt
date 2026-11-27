@@ -3,6 +3,7 @@ package io.bitbytelab.raijin.tools.http
 import burp.api.montoya.core.ToolType
 import io.bitbytelab.raijin.bridge.AuditAuthRules
 import io.bitbytelab.raijin.bridge.HttpBridge
+import io.bitbytelab.raijin.bridge.HttpRequestBuilder
 import io.bitbytelab.raijin.bridge.HttpSendOptions
 import io.bitbytelab.raijin.core.asBodyString
 import io.bitbytelab.raijin.core.asHeaders
@@ -15,6 +16,7 @@ import io.bitbytelab.raijin.state.TrafficRule
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.server.Server
+import io.modelcontextprotocol.kotlin.sdk.types.CallToolResult
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import kotlinx.serialization.json.*
 
@@ -49,6 +51,27 @@ object HttpTools {
     internal val LENGTHS = 0..Int.MAX_VALUE
 
     private const val TIMEOUT_DESCRIPTION = "0 = no hard timeout, max 600000, default 25000"
+
+    private const val URL_NOT_ABSOLUTE = HttpRequestBuilder.URL_NOT_ABSOLUTE
+
+    /**
+     * `invalid_arguments` for a `url` written without a scheme, with both schemes as
+     * `did_you_mean`; no `retry`, since the sender must not pick the scheme. Null when [url] has
+     * one (or is absent): then the build error stands.
+     */
+    private fun schemeError(url: String?): CallToolResult? {
+        if (url == null || HttpRequestBuilder.hasScheme(url)) return null
+        return io.bitbytelab.raijin.tools.ToolArgs.error(
+            "invalid_arguments",
+            "http_send_request: 'url' must be absolute (scheme://host/path), got \"$url\".",
+        ) {
+            put("param", "url")
+            put("got", url)
+            putJsonArray("did_you_mean") {
+                HttpRequestBuilder.schemeGuesses(url).forEach { add(it) }
+            }
+        }
+    }
 
     fun register(server: Server, bridge: HttpBridge, stateManager: StateManager) {
         val toolTypes = ToolType.entries.map { it.name }
@@ -254,6 +277,15 @@ Out-of-range numbers are clamped and reported in notes. Returns full response wi
                         http2Fields,
                         options,
                     )
+                if (
+                    (result["error"] as? JsonPrimitive)
+                        ?.contentOrNull
+                        ?.contains(URL_NOT_ABSOLUTE) == true
+                ) {
+                    schemeError(url)?.let {
+                        return@addTool it
+                    }
+                }
 
                 val augmented =
                     if (headersWarning != null) {
@@ -285,9 +317,33 @@ Out-of-range numbers are clamped and reported in notes. Returns full response wi
                             "sent non-string header value(s) of ${it.joinToString(", ")} as text"
                     }
 
-                toolJsonResult(args.withNotes(augmented))
+                // Sent but nothing came back: an error, with every request field kept. Done here
+                // and not in the bridge, whose other callers (probes) keep the plain result.
+                val noResponse = (augmented["no_response"] as? JsonPrimitive)?.contentOrNull
+                val sent =
+                    if (
+                        (augmented["has_response"] as? JsonPrimitive)?.booleanOrNull == false &&
+                            "error" !in augmented
+                    ) {
+                        JsonObject(
+                            linkedMapOf<String, JsonElement>(
+                                "error" to
+                                    JsonPrimitive(
+                                        "http_send_request: ${noResponse ?: "no response"}.",
+                                    ),
+                                "code" to JsonPrimitive("no_response"),
+                            ) + augmented,
+                        )
+                    } else augmented
+                toolJsonResult(args.withNotes(sent))
             } catch (e: Exception) {
-                toolError(e.message ?: "Unknown error")
+                val message = e.message ?: "Unknown error"
+                val rawUrl = (request.params.arguments?.get("url") as? JsonPrimitive)?.contentOrNull
+                if (URL_NOT_ABSOLUTE in message)
+                    schemeError(rawUrl)?.let {
+                        return@addTool it
+                    }
+                toolError(message)
             }
         }
 

@@ -1,22 +1,22 @@
 package io.bitbytelab.raijin.bridge
 
 import io.bitbytelab.raijin.core.BodyText
+import java.util.TreeMap
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToLong
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
-import java.util.TreeMap
-import kotlin.math.abs
-import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.roundToLong
 
 /**
- * Groups the responses of one run (a race batch, a fuzz run) into clusters of equivalent
- * responses, so a report reads "19 x 409, 1 x 200 with another body" instead of listing every
- * response or comparing raw lengths.
+ * Groups the responses of one run (a race batch, a fuzz run) into clusters of equivalent responses,
+ * so a report reads "19 x 409, 1 x 200 with another body" instead of listing every response or
+ * comparing raw lengths.
  *
  * Two responses share a cluster when they have the same status code and their bodies are the same
  * text, or close in length and at least `similarity` percent alike (character-bigram Dice
@@ -29,7 +29,10 @@ internal object HttpResponseClusters {
 
     const val DEFAULT_SIMILARITY = 90.0
 
-    /** Bodies are compared on a prefix: the bigram metric gains little from more text and costs linear time. */
+    /**
+     * Bodies are compared on a prefix: the bigram metric gains little from more text and costs
+     * linear time.
+     */
     const val MAX_COMPARED_CHARS = 20_000
 
     /** Clusters kept apart; responses that fit none beyond that share one overflow cluster. */
@@ -64,9 +67,19 @@ internal object HttpResponseClusters {
      * @param unanswered requests that got no response.
      * @param json `cluster_count`, `uniform`, `clusters`, `status_code_distribution` and `timing`.
      */
-    class Summary(val clusterOf: Map<Int, Int>, val clusterCount: Int, val unanswered: Int, val json: JsonObject)
+    class Summary(
+        val clusterOf: Map<Int, Int>,
+        val clusterCount: Int,
+        val unanswered: Int,
+        val json: JsonObject,
+    )
 
-    private class Cluster(val status: Int, leader: Sample, val prefix: String, val overflow: Boolean) {
+    private class Cluster(
+        val status: Int,
+        leader: Sample,
+        val prefix: String,
+        val overflow: Boolean,
+    ) {
         val leaderIndex = leader.index
         val leaderLength = leader.length
         var bigrams: Set<Int>? = null
@@ -84,7 +97,8 @@ internal object HttpResponseClusters {
             statuses.merge(sample.status, 1, Int::plus)
             sample.timeMs?.let { times += it }
             val label = sample.label
-            if (label != null && examples.size < MAX_EXAMPLES && label !in examples) examples += label
+            if (label != null && examples.size < MAX_EXAMPLES && label !in examples)
+                examples += label
         }
     }
 
@@ -99,27 +113,48 @@ internal object HttpResponseClusters {
         private val timed = ArrayList<Pair<Int, Double>>()
         private val statusCounts = TreeMap<Int, Int>()
 
-        /** Returns the index of the first response of the cluster [sample] joined (its own index when it starts one). */
+        /**
+         * Returns the index of the first response of the cluster [sample] joined (its own index
+         * when it starts one).
+         */
         @Synchronized
         fun add(sample: Sample): Int {
             statusCounts.merge(sample.status, 1, Int::plus)
             sample.timeMs?.let { timed += sample.index to it }
-            val prefix = if (sample.body.length > MAX_COMPARED_CHARS) sample.body.substring(0, MAX_COMPARED_CHARS) else sample.body
+            val prefix =
+                if (sample.body.length > MAX_COMPARED_CHARS)
+                    sample.body.substring(0, MAX_COMPARED_CHARS)
+                else sample.body
             var sampleBigrams: Set<Int>? = null
             val match = clusters.firstOrNull { cluster ->
-                !cluster.overflow && cluster.status == sample.status &&
-                    equivalent(cluster, sample.length, prefix) { sampleBigrams ?: bigrams(prefix).also { sampleBigrams = it } }
+                !cluster.overflow &&
+                    cluster.status == sample.status &&
+                    equivalent(cluster, sample.length, prefix) {
+                        sampleBigrams ?: bigrams(prefix).also { sampleBigrams = it }
+                    }
             }
-            val target = match ?: if (clusters.count { !it.overflow } < MAX_CLUSTERS) {
-                Cluster(sample.status, sample, prefix, overflow = false).also { clusters += it }
-            } else {
-                clusters.firstOrNull { it.overflow } ?: Cluster(sample.status, sample, prefix, overflow = true).also { clusters += it }
-            }
+            val target =
+                match
+                    ?: if (clusters.count { !it.overflow } < MAX_CLUSTERS) {
+                        Cluster(sample.status, sample, prefix, overflow = false).also {
+                            clusters += it
+                        }
+                    } else {
+                        clusters.firstOrNull { it.overflow }
+                            ?: Cluster(sample.status, sample, prefix, overflow = true).also {
+                                clusters += it
+                            }
+                    }
             target.add(sample)
             return target.leaderIndex
         }
 
-        private fun equivalent(cluster: Cluster, length: Int, prefix: String, sampleBigrams: () -> Set<Int>): Boolean {
+        private fun equivalent(
+            cluster: Cluster,
+            length: Int,
+            prefix: String,
+            sampleBigrams: () -> Set<Int>,
+        ): Boolean {
             if (cluster.prefix == prefix && cluster.leaderLength == length) return true
             if (threshold >= 100.0) return false
             // The share of the longer body the shorter one can cover at best: a far shorter or
@@ -127,19 +162,25 @@ internal object HttpResponseClusters {
             val shorter = min(cluster.leaderLength, length)
             val longer = max(cluster.leaderLength, length)
             if (longer > 0 && 200.0 * shorter / (shorter + longer) < threshold) return false
-            val leaderBigrams = cluster.bigrams ?: bigrams(cluster.prefix).also { cluster.bigrams = it }
+            val leaderBigrams =
+                cluster.bigrams ?: bigrams(cluster.prefix).also { cluster.bigrams = it }
             return dice(leaderBigrams, sampleBigrams()) >= threshold
         }
 
         /** Clusters numbered from the largest down; among equals the one seen first comes first. */
         @Synchronized
         fun build(): Summary {
-            val ordered = clusters.sortedWith(
-                compareBy<Cluster> { it.overflow }.thenByDescending { it.indices.size }.thenBy { it.indices.minOrNull() ?: Int.MAX_VALUE }
-            )
+            val ordered =
+                clusters.sortedWith(
+                    compareBy<Cluster> { it.overflow }
+                        .thenByDescending { it.indices.size }
+                        .thenBy { it.indices.minOrNull() ?: Int.MAX_VALUE },
+                )
             val clusterOf = HashMap<Int, Int>()
             ordered.forEachIndexed { id, cluster -> cluster.indices.forEach { clusterOf[it] = id } }
-            val answered = ordered.count { !it.overflow && it.status != 0 } + if (ordered.any { it.overflow }) 1 else 0
+            val answered =
+                ordered.count { !it.overflow && it.status != 0 } +
+                    if (ordered.any { it.overflow }) 1 else 0
             val unanswered = statusCounts[0] ?: 0
             val json = buildJsonObject {
                 put("cluster_count", ordered.size)
@@ -160,7 +201,9 @@ internal object HttpResponseClusters {
             put("cluster", id)
             put("count", cluster.indices.size)
             if (cluster.overflow) {
-                putJsonObject("status_codes") { cluster.statuses.forEach { (status, count) -> put(status.toString(), count) } }
+                putJsonObject("status_codes") {
+                    cluster.statuses.forEach { (status, count) -> put(status.toString(), count) }
+                }
             } else {
                 put("status_code", cluster.status)
                 if (cluster.status == 0) put("no_response", true)
@@ -168,7 +211,10 @@ internal object HttpResponseClusters {
             if (cluster.minLength == cluster.maxLength) {
                 put("body_length", cluster.minLength)
             } else {
-                putJsonObject("body_length") { put("min", cluster.minLength); put("max", cluster.maxLength) }
+                putJsonObject("body_length") {
+                    put("min", cluster.minLength)
+                    put("max", cluster.maxLength)
+                }
             }
             if (cluster.times.isNotEmpty()) {
                 val sorted = cluster.times.sorted()
@@ -182,11 +228,16 @@ internal object HttpResponseClusters {
             val indices = cluster.indices.sorted()
             putJsonArray("indices") { indices.take(MAX_LISTED_INDICES).forEach { add(it) } }
             if (indices.size > MAX_LISTED_INDICES) put("indices_truncated", true)
-            if (cluster.examples.isNotEmpty()) putJsonArray("examples") { cluster.examples.forEach { add(it) } }
-            if (cluster.prefix.isNotEmpty()) put("sample", BodyText.render(cluster.prefix, SAMPLE_CHARS).text)
+            if (cluster.examples.isNotEmpty())
+                putJsonArray("examples") { cluster.examples.forEach { add(it) } }
+            if (cluster.prefix.isNotEmpty())
+                put("sample", BodyText.render(cluster.prefix, SAMPLE_CHARS).text)
             if (cluster.overflow) {
                 put("overflow", true)
-                put("note", "More than $MAX_CLUSTERS different responses: the rest are counted here without being compared.")
+                put(
+                    "overflow_detail",
+                    "More than $MAX_CLUSTERS different responses: the rest are counted here without being compared.",
+                )
             }
         }
 
@@ -199,11 +250,18 @@ internal object HttpResponseClusters {
                 put("median_ms", round1(middle))
                 put("max_ms", round1(sorted.last()))
                 val limit = outlierLimit(sorted, middle)
-                val slow = if (limit == null) emptyList() else timed.filter { it.second > limit }.sortedByDescending { it.second }
+                val slow =
+                    if (limit == null) emptyList()
+                    else timed.filter { it.second > limit }.sortedByDescending { it.second }
                 if (slow.isNotEmpty()) {
                     putJsonArray("outliers") {
                         slow.take(MAX_LISTED_INDICES).forEach { (index, time) ->
-                            add(buildJsonObject { put("index", index); put("time_ms", round1(time)) })
+                            add(
+                                buildJsonObject {
+                                    put("index", index)
+                                    put("time_ms", round1(time))
+                                },
+                            )
                         }
                     }
                 }
@@ -220,28 +278,33 @@ internal object HttpResponseClusters {
      * requests that were answered in more than one way: with a payload per request the requests
      * differ, so different answers are expected and the clusters must be read against the payloads.
      */
-    fun raceAnalysis(summary: Summary, identicalRequests: Boolean, similarity: Double = DEFAULT_SIMILARITY): JsonObject {
+    fun raceAnalysis(
+        summary: Summary,
+        identicalRequests: Boolean,
+        similarity: Double = DEFAULT_SIMILARITY,
+    ): JsonObject {
         val variation = summary.clusterCount > 1
-        val note = when {
-            summary.clusterCount == 0 -> "No response was received."
-            !variation ->
-                "Every response is equivalent (same status, bodies at least ${similarity.toInt()}% alike), so the responses " +
-                    "themselves show no race. An effect may still exist in the application state (a balance, a counter, " +
-                    "duplicate objects): check it."
-            identicalRequests ->
-                "Identical requests released together were answered in ${summary.clusterCount} different ways. For a " +
-                    "once-only or limited action, count the responses in the success cluster: more than the limit allows " +
-                    "means the race was won."
-            else ->
-                "The responses fall into ${summary.clusterCount} clusters, but the requests carried different payloads: " +
-                    "compare each cluster with its payloads before reading this as a race."
-        }
+        val verdict =
+            when {
+                summary.clusterCount == 0 -> "No response was received."
+                !variation ->
+                    "Every response is equivalent (same status, bodies at least ${similarity.toInt()}% alike), so the responses " +
+                        "themselves show no race. An effect may still exist in the application state (a balance, a counter, " +
+                        "duplicate objects): check it."
+                identicalRequests ->
+                    "Identical requests released together were answered in ${summary.clusterCount} different ways. For a " +
+                        "once-only or limited action, count the responses in the success cluster: more than the limit allows " +
+                        "means the race was won."
+                else ->
+                    "The responses fall into ${summary.clusterCount} clusters, but the requests carried different payloads: " +
+                        "compare each cluster with its payloads before reading this as a race."
+            }
         return buildJsonObject {
             put("race_condition_likely", variation && identicalRequests)
             put("variation", variation)
             summary.json.forEach { (key, value) -> put(key, value) }
             if (summary.unanswered > 0) put("unanswered", summary.unanswered)
-            put("note", note)
+            put("verdict", verdict)
         }
     }
 
@@ -253,7 +316,9 @@ internal object HttpResponseClusters {
         return out
     }
 
-    /** Dice coefficient of two bigram sets as a percentage (0..100); two empty sets share nothing. */
+    /**
+     * Dice coefficient of two bigram sets as a percentage (0..100); two empty sets share nothing.
+     */
     internal fun dice(a: Set<Int>, b: Set<Int>): Double {
         val total = a.size + b.size
         if (total == 0) return 0.0

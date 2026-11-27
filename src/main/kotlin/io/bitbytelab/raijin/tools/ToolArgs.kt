@@ -37,6 +37,66 @@ internal object ToolArgs {
             .toList()
     }
 
+    /** A suggested call name; [sameWords] when it says the same words as the name asked for. */
+    data class CallHint(val name: String, val sameWords: Boolean)
+
+    private val STOP_WORDS = setOf("to", "the", "a", "an", "of", "for", "in", "on", "by")
+    private val CANONICAL_WORDS: Map<String, String> =
+        listOf("get", "list", "show", "fetch", "read", "view", "query").associateWith { "get" } +
+            listOf("add", "create", "new", "include", "insert").associateWith { "add" } +
+            listOf("find", "search", "grep", "lookup").associateWith { "search" } +
+            mapOf("scanner" to "scan")
+
+    /**
+     * The words of a call name: [ToolNames.norm] split on `_`, without stop words, singular, and
+     * with synonyms in one form (`list`/`show` -> `get`, `create`/`include` -> `add`, `find` ->
+     * `search`, `scanner` -> `scan`). Same rule as the CLI's `intent_tokens`.
+     */
+    internal fun intentTokens(name: String): Set<String> =
+        ToolNames.norm(name)
+            .split('_')
+            .filter { it.isNotEmpty() && it !in STOP_WORDS }
+            .map {
+                if (it.length > 3 && it.endsWith('s') && !it.endsWith("ss")) it.dropLast(1) else it
+            }
+            .map { CANONICAL_WORDS[it] ?: it }
+            .toSet()
+
+    /**
+     * Up to [max] call names of [names] for [wanted], by intent: first the ones with the same words
+     * ([intentTokens]), then the near ones of [closest]'s rule (by edit distance), then the ones
+     * holding every word of [wanted] (fewest extra words first). `ai` calls rank after the others
+     * of their class. Same rule as the CLI's `suggest_call`.
+     */
+    fun closestCalls(wanted: String, names: Collection<String>, max: Int = 3): List<CallHint> {
+        val w = ToolNames.norm(wanted)
+        if (w.isEmpty()) return emptyList()
+        val limit = maxOf(2, w.length / 3)
+        val want = intentTokens(wanted)
+        data class Ranked(val name: String, val cls: Int, val ai: Int, val sub: Int)
+        return names
+            .asSequence()
+            .distinct()
+            .mapNotNull { name ->
+                val n = ToolNames.norm(name)
+                val have = intentTokens(name)
+                val d = levenshtein(w, n)
+                val cls =
+                    when {
+                        want.isNotEmpty() && have == want -> 0 to 0
+                        d <= limit || containsNear(w, n) -> 1 to d
+                        want.isNotEmpty() && have.containsAll(want) -> 2 to (have.size - want.size)
+                        else -> return@mapNotNull null
+                    }
+                val ai = if (n == "ai" || n.startsWith("ai_")) 1 else 0
+                Ranked(name, cls.first, ai, cls.second)
+            }
+            .sortedWith(compareBy<Ranked>({ it.cls }, { it.ai }, { it.sub }, { it.name }))
+            .take(max)
+            .map { CallHint(it.name, it.cls == 0) }
+            .toList()
+    }
+
     /**
      * Whether one of [wanted] and [name] (both normalized) contains the other and the shorter is
      * long enough to mean it: at least 4 chars and 60% of [wanted], so `ai` is not near `email`.
@@ -92,7 +152,7 @@ internal object ToolArgs {
         required: Set<String>,
     ): JsonObject = buildJsonObject {
         if (action != null) put("action", action)
-        val needed = required - ToolExamples.ID_SOURCES[tool].orEmpty().keys
+        val needed = required - ToolExamples.ids(tool, action).keys
         val picked = ToolExamples.of(tool, action)?.takeIf { fits(it, props, needed) }
         if (picked != null) {
             picked.forEach { (k, v) -> put(k, v) }
@@ -201,12 +261,42 @@ internal object ToolArgs {
     private val INTEGER_TEXT = Regex("^-?\\d+$")
     private val NUMBER_TEXT = Regex("^-?(\\d+\\.?\\d*|\\.\\d+)([eE][-+]?\\d+)?$")
 
+    /** Parameters whose content is sent or stored as written: a one-item array stays JSON text. */
+    private val PAYLOAD_PARAMS =
+        setOf(
+            "body",
+            "data",
+            "raw_request",
+            "raw_request_hex",
+            "headers",
+            "script",
+            "payload",
+            "message",
+            "request",
+            "response",
+            "value",
+            "content",
+        )
+
+    private val SCALAR_TYPES = setOf("string", "integer", "number", "boolean")
+
     private fun coerceValue(
         name: String,
         def: JsonObject,
-        v: JsonElement,
+        given: JsonElement,
         notes: MutableList<String>,
     ): JsonElement {
+        val single = (given as? JsonArray)?.singleOrNull() as? JsonPrimitive
+        val v =
+            if (
+                single != null &&
+                    single !is JsonNull &&
+                    def.typeName() in SCALAR_TYPES &&
+                    name !in PAYLOAD_PARAMS
+            ) {
+                notes += "read '$name' from a one-item array"
+                single
+            } else given
         val typed =
             when (def.typeName()) {
                 "string" ->
@@ -312,10 +402,24 @@ internal object ToolArgs {
         val allowed = stringEnum(def) ?: return v
         val p = v as? JsonPrimitive ?: return v
         if (!p.isString || p.content in allowed) return v
-        val key = enumKey(p.content)
-        val hit = allowed.filter { enumKey(it) == key }.singleOrNull() ?: return v
+        fun hitOf(s: String): String? =
+            if (s in allowed) s else allowed.filter { enumKey(it) == enumKey(s) }.singleOrNull()
+        val hit = hitOf(p.content) ?: unquote(p.content)?.let(::hitOf) ?: return v
         notes += "matched '$name' \"${p.content}\" to \"$hit\""
         return JsonPrimitive(hit)
+    }
+
+    private const val QUOTES = "\"'`"
+
+    /**
+     * [s] trimmed and without one pair of matching surrounding quotes (`"`, `'` or a backtick), or
+     * null when it is not quoted. Same rule as the CLI's `error::unquote`.
+     */
+    internal fun unquote(s: String): String? {
+        val t = s.trim()
+        return if (t.length >= 2 && t.first() == t.last() && t.first() in QUOTES)
+            t.substring(1, t.length - 1)
+        else null
     }
 
     /**
@@ -420,27 +524,70 @@ internal object ToolArgs {
         return Coerced(JsonObject(out), notes)
     }
 
+    /**
+     * `out_of_range` for the first integer/number argument below 0 whose schema `minimum` is >= 0;
+     * `retry` drops it (default applies) unless [destructive]. Values below a minimum >= 1 but not
+     * negative are left to the handlers, which clamp them.
+     */
+    fun rangeCheck(
+        call: String,
+        props: JsonObject,
+        args: JsonObject,
+        usage: String,
+        example: JsonObject,
+        destructive: Boolean,
+    ): CallToolResult? {
+        for ((param, value) in args) {
+            if (param == "action") continue
+            val def = props[param] as? JsonObject ?: continue
+            val type = def.typeName()
+            if (type != "integer" && type != "number") continue
+            val min = (def["minimum"] as? JsonPrimitive)?.takeIf { !it.isString } ?: continue
+            val minValue = min.doubleOrNull ?: continue
+            val v = (value as? JsonPrimitive)?.takeIf { !it.isString }?.doubleOrNull ?: continue
+            if (minValue < 0 || v >= 0) continue
+            val kind = if (type == "integer") "an integer" else "a number"
+            return error(
+                "out_of_range",
+                "$call: '$param' must be $kind ≥ ${min.content}, got ${value.jsonPrimitive.content}.",
+            ) {
+                put("param", param)
+                put("got", value)
+                if (!destructive) put("retry", JsonObject(args - param))
+                put("usage", usage)
+                put("example", example)
+            }
+        }
+        return null
+    }
+
     private val PLACEHOLDER_FROM = Regex("^<[^<>]* from [^<>]*>$")
     private val ID_LIKE = setOf("id", "url", "uri", "token", "base_url")
+
+    /** Parameters a placeholder in makes the call pointless: the target and what is sent. */
+    private val STRICT_PLACEHOLDER_PARAMS = setOf("host", "urls", "request", "name", "domain")
 
     private fun isPlaceholder(param: String, s: String): Boolean =
         s == "<$param>" || PLACEHOLDER_FROM.matches(s)
 
     /**
      * A placeholder copied from an example (`"<token>"`, `"<run_id from turbo_run.list>"`) in
-     * [args]: for an id, URL or token parameter (also any listed in [ToolExamples.ID_SOURCES]) a
-     * `placeholder_value` error, since such a call cannot do what was meant; for any other
-     * parameter a note, and the value is sent as written. Returns (error or null, notes).
+     * [args]: a `placeholder_value` error, since such a call cannot do what was meant, for any
+     * parameter of a [destructive] call and for an id, URL, token, target or request parameter
+     * (also any listed in [ToolExamples.ids]); for any other parameter a note, and the value is
+     * sent as written. Returns (error or null, notes).
      */
     fun placeholderCheck(
         call: String,
         tool: String,
+        action: String?,
         props: JsonObject,
         args: JsonObject,
         example: JsonObject,
+        destructive: Boolean,
     ): Pair<CallToolResult?, List<String>> {
         val notes = mutableListOf<String>()
-        val ids = ToolExamples.ID_SOURCES[tool].orEmpty()
+        val ids = ToolExamples.ids(tool, action)
         for ((param, value) in args) {
             if (param == "action" || param !in props) continue
             val items = (value as? JsonArray)?.toList() ?: listOf(value)
@@ -452,16 +599,18 @@ internal object ToolArgs {
                         ?.takeIf { isPlaceholder(param, it) }
                 } ?: continue
             val strict =
-                param in ID_LIKE ||
+                destructive ||
+                    param in ID_LIKE ||
                     param.endsWith("_id") ||
                     param.endsWith("_url") ||
                     param.endsWith("_token") ||
-                    param in ids
+                    param in ids ||
+                    param in STRICT_PLACEHOLDER_PARAMS
             if (!strict) {
                 notes += "'$param' is the placeholder \"$v\" from an example; sent as written"
                 continue
             }
-            val source = ToolExamples.idSource(tool, param)
+            val source = ToolExamples.idSource(tool, action, param)
             val from = (source?.get("do") as? JsonPrimitive)?.content
             val exampleValue = (example[param] as? JsonPrimitive)?.takeIf { it.isString }?.content
             return error(
@@ -752,7 +901,7 @@ internal object ToolArgs {
                 fields.putIfAbsent("usage", JsonPrimitive(usage))
                 fields.putIfAbsent("example", example)
             }
-            idSee(tool, fields)
+            idSee(tool, action, fields)
             fields.putIfAbsent("retryable", JsonPrimitive(code in RETRYABLE))
             return result.copy(content = listOf(content.copy(text = envelope(fields).toString())))
         }
@@ -772,11 +921,8 @@ internal object ToolArgs {
             when {
                 bad != null -> {
                     if (BARE_CODE.matches(error)) {
-                        val more =
-                            if (allowedCut) ", ... (${bad.third.size} values; guide lists all)"
-                            else ""
                         error =
-                            "$call: '${bad.first}' must be one of ${allowedShown.joinToString(", ") { "\"$it\"" }}$more; got \"${bad.second}\""
+                            "$call: '${bad.first}' is not one of the ${bad.third.size} allowed values (see 'allowed'); got \"${bad.second}\"."
                     }
                     "invalid_enum"
                 }
@@ -825,7 +971,7 @@ internal object ToolArgs {
             fields["param"] = JsonPrimitive(bad.first)
             fields["got"] = JsonPrimitive(bad.second)
             fields["allowed"] = JsonArray(allowedShown.map { JsonPrimitive(it) })
-            if (allowedCut) fields.putIfAbsent("see", guideCall(call))
+            if (allowedCut) fields.putIfAbsent("see", listCall(tool) ?: guideCall(call))
         } else if (code != "tool_failed" && "param" !in fields) {
             namedParam(
                     error,
@@ -843,7 +989,7 @@ internal object ToolArgs {
                 fields.putIfAbsent("expected", JsonPrimitive(it.groupValues[2].lowercase()))
             }
         }
-        idSee(tool, fields)
+        idSee(tool, action, fields)
         if (code == "not_found") listCall(tool)?.let { fields.putIfAbsent("see", it) }
         if (code in ARGUMENT_CODES) {
             fields["usage"] = JsonPrimitive(usage)
@@ -857,9 +1003,9 @@ internal object ToolArgs {
      * `see` = the call that lists ids of the envelope's `param` ([ToolExamples.idSource]), when it
      * has one.
      */
-    private fun idSee(tool: String, fields: MutableMap<String, JsonElement>) {
+    private fun idSee(tool: String, action: String?, fields: MutableMap<String, JsonElement>) {
         val param = (fields["param"] as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return
-        ToolExamples.idSource(tool, param)?.let { fields.putIfAbsent("see", it) }
+        ToolExamples.idSource(tool, action, param)?.let { fields.putIfAbsent("see", it) }
     }
 
     /**
@@ -922,17 +1068,22 @@ internal object ToolArgs {
     /**
      * [result] with [notes] (what the server changed in the call) in its `notes` array, then its
      * warnings mirrored there too ([mirrorWarnings]). Only a result that is one text block holding
-     * a JSON object takes them: `notes` is added, or appended to when it is already an array; any
-     * other result is returned as is.
+     * a JSON object takes them: `notes` is added, or appended to when it is already an array. A
+     * text block that is not JSON at all gets the notes as a leading `note: ...` line; any other
+     * result is returned as is.
      */
     fun withNotes(result: CallToolResult, notes: List<String>): CallToolResult {
         val content = result.content.singleOrNull() as? TextContent ?: return result
         // Parsing every result only to find no warning would cost the large ones (history, bodies)
         // dearly.
         if (notes.isEmpty() && WARNING_HINTS.none { it in content.text }) return result
-        val json =
-            runCatching { Json.parseToJsonElement(content.text) }.getOrNull() as? JsonObject
-                ?: return result
+        val parsed = runCatching { Json.parseToJsonElement(content.text) }.getOrNull()
+        if (parsed == null && notes.isNotEmpty()) {
+            // Plain text (a doc, a script): the notes go in front of it.
+            val text = "note: ${notes.joinToString("; ")}\n\n${content.text}"
+            return result.copy(content = listOf(content.copy(text = text)))
+        }
+        val json = parsed as? JsonObject ?: return result
         val existing = json["notes"]
         if (existing != null && existing !is JsonArray) return result
         val have =

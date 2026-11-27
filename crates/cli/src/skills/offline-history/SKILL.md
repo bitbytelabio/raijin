@@ -46,7 +46,7 @@ and the scanner issues Burp reported. Live data of a running Burp is `proxy-traf
 ## Pitfalls
 - For a large target, give each subagent one project: pass `project` (a name or a list) in every history call:
   `run {"do":"history_list","project":"day1","limit":100}`.
-- A project whose Burp is running is still read, with a warning that its data may be incomplete; for live data
+- A project whose Burp is running is still read, with a warning, once per session, that its data may be incomplete; for live data
   use `proxy_history` on the running Burp instead.
 - `history_search` patterns are Rust regexes over raw bytes; `(?i)` makes them case-insensitive.
 

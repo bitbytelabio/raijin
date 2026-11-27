@@ -59,7 +59,9 @@ internal object ToolNames {
     }
 
     private val DESTRUCTIVE_ACTION =
-        Regex("(^|_)(delete|remove|clear|shutdown|stop|kill|reset|drop|purge|import)(_|$)")
+        Regex(
+            "(^|_)(delete|remove|clear|shutdown|stop|kill|reset|drop|purge|import|unregister)(_|$)",
+        )
 
     private val groups = ToolConsolidation.GROUPS.associateBy { it.tool }
 
@@ -166,18 +168,27 @@ internal object ToolNames {
             }
         }
 
+        // A grouped tool is never suggested without its action.
         val callNames =
-            tools.keys + published.flatMap { g -> g.actions.keys.map { "${g.tool}.$it" } }
-        val hints = ToolArgs.closest(n, callNames, 3)
-        // Only a near, exact call: within 2 edits, an action named for a grouped tool, nothing
-        // removed.
-        val retry =
-            hints.singleOrNull()?.takeIf { name ->
-                val tool = name.substringBefore('.')
-                ToolArgs.levenshtein(wanted, norm(name)) <= 2 &&
-                    (tool !in groups || '.' in name) &&
-                    !destructive(tool, name.substringAfter('.', "").ifEmpty { null }, tools[tool])
-            }
+            tools.keys.filter { it !in groups } +
+                published.flatMap { g -> g.actions.keys.map { "${g.tool}.$it" } }
+        val found = ToolArgs.closestCalls(n, callNames, 3)
+        val hints = found.map { it.name }
+        // Only a sure call: a single hint within 2 edits, or the one hint with the same words;
+        // an action named for a grouped tool, nothing removed.
+        val sure =
+            found.singleOrNull()?.name?.takeIf { ToolArgs.levenshtein(wanted, norm(it)) <= 2 }
+                ?: found
+                    .firstOrNull()
+                    ?.takeIf { first ->
+                        first.sameWords && found.count { it.sameWords } == 1
+                    }
+                    ?.name
+        val retry = sure?.takeIf { name ->
+            val tool = name.substringBefore('.')
+            (tool !in groups || '.' in name) &&
+                !destructive(tool, name.substringAfter('.', "").ifEmpty { null }, tools[tool])
+        }
         return NotFound(hints, retry)
     }
 }

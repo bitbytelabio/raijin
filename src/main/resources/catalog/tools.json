@@ -178,7 +178,7 @@
           "example": {
             "do": "ai.prompt",
             "messages": [
-              "<messages>"
+              "Summarise the login flow in one sentence."
             ]
           },
           "description": "Send a prompt to Burp Suite's built-in AI and receive a response. Useful for security analysis, vulnerability explanation, and remediation advice. Parameters: messages (required, array of strings forming the prompt), context (optional string providing additional background context for the AI). Requires Burp Suite Professional with AI enabled.",
@@ -678,7 +678,7 @@
       "domain": "recon",
       "example": {
         "do": "api_import_openapi",
-        "spec_json": "<spec_json>"
+        "spec_json": "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Example\",\"version\":\"1\"},\"servers\":[{\"url\":\"https://example.com\"}],\"paths\":{\"/health\":{\"get\":{\"responses\":{\"200\":{\"description\":\"ok\"}}}}}}"
       },
       "annotations": {
         "readOnlyHint": false,
@@ -1072,7 +1072,8 @@
       "domain": "scanner",
       "example": {
         "do": "bambda_import",
-        "script": "<script>"
+        "script": "return requestResponse.request().url().contains(\"/api/\");",
+        "name": "API requests"
       },
       "annotations": {
         "readOnlyHint": false,
@@ -1321,7 +1322,7 @@
     },
     {
       "name": "collaborator",
-      "description": "Burp Collaborator out-of-band testing: clients, payloads, polling.\nCall one action as collaborator.<action> (MCP clients put the action in the \"action\" parameter); * marks a required parameter. Example: {\"do\":\"collaborator.get_secret\"}\n- collaborator.create_client(): Create a Burp Collaborator client for out-of-band (OOB) payloads; its secret key is saved in the Burp project, so it survives an extension reload.\n- collaborator.restore_client(secret_key*): Restore a Collaborator client from its secret key (clients created in this Burp project come back by themselves; this is for a key from elsewhere).\n- collaborator.get_secret(client_id*): Get the secret key for a Collaborator client.\n- collaborator.generate_payload(client_id*, custom_data): Generate a unique Collaborator payload (subdomain) for OOB detection and return its payload_id, the id carried by every interaction it causes.\n- collaborator.default_payload(without_server_location): Generate a Collaborator payload using Burp's DEFAULT generator (no client_id needed).\n- collaborator.poll(client_id*, type, payload_id, since, limit, max_body_length): Poll for Collaborator interactions (DNS, HTTP with full request and response, SMTP); all are kept in a history, so filters and repeated polls lose nothing.\n- collaborator.server_info(client_id*): Get the Collaborator server address and metadata for a given client.\n- collaborator.remove_client(client_id*): Drop a Collaborator client from Raijin's tracking, with its saved secret key and its recorded interactions, so it is not restored on the next load.\n- collaborator.list_clients(): List the Collaborator clients registered in this Burp project, including the ones restored after an extension reload.",
+      "description": "Burp Collaborator out-of-band testing: clients, payloads, polling.\nCall one action as collaborator.<action> (MCP clients put the action in the \"action\" parameter); * marks a required parameter. Example: {\"do\":\"collaborator.restore_client\"}\n- collaborator.create_client(): Create a Burp Collaborator client for out-of-band (OOB) payloads; its secret key is saved in the Burp project, so it survives an extension reload.\n- collaborator.restore_client(secret_key*): Restore a Collaborator client from its secret key (clients created in this Burp project come back by themselves; this is for a key from elsewhere).\n- collaborator.get_secret(client_id*): Get the secret key for a Collaborator client.\n- collaborator.generate_payload(client_id*, custom_data): Generate a unique Collaborator payload (subdomain) for OOB detection and return its payload_id, the id carried by every interaction it causes.\n- collaborator.default_payload(without_server_location): Generate a Collaborator payload using Burp's DEFAULT generator (no client_id needed).\n- collaborator.poll(client_id*, type, payload_id, since, limit, max_body_length): Poll for Collaborator interactions (DNS, HTTP with full request and response, SMTP); all are kept in a history, so filters and repeated polls lose nothing.\n- collaborator.server_info(client_id*): Get the Collaborator server address and metadata for a given client.\n- collaborator.remove_client(client_id*): Drop a Collaborator client from Raijin's tracking, with its saved secret key and its recorded interactions, so it is not restored on the next load.\n- collaborator.list_clients(): List the Collaborator clients registered in this Burp project, including the ones restored after an extension reload.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1410,8 +1411,7 @@
             "secret_key"
           ],
           "example": {
-            "do": "collaborator.restore_client",
-            "secret_key": "<secret_key>"
+            "do": "collaborator.restore_client"
           },
           "description": "Restore a Collaborator client from its secret key (clients created in this Burp project come back by themselves; this is for a key from elsewhere). That covers a client from another project and one dropped with collaborator.remove_client. A key that is already registered returns its existing client. Pro edition only.",
           "properties": {
@@ -1747,7 +1747,7 @@
           ],
           "example": {
             "do": "config.proxy_listener_add",
-            "interface": "<interface>"
+            "interface": "127.0.0.1:8081"
           },
           "description": "Add a new proxy listener to Burp Suite's proxy configuration. Parameters: interface (string, e.g. '127.0.0.1:8081'), tls (boolean, enable TLS termination; defaults to false), redirect_host (optional string, hostname to redirect to), redirect_port (optional number, port to redirect to), certificate (optional string, certificate mode e.g. 'per_host', 'self_signed').",
           "properties": {
@@ -1810,8 +1810,9 @@
           "example": {
             "do": "config.match_replace_add",
             "type": "request_header",
-            "match": "<match>",
-            "replace": "<replace>"
+            "match": "^User-Agent.*$",
+            "replace": "User-Agent: raijin-test",
+            "comment": "example"
           },
           "description": "Add a match-and-replace rule to Burp Suite's proxy configuration. These rules automatically modify requests/responses passing through the proxy. Parameters: type (string, e.g. 'request_header', 'request_body', 'response_header', 'response_body'), match (string, text or regex to match), replace (string, replacement text), comment (optional string, rule description), enabled (boolean, whether the rule is active; defaults to true).",
           "properties": {
@@ -1890,8 +1891,8 @@
           ],
           "example": {
             "do": "config.upstream_proxy_set",
-            "host": "<host>",
-            "port": 1
+            "host": "127.0.0.1",
+            "port": 8080
           },
           "description": "Configure an upstream proxy server that Burp Suite will route traffic through. Useful for chaining with other tools (e.g. corporate proxy, Tor). Parameters: host (string, upstream proxy hostname), port (number, proxy port), type (string, proxy type: 'HTTP', 'SOCKS4', 'SOCKS5'; defaults to 'HTTP'), auth_user (optional string, proxy authentication username), auth_pass (optional string, proxy authentication password), destination_host (optional string, destination host filter pattern; defaults to '*' for all traffic).",
           "properties": {
@@ -1943,7 +1944,7 @@
           ],
           "example": {
             "do": "config.intruder_payload_processor_register",
-            "name": "<name>",
+            "name": "base64-encode",
             "transform_type": "encode_base64"
           },
           "description": "Register a custom payload processor with Intruder that transforms payloads during a run. Supported transform types: encode_base64, encode_url, hash_md5, hash_sha1, hash_sha256, prefix (prepend string), suffix (append string), regex_replace (apply regex replacement). Parameters: name (processor name; registering a name again replaces that processor), transform_type (one of the supported types), prefix_value (string to prepend, for prefix type), suffix_value (string to append, for suffix type), regex_pattern (regex pattern, for regex_replace type), regex_replacement (replacement string, for regex_replace type; group references must name groups of regex_pattern). The pattern and the replacement are validated here, not when the first payload is processed.",
@@ -1993,7 +1994,7 @@
     },
     {
       "name": "custom_check",
-      "description": "Custom Burp checks: BChecks and passive/active scan checks (create from a template, import, dry-run against proxy history, list, remove).\nCall one action as custom_check.<action> (MCP clients put the action in the \"action\" parameter); * marks a required parameter. Example: {\"do\":\"custom_check.bcheck_list\"}\n- custom_check.bcheck_create(name*, description*, type*, match_pattern, match_location, match_condition, payloads, response_match_pattern, path, collaborator_payload_type, severity*, confidence*, author, tags, issue_detail, issue_remediation): Generate and deploy a BCheck custom scan check from structured parameters.\n- custom_check.bcheck_import(script*): Import a raw BCheck script directly into Burp Suite.\n- custom_check.bcheck_list(): List all BChecks that have been deployed via MCP.\n- custom_check.bcheck_remove(id*): Remove a deployed BCheck from MCP tracking by its ID.\n- custom_check.bcheck_templates(): Get all BCheck templates with full examples, DSL reference, and usage guidance.\n- custom_check.bcheck_dry_run(type*, match_pattern, match_location, match_condition, payloads, response_match_pattern, path, collaborator_payload_type, url_pattern, in_scope_only, max_items, max_matches): Try a custom_check.bcheck_create definition against the proxy history Burp has already recorded, before deploying it.\n- custom_check.scancheck_create_passive(name*, description*, conditions*, match_mode, severity*, confidence*, issue_detail*, issue_remediation): Create a passive Script-mode scan check that analyzes every response during scanning.\n- custom_check.scancheck_create_active(name*, description*, steps*, match_mode, severity*, confidence*, issue_detail*, issue_remediation): Create an active Script-mode scan check that injects payloads at insertion points during active scanning.\n- custom_check.scancheck_list(): List all custom scan checks deployed via MCP, including those registered with scanner.register_check.\n- custom_check.scancheck_remove(id*): Remove a deployed Script-mode scan check by its ID.\n- custom_check.scancheck_templates(): Get Script-mode scan check templates, examples, and full condition reference.\n- custom_check.scancheck_dry_run(conditions, steps, match_mode, url_pattern, in_scope_only, max_items, max_matches): Try a Script-mode scan check definition against the proxy history Burp has already recorded, before deploying it.",
+      "description": "Custom Burp checks: BChecks and passive/active scan checks (create from a template, import, dry-run against proxy history, list, remove).\nCall one action as custom_check.<action> (MCP clients put the action in the \"action\" parameter); * marks a required parameter. Example: {\"do\":\"custom_check.bcheck_create\",\"name\":\"Debug header\",\"description\":\"Response exposes an X-Debug header\",\"type\":\"passive_response\",\"match_pattern\":\"X-Debug:\",\"match_location\":\"response_headers\",\"match_condition\":\"contains\",\"severity\":\"low\",\"confidence\":\"firm\"}\n- custom_check.bcheck_create(name*, description*, type*, match_pattern, match_location, match_condition, payloads, response_match_pattern, path, collaborator_payload_type, severity*, confidence*, author, tags, issue_detail, issue_remediation): Generate and deploy a BCheck custom scan check from structured parameters.\n- custom_check.bcheck_import(script*): Import a raw BCheck script directly into Burp Suite.\n- custom_check.bcheck_list(): List all BChecks that have been deployed via MCP.\n- custom_check.bcheck_remove(id*): Remove a deployed BCheck from MCP tracking by its ID.\n- custom_check.bcheck_templates(): Get all BCheck templates with full examples, DSL reference, and usage guidance.\n- custom_check.bcheck_dry_run(type*, match_pattern, match_location, match_condition, payloads, response_match_pattern, path, collaborator_payload_type, url_pattern, in_scope_only, max_items, max_matches): Try a custom_check.bcheck_create definition against the proxy history Burp has already recorded, before deploying it.\n- custom_check.scancheck_create_passive(name*, description*, conditions*, match_mode, severity*, confidence*, issue_detail*, issue_remediation): Create a passive Script-mode scan check that analyzes every response during scanning.\n- custom_check.scancheck_create_active(name*, description*, steps*, match_mode, severity*, confidence*, issue_detail*, issue_remediation): Create an active Script-mode scan check that injects payloads at insertion points during active scanning.\n- custom_check.scancheck_list(): List all custom scan checks deployed via MCP, including those registered with scanner.register_check.\n- custom_check.scancheck_remove(id*): Remove a deployed Script-mode scan check by its ID.\n- custom_check.scancheck_templates(): Get Script-mode scan check templates, examples, and full condition reference.\n- custom_check.scancheck_dry_run(conditions, steps, match_mode, url_pattern, in_scope_only, max_items, max_matches): Try a Script-mode scan check definition against the proxy history Burp has already recorded, before deploying it.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -2295,11 +2296,14 @@
           ],
           "example": {
             "do": "custom_check.bcheck_create",
-            "name": "<name>",
-            "description": "<description>",
+            "name": "Debug header",
+            "description": "Response exposes an X-Debug header",
             "type": "passive_response",
-            "severity": "high",
-            "confidence": "certain"
+            "match_pattern": "X-Debug:",
+            "match_location": "response_headers",
+            "match_condition": "contains",
+            "severity": "low",
+            "confidence": "firm"
           },
           "description": "Generate and deploy a BCheck custom scan check from structured parameters. BChecks are Burp Suite's DSL for defining custom vulnerability detection rules that run during scanning. Any text is safe in any parameter: it is written into the script as a string, never as DSL. Parameters: name (required, check name), description (required, what it detects), type (required), severity (required), confidence (required), author (optional, defaults to Raijin AI Agent), tags (optional, comma-separated), issue_detail, issue_remediation, and the definition: passive_response: match_pattern is looked for in match_location (response_body, the default; response_headers; status_code). passive_request: match_pattern is looked for in match_location (request_url, the default; request_headers; request_body). insertion_point: each of payloads is injected, and the check reports when response_match_pattern appears in the response body and was not in the response to the unmodified request. host_level: one GET of path (default /) per host, reported when the answer is 200 and its body shows response_match_pattern. path_level: each of payloads is a suffix appended to every path (default .bak, .old, .orig, .swp, ~), reported when the answer is 200, differs from the answer to a random path and, if given, shows response_match_pattern. collaborator: the header named by match_location (default Referer) is set to match_pattern, which must contain {generate_collaborator_address()} (default https://{generate_collaborator_address()}); reported on a collaborator_payload_type (dns, the default, or http) interaction. match_condition says how a pattern is compared: matches (regex, the default), contains (literal substring) or is (exact value); comparisons are case-sensitive unless a regex says (?i). An empty or missing pattern is rejected, since it would match everything. Use custom_check.bcheck_dry_run with the same definition to see what it does with the recorded proxy history first, and custom_check.bcheck_templates for the DSL itself.",
           "properties": {
@@ -2574,11 +2578,18 @@
           ],
           "example": {
             "do": "custom_check.scancheck_create_passive",
-            "name": "<name>",
-            "description": "<description>",
-            "severity": "high",
-            "confidence": "certain",
-            "issue_detail": "<issue_detail>"
+            "name": "Debug header",
+            "description": "Response exposes an X-Debug header",
+            "conditions": [
+              {
+                "location": "response_headers",
+                "pattern": "X-Debug",
+                "condition_type": "contains"
+              }
+            ],
+            "severity": "low",
+            "confidence": "firm",
+            "issue_detail": "The response carries an X-Debug header."
           },
           "description": "Create a passive Script-mode scan check that analyzes every response during scanning. More powerful than BCheck -- supports several conditions joined by AND or OR, negation, and regex/contains/equals matching across response body, headers, status code, request fields, and more. Parameters: name (required, check name; creating a name again replaces that check), description (required, what it detects), conditions (required, array of condition objects -- each with: location [response_body, response_headers, status_code, response_length, request_body, request_headers, request_url], pattern [regex or string], condition_type [matches (default), contains, equals; all case-insensitive], negate [true/false]), match_mode (all = every condition must hold, the default; any = one is enough), severity (required: high, medium, low, information), confidence (required: certain, firm, tentative), issue_detail (required, detailed issue description), issue_remediation (optional, how to fix). Use custom_check.scancheck_templates first to see examples and the full condition reference, and custom_check.scancheck_dry_run to see what the conditions match in the proxy history before deploying.",
           "properties": {
@@ -2691,11 +2702,23 @@
           ],
           "example": {
             "do": "custom_check.scancheck_create_active",
-            "name": "<name>",
-            "description": "<description>",
-            "severity": "high",
-            "confidence": "certain",
-            "issue_detail": "<issue_detail>"
+            "name": "Reflected marker",
+            "description": "The payload is reflected unencoded",
+            "steps": [
+              {
+                "payload": "raijin-probe-1",
+                "response_conditions": [
+                  {
+                    "location": "response_body",
+                    "pattern": "raijin-probe-1",
+                    "condition_type": "contains"
+                  }
+                ]
+              }
+            ],
+            "severity": "low",
+            "confidence": "tentative",
+            "issue_detail": "The injected marker came back in the response body."
           },
           "description": "Create an active Script-mode scan check that injects payloads at insertion points during active scanning. Supports multi-step payload chains: inject payload A, check response, inject payload B, confirm. The check reports only when a step matches and the response to the unmodified request would not have matched the same conditions, so a pattern the page shows anyway never raises an issue. Parameters: name (required, check name; creating a name again replaces that check), description (required, what it detects), steps (required, array of step objects -- each with: payload [string to inject], response_conditions [array of condition objects like passive checks; at least one step needs a condition on the response], match_mode [all | any for that step], stop_if_no_match [boolean, default true = required step: no match or no response ends the check without a report; false = optional step]), match_mode (default for steps: all | any), severity (required: high, medium, low, information), confidence (required: certain, firm, tentative), issue_detail (required, detailed issue description), issue_remediation (optional, how to fix). Use custom_check.scancheck_templates first to see multi-step examples.",
           "properties": {
@@ -3053,7 +3076,7 @@
           "max_events": {
             "type": "integer",
             "minimum": 0,
-            "description": "Maximum events to return (default 200) [actions: get, get_by_type]"
+            "description": "Maximum events to return (default 20) [actions: get, get_by_type]"
           }
         },
         "required": [
@@ -3110,7 +3133,7 @@
             "do": "events.get",
             "max_events": 20
           },
-          "description": "Retrieve events from the event bus using cursor-based polling. Returns events whose ID is strictly greater than since_id. Use the last event's ID as the cursor for subsequent polls. With subscription_id (from events.subscribe) it returns the subscription's matching events since its previous poll instead, and advances that cursor; since_id is then ignored. Parameters: since_id (number, return events after this ID; defaults to 0 for all events), max_events (number, maximum events to return; defaults to 200), subscription_id (string, optional).",
+          "description": "Retrieve events from the event bus using cursor-based polling. Returns events whose ID is strictly greater than since_id. Use the last event's ID as the cursor for subsequent polls. With subscription_id (from events.subscribe) it returns the subscription's matching events since its previous poll instead, and advances that cursor; since_id is then ignored. Parameters: since_id (number, return events after this ID; defaults to 0 for all events), max_events (number, maximum events to return; defaults to 20), subscription_id (string, optional).",
           "properties": {
             "since_id": {
               "type": "integer",
@@ -3119,7 +3142,7 @@
             "max_events": {
               "type": "integer",
               "minimum": 0,
-              "description": "Maximum events to return (default 200)"
+              "description": "Maximum events to return (default 20)"
             },
             "subscription_id": {
               "type": "string",
@@ -3143,7 +3166,7 @@
             ],
             "max_events": 20
           },
-          "description": "Retrieve events from the event bus filtered by event type(s). Supports cursor-based polling. Parameters: types (array of strings, event types to filter e.g. ['proxy.request', 'scanner.issue']), since_id (number, return events after this ID; defaults to 0), max_events (number, maximum events to return; defaults to 200).",
+          "description": "Retrieve events from the event bus filtered by event type(s). Supports cursor-based polling. Parameters: types (array of strings, event types to filter e.g. ['proxy.request', 'scanner.issue']), since_id (number, return events after this ID; defaults to 0), max_events (number, maximum events to return; defaults to 20).",
           "properties": {
             "types": {
               "type": "array",
@@ -3159,7 +3182,7 @@
             "max_events": {
               "type": "integer",
               "minimum": 0,
-              "description": "Maximum events to return (default 200)"
+              "description": "Maximum events to return (default 20)"
             }
           }
         },
@@ -3576,8 +3599,12 @@
       "domain": "http",
       "example": {
         "do": "http_fuzz",
-        "request": "<request>",
-        "host": "<host>"
+        "request": "GET /search?q=FUZZ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        "host": "example.com",
+        "payloads": [
+          "test",
+          "'"
+        ]
       },
       "annotations": {
         "readOnlyHint": false,
@@ -3673,8 +3700,9 @@
       "domain": "http",
       "example": {
         "do": "http_race",
-        "request": "<request>",
-        "host": "<host>"
+        "request": "POST /api/redeem HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+        "host": "example.com",
+        "count": 10
       },
       "annotations": {
         "readOnlyHint": false,
@@ -4058,11 +4086,13 @@
           ],
           "example": {
             "do": "http_rule.token_rule_create",
+            "rule_name": "bearer-from-login",
             "scope": "all",
-            "extract_from": "header",
+            "extract_from": "body",
+            "extract_json_path": "$.token",
             "inject_into": "header",
-            "inject_name": "<inject_name>",
-            "inject_value_template": "<inject_value_template>"
+            "inject_name": "Authorization",
+            "inject_value_template": "Bearer {value}"
           },
           "description": "Create a session handling rule: extract a value (CSRF token, session ID, bearer token) from responses in scope and inject it into later requests in scope. extract_from 'header' reads every header line named extract_header_name (each Set-Cookie on its own) and takes the first that yields a value; 'body' reads the body. The value is selected by extract_json_path or extract_xpath, then by extract_regex (first capture group, else the whole match; after a path it cuts a part out of the selected value). inject_into 'header', 'cookie', 'body' (form parameter), 'query' (URL parameter, written as rendered) or 'json' (inject_name is a JSONPath naming one value; an existing value is replaced in place and numbers stay numbers). A rendered value containing CR/LF is never written into a header, cookie or parameter. Raijin's internal unauthenticated probes never get rule values.",
           "properties": {
@@ -4187,6 +4217,14 @@
           ],
           "example": {
             "do": "http_rule.macro_set",
+            "name": "login",
+            "steps": [
+              {
+                "url": "https://example.com/login",
+                "method": "POST",
+                "body": "user=test&pass=test"
+              }
+            ],
             "scope": "all"
           },
           "description": "Create or replace (by name) a login macro that re-establishes an expired session automatically. When a response the macro covers (scope, tool_filter) shows an expired session (status in trigger_status, or trigger_regex matching status line + headers + body) and its request carried credentials, the macro's steps are replayed and the original request is sent once more with the refreshed session; that response replaces the expired one and reports reauthenticated: <name>. Session rules extract from step responses (use one to capture a new token); cookies set by the steps replace same-named cookies in covered requests, never added. While a macro is enabled, a deliberately stale session cookie is replaced too: disable it to send one. Safeguards: one run at a time, min_interval_ms between automatic runs, step_timeout_ms per step and for the retry, at most 20 steps and 60 s per run, suspension after max_failures runs that did not help (http_rule.macro_run or http_rule.macro_set resumes it). Steps and retries never trigger a macro; Raijin's internal unauthenticated probes never trigger one nor get its cookies. Replacing a macro resets its state. Scope: checked against Burp's target scope per the operator's mcp_scope_mode: warn (default) sends and adds scope_warning; enforce refuses (out_of_scope=true, nothing sent); off skips the check. Steps and the retry are checked.",
@@ -4459,7 +4497,15 @@
       "domain": "http",
       "example": {
         "do": "http_send_pipeline",
-        "host": "<host>"
+        "host": "example.com",
+        "requests": [
+          {
+            "raw_request": "GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n"
+          },
+          {
+            "raw_request": "GET /b HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+          }
+        ]
       },
       "annotations": {
         "readOnlyHint": false,
@@ -4845,9 +4891,9 @@
           ],
           "example": {
             "do": "http_state.cookie_jar_set",
-            "name": "<name>",
-            "value": "<value>",
-            "domain": "<domain>"
+            "name": "session",
+            "value": "test",
+            "domain": "example.com"
           },
           "description": "Set a cookie in Burp Suite's cookie jar.",
           "properties": {
@@ -5173,7 +5219,7 @@
     },
     {
       "name": "organizer",
-      "description": "Burp Organizer: send items to it, read them back, annotate.\nCall one action as organizer.<action> (MCP clients put the action in the \"action\" parameter); * marks a required parameter. Example: {\"do\":\"organizer.get_items\"}\n- organizer.send(request*, response, host*, port*, use_tls): Send an HTTP request (and optionally a response) to Burp Suite's Organizer tool for bookmarking and note-taking.\n- organizer.get_items(url_prefix, max_results, include_request, include_response, max_response_length): Retrieve items from Burp Suite's Organizer tool.\n- organizer.annotate(id*, notes, highlight): Set notes and/or a highlight color on an Organizer item by id (from organizer.get_items).",
+      "description": "Burp Organizer: send items to it, read them back, annotate.\nCall one action as organizer.<action> (MCP clients put the action in the \"action\" parameter); * marks a required parameter. Example: {\"do\":\"organizer.send\",\"request\":\"GET / HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n\",\"host\":\"example.com\",\"port\":443,\"use_tls\":true}\n- organizer.send(request*, response, host*, port*, use_tls): Send an HTTP request (and optionally a response) to Burp Suite's Organizer tool for bookmarking and note-taking.\n- organizer.get_items(url_prefix, max_results, include_request, include_response, max_response_length): Retrieve items from Burp Suite's Organizer tool.\n- organizer.annotate(id*, notes, highlight): Set notes and/or a highlight color on an Organizer item by id (from organizer.get_items).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -5277,9 +5323,10 @@
           ],
           "example": {
             "do": "organizer.send",
-            "request": "<request>",
-            "host": "<host>",
-            "port": 1
+            "request": "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "host": "example.com",
+            "port": 443,
+            "use_tls": true
           },
           "description": "Send an HTTP request (and optionally a response) to Burp Suite's Organizer tool for bookmarking and note-taking. The Organizer provides a persistent store for interesting requests found during testing. Parameters: request (raw HTTP request string, required), response (raw HTTP response string, optional), host (target hostname, required), port (target port number, required), use_tls (boolean, whether to use HTTPS, default false).",
           "properties": {
@@ -6649,7 +6696,8 @@
       "domain": "proxy",
       "example": {
         "do": "proxy_auto_auth",
-        "header_value": "<header_value>"
+        "header_value": "Bearer test-token",
+        "host_pattern": "example.com"
       },
       "annotations": {
         "readOnlyHint": false,
@@ -7903,7 +7951,7 @@
     },
     {
       "name": "scanner",
-      "description": "Burp Scanner: start crawls and audits, read issues, report, register checks.\nCall one action as scanner.<action> (MCP clients put the action in the \"action\" parameter); * marks a required parameter. Example: {\"do\":\"scanner.get_all_issues\"}\n- scanner.start_crawl(urls*, max_depth, in_scope_only): Start a web crawl against one or more target URLs.\n- scanner.start_audit(urls, requests, audit_mode, crawl_first, insertion_point_types, auth_header_name, auth_header_value): Start an active audit (vulnerability scan) against target URLs or specific HTTP requests.\n- scanner.get_all_issues(url_prefix, severity, confidence, max_results): Get all scanner issues from the site map with optional filtering by URL prefix, severity, and confidence.\n- scanner.generate_report(format, output_path*, url_prefix, severity_filter): Generate a scan report in HTML or XML format.\n- scanner.create_issue(name*, detail, remediation, severity, confidence, url*, request, response): Create a custom audit issue and add it to the site map.\n- scanner.import_bcheck(script*): Import a BCheck script into the Burp Suite scanner.\n- scanner.register_check(check_name*, check_type, issue_name*, issue_severity, issue_confidence, issue_detail, issue_remediation, passive_response_match, passive_header_match, active_payloads, active_response_match, active_grep_match): Register a custom scan check (passive or active) that matches response content and reports issues.\n- scanner.unregister_check(check_name*): Deregister a custom scan check previously created with scanner.register_check, removing it from Burp's scanner.",
+      "description": "Burp Scanner: start crawls and audits, read issues, report, register checks.\nCall one action as scanner.<action> (MCP clients put the action in the \"action\" parameter); * marks a required parameter. Example: {\"do\":\"scanner.start_crawl\",\"urls\":[\"https://example.com/\"]}\n- scanner.start_crawl(urls*, max_depth, in_scope_only): Start a web crawl against one or more target URLs.\n- scanner.start_audit(urls, requests, audit_mode, crawl_first, insertion_point_types, auth_header_name, auth_header_value): Start an active audit (vulnerability scan) against target URLs or specific HTTP requests.\n- scanner.get_all_issues(url_prefix, severity, confidence, max_results): Get all scanner issues from the site map with optional filtering by URL prefix, severity, and confidence.\n- scanner.generate_report(format, output_path*, url_prefix, severity_filter): Generate a scan report in HTML or XML format.\n- scanner.create_issue(name*, detail, remediation, severity, confidence, url*, request, response): Create a custom audit issue and add it to the site map.\n- scanner.import_bcheck(script*): Import a BCheck script into the Burp Suite scanner.\n- scanner.register_check(check_name*, check_type, issue_name*, issue_severity, issue_confidence, issue_detail, issue_remediation, passive_response_match, passive_header_match, active_payloads, active_response_match, active_grep_match): Register a custom scan check (passive or active) that matches response content and reports issues.\n- scanner.unregister_check(check_name*): Deregister a custom scan check previously created with scanner.register_check, removing it from Burp's scanner.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -7931,7 +7979,7 @@
           "max_depth": {
             "type": "integer",
             "minimum": 0,
-            "description": "Not supported by Montoya's CrawlConfiguration — accepted but always ignored; a negative value is clamped to 0 and reported as max_depth_clamped_to [actions: start_crawl]"
+            "description": "Not supported by Montoya's CrawlConfiguration — accepted but always ignored [actions: start_crawl]"
           },
           "in_scope_only": {
             "type": "boolean",
@@ -8139,7 +8187,7 @@
           "example": {
             "do": "scanner.start_crawl",
             "urls": [
-              "<urls>"
+              "https://example.com/"
             ]
           },
           "description": "Start a web crawl against one or more target URLs. Returns a task ID for tracking progress. Pro edition only. max_depth is NOT supported by Burp's Montoya API (no depth control exists) and is always ignored — check the response's 'ignored' field. in_scope_only IS enforced: out-of-scope seed URLs are dropped before crawling. Burp's own request_count in scanner_task.status can be unreliable; use sitemap.query (only_with_response=true) to gauge real progress. Scope: advisory only. An out-of-scope target gets scope_warning under mcp_scope_mode warn and enforce; it is never blocked. Flagged seeds are listed in scope_warnings (with sent_out_of_scope).",
@@ -8154,7 +8202,7 @@
             "max_depth": {
               "type": "integer",
               "minimum": 0,
-              "description": "Not supported by Montoya's CrawlConfiguration — accepted but always ignored; a negative value is clamped to 0 and reported as max_depth_clamped_to"
+              "description": "Not supported by Montoya's CrawlConfiguration — accepted but always ignored"
             },
             "in_scope_only": {
               "type": "boolean",
@@ -8277,7 +8325,8 @@
           ],
           "example": {
             "do": "scanner.generate_report",
-            "output_path": "<output_path>"
+            "output_path": "raijin-report.html",
+            "format": "HTML"
           },
           "description": "Generate a scan report in HTML or XML format. Can filter by URL prefix and severity levels. Pro edition only.",
           "properties": {
@@ -8329,8 +8378,11 @@
           ],
           "example": {
             "do": "scanner.create_issue",
-            "name": "<name>",
-            "url": "<url>"
+            "name": "Debug header exposed",
+            "url": "https://example.com/",
+            "detail": "The response carries an X-Debug header.",
+            "severity": "low",
+            "confidence": "firm"
           },
           "description": "Create a custom audit issue and add it to the site map. Useful for manual findings or integration with external tools.",
           "properties": {
@@ -8419,8 +8471,9 @@
           ],
           "example": {
             "do": "scanner.register_check",
-            "check_name": "<check_name>",
-            "issue_name": "<issue_name>"
+            "check_name": "debug-header",
+            "issue_name": "Debug header exposed",
+            "passive_header_match": "X-Debug:"
           },
           "description": "Register a custom scan check (passive or active) that matches response content and reports issues. Passive checks report when passive_response_match (body) or passive_header_match (headers) matches. Active checks inject each payload at every insertion point and report when active_response_match matches the response to a payload but not the response to the unmodified request. Registering a check_name again replaces that check. Regexes are case-insensitive and validated here. Pro edition only.",
           "properties": {
@@ -8635,7 +8688,10 @@
           ],
           "example": {
             "do": "scanner_task.add_request",
-            "request": "<request>"
+            "request": "R0VUIC8gSFRUUC8xLjENCkhvc3Q6IGV4YW1wbGUuY29tDQoNCg==",
+            "host": "example.com",
+            "port": 443,
+            "use_tls": true
           },
           "description": "Add an HTTP request to an existing audit task for scanning. The request must be base64-encoded. An auth header the audit was started with stays limited to the hosts it started with. Scope: advisory only. An out-of-scope target gets scope_warning under mcp_scope_mode warn and enforce; it is never blocked.",
           "properties": {
@@ -8970,9 +9026,10 @@
           ],
           "example": {
             "do": "send_to_tool.intruder",
-            "request": "<request>",
-            "host": "<host>",
-            "port": 1
+            "request": "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "host": "example.com",
+            "port": 443,
+            "use_tls": true
           },
           "description": "Send an HTTP request to Burp Suite's Intruder tool, ready to be configured for a payload run. Creates a new Intruder tab with the specified request. Parameters: request (raw HTTP request string), host (target hostname), port (target port), use_tls (boolean), tab_name (optional tab name).",
           "properties": {
@@ -9017,12 +9074,14 @@
           ],
           "example": {
             "do": "send_to_tool.intruder_positions",
-            "request": "<request>",
-            "host": "<host>",
-            "port": 1,
+            "request": "GET /search?q=test HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "host": "example.com",
+            "port": 443,
+            "use_tls": true,
             "positions": [
               [
-                0
+                14,
+                18
               ]
             ]
           },
@@ -9075,7 +9134,8 @@
           "example": {
             "do": "send_to_tool.comparer",
             "data": [
-              "<data>"
+              "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<p>test</p>",
+              "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n<p>missing</p>"
             ]
           },
           "description": "Send data items to Burp Suite's Comparer tool for side-by-side comparison. Useful for comparing HTTP requests, responses, or any text data to identify differences. Parameters: data (array of strings, each string becomes a separate item in the Comparer). At least one item is required; typically two items are sent for comparison.",
@@ -9099,7 +9159,7 @@
           "example": {
             "do": "send_to_tool.decoder",
             "data": [
-              "<data>"
+              "aGVsbG8="
             ]
           },
           "description": "Send data to Burp Suite's Decoder tool for manual encoding, decoding, and hashing operations. The data will appear in a new Decoder tab where various transformations can be applied interactively. Parameters: data (array of strings, each string becomes a separate Decoder item). A single string is accepted as one item.",
@@ -9418,9 +9478,11 @@
           ],
           "example": {
             "do": "sitemap.add_request",
-            "request": "<request>",
-            "host": "<host>",
-            "port": 1
+            "request": "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "host": "example.com",
+            "port": 443,
+            "use_tls": true,
+            "response": "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<p>test</p>"
           },
           "description": "Add an HTTP request (and optional response) to the Burp Suite site map. This allows programmatic population of the site map with discovered endpoints. Parameters: request (raw HTTP request string), response (optional, raw HTTP response string), host (target hostname), port (target port), use_tls (boolean).",
           "properties": {
@@ -9468,11 +9530,11 @@
           ],
           "example": {
             "do": "sitemap.add_issue",
-            "name": "<name>",
-            "detail": "<detail>",
-            "severity": "HIGH",
-            "confidence": "CERTAIN",
-            "url": "<url>"
+            "name": "Debug header exposed",
+            "detail": "The response carries an X-Debug header.",
+            "severity": "LOW",
+            "confidence": "FIRM",
+            "url": "https://example.com/"
           },
           "description": "Add a custom audit issue to the Burp Suite site map. Used to report custom-discovered vulnerabilities alongside Burp's built-in scanner findings. Parameters: name (issue title), detail (HTML description of the issue), remediation (optional, HTML remediation advice), severity (HIGH, MEDIUM, LOW, or INFORMATION), confidence (CERTAIN, FIRM, or TENTATIVE), url (affected URL), request (optional, raw HTTP request demonstrating the issue), response (optional, raw HTTP response demonstrating the issue).",
           "properties": {
@@ -10134,7 +10196,7 @@
           ],
           "example": {
             "do": "turbo_run.save_to_organizer",
-            "items": "<items>"
+            "items": "[{\"request_id\":1,\"notes\":\"interesting\"}]"
           },
           "description": "Save results from a Turbo run to Burp's Organizer with notes (the run id and script are appended to the notes).",
           "properties": {
@@ -10604,7 +10666,7 @@
     },
     {
       "name": "websocket",
-      "description": "WebSockets: open connections, send, read messages, intercept rules, proxy WebSocket history.\nCall one action as websocket.<action> (MCP clients put the action in the \"action\" parameter); * marks a required parameter. Example: {\"do\":\"websocket.list\"}\n- websocket.create(url*, headers, subprotocol): Create a new WebSocket connection to a target URL.\n- websocket.send_text(connection_id*, message*): Send a text message on an existing WebSocket connection.\n- websocket.send_binary(connection_id*, data*): Send a binary message on an existing WebSocket connection.\n- websocket.close(connection_id*): Close an existing WebSocket connection.\n- websocket.list(): List all tracked WebSocket connections, including both programmatically created connections and those intercepted through Burp's proxy.\n- websocket.get_messages(connection_id*, direction, since_index, max_results): Retrieve messages from a specific WebSocket connection with optional filtering and pagination.\n- websocket.set_intercept_rule(rule_id, match_url, match_message, direction, rule_action*, modify_regex, modify_replacement, tag_comment, message_type, enabled): Create or update a WebSocket message interception rule.\n- websocket.wait_message(connection_id*, since_index, direction, message_type, pattern, timeout_ms): Wait for the next WebSocket frame that matches a direction, type and/or regex, instead of polling websocket.get_messages.\n- websocket.fuzz(connection_id, url, headers, subprotocol, payloads, payload_library, template, marker, payload_encoding, message_type, setup_messages, pattern, start_index, delay_ms, window_ms, idle_ms, timeout_ms, max_frame_length): Fuzz a WebSocket endpoint: send each payload as one message and get back the frames it triggered, plus clusters of similar responses.\n- websocket.list_intercept_rules(): List the WebSocket intercept rules in the order they are evaluated, each with its match criteria, action and enabled state.\n- websocket.remove_intercept_rule(rule_id*): Remove a WebSocket intercept rule by its rule ID.\n- websocket.history(start_index, count, host, direction, websocket_id, url): Get WebSocket proxy history entries with optional filtering by connection (websocket_id), upgrade URL, host and direction (client_to_server or server_to_clie...\n- websocket.history_search(pattern*, direction, max_results, websocket_id, url, start_index): Search WebSocket proxy history using a regex pattern on message payloads.",
+      "description": "WebSockets: open connections, send, read messages, intercept rules, proxy WebSocket history.\nCall one action as websocket.<action> (MCP clients put the action in the \"action\" parameter); * marks a required parameter. Example: {\"do\":\"websocket.create\",\"url\":\"wss://example.com/ws\"}\n- websocket.create(url*, headers, subprotocol): Create a new WebSocket connection to a target URL.\n- websocket.send_text(connection_id*, message*): Send a text message on an existing WebSocket connection.\n- websocket.send_binary(connection_id*, data*): Send a binary message on an existing WebSocket connection.\n- websocket.close(connection_id*): Close an existing WebSocket connection.\n- websocket.list(): List all tracked WebSocket connections, including both programmatically created connections and those intercepted through Burp's proxy.\n- websocket.get_messages(connection_id*, direction, since_index, max_results): Retrieve messages from a specific WebSocket connection with optional filtering and pagination.\n- websocket.set_intercept_rule(rule_id, match_url, match_message, direction, rule_action*, modify_regex, modify_replacement, tag_comment, message_type, enabled): Create or update a WebSocket message interception rule.\n- websocket.wait_message(connection_id*, since_index, direction, message_type, pattern, timeout_ms): Wait for the next WebSocket frame that matches a direction, type and/or regex, instead of polling websocket.get_messages.\n- websocket.fuzz(connection_id, url, headers, subprotocol, payloads, payload_library, template, marker, payload_encoding, message_type, setup_messages, pattern, start_index, delay_ms, window_ms, idle_ms, timeout_ms, max_frame_length): Fuzz a WebSocket endpoint: send each payload as one message and get back the frames it triggered, plus clusters of similar responses.\n- websocket.list_intercept_rules(): List the WebSocket intercept rules in the order they are evaluated, each with its match criteria, action and enabled state.\n- websocket.remove_intercept_rule(rule_id*): Remove a WebSocket intercept rule by its rule ID.\n- websocket.history(start_index, count, host, direction, websocket_id, url): Get WebSocket proxy history entries with optional filtering by connection (websocket_id), upgrade URL, host and direction (client_to_server or server_to_clie...\n- websocket.history_search(pattern*, direction, max_results, websocket_id, url, start_index): Search WebSocket proxy history using a regex pattern on message payloads.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -10828,7 +10890,7 @@
           ],
           "example": {
             "do": "websocket.create",
-            "url": "<url>"
+            "url": "wss://example.com/ws"
           },
           "description": "Create a new WebSocket connection to a target URL. Constructs an HTTP upgrade request and establishes a WebSocket connection through Burp. All messages are automatically captured and available via websocket.get_messages. Parameters: url (WebSocket URL, e.g. 'wss://example.com/ws', required), headers (optional object of additional HTTP headers as key-value pairs), subprotocol (optional string, WebSocket subprotocol to request). The upgrade goes out exactly as given: a raw CR/LF in the path, query or a header is sent as written and reported in warnings. Scope: advisory only. An out-of-scope target gets scope_warning under mcp_scope_mode warn and enforce; it is never blocked.",
           "properties": {
@@ -10857,7 +10919,7 @@
           ],
           "example": {
             "do": "websocket.send_text",
-            "message": "<message>"
+            "message": "ping"
           },
           "description": "Send a text message on an existing WebSocket connection. The message is tracked and can be retrieved later via websocket.get_messages. Parameters: connection_id (string, the WebSocket connection ID, required), message (string, the text message to send, required).",
           "properties": {
@@ -10882,7 +10944,7 @@
           ],
           "example": {
             "do": "websocket.send_binary",
-            "data": "<data>"
+            "data": "aGVsbG8="
           },
           "description": "Send a binary message on an existing WebSocket connection. The data is base64 (standard or URL-safe alphabet, padding optional, whitespace ignored) and is decoded before transmission; the frame is recorded as the canonical base64 of the bytes sent. Parameters: connection_id (string, the WebSocket connection ID, required), data (string, base64-encoded binary data to send, required).",
           "properties": {

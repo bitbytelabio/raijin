@@ -15,7 +15,7 @@ import kotlinx.serialization.json.*
 
 object EventsTools {
 
-    private const val DEFAULT_MAX_EVENTS = 200
+    private const val DEFAULT_MAX_EVENTS = 20
 
     fun register(server: Server, eventBus: EventBus) {
 
@@ -29,7 +29,7 @@ object EventsTools {
                     "subscription's matching events since its previous poll instead, and advances that " +
                     "cursor; since_id is then ignored. Parameters: since_id (number, return events after " +
                     "this ID; defaults to 0 for all events), max_events (number, maximum events to return; " +
-                    "defaults to 200), subscription_id (string, optional).",
+                    "defaults to $DEFAULT_MAX_EVENTS), subscription_id (string, optional).",
             inputSchema =
                 ToolSchema(
                     properties =
@@ -111,7 +111,7 @@ object EventsTools {
                 "Retrieve events from the event bus filtered by event type(s). Supports " +
                     "cursor-based polling. Parameters: types (array of strings, event types to filter " +
                     "e.g. ['proxy.request', 'scanner.issue']), since_id (number, return events after " +
-                    "this ID; defaults to 0), max_events (number, maximum events to return; defaults to 200).",
+                    "this ID; defaults to 0), max_events (number, maximum events to return; defaults to $DEFAULT_MAX_EVENTS).",
             inputSchema =
                 ToolSchema(
                     properties =

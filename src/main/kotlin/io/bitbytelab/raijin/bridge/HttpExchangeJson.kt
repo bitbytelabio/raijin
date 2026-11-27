@@ -2,27 +2,83 @@ package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.http.message.HttpRequestResponse
 import io.bitbytelab.raijin.core.BodyText
+import io.bitbytelab.raijin.safety.ScopeGate
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.put
 
 /**
  * The `error` of a multi-request call none of whose [ran] [unit]s (`step`, `request`) got a
- * response: `"<call>: none of the 3 steps that ran got a response (step 0: <reason>)."`.
+ * response: `"<call>: none of the 3 steps that ran got a response (step 1: <reason>)."`.
+ * [firstNumber] is the 1-based number of the item the reason is about.
  */
 internal fun noResponseError(
     call: String,
     unit: String,
     ran: Int,
-    firstIndex: Int,
+    firstNumber: Int,
     reason: String,
 ): String {
     val what = if (unit == "step") "steps that ran" else "${unit}s"
-    return "$call: none of the $ran $what got a response ($unit $firstIndex: ${reason.trimEnd('.')})."
+    return "$call: none of the $ran $what got a response ($unit $firstNumber: ${reason.trimEnd('.')})."
+}
+
+/**
+ * The top-level `error`, `code` and (for an argument error) `param` of a multi-request call none of
+ * whose [items] got a response. [unit] is "step" or "request"; [listParam] is "steps" or
+ * "requests"; [numberKey] is the 1-based number field of each item.
+ *
+ * Nothing sent (every item has phase "build" or out_of_scope true, at least one "build"): the first
+ * build item's error as missing_parameter / invalid_arguments. Else no_response, naming the first
+ * item that was sent.
+ */
+internal fun noResponseFields(
+    call: String,
+    unit: String,
+    listParam: String,
+    numberKey: String,
+    items: List<JsonObject>,
+): JsonObject {
+    fun JsonObject.built() = (this["phase"] as? JsonPrimitive)?.contentOrNull == "build"
+    fun JsonObject.blocked() =
+        (this[ScopeGate.OUT_OF_SCOPE] as? JsonPrimitive)?.booleanOrNull == true
+    fun JsonObject.number() = (this[numberKey] as? JsonPrimitive)?.intOrNull ?: 1
+    val firstBuild = items.firstOrNull { it.built() }
+    if (firstBuild != null && items.all { it.built() || it.blocked() }) {
+        val n = firstBuild.number()
+        val err = (firstBuild["error"] as? JsonPrimitive)?.contentOrNull ?: "unknown error"
+        return buildJsonObject {
+            if (err == HttpRequestBuilder.MISSING_TARGET) {
+                put("error", "$call: $unit $n has neither 'url' nor 'raw_request'.")
+                put("code", "missing_parameter")
+                put("param", "$listParam[$n].url")
+            } else {
+                put("error", "$call: $unit $n could not be built: ${err.trimEnd('.')}.")
+                put("code", "invalid_arguments")
+                put("param", "$listParam[$n]")
+            }
+        }
+    }
+    val firstSent = items.firstOrNull { !it.built() && !it.blocked() } ?: items.firstOrNull()
+    return buildJsonObject {
+        put(
+            "error",
+            noResponseError(
+                call,
+                unit,
+                items.size,
+                firstSent?.number() ?: 1,
+                noResponseReason(listOfNotNull(firstSent)),
+            ),
+        )
+        put("code", "no_response")
+    }
 }
 
 /**

@@ -5,3 +5,4 @@ pub mod args;
 pub mod error;
 pub mod server;
 pub mod spill;
+pub mod stdin;

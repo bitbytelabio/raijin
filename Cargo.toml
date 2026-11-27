@@ -6,7 +6,7 @@ resolver = "2"
 # Equals `version` in build.gradle.kts (the release workflow checks it).
 version = "2.4.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.100"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -19,6 +19,7 @@ glob = "0.3"
 memchr = "2.8"
 nix = "0.32"
 regex = "1.13"
+regex-syntax = "0.8"
 reqwest = { version = "0.13", default-features = false }
 rmcp = "3.12"
 schemars = "1.2"

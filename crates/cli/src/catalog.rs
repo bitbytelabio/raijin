@@ -141,10 +141,12 @@ impl Catalog {
         names
     }
 
-    /// The names a "did you mean" offers: tools and `tool.action`, not old member names.
+    /// The names a "did you mean" offers: ungrouped tools and `tool.action` (a grouped tool is
+    /// never offered without its action), not old member names.
     pub fn suggestion_names(&self) -> Vec<String> {
         self.tools
             .iter()
+            .filter(|t| t.actions.is_empty())
             .map(|t| t.name.clone())
             .chain(
                 self.tools
@@ -198,9 +200,9 @@ impl Catalog {
             return found("util".to_owned(), Some("hash".to_owned()), Some(note));
         }
         let names = self.suggestion_names();
-        let did_you_mean = crate::util::suggest(trimmed, names.iter().map(String::as_str), 3)
+        let did_you_mean = crate::util::suggest_call(trimmed, names.iter().map(String::as_str), 3)
             .into_iter()
-            .map(str::to_owned)
+            .map(|s| s.name.to_owned())
             .collect();
         Resolved::NotFound { did_you_mean }
     }
@@ -209,9 +211,18 @@ impl Catalog {
     /// it (`ToolNames.destructive`): an action word such as `delete` or `shutdown` for a grouped
     /// call, else the tool's `destructiveHint`.
     pub fn destructive(&self, tool: &str, action: Option<&str>) -> bool {
-        const WORDS: [&str; 10] = [
-            "delete", "remove", "clear", "shutdown", "stop", "kill", "reset", "drop", "purge",
+        const WORDS: [&str; 11] = [
+            "delete",
+            "remove",
+            "clear",
+            "shutdown",
+            "stop",
+            "kill",
+            "reset",
+            "drop",
+            "purge",
             "import",
+            "unregister",
         ];
         match action {
             Some(action) if self.tool(tool).is_some_and(|t| !t.actions.is_empty()) => {

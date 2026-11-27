@@ -1,5 +1,6 @@
 package io.bitbytelab.raijin.bridge
 
+import burp.api.montoya.core.ByteArray as BurpByteArray
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.HttpHeader
 import burp.api.montoya.http.message.requests.HttpRequest
@@ -18,7 +19,6 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
-import burp.api.montoya.core.ByteArray as BurpByteArray
 
 /**
  * Builds the Montoya requests the HTTP tools send: from raw request text, from a URL with
@@ -29,24 +29,47 @@ internal object HttpRequestBuilder {
 
     private val HEADER_BLOCK_END = Regex("\\r?\\n\\r?\\n")
 
+    /** The build error of a request object with neither target. */
+    const val MISSING_TARGET = "Either 'url' or 'raw_request' must be provided"
+
+    /** Start of the build error of a URL without scheme and host. */
+    const val URL_NOT_ABSOLUTE = "url must be absolute"
+
+    private val SCHEME = Regex("^[A-Za-z][A-Za-z0-9+.-]*://")
+
+    /** Whether [url] starts with `scheme://`. */
+    fun hasScheme(url: String): Boolean = SCHEME.containsMatchIn(url.trim())
+
+    /**
+     * [url] with `https://` and with `http://`, for a URL written without a scheme (`example.com`,
+     * `//example.com`); empty for a path (`/admin`), which names no host to guess.
+     */
+    fun schemeGuesses(url: String): List<String> {
+        val t = url.trim()
+        if (t.isEmpty() || (t.startsWith('/') && !t.startsWith("//"))) return emptyList()
+        return t.trimStart('/').let { listOf("https://$it", "http://$it") }
+    }
+
     /**
      * Builds a request from either [rawRequest] or [url] plus structured parts.
      *
      * - Raw CR/LF, and only CR/LF, is stripped from the structured inputs (url, method, header
      *   names and values): a stray newline from an LLM would otherwise reach the HTTP/2 `:path` or
-     *   split a header and get the request kettled (issue #7). [RequestHygiene.scan] reports what was
-     *   removed. Every other byte is sent as given. Raw request text and the byte-level tools keep
-     *   their CR/LF.
+     *   split a header and get the request kettled (issue #7). [RequestHygiene.scan] reports what
+     *   was removed. Every other byte is sent as given. Raw request text and the byte-level tools
+     *   keep their CR/LF.
      * - [rawRequest] gets its header block's line endings canonicalized and, unless
      *   [autoFixContentLength] is false, its Content-Length recomputed (recorded in [fixReport]).
      *   Its target is [url]'s scheme and authority when a url is given too, else the Host header;
-     *   explicit [host] / [port] / [useTls] win, and without port information it defaults to TLS
-     *   on 443 (80 when [useTls] is false). [headers] are applied on top of it.
+     *   explicit [host] / [port] / [useTls] win, and without port information it defaults to TLS on
+     *   443 (80 when [useTls] is false). [headers] are applied on top of it.
      * - [url] is split leniently ([splitUrl]): the request target is sent exactly as written, and
-     *   the Host header is the URL's authority; [host] / [port] only change where the connection goes.
+     *   the Host header is the URL's authority; [host] / [port] only change where the connection
+     *   goes.
      * - [url] with [preserveHeaders] (default) builds the complete request text with the caller's
      *   headers byte-exact, so Burp's default User-Agent/Accept/... are not injected; with
-     *   [preserveHeaders] false Burp's `httpRequestFromUrl` defaults are kept and [headers] layered on.
+     *   [preserveHeaders] false Burp's `httpRequestFromUrl` defaults are kept and [headers] layered
+     *   on.
      */
     fun build(
         url: String?,
@@ -63,16 +86,36 @@ internal object HttpRequestBuilder {
     ): HttpRequest {
         val cUrl = url?.let { RequestHygiene.stripCrlf(it) }
         val cMethod = method?.let { RequestHygiene.stripCrlf(it) }
-        val cHeaders = headers?.entries?.associate {
-            RequestHygiene.stripCrlf(it.key) to RequestHygiene.stripCrlf(it.value)
-        }
+        val cHeaders =
+            headers?.entries?.associate {
+                RequestHygiene.stripCrlf(it.key) to RequestHygiene.stripCrlf(it.value)
+            }
 
-        var request: HttpRequest = when {
-            rawRequest != null -> fromRawRequest(rawRequest, cUrl, host, port, useTls, autoFixContentLength, fixReport)
-            cUrl != null && preserveHeaders -> fromUrlPreservingHeaders(cUrl, cMethod, cHeaders.orEmpty(), body, host, port, useTls)
-            cUrl != null -> fromUrlMontoya(cUrl, cMethod, cHeaders, body, host, port, useTls)
-            else -> throw IllegalArgumentException("Either 'url' or 'raw_request' must be provided")
-        }
+        var request: HttpRequest =
+            when {
+                rawRequest != null ->
+                    fromRawRequest(
+                        rawRequest,
+                        cUrl,
+                        host,
+                        port,
+                        useTls,
+                        autoFixContentLength,
+                        fixReport,
+                    )
+                cUrl != null && preserveHeaders ->
+                    fromUrlPreservingHeaders(
+                        cUrl,
+                        cMethod,
+                        cHeaders.orEmpty(),
+                        body,
+                        host,
+                        port,
+                        useTls,
+                    )
+                cUrl != null -> fromUrlMontoya(cUrl, cMethod, cHeaders, body, host, port, useTls)
+                else -> throw IllegalArgumentException(MISSING_TARGET)
+            }
 
         // For raw_request: extra (sanitized) header overrides via the headers map.
         if (rawRequest != null) {
@@ -82,7 +125,8 @@ internal object HttpRequestBuilder {
     }
 
     /** Fields of http_send_request that a batch item or chain step cannot carry. */
-    val UNSUPPORTED_ITEM_FIELDS = listOf("http2_headers", "follow_redirects", "sni", "verify_tls", "response_timeout_ms")
+    val UNSUPPORTED_ITEM_FIELDS =
+        listOf("http2_headers", "follow_redirects", "sni", "verify_tls", "response_timeout_ms")
 
     /**
      * Builds a request from a request object as `http_send_requests_parallel` items and
@@ -91,12 +135,19 @@ internal object HttpRequestBuilder {
      * `preserve_headers` (both default true). [fixReport] receives the item's
      * `content_length_rewritten`, `headers_warning` and hygiene `warnings`.
      *
-     * @throws IllegalArgumentException for a field only http_send_request supports ([UNSUPPORTED_ITEM_FIELDS]).
+     * @throws IllegalArgumentException for a field only http_send_request supports
+     *   ([UNSUPPORTED_ITEM_FIELDS]).
      */
-    fun fromObject(obj: JsonObject, fixReport: MutableMap<String, JsonElement>? = null): HttpRequest {
-        UNSUPPORTED_ITEM_FIELDS.firstOrNull { obj[it] != null && obj[it] !is JsonNull }?.let {
-            throw IllegalArgumentException("$it is not supported per item here; use http_send_request")
-        }
+    fun fromObject(
+        obj: JsonObject,
+        fixReport: MutableMap<String, JsonElement>? = null,
+    ): HttpRequest {
+        UNSUPPORTED_ITEM_FIELDS.firstOrNull { obj[it] != null && obj[it] !is JsonNull }
+            ?.let {
+                throw IllegalArgumentException(
+                    "$it is not supported per item here; use http_send_request",
+                )
+            }
         val url = obj["url"]?.jsonPrimitive?.contentOrNull
         val method = obj["method"]?.jsonPrimitive?.contentOrNull
         val parsed = obj["headers"].asHeaders()
@@ -108,7 +159,8 @@ internal object HttpRequestBuilder {
         if (fixReport != null) {
             headersWarning?.let { fixReport["headers_warning"] = JsonPrimitive(it) }
             val hygiene = RequestHygiene.scan(method, url, headers)
-            if (hygiene.isNotEmpty()) fixReport["warnings"] = JsonArray(hygiene.map { JsonPrimitive(it) })
+            if (hygiene.isNotEmpty())
+                fixReport["warnings"] = JsonArray(hygiene.map { JsonPrimitive(it) })
         }
         return build(
             url = url,
@@ -129,7 +181,8 @@ internal object HttpRequestBuilder {
      * A native HTTP/2 request (Montoya `HttpRequest.http2Request`): [fields] are its header list,
      * pseudo-headers included, sent in the order given without any check, so a test can repeat,
      * reorder, omit or malform them. When [fields] holds no pseudo-header at all, `:method`,
-     * `:scheme`, `:authority` and `:path` are derived from [url] / [method] / the target and put first.
+     * `:scheme`, `:authority` and `:path` are derived from [url] / [method] / the target and put
+     * first.
      *
      * The target is [host] / [port] / [useTls] when given, else the URL's, else the `:authority`
      * and `:scheme` fields'. The body is sent as given (no Content-Length is added: include a
@@ -159,26 +212,51 @@ internal object HttpRequestBuilder {
     data class Target(val host: String, val port: Int, val tls: Boolean)
 
     /** See [http2]: explicit overrides, then the URL, then the `:authority` / `:scheme` fields. */
-    fun http2Target(url: String?, host: String?, port: Int?, useTls: Boolean?, fields: List<Pair<String, String>>): Target {
+    fun http2Target(
+        url: String?,
+        host: String?,
+        port: Int?,
+        useTls: Boolean?,
+        fields: List<Pair<String, String>>,
+    ): Target {
         val parts = url?.let { splitUrl(it) }
         val urlHost = parts?.authority?.let { parseHostValue(it) }
         val fieldScheme = fields.firstOrNull { it.first == ":scheme" }?.second
-        val authority = fields.firstOrNull { it.first == ":authority" }?.second?.let { parseHostValue(it.trim()) }
-        val tls = useTls
-            ?: parts?.scheme?.equals("https", ignoreCase = true)
-            ?: fieldScheme?.let { !it.equals("http", ignoreCase = true) }
-            ?: true
-        val resolvedHost = host ?: urlHost?.first ?: authority?.first
-            ?: throw IllegalArgumentException("An HTTP/2 request needs a target: give 'url', 'host', or an ':authority' field")
-        val resolvedPort = port
-            ?: urlHost?.second
-            ?: (if (host == null && urlHost == null) authority?.second else null)
-            ?: if (tls) 443 else 80
+        val authority =
+            fields
+                .firstOrNull { it.first == ":authority" }
+                ?.second
+                ?.let { parseHostValue(it.trim()) }
+        val tls =
+            useTls
+                ?: parts?.scheme?.equals("https", ignoreCase = true)
+                ?: fieldScheme?.let { !it.equals("http", ignoreCase = true) }
+                ?: true
+        val resolvedHost =
+            host
+                ?: urlHost?.first
+                ?: authority?.first
+                ?: throw IllegalArgumentException(
+                    "An HTTP/2 request needs a target: give 'url', 'host', or an ':authority' field",
+                )
+        val resolvedPort =
+            port
+                ?: urlHost?.second
+                ?: (if (host == null && urlHost == null) authority?.second else null)
+                ?: if (tls) 443 else 80
         return Target(resolvedHost, resolvedPort, tls)
     }
 
-    /** The header list of a native HTTP/2 request; see [http2]. `:path` and `:authority` are the URL's as written. */
-    fun http2Fields(url: String?, method: String?, target: Target, fields: List<Pair<String, String>>): List<Pair<String, String>> {
+    /**
+     * The header list of a native HTTP/2 request; see [http2]. `:path` and `:authority` are the
+     * URL's as written.
+     */
+    fun http2Fields(
+        url: String?,
+        method: String?,
+        target: Target,
+        fields: List<Pair<String, String>>,
+    ): List<Pair<String, String>> {
         if (fields.any { it.first.startsWith(":") }) return fields
         val parts = url?.let { splitUrl(it) }
         val path = parts?.target ?: url?.takeIf { it.startsWith("/") } ?: "/"
@@ -196,24 +274,27 @@ internal object HttpRequestBuilder {
     private val URL_SPLIT = Regex("^([A-Za-z][A-Za-z0-9+.-]*)://([^/?#]*)([^#]*)")
 
     /**
-     * Splits `scheme://authority/target` leniently: hosts with `_`, targets with spaces, `|`, `{` or
-     * `<script>` all pass, byte for byte. The authority loses any `userinfo@`; an empty target is `/`
-     * and a bare `?query` gets a leading `/`. Null when [url] is not absolute.
+     * Splits `scheme://authority/target` leniently: hosts with `_`, targets with spaces, `|`, `{`
+     * or `<script>` all pass, byte for byte. The authority loses any `userinfo@`; an empty target
+     * is `/` and a bare `?query` gets a leading `/`. Null when [url] is not absolute.
      */
     internal fun splitUrl(url: String): UrlParts? {
         val m = URL_SPLIT.find(url) ?: return null
         val authority = m.groupValues[2].substringAfterLast('@')
         val raw = m.groupValues[3]
-        val target = when {
-            raw.isEmpty() -> "/"
-            raw.startsWith("?") -> "/$raw"
-            else -> raw
-        }
+        val target =
+            when {
+                raw.isEmpty() -> "/"
+                raw.startsWith("?") -> "/$raw"
+                else -> raw
+            }
         return UrlParts(m.groupValues[1], authority, target)
     }
 
     private fun authority(target: Target): String {
-        val literal = if (target.host.contains(':') && !target.host.startsWith("[")) "[${target.host}]" else target.host
+        val literal =
+            if (target.host.contains(':') && !target.host.startsWith("[")) "[${target.host}]"
+            else target.host
         val defaultPort = (target.tls && target.port == 443) || (!target.tls && target.port == 80)
         return if (defaultPort) literal else "$literal:${target.port}"
     }
@@ -236,18 +317,23 @@ internal object HttpRequestBuilder {
         val normalized = RequestHygiene.normalizeCrlf(rawRequest)
         // One charset for the Content-Length count and the bytes on the wire.
         val charset = RequestHygiene.wireCharset(normalized)
-        val cleaned = if (autoFixContentLength) {
-            val fix = RequestHygiene.fixContentLength(normalized, utf8Body = charset == Charsets.UTF_8)
-            if (fix.rewrittenFrom != null && fixReport != null) {
-                fixReport["content_length_rewritten"] = buildJsonObject {
-                    put("from", fix.rewrittenFrom)
-                    put("to", fix.rewrittenTo)
+        val cleaned =
+            if (autoFixContentLength) {
+                val fix =
+                    RequestHygiene.fixContentLength(
+                        normalized,
+                        utf8Body = charset == Charsets.UTF_8,
+                    )
+                if (fix.rewrittenFrom != null && fixReport != null) {
+                    fixReport["content_length_rewritten"] = buildJsonObject {
+                        put("from", fix.rewrittenFrom)
+                        put("to", fix.rewrittenTo)
+                    }
                 }
+                fix.request
+            } else {
+                normalized
             }
-            fix.request
-        } else {
-            normalized
-        }
         val bytes = BurpByteArray.byteArray(*cleaned.toByteArray(charset))
 
         if (url != null) {
@@ -262,7 +348,10 @@ internal object HttpRequestBuilder {
         // Modern web default: TLS:443 unless the caller says otherwise.
         val effectivePort = port ?: hostHeaderPort ?: if (useTls == false) 80 else 443
         val effectiveTls = useTls ?: (effectivePort != 80)
-        return HttpRequest.httpRequest(HttpService.httpService(resolvedHost, effectivePort, effectiveTls), bytes)
+        return HttpRequest.httpRequest(
+            HttpService.httpService(resolvedHost, effectivePort, effectiveTls),
+            bytes,
+        )
     }
 
     /** The complete request text built from the URL with the caller's headers byte-exact. */
@@ -275,9 +364,12 @@ internal object HttpRequestBuilder {
         portOverride: Int?,
         tlsOverride: Boolean?,
     ): HttpRequest {
-        val (svcHost, svcPort, svcTls) = resolveService(url, hostOverride, portOverride, tlsOverride)
-        val rawHttp = constructRawHttpRequest(url, method ?: "GET", headers, body, svcHost, svcPort, svcTls)
-        val bytes = BurpByteArray.byteArray(*rawHttp.toByteArray(RequestHygiene.wireCharset(rawHttp)))
+        val (svcHost, svcPort, svcTls) =
+            resolveService(url, hostOverride, portOverride, tlsOverride)
+        val rawHttp =
+            constructRawHttpRequest(url, method ?: "GET", headers, body, svcHost, svcPort, svcTls)
+        val bytes =
+            BurpByteArray.byteArray(*rawHttp.toByteArray(RequestHygiene.wireCharset(rawHttp)))
         return HttpRequest.httpRequest(HttpService.httpService(svcHost, svcPort, svcTls), bytes)
     }
 
@@ -298,8 +390,14 @@ internal object HttpRequestBuilder {
         if (hostOverride != null || portOverride != null || tlsOverride != null) {
             // Same resolution as the preserve-headers path, so an override means the same on both;
             // Montoya's own URL parse supplies the host when java.net.URI cannot.
-            val montoyaHost = try { req.httpService()?.host() } catch (_: Exception) { null }
-            val (svcHost, svcPort, svcTls) = resolveService(url, hostOverride, portOverride, tlsOverride, montoyaHost)
+            val montoyaHost =
+                try {
+                    req.httpService()?.host()
+                } catch (_: Exception) {
+                    null
+                }
+            val (svcHost, svcPort, svcTls) =
+                resolveService(url, hostOverride, portOverride, tlsOverride, montoyaHost)
             req = req.withService(HttpService.httpService(svcHost, svcPort, svcTls))
         }
         return req
@@ -318,16 +416,22 @@ internal object HttpRequestBuilder {
     ): Triple<String, Int, Boolean> {
         val parts = splitUrl(url)
         val urlHost = parts?.authority?.let { parseHostValue(it) }
-        val tls = tlsOverride ?: (parts?.scheme?.equals("https", ignoreCase = true) ?: url.startsWith("https", ignoreCase = true))
-        val host = hostOverride ?: urlHost?.first ?: fallbackHost
-            ?: throw IllegalArgumentException("url must be absolute (scheme://host/path): $url")
+        val tls =
+            tlsOverride
+                ?: (parts?.scheme?.equals("https", ignoreCase = true)
+                    ?: url.startsWith("https", ignoreCase = true))
+        val host =
+            hostOverride
+                ?: urlHost?.first
+                ?: fallbackHost
+                ?: throw IllegalArgumentException("$URL_NOT_ABSOLUTE (scheme://host/path): $url")
         val port = portOverride ?: urlHost?.second ?: if (tls) 443 else 80
         return Triple(host, port, tls)
     }
 
     /**
-     * Constructs a complete raw HTTP/1.1 request from structured parameters. Caller headers are kept
-     * exactly; Host and Content-Length are only added when missing.
+     * Constructs a complete raw HTTP/1.1 request from structured parameters. Caller headers are
+     * kept exactly; Host and Content-Length are only added when missing.
      */
     fun constructRawHttpRequest(
         url: String,
@@ -338,17 +442,22 @@ internal object HttpRequestBuilder {
         port: Int,
         tls: Boolean,
     ): String {
-        // The target goes out exactly as written: no decoding, no re-encoding, never replaced by "/".
+        // The target goes out exactly as written: no decoding, no re-encoding, never replaced by
+        // "/".
         val parts = splitUrl(url)
         val requestTarget = parts?.target ?: url.ifEmpty { "/" }
 
         // Host is the URL's authority as written; a host/port override only moves the connection.
-        val hostHeader = parts?.authority?.ifEmpty { null } ?: run {
-            val isDefaultPort = (tls && port == 443) || (!tls && port == 80)
-            // A bare IPv6 literal (host override "::1") gets its brackets back for the Host header.
-            val hostLiteral = if (host.contains(':') && !host.startsWith("[")) "[$host]" else host
-            if (isDefaultPort) hostLiteral else "$hostLiteral:$port"
-        }
+        val hostHeader =
+            parts?.authority?.ifEmpty { null }
+                ?: run {
+                    val isDefaultPort = (tls && port == 443) || (!tls && port == 80)
+                    // A bare IPv6 literal (host override "::1") gets its brackets back for the Host
+                    // header.
+                    val hostLiteral =
+                        if (host.contains(':') && !host.startsWith("[")) "[$host]" else host
+                    if (isDefaultPort) hostLiteral else "$hostLiteral:$port"
+                }
 
         val sb = StringBuilder()
         sb.append("$method $requestTarget HTTP/1.1\r\n")
@@ -359,11 +468,14 @@ internal object HttpRequestBuilder {
         headers.forEach { (k, v) -> sb.append("$k: $v\r\n") }
 
         val hasContentLength = headers.keys.any { it.equals("Content-Length", ignoreCase = true) }
-        val hasTransferEncoding = headers.keys.any { it.equals("Transfer-Encoding", ignoreCase = true) }
+        val hasTransferEncoding =
+            headers.keys.any { it.equals("Transfer-Encoding", ignoreCase = true) }
         if (body != null && !hasContentLength && !hasTransferEncoding) {
             // Counted in the charset the whole request is sent with: a wide char anywhere (even in
             // a header) sends the body's Latin-1 chars as two UTF-8 bytes each.
-            val charset = if (RequestHygiene.wireCharset(sb) == Charsets.UTF_8) Charsets.UTF_8 else RequestHygiene.wireCharset(body)
+            val charset =
+                if (RequestHygiene.wireCharset(sb) == Charsets.UTF_8) Charsets.UTF_8
+                else RequestHygiene.wireCharset(body)
             sb.append("Content-Length: ${body.toByteArray(charset).size}\r\n")
         }
 
@@ -389,24 +501,34 @@ internal object HttpRequestBuilder {
         return null
     }
 
-    /** Host and port of a Host header value or URL authority (`h`, `h:8080`, `[::1]:8443`, bare IPv6). */
+    /**
+     * Host and port of a Host header value or URL authority (`h`, `h:8080`, `[::1]:8443`, bare
+     * IPv6).
+     */
     internal fun parseHostValue(value: String): Pair<String, Int?>? {
         if (value.isEmpty() || value.any { it.isWhitespace() }) return null
         if (value.startsWith("[")) {
             val close = value.indexOf(']')
             if (close <= 1) return null
-            val port = value.substring(close + 1).takeIf { it.startsWith(":") }?.let { parsePort(it.substring(1)) }
+            val port =
+                value
+                    .substring(close + 1)
+                    .takeIf { it.startsWith(":") }
+                    ?.let { parsePort(it.substring(1)) }
             return value.substring(1, close) to port
         }
         val colon = value.indexOf(':')
         return when {
             colon < 0 -> value to null
-            value.indexOf(':', colon + 1) >= 0 -> value to null // bare IPv6 literal: every colon is the address's
+            value.indexOf(':', colon + 1) >= 0 ->
+                value to null // bare IPv6 literal: every colon is the address's
             colon == 0 -> null
             else -> value.substring(0, colon) to parsePort(value.substring(colon + 1))
         }
     }
 
     private fun parsePort(s: String): Int? =
-        s.takeIf { it.isNotEmpty() && it.all { c -> c in '0'..'9' } }?.toIntOrNull()?.takeIf { it in 1..65535 }
+        s.takeIf { it.isNotEmpty() && it.all { c -> c in '0'..'9' } }
+            ?.toIntOrNull()
+            ?.takeIf { it in 1..65535 }
 }

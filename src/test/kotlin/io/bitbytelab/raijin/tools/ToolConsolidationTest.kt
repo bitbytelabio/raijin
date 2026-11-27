@@ -459,7 +459,11 @@ class ToolConsolidationTest {
                     put("data", "x")
                 },
             )
-        assertEquals("""util_hash:{"algorithm":"SHA_256","data":"x"}""", text(r))
+        assertEquals(
+            "note: ran action 'sha256' as 'hash' with {\"algorithm\":\"SHA_256\"}\n\n" +
+                """util_hash:{"algorithm":"SHA_256","data":"x"}""",
+            text(r),
+        )
     }
 
     @Test

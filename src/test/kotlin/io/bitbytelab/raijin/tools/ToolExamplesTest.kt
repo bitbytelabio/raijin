@@ -58,7 +58,7 @@ class ToolExamplesTest {
                         else ->
                             return@mapNotNull "$key: grouped tools need tool.action, others the tool name"
                     }
-                val needed = schema.second - ToolExamples.ID_SOURCES[tool].orEmpty().keys
+                val needed = schema.second - ToolExamples.ids(tool, action).keys
                 if (ToolArgs.fits(args, schema.first, needed)) null
                 else "$key: $args does not fit ${schema.first.keys}"
             }
@@ -144,7 +144,110 @@ class ToolExamplesTest {
          * Catalog examples that still show a `"<param>"` placeholder; lower it as real values are
          * added.
          */
-        const val MAX_PLACEHOLDER_EXAMPLES = 37
+        const val MAX_PLACEHOLDER_EXAMPLES = 8
+    }
+
+    @Test
+    fun `every catalog example runs clean`() {
+        val text =
+            javaClass.getResourceAsStream("/catalog/tools.json")!!.readBytes().decodeToString()
+        val tools =
+            Json.parseToJsonElement(text).jsonObject.getValue("tools").jsonArray.map {
+                it.jsonObject
+            }
+        val published = real.value.published.tools
+        // (call, tool, action, example, props, required) of every catalog call.
+        data class Call(
+            val name: String,
+            val tool: String,
+            val action: String?,
+            val example: JsonObject,
+            val props: JsonObject,
+            val required: Set<String>,
+        )
+        fun JsonObject.names(key: String) =
+            (this[key] as? JsonArray).orEmpty().map { it.jsonPrimitive.content }.toSet()
+        val calls = tools.flatMap { t ->
+            val name = t.getValue("name").jsonPrimitive.content
+            val actions = t["actions"] as? JsonObject
+            if (actions == null) {
+                val schema = t.getValue("inputSchema").jsonObject
+                val props = schema["properties"] as? JsonObject ?: JsonObject(emptyMap())
+                val required = schema.names("required")
+                val own =
+                    (t["example"] as? JsonObject)?.let {
+                        Call(name, name, null, it, props, required)
+                    }
+                val built =
+                    published[name]?.let {
+                        Call(
+                            name,
+                            name,
+                            null,
+                            ToolArgs.example(name, null, props, required),
+                            props,
+                            required,
+                        )
+                    }
+                listOfNotNull(own, built)
+            } else {
+                actions.map { (a, spec) ->
+                    val s = spec.jsonObject
+                    Call(
+                        "$name.$a",
+                        name,
+                        a,
+                        s.getValue("example").jsonObject,
+                        s["properties"] as? JsonObject ?: JsonObject(emptyMap()),
+                        s.names("required"),
+                    )
+                }
+            }
+        }
+        val bad =
+            calls
+                .filter { !ToolNames.destructive(it.tool, it.action, published[it.tool]?.tool) }
+                .mapNotNull { c ->
+                    val args = JsonObject(c.example - "do" - "action")
+                    val placeholder =
+                        args.entries.firstOrNull { (k, v) -> v == JsonPrimitive("<$k>") }
+                    when {
+                        placeholder != null -> "${c.name}: placeholder ${placeholder.key}"
+                        !ToolArgs.fits(
+                            args,
+                            c.props,
+                            c.required - ToolExamples.ids(c.tool, c.action).keys,
+                        ) -> "${c.name}: $args does not fit"
+                        else -> null
+                    }
+                }
+        assertEquals(emptyList(), bad)
+    }
+
+    @Test
+    fun `a call missing only an id points at the call that lists it, without an example`() {
+        val turbo = real.value.published.tools.getValue("turbo_run")
+        val result = runBlocking {
+            turbo.handler(
+                testClientConnection,
+                CallToolRequest(
+                    CallToolRequestParams(
+                        "turbo_run",
+                        JsonObject(mapOf("action" to JsonPrimitive("results"))),
+                    ),
+                ),
+            )
+        }
+        val text = (result.content.single() as TextContent).text
+        val body = Json.parseToJsonElement(text).jsonObject
+        assertEquals(JsonPrimitive("missing_parameter"), body["code"], text)
+        val error = body.getValue("error").jsonPrimitive.content
+        assertTrue(
+            "First list them with turbo_run.list" in error && "as in 'example'" !in error,
+            text,
+        )
+        assertTrue("example" !in body, text)
+        assertEquals(JsonObject(mapOf("do" to JsonPrimitive("turbo_run.list"))), body["see"], text)
     }
 
     @Test

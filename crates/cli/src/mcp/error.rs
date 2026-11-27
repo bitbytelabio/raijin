@@ -181,7 +181,8 @@ impl ToolError {
 
 /// `result` with `notes` (what the server changed in the call) in its `notes` array. Only a result
 /// that is one text block holding a JSON object takes them: `notes` is added, or appended to when it
-/// is already an array; any other result is returned as is.
+/// is already an array. A text block that is not JSON at all gets them as a leading `note: ...`
+/// line; any other result is returned as is. Same rule as the extension's `ToolArgs.withNotes`.
 pub fn with_notes(mut result: CallToolResult, notes: &[String]) -> CallToolResult {
     if notes.is_empty() || result.content.len() != 1 {
         return result;
@@ -189,8 +190,15 @@ pub fn with_notes(mut result: CallToolResult, notes: &[String]) -> CallToolResul
     let Some(text) = result.content[0].as_text() else {
         return result;
     };
-    let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(&text.text) else {
-        return result;
+    let mut object = match serde_json::from_str::<Value>(&text.text) {
+        Ok(Value::Object(object)) => object,
+        Ok(_) => return result,
+        // Plain text (a playbook, the overview): the notes go in front of it.
+        Err(_) => {
+            let prefixed = format!("note: {}\n\n{}", notes.join("; "), text.text);
+            result.content[0] = ContentBlock::text(prefixed);
+            return result;
+        }
     };
     match object.get_mut("notes") {
         None => {
@@ -296,6 +304,15 @@ pub fn strip_server_prefix(name: &str) -> Option<&str> {
     })
 }
 
+/// `s` trimmed and without one pair of matching surrounding quotes (`"`, `'` or a backtick), or
+/// None when it is not quoted. Same rule as the extension's `ToolArgs.unquote`.
+pub fn unquote(s: &str) -> Option<&str> {
+    let t = s.trim();
+    let first = t.chars().next()?;
+    (t.chars().count() >= 2 && matches!(first, '"' | '\'' | '`') && t.ends_with(first))
+        .then(|| &t[1..t.len() - 1])
+}
+
 /// Name normal form: trimmed, lowercase, `-`, `.`, `/` and spaces as `_`.
 pub fn norm(name: &str) -> String {
     name.trim()
@@ -365,10 +382,15 @@ mod tests {
     }
 
     #[test]
-    fn notes_join_a_json_object_result_only() {
+    fn notes_join_a_json_object_result_or_lead_plain_text() {
         let plain = CallToolResult::success(vec![ContentBlock::text("not json")]);
-        let same = with_notes(plain.clone(), &["n".to_owned()]);
-        assert_eq!(same, plain);
+        let led = with_notes(plain, &["n".to_owned(), "m".to_owned()]);
+        assert_eq!(
+            led.content[0].as_text().map(|t| t.text.as_str()),
+            Some("note: n; m\n\nnot json")
+        );
+        let array = CallToolResult::success(vec![ContentBlock::text("[1]")]);
+        assert_eq!(with_notes(array.clone(), &["n".to_owned()]), array);
         let object = CallToolResult::success(vec![ContentBlock::text(r#"{"a":1,"notes":["x"]}"#)]);
         let noted = with_notes(object, &["y".to_owned()]);
         assert_eq!(

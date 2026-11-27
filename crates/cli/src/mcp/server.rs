@@ -27,13 +27,13 @@ use tokio::sync::OnceCell;
 use super::api::{ApiError, Endpoint, ToolApi};
 use super::args::{call_fits, parse_args, schema_of};
 use super::error::{self, Code, ToolError, guide_call};
-use super::spill;
+use super::{spill, stdin};
 use crate::burp::{instance, launch};
 use crate::catalog::{self, ActionSpec, Catalog, SKILL_FILE, ToolSpec};
 use crate::config::{Mode, Remote, Target, user_state_dir};
 use crate::history;
 use crate::jar::{self, Assets};
-use crate::util::{contains_near, edit_distance, suggest, truncate_utf8};
+use crate::util::{contains_near, edit_distance, suggest, suggest_call, truncate_utf8};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Surface {
@@ -299,6 +299,68 @@ fn with_project(mut result: CallToolResult, project: &str) -> CallToolResult {
     result
 }
 
+/// Whether `value` is what a strict-mode client sends for a property it has nothing for: a blank
+/// string, `[]` or `{}`.
+fn is_empty_value(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        _ => false,
+    }
+}
+
+/// Reads what a `run` call holds besides the call itself, each reading noted: an empty `do`,
+/// `batch` or `project` (a strict-mode client fills every property) is dropped, and without a
+/// call key a pasted `see` (`{"see":{"do":"turbo_run.list"}}`) becomes the call. A pasted guide
+/// call (`{"guide":{"topic":"util.hash"}}`) gives `Some` with guide's arguments, every other key
+/// but `project` noted as ignored.
+fn read_pasted_calls(raw: &mut JsonObject, notes: &mut Vec<String>) -> Option<JsonObject> {
+    for key in ["do", "batch", "project"] {
+        match raw.get(key) {
+            Some(Value::Null) => {
+                raw.remove(key);
+            }
+            Some(v) if is_empty_value(v) => {
+                raw.remove(key);
+                notes.push(format!("ignored empty '{key}'"));
+            }
+            _ => {}
+        }
+    }
+    if CALL_KEYS.iter().any(|k| raw.contains_key(*k)) {
+        return None;
+    }
+    if let Some(Value::Object(_)) = raw.get("see")
+        && let Some(Value::Object(see)) = raw.remove("see")
+    {
+        for (k, v) in see {
+            raw.entry(k).or_insert(v);
+        }
+        notes.push("read 'see' as the call to make".to_owned());
+        if CALL_KEYS.iter().any(|k| raw.contains_key(*k)) {
+            return None;
+        }
+    }
+    let guide = raw.remove("guide")?;
+    let args = match guide {
+        Value::Object(o) => o,
+        Value::String(s) => {
+            let mut o = JsonObject::new();
+            o.insert("topic".to_owned(), json!(s));
+            o
+        }
+        _ => JsonObject::new(),
+    };
+    notes.extend(
+        raw.keys()
+            .filter(|k| k.as_str() != "project")
+            .map(|k| format!("ignored '{k}' next to \"guide\"")),
+    );
+    notes.push("ran guide; tool calls go in \"do\"".to_owned());
+    Some(args)
+}
+
 /// `batch` given as `kind` ("a string", "an object", ...) instead of an array.
 fn batch_type_error(kind: &str, got: Value) -> CallToolResult {
     ToolError::new(
@@ -383,6 +445,34 @@ fn read_bail(value: Option<Value>) -> Result<(bool, Option<String>), ToolError> 
     }
 }
 
+/// `bail` taken out of every batch step, each noted: it belongs next to `batch`, so the first one
+/// is the batch's (`Some`) unless `bail_given` (one was next to `batch`), and the rest are ignored.
+/// A step `bail` that is no boolean is refused as [`read_bail`] refuses it.
+fn take_step_bail(
+    steps: &mut [Value],
+    bail_given: bool,
+    notes: &mut Vec<String>,
+) -> Result<Option<bool>, ToolError> {
+    let mut bail = None;
+    for (i, step) in steps.iter_mut().enumerate() {
+        let Some(step_bail) = step.as_object_mut().and_then(|s| s.remove("bail")) else {
+            continue;
+        };
+        let n = i + 1;
+        if bail_given || bail.is_some() {
+            notes.push(format!(
+                "ignored 'bail' in step {n}; set it once next to batch"
+            ));
+            continue;
+        }
+        let (b, note) = read_bail(Some(step_bail))?;
+        notes.extend(note);
+        notes.push(format!("read 'bail' from step {n} as the batch's bail"));
+        bail = Some(b);
+    }
+    Ok(bail)
+}
+
 /// A history tool's failure as an envelope: a bad ref is `invalid_arguments`, a ref with nothing
 /// behind it `not_found`, an unknown project `invalid_enum` with the known ones (and `retry` when
 /// there is only one); anything else `tool_failed`.
@@ -404,6 +494,14 @@ fn history_error(tool: &str, e: &anyhow::Error, sent: &JsonObject) -> ToolError 
         Some(history::Problem::NotFound(message)) => {
             ToolError::new(Code::NotFound, format!("{tool}: {message}.")).see(list)
         }
+        Some(history::Problem::BadPattern { pattern, reason }) => ToolError::new(
+            Code::InvalidArguments,
+            format!(
+                "{tool}: 'pattern' is not a valid regex ({reason}); escape regex characters such as [ ( . * with a backslash to match them literally."
+            ),
+        )
+        .param("pattern")
+        .got(json!(pattern)),
         // The project came from a ref (`history_show`, `history_diff`): the ref is what to fix.
         Some(history::Problem::UnknownProject { wanted, known })
             if !sent.contains_key("project") =>
@@ -668,6 +766,7 @@ fn named_without_do(
         .into_iter()
         .find(|k| raw.get(*k).is_some_and(Value::is_string))
     {
+        notes.push(format!("read '{key}' as 'do'"));
         return raw.remove(key);
     }
     if let Some(Value::Object(function)) = raw.get("function")
@@ -751,6 +850,59 @@ fn parenthesised(tool: &str) -> Option<(String, Option<SuffixArgs>)> {
     Some((name.to_owned(), Some(args)))
 }
 
+/// What names the tool of a `run` call, removed from `raw`: `do`, else [`named_without_do`]. A
+/// whole call in `do` (`"{\"do\":\"history_list\",\"limit\":1}"`, or the object itself) gives its
+/// `do`, and its other keys join `raw` where `raw` lacks them. Each reading is noted.
+fn named_tool(
+    raw: &mut JsonObject,
+    names_tool: &impl Fn(&str) -> bool,
+    notes: &mut Vec<String>,
+) -> Option<Value> {
+    let mut named = match raw.remove("do") {
+        Some(value) => Some(value),
+        None => named_without_do(raw, names_tool, notes),
+    };
+    if let Some(Value::String(s)) = &named
+        && s.trim_start().starts_with('{')
+        && let Ok(call) = serde_json::from_str::<JsonObject>(s)
+    {
+        notes.push("read 'do' as a JSON call".to_owned());
+        named = Some(Value::Object(call));
+    }
+    let Some(Value::Object(inner)) = &mut named else {
+        return named;
+    };
+    if !inner.contains_key("do") {
+        return named;
+    }
+    let mut tool = None;
+    for (k, v) in std::mem::take(inner) {
+        if k == "do" {
+            tool = Some(v);
+        } else {
+            raw.entry(k).or_insert(v);
+        }
+    }
+    tool
+}
+
+/// `tool` without surrounding quotes (`` `history_list` ``) and a server prefix (`mcp__raijin__`),
+/// each reading noted.
+fn bare_tool_name(tool: String, notes: &mut Vec<String>) -> String {
+    let mut tool = tool;
+    if let Some(inner) = error::unquote(&tool) {
+        let inner = inner.trim().to_owned();
+        notes.push(format!("read '{tool}' as {inner}"));
+        tool = inner;
+    }
+    if let Some(stripped) = error::strip_server_prefix(&tool) {
+        let stripped = stripped.trim().to_owned();
+        notes.push(format!("read '{tool}' as {stripped}"));
+        tool = stripped;
+    }
+    tool
+}
+
 /// Reads a `run` call: `do` (else a [`NAMING_KEYS`] string, an `OpenAI` function call, or an
 /// `action` that `names_tool`) names the tool, without a server prefix (`mcp__raijin__`) and with
 /// a `(k=v, ...)` suffix read as arguments. `project` picks the Burp unless the tool takes a
@@ -764,11 +916,18 @@ fn normalize_run(
     names_tool: impl Fn(&str) -> bool,
 ) -> Result<Call, ToolError> {
     let mut notes = Vec::new();
-    let named = match raw.remove("do") {
-        Some(value) => Some(value),
-        None => named_without_do(&mut raw, &names_tool, &mut notes),
-    };
-    let mut tool = match named {
+    // A strict-mode client fills `project` even when it has none.
+    match raw.get("project") {
+        Some(Value::Null) => {
+            raw.remove("project");
+        }
+        Some(Value::String(p)) if p.trim().is_empty() => {
+            raw.remove("project");
+            notes.push("ignored empty 'project'".to_owned());
+        }
+        _ => {}
+    }
+    let mut tool = match named_tool(&mut raw, &names_tool, &mut notes) {
         Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_owned(),
         None | Some(Value::Null | Value::String(_)) => {
             return Err(ToolError::new(Code::MissingParameter, MISSING_DO)
@@ -790,11 +949,7 @@ fn normalize_run(
             .see(guide_call(None)));
         }
     };
-    if let Some(stripped) = error::strip_server_prefix(&tool) {
-        let stripped = stripped.trim().to_owned();
-        notes.push(format!("read '{tool}' as {stripped}"));
-        tool = stripped;
-    }
+    tool = bare_tool_name(tool, &mut notes);
     if let Some((name, args)) = parenthesised(&tool) {
         let with = match args {
             None => "; its arguments were not read (a quoted value holds a comma): pass them as keys next to \"do\"".to_owned(),
@@ -836,6 +991,7 @@ fn normalize_run(
         match wrapped {
             Some(wrapped) => {
                 raw.remove(key);
+                notes.push(format!("read the parameters inside '{key}'"));
                 for (k, v) in wrapped {
                     raw.entry(k).or_insert(v);
                 }
@@ -933,37 +1089,42 @@ fn safe_call_schema(catalog: &Catalog, hit: &str) -> Option<JsonObject> {
     }
 }
 
-/// `unknown_tool` for `tool`: up to three near call names in `did_you_mean`, and `retry` only when
-/// exactly one is near enough to be certain (edit distance ≤ 2, or contained in `tool`, and not
-/// `tool` itself), names
-/// one call exactly (an action for a grouped tool), removes or stops nothing, and takes `arguments`
-/// as they are.
+/// `unknown_tool` for `tool`: up to three call names by intent ([`suggest_call`]) in
+/// `did_you_mean`, and `retry` only when one is certain (the single hit within edit distance 2 or
+/// contained in `tool`, or the only hit saying the same words) and not `tool` itself, names one
+/// call exactly (an action for a grouped tool), removes or stops nothing, and takes `arguments` as
+/// they are.
 fn unknown_tool_error(catalog: &Catalog, tool: &str, arguments: &JsonObject) -> ToolError {
     let mut names = catalog.suggestion_names();
     names.extend(LOCAL_TOOLS.iter().map(|t| t.name.to_owned()));
-    let hits: Vec<String> = suggest(tool, names.iter().map(String::as_str), 3)
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    let found = suggest_call(tool, names.iter().map(String::as_str), 3);
+    let hits: Vec<String> = found.iter().map(|s| s.name.to_owned()).collect();
     let mut err = ToolError::new(
         Code::UnknownTool,
         format!("unknown tool \"{tool}\"; guide {{}} lists every tool."),
     )
     .see(guide_call(None));
-    if let [hit] = hits.as_slice() {
-        let (w, h) = (error::norm(tool), error::norm(hit));
-        // The same name (an extension older than the catalog lacks it) would only fail again.
-        let near =
-            w != h && (edit_distance(&w, &h) <= 2 || (w.contains(&h) && contains_near(&w, &h)));
-        if near
-            && let Some(schema) = safe_call_schema(catalog, hit)
-            && call_fits(&schema, arguments)
-        {
-            let mut call = Map::new();
-            call.insert("do".to_owned(), json!(hit));
-            call.extend(arguments.clone());
-            err = err.retry(Value::Object(call));
+    let w = error::norm(tool);
+    let near = match found.as_slice() {
+        [only] => {
+            let h = error::norm(only.name);
+            edit_distance(&w, &h) <= 2 || (w.contains(&h) && contains_near(&w, &h))
         }
+        _ => false,
+    };
+    let same_words = found.first().is_some_and(|s| s.same_words)
+        && found.iter().filter(|s| s.same_words).count() == 1;
+    // The same name (an extension older than the catalog lacks it) would only fail again.
+    if let Some(hit) = found.first().map(|s| s.name)
+        && (near || same_words)
+        && error::norm(hit) != w
+        && let Some(schema) = safe_call_schema(catalog, hit)
+        && call_fits(&schema, arguments)
+    {
+        let mut call = Map::new();
+        call.insert("do".to_owned(), json!(hit));
+        call.extend(arguments.clone());
+        err = err.retry(Value::Object(call));
     }
     err.did_you_mean(hits)
 }
@@ -1053,6 +1214,27 @@ pub struct Gateway {
     inline_limit: usize,
     assets: OnceCell<Result<Arc<Assets>, String>>,
     api: ToolApi,
+    /// Projects whose "is running; data may be incomplete" warning this session already gave.
+    warned_live: std::sync::Mutex<BTreeSet<String>>,
+}
+
+/// `value`'s `warnings` without the live-project warning ([`history::source::LIVE_INCOMPLETE`]) of
+/// a project already in `seen`; a project whose warning is kept is added to `seen`. Other warnings
+/// stay, and an empty array stays `[]`.
+fn drop_repeated_live_warnings(value: &mut Value, seen: &mut BTreeSet<String>) {
+    let Some(Value::Array(warnings)) = value.get_mut("warnings") else {
+        return;
+    };
+    warnings.retain(|w| {
+        let live = w
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|e| e.ends_with(history::source::LIVE_INCOMPLETE));
+        let Some(project) = w.get("project").and_then(Value::as_str) else {
+            return true;
+        };
+        !live || seen.insert(project.to_owned())
+    });
 }
 
 pub async fn serve(surface: Surface, remote_flag: Option<String>) -> Result<()> {
@@ -1082,8 +1264,11 @@ pub async fn serve(surface: Surface, remote_flag: Option<String>) -> Result<()> 
         inline_limit: usize::try_from(inline_kb.saturating_mul(1024)).unwrap_or(usize::MAX),
         assets: OnceCell::new(),
         api: ToolApi::new(),
+        warned_live: std::sync::Mutex::default(),
     };
-    let service = gateway.serve(rmcp::transport::stdio()).await?;
+    let service = gateway
+        .serve((stdin::repaired_stdin(), tokio::io::stdout()))
+        .await?;
     service.waiting().await?;
     Ok(())
 }
@@ -1229,6 +1414,9 @@ impl Gateway {
     async fn run(&self, raw: Option<JsonObject>) -> CallToolResult {
         let mut raw = raw.unwrap_or_default();
         let mut notes = Vec::new();
+        if let Some(guide) = read_pasted_calls(&mut raw, &mut notes) {
+            return error::with_notes(self.guide_tool(Some(guide)).await, &notes);
+        }
         let assets = self.assets().await.ok();
         let catalog = assets.as_deref().map(|a| &a.catalog);
         // `steps` is what other tools call a batch, unless a tool is named (`action` naming one
@@ -1246,6 +1434,7 @@ impl Gateway {
             notes.push("read 'steps' as 'batch'".to_owned());
             raw.insert("batch".to_owned(), steps);
         }
+        let bail_given = raw.get("bail").is_some_and(|v| !v.is_null());
         let bail = match read_bail(raw.remove("bail")) {
             Ok((bail, note)) => {
                 notes.extend(note);
@@ -1253,16 +1442,16 @@ impl Gateway {
             }
             Err(e) => return e.into_result(),
         };
-        // A client may fill every declared property; a null `batch` means no batch.
-        if let Some(batch) = raw.remove("batch").filter(|b| !b.is_null()) {
+        if let Some(batch) = raw.remove("batch") {
             if CALL_KEYS
                 .iter()
                 .any(|k| *k != "batch" && raw.contains_key(*k))
             {
                 return ToolError::new(
                     Code::InvalidArguments,
-                    "run: pass either do or batch, not both.",
+                    "run: pass either do or batch, not both: drop \"batch\" to run one tool, or move the \"do\" call into batch.",
                 )
+                .param("batch")
                 .into_result();
             }
             if let Some(extra) = raw.keys().find(|k| k.as_str() != "project") {
@@ -1308,7 +1497,7 @@ impl Gateway {
                 .get("project")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            return self.batch(steps, bail, project, &notes).await;
+            return self.batch(steps, bail, bail_given, project, &notes).await;
         }
         let result = match normalize_run(
             raw,
@@ -1328,15 +1517,17 @@ impl Gateway {
     async fn batch(
         &self,
         steps: Vec<Value>,
-        bail: bool,
+        mut bail: bool,
+        bail_given: bool,
         project: Option<String>,
         notes: &[String],
     ) -> CallToolResult {
         let assets = self.assets().await.ok();
         let catalog = assets.as_deref().map(|a| &a.catalog);
         let total = steps.len();
+        let mut notes = notes.to_vec();
         // A bare name is a step without parameters: "burp_status" is {"do":"burp_status"}.
-        let steps: Vec<Value> = steps
+        let mut steps: Vec<Value> = steps
             .into_iter()
             .map(|step| match step {
                 Value::String(name) => json!({ "do": name }),
@@ -1352,6 +1543,11 @@ impl Gateway {
                 other => other,
             })
             .collect();
+        match take_step_bail(&mut steps, bail_given, &mut notes) {
+            Ok(Some(step_bail)) => bail = step_bail,
+            Ok(None) => {}
+            Err(e) => return error::with_notes(e.into_result(), &notes),
+        }
         let mut out = Vec::with_capacity(total);
         let mut failures: Vec<(usize, Value)> = Vec::new();
         let mut stopped_after = None;
@@ -1408,7 +1604,7 @@ impl Gateway {
         let not_run: &[Value] = stopped_after.map_or(&[], |k| &steps[k..]);
         let retry = batch_retry(&failures, not_run, bail);
         let result = batch_result(out, &failures, stopped_after, total, retry);
-        self.spill(error::with_notes(result, notes), "batch")
+        self.spill(error::with_notes(result, &notes), "batch")
     }
 
     async fn run_one(&self, call: Call) -> CallToolResult {
@@ -1610,15 +1806,16 @@ impl Gateway {
         arguments: Option<JsonObject>,
         project: Option<&str>,
     ) -> CallToolResult {
+        let mut notes = Vec::new();
         // A `/` would split the API path: `scope/check` means `scope.check`.
         let dotted;
         let tool = if tool.contains('/') {
             dotted = tool.replace('/', ".");
+            notes.push(format!("read '{tool}' as {dotted}"));
             dotted.as_str()
         } else {
             tool
         };
-        let mut notes = Vec::new();
         let project: Option<String> = match project {
             None => None,
             Some(wanted) => match self.resolve_project(wanted) {
@@ -1717,6 +1914,24 @@ impl Gateway {
                     .retry(json!({"batch": [up, call], "bail": true}))
                     .into_result()
             }
+        }
+    }
+
+    /// The `guide` tool: its arguments read leniently ([`topic_alias`], [`only_topic`]), each
+    /// reading noted.
+    async fn guide_tool(&self, arguments: Option<JsonObject>) -> CallToolResult {
+        let (arguments, renamed) = topic_alias(arguments);
+        let (arguments, ignored) = only_topic(arguments);
+        match parse_args::<GuideArgs>("guide", arguments, &json!({"topic": "overview"}), false) {
+            Ok((args, mut notes)) => {
+                notes.extend(renamed);
+                notes.extend(ignored);
+                error::with_notes(self.guide(args).await, &notes)
+            }
+            Err(e) => e
+                .clear_example()
+                .see(guide_call(Some("overview")))
+                .into_result(),
         }
     }
 
@@ -1963,6 +2178,12 @@ impl Gateway {
                 ),
             )
         };
+        // `notes` is an array, as in every result, so the call's own notes join it.
+        let notes: Vec<String> = if notes.is_empty() {
+            Vec::new()
+        } else {
+            vec![notes]
+        };
         Some(json!({
             "domain": domain,
             "description": description,
@@ -2097,8 +2318,11 @@ impl Gateway {
             outcome = run_history_blocking(target, local, Some(sent.clone())).await;
         }
         let result = match outcome {
-            Ok((value, parsed)) => {
+            Ok((mut value, parsed)) => {
                 notes.extend(parsed);
+                if let Ok(mut seen) = self.warned_live.lock() {
+                    drop_repeated_live_warnings(&mut value, &mut seen);
+                }
                 text(&value)
             }
             Err(HistoryFailure::Refused(e)) => e.into_result(),
@@ -2366,24 +2590,37 @@ fn sentence_topics(topic: &str, catalog: Option<&Catalog>) -> Vec<String> {
     scored.into_iter().take(3).map(|(_, name)| name).collect()
 }
 
-/// `guide` arguments with `name`, `tool` or `do` read as `topic` (when no topic is given), and the
-/// note saying so.
-fn topic_alias(arguments: Option<JsonObject>) -> (Option<JsonObject>, Option<String>) {
+/// `guide` arguments with the topic found: `name`, `tool` or `do` read as `topic` when no topic is
+/// given, else the one key of the call when it holds a string (`topc`), and a server prefix
+/// (`mcp__raijin__`) stripped off the topic; a note per reading.
+fn topic_alias(arguments: Option<JsonObject>) -> (Option<JsonObject>, Vec<String>) {
     let Some(mut arguments) = arguments else {
-        return (None, None);
+        return (None, Vec::new());
     };
-    if arguments.get("topic").is_some_and(|t| !t.is_null()) {
-        return (Some(arguments), None);
+    let mut notes = Vec::new();
+    if arguments.get("topic").is_none_or(Value::is_null) {
+        let key = ["name", "tool", "do"]
+            .into_iter()
+            .find(|k| arguments.contains_key(*k))
+            .map(str::to_owned)
+            .or_else(|| match arguments.iter().next() {
+                Some((k, Value::String(_))) if arguments.len() == 1 => Some(k.clone()),
+                _ => None,
+            });
+        if let Some(key) = key {
+            let value = arguments.remove(&key).unwrap_or_default();
+            arguments.insert("topic".to_owned(), value);
+            notes.push(format!("read '{key}' as 'topic'"));
+        }
     }
-    let Some(key) = ["name", "tool", "do"]
-        .into_iter()
-        .find(|k| arguments.contains_key(*k))
-    else {
-        return (Some(arguments), None);
-    };
-    let value = arguments.remove(key).unwrap_or_default();
-    arguments.insert("topic".to_owned(), value);
-    (Some(arguments), Some(format!("read '{key}' as 'topic'")))
+    if let Some(Value::String(topic)) = arguments.get("topic")
+        && let Some(stripped) = error::strip_server_prefix(topic)
+    {
+        let stripped = stripped.trim().to_owned();
+        notes.push(format!("read '{topic}' as {stripped}"));
+        arguments.insert("topic".to_owned(), json!(stripped));
+    }
+    (Some(arguments), notes)
 }
 
 /// A `guide` topic as written in a resource or prompt reference: without `skill://`, a leading `/`
@@ -2539,39 +2776,53 @@ impl ServerHandler for Gateway {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let name = request.name.to_string();
+        // What the stdin repair changed in the request (`stdin::repair`); rmcp moves a request's
+        // `_meta` into the context.
+        let mut notes: Vec<String> = context
+            .meta
+            .0
+            .0
+            .get(stdin::NOTES_META_KEY)
+            .or_else(|| {
+                request
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.0.0.get(stdin::NOTES_META_KEY))
+            })
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        let raw_name = request.name.to_string();
+        let canonical = error::norm(error::strip_server_prefix(&raw_name).unwrap_or(&raw_name));
+        let name = if matches!(canonical.as_str(), "run" | "guide") && canonical != raw_name {
+            notes.push(format!("read tool '{raw_name}' as {canonical}"));
+            canonical
+        } else {
+            raw_name
+        };
         let arguments = request.arguments;
         let result = match name.as_str() {
-            "guide" => {
-                let (arguments, renamed) = topic_alias(arguments);
-                let (arguments, ignored) = only_topic(arguments);
-                match parse_args::<GuideArgs>(
-                    &name,
-                    arguments,
-                    &json!({"topic": "overview"}),
-                    false,
-                ) {
-                    Ok((args, mut notes)) => {
-                        notes.extend(renamed);
-                        notes.extend(ignored);
-                        error::with_notes(self.guide(args).await, &notes)
-                    }
-                    Err(e) => e
-                        .clear_example()
-                        .see(guide_call(Some("overview")))
-                        .into_result(),
-                }
-            }
+            "guide" => self.guide_tool(arguments).await,
             "run" => self.run(arguments).await,
             // A Raijin tool called directly: run it as run would.
             _ if self.runnable(&name).await => {
+                let notes = if self.surface == Surface::Full {
+                    Vec::new()
+                } else {
+                    vec![format!(
+                        "ran '{name}' through run; call run {{\"do\":\"{name}\", ...}}"
+                    )]
+                };
                 self.run_one(Call {
                     tool: name,
                     arguments,
                     project: None,
-                    notes: Vec::new(),
+                    notes,
                 })
                 .await
             }
@@ -2586,7 +2837,9 @@ impl ServerHandler for Gateway {
             .example(run_example())
             .into_result(),
         };
-        Ok(CallToolResponse::Complete(result))
+        Ok(CallToolResponse::Complete(error::with_notes(
+            result, &notes,
+        )))
     }
 
     fn list_prompts(
@@ -2714,6 +2967,23 @@ mod tests {
 
     fn object(value: Value) -> JsonObject {
         serde_json::from_value(value).expect("object")
+    }
+
+    #[test]
+    fn a_live_project_warning_is_given_once() {
+        let live =
+            json!({"project": "main", "error": "project main is running; data may be incomplete"});
+        let other = json!({"project": "main", "error": "could not read the archive"});
+        let mut seen = BTreeSet::new();
+        let mut first = json!({"rows": [], "warnings": [live.clone(), other.clone()]});
+        drop_repeated_live_warnings(&mut first, &mut seen);
+        assert_eq!(first["warnings"], json!([live.clone(), other.clone()]));
+        let mut second = json!({"rows": [], "warnings": [live.clone(), other.clone()]});
+        drop_repeated_live_warnings(&mut second, &mut seen);
+        assert_eq!(second["warnings"], json!([other]));
+        let mut only = json!({"warnings": [live]});
+        drop_repeated_live_warnings(&mut only, &mut seen);
+        assert_eq!(only["warnings"], json!([]));
     }
 
     #[test]
@@ -2983,6 +3253,7 @@ mod weak_model {
             inline_limit: 1 << 20,
             assets: OnceCell::new(),
             api: ToolApi::new(),
+            warned_live: std::sync::Mutex::default(),
         }
     }
 
@@ -2995,8 +3266,8 @@ mod weak_model {
             (json!({"do": "history_list()"}), true),
             (json!({"do": "history_list(limit=1)"}), true),
             (json!({"do": "history/list", "limit": 1}), false),
-            (json!({"function": "history_list"}), false),
-            (json!({"tool_name": "history_list", "limit": 1}), false),
+            (json!({"function": "history_list"}), true),
+            (json!({"tool_name": "history_list", "limit": 1}), true),
             (json!({"action": "history_list"}), true),
             (
                 json!({"type": "function", "function": {"name": "history_list", "arguments": "{\"limit\":1}"}}),

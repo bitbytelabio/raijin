@@ -307,7 +307,7 @@ class HttpBridge(
             val items = built.map { b ->
                 val result = resultsArray[b.originalIndex]
                 val item = buildJsonObject {
-                    put("index", b.originalIndex)
+                    put("request", b.originalIndex + 1)
                     val scope = b.scope
                     when {
                         b.error != null -> {
@@ -339,22 +339,17 @@ class HttpBridge(
                         "Not sent: all ${blocked.size} requests are outside Burp's target scope (mcp_scope_mode=enforce).",
                     )
                 } else if (built.isNotEmpty() && resultsArray.none { it?.hasResponse() == true }) {
-                    val first = items.first()
-                    val index = (first["index"] as? JsonPrimitive)?.intOrNull ?: 0
-                    put(
-                        "error",
-                        noResponseError(
+                    noResponseFields(
                             "http_send_requests_parallel",
                             "request",
-                            requests.size,
-                            index,
-                            noResponseReason(items),
-                        ),
-                    )
-                    put("code", "no_response")
+                            "requests",
+                            "request",
+                            items,
+                        )
+                        .forEach { (k, v) -> put(k, v) }
                 }
                 put("total_requests", requests.size)
-                put("total_responses", resultsArray.count { it != null })
+                put("total_responses", resultsArray.count { it?.hasResponse() == true })
                 put("total_elapsed_ms", totalElapsedMs)
                 put("groups_dispatched", grouped.size)
                 if (blocked.isNotEmpty()) put(ScopeGate.SKIPPED, blocked.size)
@@ -398,7 +393,7 @@ class HttpBridge(
         val items =
             result.steps.map { step ->
                 val item = buildJsonObject {
-                    put("step", step.index)
+                    put("step", step.index + 1)
                     put("success", step.success)
                     val exchange = step.exchange
                     val scope = step.scope
@@ -426,6 +421,7 @@ class HttpBridge(
                         scope.denyJson().forEach { (k, v) -> put(k, v) }
                     } else {
                         put("error", step.error ?: "Unknown error")
+                        step.phase?.let { put("phase", it) }
                         if (step.timeout) put("is_timeout", true)
                     }
                     if (step.unresolvedPlaceholders.isNotEmpty()) {
@@ -448,18 +444,8 @@ class HttpBridge(
                 result.steps.isNotEmpty() &&
                     result.steps.none { it.exchange?.hasResponse() == true }
             ) {
-                val first = result.steps.first()
-                put(
-                    "error",
-                    noResponseError(
-                        "http_send_request_chain",
-                        "step",
-                        result.steps.size,
-                        first.index,
-                        noResponseReason(items),
-                    ),
-                )
-                put("code", "no_response")
+                noResponseFields("http_send_request_chain", "step", "steps", "step", items)
+                    .forEach { (k, v) -> put(k, v) }
             }
             put("total_steps", steps.size)
             put("completed_steps", result.steps.count { it.exchange != null })
@@ -586,33 +572,51 @@ class HttpBridge(
             // Same (path, domain) argument order as setCookie above — see its comment.
             api.http().cookieJar().setCookie(name, "", path, domain, past)
 
-            val stillPresent =
+            var lookupFailed = false
+            val remaining =
                 try {
-                    api.http().cookieJar().cookies().any {
+                    api.http().cookieJar().cookies().firstOrNull {
                         it.name() == name &&
                             it.domain().equals(domain, ignoreCase = true) &&
                             it.path() == path
                     }
                 } catch (_: Exception) {
+                    lookupFailed = true
                     null
                 }
+            val expired =
+                remaining?.expiration()?.orElse(null)?.isBefore(ZonedDateTime.now()) == true
 
+            if (remaining != null && !expired) {
+                return buildJsonObject {
+                    put(
+                        "error",
+                        "http_state.cookie_jar_delete: cookie '$name' for $domain$path is still in the jar and not expired after expiring it.",
+                    )
+                    put("code", "tool_failed")
+                    put("name", name)
+                    put("domain", domain)
+                    put("path", path)
+                }
+            }
             buildJsonObject {
                 put("name", name)
                 put("domain", domain)
                 put("path", path)
-                when (stillPresent) {
-                    false -> put("deleted", true)
-                    true -> {
-                        put("deleted", false)
-                        put(
-                            "note",
-                            "The cookie still appears in the jar after setting an expired value — Burp may retain an expired record rather than dropping it. Try an empty 'value' lookup, or clear it manually in the Proxy > HTTP history > Cookie jar UI.",
-                        )
-                    }
-                    null -> {
+                when {
+                    lookupFailed -> {
                         put("deleted", "unknown")
-                        put("note", "Could not confirm removal by re-reading the cookie jar.")
+                        putJsonArray("notes") { add("could not re-read the cookie jar to confirm") }
+                    }
+                    remaining == null -> put("deleted", true)
+                    else -> {
+                        put("deleted", true)
+                        put("expired_record_kept", true)
+                        putJsonArray("notes") {
+                            add(
+                                "Burp keeps an expired, empty record of the cookie in the jar; Montoya cannot drop it",
+                            )
+                        }
                     }
                 }
             }

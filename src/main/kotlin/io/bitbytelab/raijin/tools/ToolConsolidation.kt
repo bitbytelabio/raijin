@@ -674,8 +674,11 @@ object ToolConsolidation {
                 )
             }
             val c = ToolArgs.coerce(props, args)
+            ToolArgs.rangeCheck(name, props, c.args, usage, example, destructive)?.let {
+                return@addTool ToolArgs.withNotes(it, renamed.notes + c.notes)
+            }
             val (placeholder, placeholderNotes) =
-                ToolArgs.placeholderCheck(name, name, props, c.args, example)
+                ToolArgs.placeholderCheck(name, name, null, props, c.args, example, destructive)
             if (placeholder != null)
                 return@addTool ToolArgs.withNotes(placeholder, renamed.notes + c.notes)
             val forwarded =
@@ -967,6 +970,23 @@ object ToolConsolidation {
         }
 
         val missing = spec.required.filter { args[it] == null || args[it] is JsonNull }
+        val idMissing = missing.filter { ToolExamples.idSource(g.tool, resolved, it) != null }
+        if (missing.isNotEmpty() && idMissing.size == missing.size) {
+            // Only ids are missing: the example cannot hold them, so point at the list call.
+            val source = ToolExamples.idSource(g.tool, resolved, idMissing.first())!!
+            val from = source.getValue("do").jsonPrimitive.content
+            return ToolArgs.withNotes(
+                ToolArgs.error(
+                    "missing_parameter",
+                    "$call needs '${idMissing.first()}'. First list them with $from.",
+                ) {
+                    put("param", idMissing.first())
+                    put("usage", spec.usage)
+                    put("see", source)
+                },
+                notes,
+            )
+        }
         if (missing.isNotEmpty()) {
             return ToolArgs.withNotes(
                 ToolArgs.error(
@@ -977,7 +997,7 @@ object ToolConsolidation {
                     put("param", missing.first())
                     put("usage", spec.usage)
                     put("example", spec.example)
-                    ToolExamples.idSource(g.tool, missing.first())?.let { put("see", it) }
+                    ToolExamples.idSource(g.tool, resolved, missing.first())?.let { put("see", it) }
                 },
                 notes,
             )
@@ -985,8 +1005,19 @@ object ToolConsolidation {
 
         val c = ToolArgs.coerce(spec.props, args)
         notes += c.notes
+        ToolArgs.rangeCheck(call, spec.props, c.args, spec.usage, spec.example, destructive)?.let {
+            return ToolArgs.withNotes(it, notes)
+        }
         val (placeholder, placeholderNotes) =
-            ToolArgs.placeholderCheck(call, g.tool, spec.props, c.args, spec.example)
+            ToolArgs.placeholderCheck(
+                call,
+                g.tool,
+                resolved,
+                spec.props,
+                c.args,
+                spec.example,
+                destructive,
+            )
         if (placeholder != null) return ToolArgs.withNotes(placeholder, notes)
         notes += placeholderNotes
         val forwarded = buildJsonObject {

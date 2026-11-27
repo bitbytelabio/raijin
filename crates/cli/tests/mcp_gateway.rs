@@ -373,8 +373,20 @@ async fn batch_runs_steps_in_order_and_bails() {
     .await;
     assert_eq!(rows(&filled), 1);
 
+    // An empty batch is what a strict-mode client sends for "no batch": the call then lacks "do".
     let empty = call(&client, "run", json!({"batch": []})).await;
-    assert!(text(&empty).contains("at least one"), "{}", text(&empty));
+    assert_eq!(envelope(&empty)["code"], "missing_parameter");
+    assert!(
+        text(&empty).contains("ignored empty 'batch'"),
+        "{}",
+        text(&empty)
+    );
+    let empty_text = call(&client, "run", json!({"batch": "[]"})).await;
+    assert!(
+        text(&empty_text).contains("at least one"),
+        "{}",
+        text(&empty_text)
+    );
     let both = call(&client, "run", json!({"do": "x", "batch": [{}]})).await;
     assert!(
         text(&both).contains("either do or batch"),
@@ -382,6 +394,208 @@ async fn batch_runs_steps_in_order_and_bails() {
         text(&both)
     );
     client.cancel().await.expect("close");
+}
+
+/// The second round of weak-model shapes from the 2.4.1 smoke test (Burp down).
+#[tokio::test]
+async fn weak_model_calls_round_two() {
+    let fixture = common::target("");
+    let client = connect(&fixture).await;
+    // A JSON result holds its notes in `notes`, a plain-text one in a leading `note:` line.
+    let has_note = |r: &CallToolResult, wanted: &str| {
+        assert!(text(r).contains(wanted), "no note {wanted:?}: {}", text(r));
+    };
+
+    // A strict-mode client fills every property of run.
+    let filled = call(
+        &client,
+        "run",
+        json!({"do": "history_list", "batch": [], "bail": false, "project": "", "limit": 1}),
+    )
+    .await;
+    assert_eq!(rows(&filled), 1);
+    has_note(&filled, "ignored empty 'batch'");
+    has_note(&filled, "ignored empty 'project'");
+
+    // `guide` and `see` pasted into run.
+    let guide = call(&client, "run", json!({"guide": {"topic": "util.hash"}})).await;
+    assert_ne!(guide.is_error, Some(true), "{}", text(&guide));
+    assert!(text(&guide).contains("util.hash"), "{}", text(&guide));
+    let see = call(
+        &client,
+        "run",
+        json!({"see": {"do": "history_list", "limit": 1}}),
+    )
+    .await;
+    assert_eq!(rows(&see), 1);
+
+    // A quoted name, and the whole call as JSON text in do.
+    let quoted = call(&client, "run", json!({"do": "`history_list`", "limit": 1})).await;
+    assert_eq!(rows(&quoted), 1);
+    let nested = call(
+        &client,
+        "run",
+        json!({"do": "{\"do\":\"history_list\",\"limit\":1}"}),
+    )
+    .await;
+    assert_eq!(rows(&nested), 1);
+
+    // A bad regex is an argument error on one line.
+    let regex = envelope(
+        &call(
+            &client,
+            "run",
+            json!({"do": "history_search", "pattern": "[a-"}),
+        )
+        .await,
+    );
+    assert_eq!(regex["code"], "invalid_arguments", "{regex}");
+    assert_eq!(regex["param"], "pattern", "{regex}");
+    assert_eq!(regex["retryable"], true, "{regex}");
+    assert!(
+        !regex["error"].as_str().unwrap_or_default().contains('\n'),
+        "{regex}"
+    );
+
+    // Suggestions by intent.
+    let request = envelope(
+        &call(
+            &client,
+            "run",
+            json!({"do": "http_request", "url": "https://a.b/"}),
+        )
+        .await,
+    );
+    assert_eq!(request["did_you_mean"][0], "http_send_request", "{request}");
+    let status = envelope(&call(&client, "run", json!({"do": "status"})).await);
+    assert_eq!(status["did_you_mean"][0], "burp_status", "{status}");
+    let findings = envelope(&call(&client, "run", json!({"do": "list_findings"})).await);
+    assert_eq!(
+        findings["retry"],
+        json!({"do": "findings.list"}),
+        "{findings}"
+    );
+
+    client.cancel().await.expect("close");
+}
+
+/// Round two, continued: guide keys, tool names and batch keys in the wrong place.
+#[tokio::test]
+async fn weak_model_names_round_two() {
+    let fixture = common::target("");
+    let client = connect(&fixture).await;
+    let has_note = |r: &CallToolResult, wanted: &str| {
+        assert!(text(r).contains(wanted), "no note {wanted:?}: {}", text(r));
+    };
+
+    // guide reads a misspelt key and a prefixed topic.
+    let topc = call(&client, "guide", json!({"topc": "history"})).await;
+    assert_ne!(topc.is_error, Some(true), "{}", text(&topc));
+    has_note(&topc, "read 'topc' as 'topic'");
+    let prefixed = call(
+        &client,
+        "guide",
+        json!({"topic": "mcp__raijin__history_list"}),
+    )
+    .await;
+    assert_ne!(prefixed.is_error, Some(true), "{}", text(&prefixed));
+    assert!(
+        text(&prefixed).contains("history_list"),
+        "{}",
+        text(&prefixed)
+    );
+
+    // The tool name in another case.
+    let upper = call(&client, "Run", json!({"do": "history_list", "limit": 1})).await;
+    assert_eq!(rows(&upper), 1);
+    has_note(&upper, "read tool 'Run' as run");
+
+    // `bail` inside a step is the batch's.
+    let bail = call(
+        &client,
+        "run",
+        json!({"batch": [{"do": "history_show"}, {"do": "history_list", "bail": true}]}),
+    )
+    .await;
+    assert!(
+        !text(&bail).contains("unknown_parameter"),
+        "{}",
+        text(&bail)
+    );
+    has_note(&bail, "read 'bail' from step 2 as the batch's bail");
+
+    let both = envelope(
+        &call(
+            &client,
+            "run",
+            json!({"do": "burp_status", "batch": [{"do": "burp_status"}]}),
+        )
+        .await,
+    );
+    assert_eq!(both["param"], "batch", "{both}");
+    assert!(
+        both["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("drop \"batch\""),
+        "{both}"
+    );
+
+    client.cancel().await.expect("close");
+}
+
+/// A client that sends `arguments` as a JSON string still gets its call run.
+#[tokio::test]
+async fn string_arguments_are_parsed() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let fixture = common::target("");
+    let mut child = command(&fixture, &["mcp"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn raijin mcp");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+    for message in [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "run", "arguments": "{\"do\":\"history_list\",\"limit\":1}"}}),
+    ] {
+        stdin
+            .write_all(format!("{message}\n").as_bytes())
+            .await
+            .expect("write");
+    }
+    stdin.flush().await.expect("flush");
+    let response = loop {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(30), lines.next_line())
+            .await
+            .expect("answer in time")
+            .expect("read")
+            .expect("a line before EOF");
+        let value: Value = serde_json::from_str(&line).expect("json line");
+        if value["id"] == 2 {
+            break value;
+        }
+    };
+    assert!(response.get("error").is_none(), "{response}");
+    let body: Value = serde_json::from_str(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content"),
+    )
+    .expect("json text");
+    assert_eq!(body["rows"].as_array().map(Vec::len), Some(1), "{body}");
+    assert!(
+        body["notes"].as_array().is_some_and(|n| n
+            .iter()
+            .any(|n| n == "parsed 'arguments' from a JSON string")),
+        "{body}"
+    );
+    drop(stdin);
+    let _ = child.kill().await;
 }
 
 /// An error result: JSON with a string `code` and a boolean `retryable`.

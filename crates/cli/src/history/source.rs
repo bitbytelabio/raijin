@@ -156,6 +156,9 @@ pub fn find(target: &Target, project: &str) -> Result<Source> {
     })
 }
 
+/// The end of the warning a live project's data gets.
+pub const LIVE_INCOMPLETE: &str = "is running; data may be incomplete";
+
 /// Runs `f` on every source in its own thread. A failure becomes a warning; a live project gets
 /// a warning that its data may be incomplete.
 pub fn par_map<T: Send>(
@@ -196,7 +199,7 @@ pub fn par_map<T: Send>(
                 if source.live {
                     warnings.push(Warning {
                         project: source.project.clone(),
-                        error: format!("project {} is running; data may be incomplete", source.project),
+                        error: format!("project {} {LIVE_INCOMPLETE}", source.project),
                     });
                 }
                 out.push(value);

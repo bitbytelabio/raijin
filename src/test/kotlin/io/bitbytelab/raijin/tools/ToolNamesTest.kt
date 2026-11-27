@@ -70,6 +70,40 @@ class ToolNamesTest {
         assertEquals(ToolNames.NotFound(emptyList(), null), resolve("nope_tool"))
     }
 
+    /** Every call name `run` takes: ungrouped tools and `tool.action`, never a bare group. */
+    private val callNames: List<String> =
+        ToolConsolidation.KEEP.toList() +
+            ToolConsolidation.GROUPS.flatMap { g -> g.actions.keys.map { "${g.tool}.$it" } }
+
+    private fun firstCalls(wanted: String) =
+        ToolArgs.closestCalls(wanted, callNames).map { it.name }
+
+    @Test
+    fun `call suggestions follow what the name asks for`() {
+        assertEquals("http_send_request", firstCalls("http_request").first())
+        assertEquals("proxy_history_search", firstCalls("search_history").first())
+        assertEquals("util.base64_decode", firstCalls("decode_base64").first())
+        assertEquals("scope.include", firstCalls("add_to_scope").first())
+        assertEquals("findings.add", firstCalls("add_finding").first())
+        assertEquals(
+            listOf("scanner.start_audit", "scanner.start_crawl"),
+            firstCalls("start_scan").take(2),
+        )
+        val list = ToolArgs.closestCalls("list_findings", callNames)
+        assertEquals(ToolArgs.CallHint("findings.list", true), list.first())
+        assertEquals(1, list.count { it.sameWords })
+        assertEquals(
+            ToolNames.NotFound(list.map { it.name }, "findings.list"),
+            resolve("list_findings"),
+        )
+        assertTrue(firstCalls("status").first() != "ai.status", firstCalls("status").toString())
+        val groups = ToolConsolidation.GROUPS.map { it.tool }.toSet()
+        for (wanted in listOf("findings", "scope", "list_findings", "status", "burp")) {
+            val r = resolve(wanted) as? ToolNames.NotFound ?: continue
+            assertTrue(r.didYouMean.none { it in groups }, "$wanted: ${r.didYouMean}")
+        }
+    }
+
     @Test
     fun `short names are not near longer unrelated words`() {
         val names = published.keys + listOf("ai", "log")

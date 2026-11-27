@@ -272,6 +272,7 @@ dependencies = [
  "glob",
  "nix 0.32.0",
  "regex",
+ "regex-syntax",
  "reqwest",
  "rmcp",
  "schemars",

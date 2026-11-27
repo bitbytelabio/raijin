@@ -1,0 +1,4 @@
+- https://github.com/PortSwigger/url-cheatsheet-data
+- https://github.com/PortSwigger/BChecks
+- https://github.com/PortSwigger/bambdas
+- https://github.com/PortSwigger/xss-cheatsheet-data

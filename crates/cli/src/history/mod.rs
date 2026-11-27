@@ -25,12 +25,17 @@ pub enum Problem {
     NotFound(String),
     /// A project the target does not have.
     UnknownProject { wanted: String, known: Vec<String> },
+    /// A search pattern that is not a regex, with why on one line.
+    BadPattern { pattern: String, reason: String },
 }
 
 impl std::fmt::Display for Problem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BadRef(message) | Self::NotFound(message) => f.write_str(message),
+            Self::BadPattern { reason, .. } => {
+                write!(f, "'pattern' is not a valid regex ({reason})")
+            }
             Self::UnknownProject { wanted, known } => {
                 write!(f, "no project {wanted:?}; known: {}", known.join(", "))
             }

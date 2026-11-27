@@ -15,6 +15,13 @@
 - Examples hold real values; ids that come from another call are left out and point at the call that lists them. A placeholder copied from an example (`"<token>"`, `"<run_id from turbo_run.list>"`) in an id, URL or token is `placeholder_value`; elsewhere it is sent and noted.
 - `allowed` lists at most 20 values (the closest first) and `did_you_mean` at most 5. Not-found messages name the id (`turbo_run.status: no run "nope". List them with turbo_run.list.`), and every `error` ends in `.`, `!` or `?`.
 - Warnings (`scope_warning`, `headers_warning`, `warnings`, `*_clamped_to`, per step or request) are also listed in `notes`; the old fields stay for this release.
+- Every action that adds, sends or imports has a real example (`config.match_replace_add`, `custom_check.*_create*`, `http_race`, `scanner.start_crawl`, ...); only destructive actions keep placeholders. A placeholder in `host`, `urls`, `request`, `name` or `domain`, or in any parameter of a destructive call, is `placeholder_value`. A call missing only an id (`turbo_run.results` without `run_id`) says "First list them with turbo_run.list" with that call in `see`, and no `example`.
+- A negative number below a schema minimum of 0 is `out_of_range` with a `retry` that drops it (none for a destructive call).
+- A one-item array for a scalar parameter (`"url":["https://a.b/"]`) and a quoted enum value (`"\"MD5\""`) are read as meant, noted; payload parameters (`data`, `body`, `request`, ...) keep the array as text.
+- An enum error says how many values are allowed and lists them once, in `allowed`; when cut, `see` is the call that lists them (`turbo_docs.list_examples`).
+- Call-name suggestions follow the words of the name: `http_request` suggests `http_send_request`, `add_to_scope` `scope.include`, `list_findings` `findings.list` (with `retry`); a grouped tool is never suggested without its action, and `ai.*` ranks last.
+- One `notes` field: the scope-mode change of `persistence.preference_*` and `http_state.cookie_jar_delete` are `notes` arrays, `http_race`'s analysis `note` is `verdict` and a cluster's overflow `note` is `overflow_detail`. A plain-text result gets its notes as a leading `note:` line.
+- `unregister` actions (`scanner.unregister_check`, ...) count as destructive.
 
 ### Extension
 - `http_send_request`: `headers` takes `["X-A: 1"]`; a header entry it cannot read refuses the call and sends nothing (also per item in `http_send_requests_parallel` and `http_send_request_chain`). A raw request without a Host header and without `host` says so. A request with no response carries `no_response` with the target, and `time_request_sent` is null instead of the epoch.
@@ -23,6 +30,10 @@
 - Tool API: HTTP 400/415 answers and a throwing tool carry `code` and `retryable`. An `action` argument that differs from the one in the name is noted.
 - `http_send_request_chain` and `http_send_requests_parallel` where nothing got a response are errors (`no_response`) naming the first reason. `http_send_request` notes TLS chosen for a raw request, `url` ignored next to `raw_request`, and non-string header values sent as text.
 - `util.compress`/`util.decompress` refuse `data` that is not base64 like `util.base64_decode`; `probe.access_control` says which of `requests`/`identities` is missing or short; `scope.remove` out of range is `out_of_range` with the list size.
+- `http_send_request` without a response is an error (`code: no_response`) that keeps every request field. A `url` without a scheme is `invalid_arguments` with both schemes in `did_you_mean` (no `retry`: the scheme is the caller's choice); `scope.check`/`include`/`exclude` do the same, `scope.check` with the `https` guess in `retry`.
+- `http_send_request_chain` and `http_send_requests_parallel` number steps and requests from 1 (`step`, and `request` instead of `index`); a step that could not be built has `phase: "build"`, and when nothing was sent the error is the build error (`missing_parameter` with `param: "steps[1].url"`, or `invalid_arguments`) instead of `no_response`. `total_responses` counts only real responses.
+- `http_state.cookie_jar_delete` reports `deleted: true` with `expired_record_kept` when Burp keeps an expired, empty record, and an error when the cookie is still live.
+- `events.get` returns 20 events by default.
 
 ### raijin CLI
 - With Burp down, a name the catalog does not know is `unknown_tool` with suggestions right away; a known one gets `retry`: `{"batch":[{"do":"burp_up"},<the call>],"bail":true}` (none for a destructive call).
@@ -34,13 +45,17 @@
 - `project` in another case runs on the project it means (noted); an unknown one is `invalid_enum` listing the target's projects instead of a `retry` that starts a new Burp. A bare history ref (`1`) on a one-project target reads as `main:1`.
 - A batch with failures has `failed_steps`; when every step failed it is an error, and `retry` repeats only the failed steps (with their own `retry`) and the ones not run.
 - `guide` reads `do` as `topic`, ignores other keys with a note, and a topic written as a sentence is matched by its words. Its errors carry no `retry` or `example`.
+- A strict-mode client that fills every property works: an empty `do`, `batch` or `project` (`""`, `[]`, `{}`) is ignored with a note. `run` also takes a pasted `see` (`{"see":{"do":"turbo_run.list"}}`) and a pasted guide call (`{"guide":{"topic":"util.hash"}}`), a quoted tool name, and the whole call as JSON text in `do`; every such reading is noted. These forms only unwrap how the call was sent: a destructive tool still runs only under its exact name, and an empty `project` means the default one. `do` with `batch` says which to drop; `bail` inside a step is read once as the batch's.
+- `tools/call` with `arguments` as a JSON string is parsed instead of refused by the protocol layer (a plain string is `guide`'s topic or `run`'s `do`); `Run`, `GUIDE` and prefixed names of the two tools are read as them; a Burp tool called directly on the lean surface notes the `run` form.
+- `guide` reads a lone misspelt key (`topc`) as `topic` and strips a server prefix from it; its notes reach plain-text answers too, and a domain topic's `notes` is an array.
+- `history_search` with an invalid regex is `invalid_arguments` on `pattern`, with the parser's reason on one line. A running project's "data may be incomplete" warning is given once per session.
 
 ## 2.4.1
 
 ### Tool calls
 - Every error is one JSON object: `error`, `code`, and when they help `param`, `got`, `allowed`, `did_you_mean`, `usage`, `example`, `retry` (a complete corrected call, given only when the fix is certain), `retryable` and `see`. A handler error about a value outside its enum becomes `invalid_enum` with `allowed`; other argument errors get `code: invalid_arguments`.
 - Strings that clearly mean a number or boolean (`"20"`, `"true"`), whole floats for integers (`5.0`) and enum values in another case or spelling (`sha256` for `SHA_256`) are read as the declared type; the result says so in `notes`. A misnamed parameter from another tool's vocabulary (`limit`, `offset`, `uri`, ...) suggests the right one with a ready `retry`.
-- Tool names are resolved forgivingly: case and `-`/`.`/space separators (`Burp.Version`), old member names, `group.action`, and `util.sha256` / `sha256` as `util.hash` with that algorithm. A destructive tool never runs from an inexact name; it comes back as `unknown_tool` with the exact call in `retry`.
+- Tool names are resolved forgivingly: case and `-`/`.`/space separators (`Burp.Version`), old member names, `group.action`, and `util.sha256` / `sha256` as `util.hash` with that algorithm. A destructive tool named in another case or misspelled never runs; it comes back as `unknown_tool` with the exact call in `retry`. Prefixed (`mcp__raijin__`), `/`-separated and OpenAI-shaped names of it run, with a note.
 
 ### Extension
 - Tool API: `GET /api/v1/info` carries the server instructions; `GET /api/v1/resources` and `GET /api/v1/resources/read?uri=` expose the MCP resources. `POST /api/v1/tools/<name>` answers an unknown name with an `unknown_tool` result (suggestions, `retry`) instead of a 404, and gives error `example`/`retry` as `run` calls (`{"do":"tool.action",...}`).

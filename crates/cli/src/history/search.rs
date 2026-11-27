@@ -1,11 +1,11 @@
 //! `history search` / `history_search`: a byte regex over raw requests and responses.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use regex::bytes::{Regex, RegexBuilder};
 use serde::Serialize;
 
 use super::source::{self, Kinds, Load};
-use super::{Filters, Selection, Warning};
+use super::{Filters, Problem, Selection, Warning};
 use crate::config::Target;
 
 const DEFAULT_CONTEXT: usize = 80;
@@ -77,11 +77,28 @@ pub struct SearchResult {
     pub warnings: Vec<Warning>,
 }
 
+/// Why `pattern` is not a regex, on one line: the parser's error kind and offset, else the
+/// `error: ` line of `e` (a size limit), else `e` with its line breaks as spaces.
+fn pattern_error(pattern: &str, e: &regex::Error) -> String {
+    if let Err(ast) = regex_syntax::ast::parse::Parser::new().parse(pattern) {
+        return format!("{} at {}", ast.kind(), ast.span().start.offset);
+    }
+    let text = e.to_string();
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("error: "))
+        .map_or_else(|| text.replace('\n', " "), str::to_owned)
+}
+
 pub fn run(target: &Target, params: &SearchParams) -> Result<SearchResult> {
     let regex: Regex = RegexBuilder::new(&params.pattern)
         .size_limit(REGEX_SIZE_LIMIT)
         .build()
-        .with_context(|| format!("bad pattern {:?}", params.pattern))?;
+        .map_err(|e| {
+            anyhow::Error::new(Problem::BadPattern {
+                pattern: params.pattern.clone(),
+                reason: pattern_error(&params.pattern, &e),
+            })
+        })?;
     let part = params.part.unwrap_or_default();
     let context = params
         .context_bytes
