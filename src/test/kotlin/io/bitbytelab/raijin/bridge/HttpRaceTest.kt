@@ -163,6 +163,11 @@ class HttpRaceTest {
         )
         assertEquals(2, out.getValue("results").jsonArray.size)
         assertFalse("race_condition_likely" in out.getValue("analysis").jsonObject, out.toString())
+        assertFalse("uniform" in out.getValue("analysis").jsonObject, out.toString())
+        assertFalse(
+            out["notes"]?.jsonArray.orEmpty().any { "HTTP/2" in it.jsonPrimitive.content },
+            out.toString(),
+        )
     }
 
     @Test

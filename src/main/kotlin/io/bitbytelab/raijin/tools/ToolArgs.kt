@@ -45,12 +45,14 @@ internal object ToolArgs {
         listOf("get", "list", "show", "fetch", "read", "view", "query").associateWith { "get" } +
             listOf("add", "create", "new", "include", "insert").associateWith { "add" } +
             listOf("find", "search", "grep", "lookup").associateWith { "search" } +
+            listOf("delete", "clear", "drop", "remove").associateWith { "remove" } +
             mapOf("scanner" to "scan")
 
     /**
      * The words of a call name: [ToolNames.norm] split on `_`, without stop words, singular, and
      * with synonyms in one form (`list`/`show` -> `get`, `create`/`include` -> `add`, `find` ->
-     * `search`, `scanner` -> `scan`). Same rule as the CLI's `intent_tokens`.
+     * `search`, `delete`/`clear`/`drop` -> `remove`, `scanner` -> `scan`). Same rule as the CLI's
+     * `intent_tokens`.
      */
     internal fun intentTokens(name: String): Set<String> =
         ToolNames.norm(name)
@@ -471,24 +473,64 @@ internal object ToolArgs {
         if (destructive || args.isEmpty()) return Coerced(args, emptyList())
         val foreign = mutableListOf<String>()
         val optional = mutableListOf<String>()
+        val unset = mutableListOf<String>()
+        val notes = mutableListOf<String>()
         for ((k, v) in args) {
-            if (k in ignore || !isEmptyValue(v)) continue
-            val freeString = v is JsonPrimitive && v.isString && !emptyStringIsUnset(props?.get(k))
+            if (k in ignore) continue
+            val min = if (props != null && k !in required) belowMinimum(props[k], v) else null
+            if (min != null) {
+                unset += k
+                notes += "ignored 0 '$k': below its minimum $min"
+                continue
+            }
+            if (!isEmptyValue(v)) continue
+            val emptyString = v is JsonPrimitive && v.isString
+            if (
+                emptyString && k in EMPTY_IS_UNSET && props != null && k in props && k !in required
+            ) {
+                unset += k
+                notes +=
+                    if (k == "method")
+                        "empty 'method' read as unset; send an empty method with raw_request"
+                    else "ignored empty '$k'"
+                continue
+            }
+            val freeString = emptyString && !emptyStringIsUnset(props?.get(k))
             when {
                 props == null || k !in props -> foreign += k
                 k !in required && k !in EMPTY_KEPT && !freeString -> optional += k
             }
         }
-        if (foreign.isEmpty() && optional.isEmpty()) return Coerced(args, emptyList())
-        val notes = mutableListOf<String>()
+        if (foreign.isEmpty() && optional.isEmpty() && unset.isEmpty())
+            return Coerced(args, emptyList())
         if (foreign.isNotEmpty())
             notes +=
                 "ignored ${foreign.size} empty parameter${if (foreign.size == 1) "" else "s"} " +
                     "of other actions"
         if (optional.isNotEmpty())
             notes += "ignored empty optional ${optional.joinToString(", ") { "'$it'" }}"
-        val dropped = (foreign + optional).toSet()
+        val dropped = (foreign + optional + unset).toSet()
         return Coerced(JsonObject(args.filterKeys { it !in dropped }), notes)
+    }
+
+    /**
+     * Optional parameters whose `""` can only mean "not set" (no such host, method or connection):
+     * [dropEmptyUnknown] drops them, unlike a free-form string's `""`.
+     */
+    private val EMPTY_IS_UNSET = setOf("host", "sni", "connection_id", "method")
+
+    /**
+     * The schema `minimum` of [def] (as written) when [value] is the number 0 below it, for a
+     * minimum >= 1: a strict client's filler, read as unset. Null otherwise.
+     */
+    private fun belowMinimum(def: JsonElement?, value: JsonElement): String? {
+        val d = def as? JsonObject ?: return null
+        val type = d.typeName()
+        if (type != "integer" && type != "number") return null
+        val min = (d["minimum"] as? JsonPrimitive)?.takeIf { !it.isString } ?: return null
+        val minValue = min.doubleOrNull ?: return null
+        val v = (value as? JsonPrimitive)?.takeIf { !it.isString }?.doubleOrNull ?: return null
+        return if (v == 0.0 && minValue >= 1) min.content else null
     }
 
     /** Keys of [args] that are neither declared in [props] nor in [ignore], in argument order. */

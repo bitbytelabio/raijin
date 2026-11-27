@@ -6717,7 +6717,7 @@
     },
     {
       "name": "proxy_history",
-      "description": "Get HTTP proxy history entries with optional filtering by host, method, status code, status code range, MIME type. Returns request/response metadata and optionally full request/response text. Each item has 'id' (Burp's message id, what proxy_annotate takes) and 'index' (its place in the filtered list); next_start_index pages on.",
+      "description": "Get HTTP proxy history entries with optional filtering by host, method, status code, status code range, MIME type. Returns request/response metadata and optionally full request/response text. Each item has 'id' (Burp's message id, what proxy_annotate takes) and 'index' (its place in the filtered list); next_start_index pages on. For .burp files or history without Burp use history_list.",
       "inputSchema": {
         "type": "object",
         "properties": {

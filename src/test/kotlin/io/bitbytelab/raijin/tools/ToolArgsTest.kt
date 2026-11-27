@@ -106,6 +106,55 @@ class ToolArgsTest {
     }
 
     @Test
+    fun `an empty host or method and a port of 0 below its minimum are unset, a body is not`() {
+        val sendProps = buildJsonObject {
+            put(
+                "port",
+                buildJsonObject {
+                    put("type", "integer")
+                    put("minimum", 1)
+                },
+            )
+            put("method", buildJsonObject { put("type", "string") })
+            put("host", buildJsonObject { put("type", "string") })
+            put("body", buildJsonObject { put("type", "string") })
+        }
+        val c =
+            ToolArgs.dropEmptyUnknown(
+                sendProps,
+                buildJsonObject {
+                    put("port", 0)
+                    put("method", "")
+                    put("host", "")
+                    put("body", "")
+                },
+                emptySet(),
+                destructive = false,
+            )
+        assertEquals(buildJsonObject { put("body", "") }, c.args)
+        assertEquals(
+            listOf(
+                "ignored 0 'port': below its minimum 1",
+                "empty 'method' read as unset; send an empty method with raw_request",
+                "ignored empty 'host'",
+            ),
+            c.notes,
+        )
+        val required =
+            ToolArgs.dropEmptyUnknown(
+                sendProps,
+                buildJsonObject {
+                    put("port", 0)
+                    put("host", "")
+                },
+                emptySet(),
+                destructive = false,
+                required = setOf("port", "host"),
+            )
+        assertEquals(emptyList<String>(), required.notes)
+    }
+
+    @Test
     fun `a value that exists as written is not a placeholder`() {
         val cookieProps = buildJsonObject {
             put("name", buildJsonObject { put("type", "string") })

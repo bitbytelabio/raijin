@@ -103,6 +103,13 @@ internal object HttpExchangeJson {
     const val REAUTHENTICATED_HEADER = "X-Raijin-Reauthenticated"
 
     /**
+     * The method as written in the first line of [requestText]: the text before its first space, ""
+     * when the line starts with a space. Used when Montoya refuses to parse the method.
+     */
+    internal fun requestLineMethod(requestText: String): String =
+        requestText.substringBefore('\n').trimEnd('\r').substringBefore(' ')
+
+    /**
      * Serializes [result]. Bodies go through [BodyText.render] (binary placeholder, lone surrogates
      * replaced, truncation on a safe boundary).
      *
@@ -125,35 +132,56 @@ internal object HttpExchangeJson {
         // purpose).
         put("url", runCatching { result.url() }.getOrNull().orEmpty())
 
-        try {
-            val req = result.request()
-            if (req != null) {
-                put("request_method", req.method())
-                put("request_url", req.url())
-                put("request_host", req.httpService().host())
-                put("request_port", req.httpService().port())
-                put("request_secure", req.httpService().secure())
-                put("request_http_version", req.httpVersion())
-                put(
-                    "request_headers",
-                    buildJsonArray {
-                        req.headers().forEach { h ->
-                            add(
-                                buildJsonObject {
-                                    put("name", h.name())
-                                    put("value", h.value())
-                                },
-                            )
-                        }
-                    },
-                )
-                val requestBody = BodyText.render(req.bodyToString())
-                put("request_body", requestBody.text)
-                if (requestBody.binary) put("request_body_binary", true)
-                if (requestBody.truncated) put("request_body_truncated", true)
-            }
-        } catch (e: Exception) {
+        // Each field is read on its own: Montoya throws from method()/url() of a request sent
+        // with a malformed request line, and the other fields are still worth reporting.
+        val reqRead = runCatching { result.request() }
+        reqRead.onFailure { e ->
             put("request_serialize_error", e.message ?: "failed to serialize request")
+        }
+        val req = reqRead.getOrNull()
+        if (req != null) {
+            var unreadField = false
+            fun <T> field(read: () -> T): T? =
+                runCatching(read).onFailure { unreadField = true }.getOrNull()
+
+            put(
+                "request_method",
+                field { req.method() }
+                    ?: requestLineMethod(runCatching { req.toString() }.getOrNull().orEmpty()),
+            )
+            field { req.url() }?.let { put("request_url", it) }
+            field { req.httpService() }
+                ?.let { service ->
+                    field { service.host() }?.let { put("request_host", it) }
+                    field { service.port() }?.let { put("request_port", it) }
+                    field { service.secure() }?.let { put("request_secure", it) }
+                }
+            field { req.httpVersion() }?.let { put("request_http_version", it) }
+            field {
+                buildJsonArray {
+                    req.headers().forEach { h ->
+                        add(
+                            buildJsonObject {
+                                put("name", h.name())
+                                put("value", h.value())
+                            },
+                        )
+                    }
+                }
+            }
+                ?.let { put("request_headers", it) }
+            field { BodyText.render(req.bodyToString()) }
+                ?.let { requestBody ->
+                    put("request_body", requestBody.text)
+                    if (requestBody.binary) put("request_body_binary", true)
+                    if (requestBody.truncated) put("request_body_truncated", true)
+                }
+            if (unreadField) {
+                runCatching { req.toByteArray() }
+                    .onFailure { e ->
+                        put("request_serialize_error", e.message ?: "failed to serialize request")
+                    }
+            }
         }
 
         if (result.hasResponse()) {

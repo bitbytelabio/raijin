@@ -228,9 +228,15 @@ class HttpPipelineBridge(private val api: MontoyaApi) {
             try {
                 openLink(target, connectionId, deadlineAtMs)
             } catch (e: ConnectionInUse) {
-                return failure("connect", e.message ?: "connection in use")
+                return failure("connect", "http_send_pipeline: ${e.message ?: "connection in use"}")
             } catch (e: Exception) {
-                return failure("connect", "connect failed: ${e.message}", code = "no_response")
+                val reason =
+                    (e.message ?: "unknown error").substringBefore(" (connect failed)").trimEnd('.')
+                return failure(
+                    "connect",
+                    "http_send_pipeline: could not connect to $host:$port: $reason.",
+                    code = "no_response",
+                )
             }
 
         val socket = link.socket

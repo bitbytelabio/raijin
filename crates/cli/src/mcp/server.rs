@@ -36,6 +36,7 @@ use crate::history;
 use crate::jar::{self, Assets};
 use crate::util::{
     Intent, contains_near, edit_distance, intent_call, suggest, suggest_call, truncate_utf8,
+    verb_calls,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -337,12 +338,27 @@ fn plain(message: impl Into<String>) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(message.into())])
 }
 
-/// A local tool's arguments read as `T`, with `local`'s example and destructiveness for errors.
+/// A local tool's arguments read as `T`, with `local`'s example and destructiveness for errors. A
+/// data tool's `source:"all"` (any case) is read as no source.
 fn local_args<T: serde::de::DeserializeOwned + JsonSchema>(
     local: &LocalTool,
-    arguments: Option<JsonObject>,
+    mut arguments: Option<JsonObject>,
 ) -> Result<(T, Vec<String>), ToolError> {
-    parse_args(local.name, arguments, &local.example(), local.destructive)
+    let mut all_note = None;
+    if local.domain == DATA
+        && let Some(args) = arguments.as_mut()
+        && args
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("all"))
+    {
+        args.remove("source");
+        all_note = Some("read 'source' \"all\" as unset".to_owned());
+    }
+    let (parsed, mut notes) =
+        parse_args(local.name, arguments, &local.example(), local.destructive)?;
+    notes.splice(0..0, all_note);
+    Ok((parsed, notes))
 }
 
 fn run_example() -> Value {
@@ -437,9 +453,9 @@ const PASTED_KEYS: [&str; 3] = ["retry", "see", "example"];
 
 /// Reads a call pasted in another shape into `raw`, when `raw` names no tool ([`CALL_KEYS`]):
 /// `{"retry":{...}}`, `{"see":...}` or `{"example":...}` (an object is the call, a string its
-/// tool), a JSON string in `arguments` holding the call, or one `tool_calls`/`tool_uses` item
-/// (`{"function":{"name":...,"arguments":...}}`, `{"recipient_name":"functions.x","parameters":...}`).
-/// Keys already in `raw` win. Each reading is noted.
+/// tool), a JSON string in `arguments` holding the call (also encoded twice), or the
+/// `tool_calls`/`tool_uses` items ([`item_call`]): one is the call, more a `batch`. Keys already
+/// in `raw` win. Each reading is noted.
 fn unwrap_call(raw: &mut JsonObject, notes: &mut Vec<String>) {
     let names_tool = |raw: &JsonObject| CALL_KEYS.iter().any(|k| raw.contains_key(*k));
     if names_tool(raw) {
@@ -470,50 +486,93 @@ fn unwrap_call(raw: &mut JsonObject, notes: &mut Vec<String>) {
         }
     }
     if let Some(Value::String(s)) = raw.get(WRAPPER_KEY)
-        && let Ok(call) = serde_json::from_str::<JsonObject>(s)
+        && let Some((call, twice)) = json_object(s)
         && CALL_KEYS.iter().any(|k| call.contains_key(*k))
     {
         raw.remove(WRAPPER_KEY);
         merge(raw, call);
         notes.push(format!("read '{WRAPPER_KEY}' as the call"));
+        if twice {
+            notes.push(DOUBLE_ENCODED.to_owned());
+        }
         return;
     }
     for key in ["tool_calls", "tool_uses"] {
         let Some(Value::Array(items)) = raw.get(key) else {
             continue;
         };
-        let [Value::Object(item)] = items.as_slice() else {
+        let mut item_notes = Vec::new();
+        let calls: Vec<JsonObject> = items
+            .iter()
+            .filter_map(Value::as_object)
+            .filter_map(|item| item_call(item, &mut item_notes))
+            .collect();
+        if calls.is_empty() || calls.len() != items.len() {
             continue;
-        };
-        let function = item.get("function").and_then(Value::as_object);
-        let name = function
-            .and_then(|f| f.get("name"))
-            .or_else(|| item.get("recipient_name"))
-            .or_else(|| item.get("name"))
-            .and_then(Value::as_str);
-        let Some(name) = name else {
-            continue;
-        };
-        let name = error::strip_server_prefix(name)
-            .unwrap_or(name)
-            .trim()
-            .to_owned();
-        let args = function
-            .and_then(|f| f.get("arguments"))
-            .or_else(|| item.get("parameters"))
-            .or_else(|| item.get("arguments"))
-            .or_else(|| item.get("input"));
-        let args = match args {
-            Some(Value::Object(o)) => o.clone(),
-            Some(Value::String(s)) => serde_json::from_str::<JsonObject>(s).unwrap_or_default(),
-            _ => JsonObject::new(),
-        };
+        }
         raw.remove(key);
-        raw.insert("do".to_owned(), json!(name));
-        merge(raw, args);
-        notes.push(format!("read '{key}' as the call"));
+        if let [call] = calls.as_slice() {
+            merge(raw, call.clone());
+            notes.push(format!("read '{key}' as the call"));
+        } else {
+            raw.insert("batch".to_owned(), json!(calls));
+            notes.push(format!("read '{key}' as a batch"));
+        }
+        notes.extend(item_notes);
         return;
     }
+}
+
+/// The note for parameters sent as JSON encoded twice (`"\"{\\\"a\\\":1}\""`).
+const DOUBLE_ENCODED: &str = "read 'arguments' as JSON inside a JSON string";
+
+/// `s` parsed as a JSON object, also when it is a JSON string holding one (encoded twice); the
+/// flag says the second parse was needed.
+fn json_object(s: &str) -> Option<(JsonObject, bool)> {
+    match serde_json::from_str::<Value>(s).ok()? {
+        Value::Object(o) => Some((o, false)),
+        Value::String(inner) => serde_json::from_str::<JsonObject>(&inner)
+            .ok()
+            .map(|o| (o, true)),
+        _ => None,
+    }
+}
+
+/// The call one `tool_calls`/`tool_uses` item holds (`{"function":{"name":...,"arguments":...}}`,
+/// `{"recipient_name":"functions.x","parameters":...}`): `do` and its arguments. None when the
+/// item names no tool.
+fn item_call(item: &JsonObject, notes: &mut Vec<String>) -> Option<JsonObject> {
+    let function = item.get("function").and_then(Value::as_object);
+    let name = function
+        .and_then(|f| f.get("name"))
+        .or_else(|| item.get("recipient_name"))
+        .or_else(|| item.get("name"))
+        .and_then(Value::as_str)?;
+    let name = error::strip_server_prefix(name).unwrap_or(name).trim();
+    let args = function
+        .and_then(|f| f.get("arguments"))
+        .or_else(|| item.get("parameters"))
+        .or_else(|| item.get("arguments"))
+        .or_else(|| item.get("input"));
+    let args = match args {
+        Some(Value::Object(o)) => o.clone(),
+        Some(Value::String(s)) => match json_object(s) {
+            Some((o, twice)) => {
+                if twice && !notes.iter().any(|n| n == DOUBLE_ENCODED) {
+                    notes.push(DOUBLE_ENCODED.to_owned());
+                }
+                o
+            }
+            None => JsonObject::new(),
+        },
+        _ => JsonObject::new(),
+    };
+    let mut call = JsonObject::new();
+    call.insert("do".to_owned(), json!(name));
+    for (k, v) in args {
+        call.entry(k).or_insert(v);
+    }
+    Some(call)
 }
 
 /// `batch` given as `kind` ("a string", "an object", ...) instead of an array.
@@ -999,16 +1058,37 @@ fn is_type_words(v: &str) -> bool {
 /// `k=v, k: v, k*: v` pieces (a `tool(...)` suffix, or the text after `tool `) read as arguments:
 /// the key without a trailing `*`, each value as JSON, else as text without surrounding quotes.
 /// A value that is a type copied from `usage` (`limit: integer`) is dropped and returned as
-/// `k: v`. The arguments are None when a piece cannot be read whole: a quoted value holding a
-/// comma (a piece with an unmatched quote), or a piece without a key (`a=1,2` cut at the comma):
-/// reading the rest would send a cut value.
+/// `k: v`. Pieces are split at commas outside quotes, so `data: "a,b"` stays whole. The arguments
+/// are None when a piece cannot be read whole: a quote left open, or a piece without a key
+/// (`a=1,2` cut at the comma): reading the rest would send a cut value.
 fn piece_args(body: &str) -> (Option<SuffixArgs>, Vec<String>) {
-    let pieces = body.split(',');
-    let unmatched = |q: char| pieces.clone().any(|p| p.matches(q).count() % 2 == 1);
-    if unmatched('"') || unmatched('\'') {
+    let Some(pieces) = split_unquoted(body) else {
         return (None, Vec::new());
+    };
+    read_pieces(pieces.into_iter().filter(|p| !p.trim().is_empty()))
+}
+
+/// `text` split at the commas outside `"..."` and `'...'`; None when a quote is left open.
+fn split_unquoted(text: &str) -> Option<Vec<&str>> {
+    let mut pieces = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == ',' => {
+                pieces.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
     }
-    read_pieces(pieces.filter(|p| !p.trim().is_empty()))
+    if quote.is_some() {
+        return None;
+    }
+    pieces.push(&text[start..]);
+    Some(pieces)
 }
 
 /// Whether `k` is a parameter name: a letter or `_`, then letters, digits and `_`.
@@ -1173,20 +1253,36 @@ fn suffix_args(
     let Some((name, args, mut dropped)) = parenthesised(&tool).or_else(|| spaced(&tool)) else {
         return (tool, Vec::new());
     };
+    let mut later = Vec::new();
     let with = match args {
         None => {
-            // Left out whole, like a type: a call that writes is not made without them.
-            dropped.push(tool[name.len()..].trim().to_owned());
-            "; its arguments were not read (a value holds a comma or a piece has no key): pass them as keys next to \"do\"".to_owned()
+            // Left out whole: a call that writes is not made without them.
+            let suffix = tool[name.len()..].trim().to_owned();
+            later.push(format!(
+                "'{suffix}': its arguments were not read (a quote left open or a piece without a key); pass them as keys next to \"do\""
+            ));
+            dropped.push(suffix);
+            String::new()
         }
         Some(args) => {
             let mut read = Vec::new();
             for (k, v) in args {
-                if !raw.contains_key(&k) {
-                    read.push(k.clone());
-                    raw.insert(k, v);
+                match raw.get(&k) {
+                    None => {
+                        read.push(k.clone());
+                        raw.insert(k, v);
+                    }
+                    Some(top) if *top != v => {
+                        later.push(format!("'{k}' given twice; used the top-level {top}"));
+                    }
+                    Some(_) => {}
                 }
             }
+            later.extend(
+                dropped
+                    .iter()
+                    .map(|piece| format!("dropped '{piece}': a type from usage, not a value")),
+            );
             if read.is_empty() {
                 String::new()
             } else {
@@ -1195,11 +1291,7 @@ fn suffix_args(
         }
     };
     notes.push(format!("read '{tool}' as {name}{with}"));
-    notes.extend(
-        dropped
-            .iter()
-            .map(|piece| format!("dropped '{piece}': a type from usage, not a value")),
-    );
+    notes.extend(later);
     (name, dropped)
 }
 
@@ -1296,14 +1388,17 @@ fn normalize_run(
         .find(|k| raw.contains_key(*k) && !declares(&tool, k))
     {
         let wrapped = match &raw[key] {
-            Value::Object(o) => Some(o.clone()),
-            Value::String(s) => serde_json::from_str::<JsonObject>(s).ok(),
+            Value::Object(o) => Some((o.clone(), false)),
+            Value::String(s) => json_object(s),
             _ => None,
         };
         match wrapped {
-            Some(wrapped) => {
+            Some((wrapped, twice)) => {
                 raw.remove(key);
                 notes.push(format!("read the parameters inside '{key}'"));
+                if twice {
+                    notes.push(DOUBLE_ENCODED.to_owned());
+                }
                 for (k, v) in wrapped {
                     raw.entry(k).or_insert(v);
                 }
@@ -1412,6 +1507,10 @@ fn unknown_tool_error(catalog: &Catalog, tool: &str, arguments: &JsonObject) -> 
     names.extend(LOCAL_TOOLS.iter().map(|t| t.name.to_owned()));
     let found = suggest_call(tool, names.iter().map(String::as_str), 3);
     let mut hits: Vec<String> = found.iter().map(|s| s.name.to_owned()).collect();
+    // The calls doing what the name's verb says (`remove_bcheck`) lead.
+    let by_verb = verb_calls(tool, hits.iter().map(String::as_str), hits.len());
+    let by_verb: Vec<String> = by_verb.into_iter().map(str::to_owned).collect();
+    hits.sort_by_key(|h| !by_verb.contains(h));
     let w = error::norm(tool);
     let near = match found.as_slice() {
         [only] => {
@@ -1539,13 +1638,104 @@ fn domain_names(catalog: &Catalog) -> Vec<String> {
     domains
 }
 
-/// `unknown_tool` for a name nothing is near: the domains to look in, `see` the nearest one.
+/// The rest of `topic` after a leading `"<domain>."` (`analysis.util.hash` -> `util.hash`), when
+/// its first segment names one of `domains` (in any case).
+fn strip_domain<'a>(topic: &'a str, domains: &[String]) -> Option<&'a str> {
+    let (first, rest) = topic.split_once('.')?;
+    (!rest.is_empty() && domains.iter().any(|d| d.eq_ignore_ascii_case(first))).then_some(rest)
+}
+
+/// The tools `guide` lists under `domain`: the catalog's, then the CLI's own.
+fn domain_tools(catalog: &Catalog, domain: &str) -> Vec<String> {
+    let mut tools: Vec<String> = catalog
+        .domains
+        .iter()
+        .filter(|d| d.name == domain)
+        .flat_map(|d| d.tools.iter().cloned())
+        .collect();
+    tools.extend(
+        LOCAL_TOOLS
+            .iter()
+            .filter(|t| t.domain == domain)
+            .map(|t| t.name.to_owned()),
+    );
+    tools
+}
+
+/// Nouns of a call name and the domain whose tools handle them, for an `unknown_tool` no tool or
+/// domain name is near.
+const NOUN_DOMAINS: &[(&str, &str)] = &[
+    ("scope", "settings"),
+    ("settings", "settings"),
+    ("setting", "settings"),
+    ("config", "settings"),
+    ("finding", "findings"),
+    ("findings", "findings"),
+    ("issue", "findings"),
+    ("issues", "findings"),
+    ("cookie", "http"),
+    ("cookies", "http"),
+    ("request", "http"),
+    ("requests", "http"),
+    ("http", "http"),
+    ("history", HISTORY),
+];
+
+/// `unknown_tool` for a name nothing is near: the domains to look in, `see` the nearest one (by
+/// name, else by a noun of the name, else `guide {}`). A name led by a domain (`data.library.get`)
+/// gets that domain's tools; one holding an action verb (`send_payload`) the calls of that verb.
 fn no_tool_error(catalog: &Catalog, tool: &str) -> ToolError {
     let domains = domain_names(catalog);
+    if let Some(rest) = strip_domain(tool.trim(), &domains) {
+        let first = tool.trim().split('.').next().unwrap_or_default();
+        let domain = domains
+            .iter()
+            .find(|d| d.eq_ignore_ascii_case(first))
+            .cloned()
+            .unwrap_or_default();
+        let tools = domain_tools(catalog, &domain);
+        let mut names: Vec<String> =
+            suggest_call(rest, tools.iter().map(String::as_str), MAX_SUGGESTED)
+                .into_iter()
+                .map(|s| s.name.to_owned())
+                .collect();
+        for t in &tools {
+            if !names.contains(t) {
+                names.push(t.clone());
+            }
+        }
+        names.truncate(MAX_SUGGESTED);
+        return ToolError::new(
+            Code::UnknownTool,
+            format!(
+                "unknown tool \"{tool}\": the domain {domain} has no such tool; guide {{\"topic\":\"{domain}\"}} lists its tools."
+            ),
+        )
+        .did_you_mean(names)
+        .see(guide_call(Some(&domain)));
+    }
+    let tokens: Vec<String> = error::norm(tool)
+        .split('_')
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect();
     let nearest = suggest(tool, domains.iter().map(String::as_str), 1)
         .first()
-        .map_or(DATA, |d| *d)
-        .to_owned();
+        .map(|d| (*d).to_owned())
+        .or_else(|| {
+            tokens.iter().find_map(|t| {
+                NOUN_DOMAINS
+                    .iter()
+                    .find(|(noun, domain)| noun == t && domains.iter().any(|d| d == domain))
+                    .map(|(_, domain)| (*domain).to_owned())
+            })
+        });
+    let mut names = catalog.suggestion_names();
+    names.extend(LOCAL_TOOLS.iter().map(|t| t.name.to_owned()));
+    let by_verb: Vec<String> = verb_calls(tool, names.iter().map(String::as_str), MAX_SUGGESTED)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     let listed: Vec<String> = domains
         .iter()
         .map(|d| {
@@ -1563,7 +1753,8 @@ fn no_tool_error(catalog: &Catalog, tool: &str) -> ToolError {
             listed.join(", ")
         ),
     )
-    .see(guide_call(Some(&nearest)))
+    .did_you_mean(by_verb)
+    .see(guide_call(nearest.as_deref()))
 }
 
 /// `inputSchema.properties.action.enum` of a schema: a grouped tool's actions.
@@ -2402,6 +2593,23 @@ impl Gateway {
                 if catalog.destructive(&name, action.as_deref()) {
                     return error.into_result();
                 }
+                // A call missing a required parameter would only fail after Burp is up.
+                let resolved = action
+                    .as_deref()
+                    .map_or_else(|| name.clone(), |a| format!("{name}.{a}"));
+                let missing_required = safe_call_schema(catalog, &resolved).is_some_and(|schema| {
+                    schema
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .is_some_and(|required| {
+                            required.iter().filter_map(Value::as_str).any(|k| {
+                                k != "project" && arguments.get(k).is_none_or(Value::is_null)
+                            })
+                        })
+                });
+                if missing_required {
+                    return error.into_result();
+                }
                 let mut up = Map::new();
                 up.insert("do".to_owned(), json!("burp_up"));
                 let mut call = Map::new();
@@ -2463,7 +2671,24 @@ impl Gateway {
             }
             Some(topic) => {
                 let names = topic_names(catalog, live.as_deref(), &other);
+                let domains = catalog.map_or_else(
+                    || [LIFECYCLE, HISTORY, DATA].map(str::to_owned).to_vec(),
+                    domain_names,
+                );
+                let first_segment = topic.split('.').next().unwrap_or_default();
                 self.topic(topic, catalog, live.as_deref(), &other)
+                    .or_else(|| {
+                        // `analysis.util.hash`: the domain before the tool.
+                        let rest = strip_domain(topic, &domains)?;
+                        let found = self.topic(rest, catalog, live.as_deref(), &other).or_else(|| {
+                            let same = normalized_topic(rest, &names, catalog)?;
+                            self.topic(same, catalog, live.as_deref(), &other)
+                        })?;
+                        Some(error::with_notes(
+                            found,
+                            &[format!("dropped the domain '{first_segment}' from the topic")],
+                        ))
+                    })
                     .or_else(|| {
                         let same = normalized_topic(topic, &names, catalog)?;
                         self.topic(same, catalog, live.as_deref(), &other)
@@ -2482,6 +2707,18 @@ impl Gateway {
                         } else {
                             by_words
                         };
+                        // An old member name (`scope_list`) is suggested as its current call.
+                        if let Some(c) = catalog {
+                            let mut seen = BTreeSet::new();
+                            did_you_mean = did_you_mean
+                                .into_iter()
+                                .map(|n| match c.aliases.get(&n) {
+                                    Some(alias) => format!("{}.{}", alias.tool, alias.action),
+                                    None => n,
+                                })
+                                .filter(|n| seen.insert(n.clone()))
+                                .collect();
+                        }
                         // Words that say what the model wants (`xss`, `BCheck`): their domain first.
                         let domain = catalog.and_then(|c| {
                             let intent = intent_call(topic)?;
@@ -2490,6 +2727,10 @@ impl Gateway {
                         if let Some(d) = &domain {
                             did_you_mean.retain(|n| n != d);
                             did_you_mean.insert(0, d.clone());
+                        }
+                        // `data.nope`: the domain the topic already names is no suggestion.
+                        if topic.contains('.') {
+                            did_you_mean.retain(|n| n != first_segment);
                         }
                         ToolError::new(
                             Code::UnknownTopic,
@@ -4177,6 +4418,20 @@ mod weak_model {
         let (name, args, _) =
             parenthesised("scope.include(url=\"https://a.com/x,y\")").expect("call");
         assert_eq!(name, "scope.include");
+        assert_eq!(
+            args,
+            Some(vec![("url".to_owned(), json!("https://a.com/x,y"))])
+        );
+        let (_, args, _) =
+            parenthesised("util.hash(data: \"a,b\", algorithm: \"MD5\")").expect("call");
+        assert_eq!(
+            args,
+            Some(vec![
+                ("data".to_owned(), json!("a,b")),
+                ("algorithm".to_owned(), json!("MD5"))
+            ])
+        );
+        let (_, args, _) = parenthesised("scope.include(url=\"https://a.com/x)").expect("call");
         assert_eq!(args, None);
         let (_, args, _) = parenthesised("history_list(limit=1, project='main')").expect("call");
         assert_eq!(
@@ -4306,6 +4561,175 @@ mod weak_model {
             (Code::InvalidArguments, Some("arguments"))
         );
         assert!(broken.error.contains("line 1 column"), "{}", broken.error);
+    }
+
+    #[test]
+    fn several_tool_calls_a_duplicate_and_double_encoded_arguments_are_read() {
+        let catalog = catalog();
+        let normalize = |raw: JsonObject| {
+            normalize_run(
+                raw,
+                |tool, key| tool_declares(Some(&catalog), tool, key),
+                |name| names_a_tool(Some(&catalog), name),
+            )
+            .expect("call")
+        };
+        let mut raw = object(json!({"tool_calls": [
+            {"function": {"name": "history_list", "arguments": "{\"limit\":1}"}},
+            {"function": {"name": "burp_status", "arguments": "{}"}}
+        ]}));
+        let mut notes = Vec::new();
+        assert_eq!(read_pasted_calls(&mut raw, &mut notes), None);
+        assert_eq!(
+            raw.get("batch"),
+            Some(&json!([{"do": "history_list", "limit": 1}, {"do": "burp_status"}]))
+        );
+        assert!(
+            notes.contains(&"read 'tool_calls' as a batch".to_owned()),
+            "{notes:?}"
+        );
+
+        let mut raw = object(json!({"arguments": "\"{\\\"do\\\":\\\"burp_status\\\"}\""}));
+        let mut notes = Vec::new();
+        assert_eq!(read_pasted_calls(&mut raw, &mut notes), None);
+        assert_eq!(normalize(raw).tool, "burp_status");
+        assert!(notes.contains(&DOUBLE_ENCODED.to_owned()), "{notes:?}");
+
+        let wrapped = normalize(object(json!({
+            "do": "history_list", "arguments": "\"{\\\"limit\\\":1}\""
+        })));
+        assert_eq!(wrapped.arguments, Some(object(json!({"limit": 1}))));
+        assert!(
+            wrapped.notes.contains(&DOUBLE_ENCODED.to_owned()),
+            "{:?}",
+            wrapped.notes
+        );
+
+        let twice = normalize(object(json!({"do": "util.hash(data: \"x\")", "data": "y"})));
+        assert_eq!(twice.arguments, Some(object(json!({"data": "y"}))));
+        assert!(
+            twice
+                .notes
+                .contains(&"'data' given twice; used the top-level \"y\"".to_owned()),
+            "{:?}",
+            twice.notes
+        );
+
+        let open = normalize(object(
+            json!({"do": "scope.include(url: \"https://a.com/x)"}),
+        ));
+        assert_eq!(open.dropped, ["(url: \"https://a.com/x)"]);
+        assert!(
+            !open.notes.iter().any(|n| n.contains("a type from usage")),
+            "{:?}",
+            open.notes
+        );
+    }
+
+    #[test]
+    fn source_all_is_read_as_no_source() {
+        let (args, notes): (data::tools::SearchArgs, _) = local_args(
+            local("data_search"),
+            Some(object(json!({"source": "ALL", "query": "svg"}))),
+        )
+        .expect("search");
+        assert_eq!(args.filters.source, None);
+        assert_eq!(notes, ["read 'source' \"all\" as unset"]);
+    }
+
+    #[test]
+    fn a_verb_leads_and_the_fallback_is_never_the_data_domain() {
+        let catalog = catalog();
+        for name in [
+            "remove_bcheck",
+            "delete_scope",
+            "delete_finding",
+            "send_payload",
+            "fuzz_xss",
+            "clear_history",
+            "drop_request",
+            "nope_tool",
+        ] {
+            let e = unknown_tool_error(&catalog, name, &JsonObject::new());
+            assert!(
+                e.retry
+                    .as_ref()
+                    .is_none_or(|r| r["do"] != json!("data_search")),
+                "{name}: {:?}",
+                e.retry
+            );
+            assert_ne!(e.see, Some(guide_call(Some(DATA))), "{name}");
+        }
+        let first = |name: &str| {
+            unknown_tool_error(&catalog, name, &JsonObject::new())
+                .did_you_mean
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(first("remove_bcheck"), "custom_check.bcheck_remove");
+        assert_eq!(first("delete_scope"), "scope.remove");
+        assert_eq!(first("delete_finding"), "findings.remove");
+        assert!(
+            first("send_payload").contains("send"),
+            "{}",
+            first("send_payload")
+        );
+        assert!(first("fuzz_xss").contains("fuzz"), "{}", first("fuzz_xss"));
+        let scope = unknown_tool_error(&catalog, "delete_scope", &JsonObject::new());
+        assert_eq!(scope.retry, None);
+
+        let library = unknown_tool_error(&catalog, "data.library.get", &JsonObject::new());
+        assert!(
+            library.did_you_mean.contains(&"data_get".to_owned()),
+            "{library:?}"
+        );
+        assert_eq!(library.see, Some(guide_call(Some(DATA))));
+        assert_eq!(library.retry, None);
+    }
+
+    #[tokio::test]
+    async fn a_guide_topic_led_by_its_domain_reads_as_the_tool() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let gateway = gateway(dir.path());
+        gateway
+            .assets
+            .set(Ok(Arc::new(Assets { catalog: catalog() })))
+            .expect("assets");
+        let text_of =
+            |r: &CallToolResult| r.content[0].as_text().map_or_default(|t| t.text.clone());
+        for (topic, domain) in [
+            ("analysis.util.hash", "analysis"),
+            ("data.data_search", DATA),
+        ] {
+            let result = gateway
+                .guide(GuideArgs {
+                    topic: Some(topic.to_owned()),
+                })
+                .await;
+            let text = text_of(&result);
+            assert_ne!(result.is_error, Some(true), "{topic}: {text}");
+            assert!(
+                text.contains(&format!("dropped the domain '{domain}' from the topic")),
+                "{topic}: {text}"
+            );
+        }
+        for topic in ["data.nope_nothing", "analysis.nope_nothing"] {
+            let result = gateway
+                .guide(GuideArgs {
+                    topic: Some(topic.to_owned()),
+                })
+                .await;
+            assert_eq!(result.is_error, Some(true), "{topic}");
+            let value: Value = serde_json::from_str(&text_of(&result)).expect("json");
+            let domain = topic.split('.').next().unwrap_or_default();
+            assert!(
+                !value["did_you_mean"]
+                    .as_array()
+                    .is_some_and(|names| names.contains(&json!(domain))),
+                "{topic}: {value}"
+            );
+        }
     }
 
     #[test]

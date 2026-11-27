@@ -178,11 +178,12 @@ pub fn category_matches(cat: &str, wanted: &str) -> bool {
     cat == wanted || cat.starts_with(&format!("{wanted}/"))
 }
 
-/// The browser name entries use for `b`: `chromium` and `edge` are `chrome`, `ff` is `firefox`.
+/// The browser name entries use for `b`: `chromium` is `chrome`, `ff` is `firefox`. `edge` stays
+/// `edge`: the cheat sheet names it on its own.
 pub fn browser_name(b: &str) -> String {
     let b = b.trim().to_lowercase();
     match b.as_str() {
-        "chromium" | "edge" => "chrome".to_owned(),
+        "chromium" => "chrome".to_owned(),
         "ff" => "firefox".to_owned(),
         _ => b,
     }
@@ -228,8 +229,12 @@ pub fn matches(e: &Entry, f: &Filters) -> bool {
         return false;
     }
     if let Some(b) = f.browser.as_deref().filter(|b| !b.is_empty()) {
-        let b = browser_name(b);
-        if !e.browsers.iter().any(|x| x.eq_ignore_ascii_case(&b)) {
+        let alias = browser_name(b);
+        if !e
+            .browsers
+            .iter()
+            .any(|x| x.eq_ignore_ascii_case(b.trim()) || x.eq_ignore_ascii_case(&alias))
+        {
             return false;
         }
     }

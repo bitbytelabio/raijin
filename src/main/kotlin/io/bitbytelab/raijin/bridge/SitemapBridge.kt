@@ -2,14 +2,15 @@ package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
 import burp.api.montoya.core.ByteArray as BurpByteArray
+import burp.api.montoya.core.HighlightColor
+import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.HttpRequestResponse
 import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.http.message.responses.HttpResponse
-import burp.api.montoya.http.HttpService
-import burp.api.montoya.sitemap.SiteMapFilter
 import burp.api.montoya.scanner.audit.issues.AuditIssue
-import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity
 import burp.api.montoya.scanner.audit.issues.AuditIssueConfidence
+import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity
+import burp.api.montoya.sitemap.SiteMapFilter
 import io.bitbytelab.raijin.core.HighlightColorName
 import io.bitbytelab.raijin.core.ProxyHistorySearch
 import io.bitbytelab.raijin.core.ServiceParts
@@ -17,29 +18,35 @@ import io.bitbytelab.raijin.core.StatusCodeRange
 import io.bitbytelab.raijin.safety.RequestHygiene
 import io.bitbytelab.raijin.safety.SafeRegex
 import kotlinx.serialization.json.*
-import burp.api.montoya.core.HighlightColor
 
 class SitemapBridge(private val api: MontoyaApi) {
 
     /** Default noise exclusion for [query]'s `exclude_noise` (overridable). */
     private val defaultNoisePattern =
-        Regex("""/cdn-cgi/|/favicon\.ico(\?|$)|/\.well-known/|/__webpack_hmr""", RegexOption.IGNORE_CASE)
+        Regex(
+            """/cdn-cgi/|/favicon\.ico(\?|$)|/\.well-known/|/__webpack_hmr""",
+            RegexOption.IGNORE_CASE,
+        )
 
     /**
-     * Queries the site map, with enough filtering to tell "the crawl is still running" from
-     * "it's done" and to separate real pages from noise — unlike the old bare-array form, which
-     * returned `status_code: 0` / `mime_type: "unknown"` for both "genuinely empty response" and
-     * "no response yet", had no way to exclude Cloudflare/cdn-cgi noise, and silently truncated
-     * past [maxResults] with no total count to tell you so.
+     * Queries the site map, with enough filtering to tell "the crawl is still running" from "it's
+     * done" and to separate real pages from noise — unlike the old bare-array form, which returned
+     * `status_code: 0` / `mime_type: "unknown"` for both "genuinely empty response" and "no
+     * response yet", had no way to exclude Cloudflare/cdn-cgi noise, and silently truncated past
+     * [maxResults] with no total count to tell you so.
      *
      * @param onlyWithResponse When true, entries with no response yet are excluded entirely.
-     * @param statusCodeRange `"min-max"` / `"200-"` / `"-299"` / `"200"` — see [StatusCodeRange.parse].
+     * @param statusCodeRange `"min-max"` / `"200-"` / `"-299"` / `"200"` — see
+     *   [StatusCodeRange.parse].
      * @param mime Case-insensitive match against the entry's stated OR inferred MIME type.
-     * @param excludeNoise When true (default), drops common non-content noise (`/cdn-cgi/`, `/favicon.ico`, `/.well-known/`, webpack HMR).
+     * @param excludeNoise When true (default), drops common non-content noise (`/cdn-cgi/`,
+     *   `/favicon.ico`, `/.well-known/`, webpack HMR).
      * @param excludePattern Additional caller-supplied regex to exclude (checked against the URL).
      * @param inScopeOnly When true, entries outside Burp's target scope are excluded.
-     * @param searchIn Which parts [searchPattern] matches against: url (default), request, response, or all — see [ProxyHistorySearch.targets].
-     * @param noteContains Substring match against the entry's annotation notes (e.g. `[MCP] Raijin` — see http_send_* tool docs).
+     * @param searchIn Which parts [searchPattern] matches against: url (default), request,
+     *   response, or all — see [ProxyHistorySearch.targets].
+     * @param noteContains Substring match against the entry's annotation notes (e.g. `[MCP] Raijin`
+     *   — see http_send_* tool docs).
      */
     fun query(
         urlPrefix: String?,
@@ -54,19 +61,23 @@ class SitemapBridge(private val api: MontoyaApi) {
         excludePattern: String? = null,
         inScopeOnly: Boolean = false,
         searchIn: String? = null,
-        noteContains: String? = null
+        noteContains: String? = null,
     ): JsonObject {
         val filter = if (urlPrefix != null) SiteMapFilter.prefixFilter(urlPrefix) else null
-        val all = if (filter != null) api.siteMap().requestResponses(filter) else api.siteMap().requestResponses()
+        val all =
+            if (filter != null) api.siteMap().requestResponses(filter)
+            else api.siteMap().requestResponses()
 
         val totalInSitemap = all.size
         val withResponse = all.count { it.hasResponse() }
 
-        val range = when (val r = StatusCodeRange.parse(statusCodeRange)) {
-            is StatusCodeRange.Result.Invalid -> return buildJsonObject { put("error", r.message) }
-            is StatusCodeRange.Result.Ok -> r.range
-            StatusCodeRange.Result.None -> null
-        }
+        val range =
+            when (val r = StatusCodeRange.parse(statusCodeRange)) {
+                is StatusCodeRange.Result.Invalid ->
+                    return buildJsonObject { put("error", r.message) }
+                is StatusCodeRange.Result.Ok -> r.range
+                StatusCodeRange.Result.None -> null
+            }
         val mimeLower = mime?.map { it.lowercase() }
         if (excludePattern != null) {
             SafeRegex.validate(excludePattern, ignoreCase = true)?.let { err ->
@@ -82,30 +93,66 @@ class SitemapBridge(private val api: MontoyaApi) {
 
         var matched = all.asSequence()
         if (onlyWithResponse) matched = matched.filter { it.hasResponse() }
-        if (range != null) matched = matched.filter { it.hasResponse() && range.contains(it.response()!!.statusCode().toInt()) }
-        if (mimeLower != null) matched = matched.filter { entry ->
-            val resp = entry.response() ?: return@filter false
-            val stated = resp.statedMimeType()?.toString()?.lowercase()
-            val inferred = resp.inferredMimeType()?.toString()?.lowercase()
-            mimeLower.any { it == stated || it == inferred }
-        }
-        if (excludeNoise) matched = matched.filter { entry -> !defaultNoisePattern.containsMatchIn(entry.request()?.url() ?: "") }
-        if (excludePattern != null) matched = matched.filter { entry ->
-            !SafeRegex.containsMatchIn(excludePattern, entry.request()?.url() ?: "", ignoreCase = true)
-        }
-        if (inScopeOnly) matched = matched.filter { entry ->
-            try { api.scope().isInScope(entry.request()?.url() ?: "") } catch (_: Exception) { false }
-        }
-        if (noteContains != null) matched = matched.filter { entry ->
-            (try { entry.annotations()?.notes() } catch (_: Exception) { null })?.contains(noteContains, ignoreCase = true) == true
-        }
-        if (searchPattern != null) matched = matched.filter { entry ->
-            val req = entry.request()
-            val resp = entry.response()
-            (targets.url && SafeRegex.containsMatchIn(searchPattern, req?.url() ?: "", ignoreCase = true)) ||
-                (targets.request && req != null && SafeRegex.containsMatchIn(searchPattern, req.toString(), ignoreCase = true)) ||
-                (targets.response && resp != null && SafeRegex.containsMatchIn(searchPattern, resp.toString(), ignoreCase = true))
-        }
+        if (range != null)
+            matched = matched.filter {
+                it.hasResponse() && range.contains(it.response()!!.statusCode().toInt())
+            }
+        if (mimeLower != null)
+            matched = matched.filter { entry ->
+                val resp = entry.response() ?: return@filter false
+                val stated = resp.statedMimeType()?.toString()?.lowercase()
+                val inferred = resp.inferredMimeType()?.toString()?.lowercase()
+                mimeLower.any { it == stated || it == inferred }
+            }
+        // A malformed entry (a request sent on purpose with an invalid method or target) makes
+        // Montoya throw from url()/method()/toString(); a filter skips the field it cannot read.
+        if (excludeNoise)
+            matched = matched.filter { entry ->
+                !defaultNoisePattern.containsMatchIn(urlOf(entry.request()) ?: "")
+            }
+        if (excludePattern != null)
+            matched = matched.filter { entry ->
+                !SafeRegex.containsMatchIn(
+                    excludePattern,
+                    urlOf(entry.request()) ?: "",
+                    ignoreCase = true,
+                )
+            }
+        if (inScopeOnly)
+            matched = matched.filter { entry ->
+                try {
+                    api.scope().isInScope(urlOf(entry.request()) ?: "")
+                } catch (_: Exception) {
+                    false
+                }
+            }
+        if (noteContains != null)
+            matched = matched.filter { entry ->
+                (try {
+                        entry.annotations()?.notes()
+                    } catch (_: Exception) {
+                        null
+                    })
+                    ?.contains(noteContains, ignoreCase = true) == true
+            }
+        if (searchPattern != null)
+            matched = matched.filter { entry ->
+                val req = entry.request()
+                val resp = entry.response()
+                val url = if (targets.url) urlOf(req) else null
+                val reqText =
+                    if (targets.request && req != null) runCatching { req.toString() }.getOrNull()
+                    else null
+                val respText =
+                    if (targets.response && resp != null)
+                        runCatching { resp.toString() }.getOrNull()
+                    else null
+                (url != null && SafeRegex.containsMatchIn(searchPattern, url, ignoreCase = true)) ||
+                    (reqText != null &&
+                        SafeRegex.containsMatchIn(searchPattern, reqText, ignoreCase = true)) ||
+                    (respText != null &&
+                        SafeRegex.containsMatchIn(searchPattern, respText, ignoreCase = true))
+            }
 
         val matchedList = matched.toList()
         val limited = matchedList.take(maxResults.coerceAtLeast(0))
@@ -114,85 +161,150 @@ class SitemapBridge(private val api: MontoyaApi) {
         val mimeHistogram = sortedMapOf<String, Int>()
         for (entry in matchedList) {
             val resp = entry.response()
-            val statusKey = resp?.statusCode()?.toString() ?: "no_response"
+            val statusKey =
+                resp?.let { r -> runCatching { r.statusCode().toString() }.getOrNull() }
+                    ?: "no_response"
             statusHistogram[statusKey] = (statusHistogram[statusKey] ?: 0) + 1
-            val mimeKey = resp?.let { it.statedMimeType()?.toString() ?: it.inferredMimeType()?.toString() } ?: "no_response"
+            val mimeKey =
+                resp?.let { r ->
+                    runCatching {
+                        r.statedMimeType()?.toString() ?: r.inferredMimeType()?.toString()
+                    }
+                        .getOrNull()
+                } ?: "no_response"
             mimeHistogram[mimeKey] = (mimeHistogram[mimeKey] ?: 0) + 1
         }
 
+        val unreadableUrls = mutableListOf<String>()
         return buildJsonObject {
             put("total_in_sitemap", totalInSitemap)
             put("with_response", withResponse)
             put("without_response", totalInSitemap - withResponse)
             put("matched", matchedList.size)
             put("returned", limited.size)
-            put("status_histogram", buildJsonObject { statusHistogram.forEach { (k, v) -> put(k, v) } })
+            put(
+                "status_histogram",
+                buildJsonObject { statusHistogram.forEach { (k, v) -> put(k, v) } },
+            )
             put("mime_histogram", buildJsonObject { mimeHistogram.forEach { (k, v) -> put(k, v) } })
-            put("entries", buildJsonArray {
-                for (entry in limited) {
-                    addJsonObject {
-                        val req = entry.request()
-                        val resp = entry.response()
-                        val hasResponse = entry.hasResponse()
+            put(
+                "entries",
+                buildJsonArray {
+                    for (entry in limited) {
+                        addJsonObject {
+                            val req = entry.request()
+                            val resp = entry.response()
+                            val hasResponse = entry.hasResponse()
 
-                        put("url", req?.url() ?: "unknown")
-                        put("method", req?.method() ?: "unknown")
-                        put("has_response", hasResponse)
-                        put("status_code", if (hasResponse) resp?.statusCode()?.toInt() else null)
-                        put("content_length", if (hasResponse) resp?.body()?.length() else null)
-                        put("mime_type", if (hasResponse) (resp?.statedMimeType()?.toString() ?: resp?.inferredMimeType()?.toString()) else null)
+                            val urlRead = req?.let { r -> runCatching { r.url() } }
+                            val url =
+                                urlRead?.getOrNull()
+                                    ?: req?.let { r ->
+                                        runCatching { r.httpService()?.toString() }.getOrNull()
+                                    }
+                                    ?: "unknown"
+                            val methodRead = req?.let { r -> runCatching { r.method() } }
+                            put("url", url)
+                            val methodError = methodRead?.exceptionOrNull()
+                            if (methodError != null) put("method", JsonNull)
+                            else put("method", methodRead?.getOrNull() ?: "unknown")
+                            val unreadable = methodError ?: urlRead?.exceptionOrNull()
+                            if (unreadable != null) {
+                                put(
+                                    "unreadable",
+                                    unreadable.message ?: unreadable.javaClass.simpleName,
+                                )
+                                unreadableUrls += url
+                            }
+                            put("has_response", hasResponse)
+                            put(
+                                "status_code",
+                                if (hasResponse) resp?.statusCode()?.toInt() else null,
+                            )
+                            put("content_length", if (hasResponse) resp?.body()?.length() else null)
+                            put(
+                                "mime_type",
+                                if (hasResponse)
+                                    (resp?.statedMimeType()?.toString()
+                                        ?: resp?.inferredMimeType()?.toString())
+                                else null,
+                            )
 
-                        if (includeRequest && req != null) {
-                            put("request", req.toString())
-                        }
+                            if (includeRequest && req != null) {
+                                runCatching { req.toString() }
+                                    .getOrNull()
+                                    ?.let { put("request", it) }
+                            }
 
-                        if (includeResponse && resp != null) {
-                            val responseStr = resp.toString()
-                            if (responseStr.length > 100_000) {
-                                put("response", responseStr.substring(0, 100_000) + "... [truncated]")
-                                put("response_truncated", true)
-                            } else {
-                                put("response", responseStr)
+                            if (includeResponse && resp != null) {
+                                val responseStr = resp.toString()
+                                if (responseStr.length > 100_000) {
+                                    put(
+                                        "response",
+                                        responseStr.substring(0, 100_000) + "... [truncated]",
+                                    )
+                                    put("response_truncated", true)
+                                } else {
+                                    put("response", responseStr)
+                                }
                             }
                         }
                     }
-                }
-            })
+                },
+            )
+            if (unreadableUrls.isNotEmpty()) {
+                putJsonArray("notes") { add(unreadableNote(unreadableUrls)) }
+            }
         }
     }
 
+    /** [HttpRequest.url], or null when there is no request or Montoya cannot read its URL. */
+    private fun urlOf(req: HttpRequest?): String? = req?.let { r ->
+        runCatching { r.url() }.getOrNull()
+    }
+
     /**
-     * Sets notes/highlight on the site map entry whose request URL exactly matches [url].
-     * Unlike Proxy history, Montoya's `SiteMap` interface exposes no per-entry update call —
-     * only `add()`. This mutates the live [burp.api.montoya.core.Annotations] object
-     * `requestResponses()` returns for the match, the same way [ProxyBridge.annotateHistoryItem]
-     * already does for proxy history; whether that mutation actually persists in Burp's own
-     * Site map view is **not documented** and should be confirmed once against a running Burp.
+     * Sets notes/highlight on the site map entry whose request URL exactly matches [url]. Unlike
+     * Proxy history, Montoya's `SiteMap` interface exposes no per-entry update call — only `add()`.
+     * This mutates the live [burp.api.montoya.core.Annotations] object `requestResponses()` returns
+     * for the match, the same way [ProxyBridge.annotateHistoryItem] already does for proxy history;
+     * whether that mutation actually persists in Burp's own Site map view is **not documented** and
+     * should be confirmed once against a running Burp.
      */
     fun annotate(url: String, notes: String?, highlight: String?): JsonObject {
-        val canonicalHighlight = if (highlight != null) {
-            HighlightColorName.canonical(highlight)
-                ?: return buildJsonObject {
-                    put("error", "Invalid highlight color: '$highlight'. Valid values: ${HighlightColorName.validValues()}")
-                }
-        } else null
+        val canonicalHighlight =
+            if (highlight != null) {
+                HighlightColorName.canonical(highlight)
+                    ?: return buildJsonObject {
+                        put(
+                            "error",
+                            "Invalid highlight color: '$highlight'. Valid values: ${HighlightColorName.validValues()}",
+                        )
+                    }
+            } else null
 
-        val candidates = try {
-            api.siteMap().requestResponses(SiteMapFilter.prefixFilter(url))
-        } catch (e: Exception) {
-            return buildJsonObject { put("error", "Failed to query site map: ${e.message}") }
-        }
-        val matches = candidates.filter { it.request()?.url() == url }
-        val target = matches.firstOrNull()
-            ?: return buildJsonObject {
-                put("annotated", false)
-                put("matched_count", 0)
-                put("error", "No site map entry found with URL '$url' (use sitemap_query to find the exact URL)")
+        val candidates =
+            try {
+                api.siteMap().requestResponses(SiteMapFilter.prefixFilter(url))
+            } catch (e: Exception) {
+                return buildJsonObject { put("error", "Failed to query site map: ${e.message}") }
             }
+        val matches = candidates.filter { it.request()?.url() == url }
+        val target =
+            matches.firstOrNull()
+                ?: return buildJsonObject {
+                    put("annotated", false)
+                    put("matched_count", 0)
+                    put(
+                        "error",
+                        "No site map entry found with URL '$url' (use sitemap_query to find the exact URL)",
+                    )
+                }
 
         val annotations = target.annotations()
         if (notes != null) annotations.setNotes(notes)
-        if (canonicalHighlight != null) annotations.setHighlightColor(HighlightColor.valueOf(canonicalHighlight))
+        if (canonicalHighlight != null)
+            annotations.setHighlightColor(HighlightColor.valueOf(canonicalHighlight))
 
         return buildJsonObject {
             put("annotated", true)
@@ -200,16 +312,21 @@ class SitemapBridge(private val api: MontoyaApi) {
             put("url", url)
             if (notes != null) put("notes", notes)
             if (canonicalHighlight != null) put("highlight", canonicalHighlight)
-            if (matches.size > 1) put("note", "${matches.size} site map entries share this exact URL; only the first was annotated.")
+            if (matches.size > 1)
+                put(
+                    "note",
+                    "${matches.size} site map entries share this exact URL; only the first was annotated.",
+                )
         }
     }
 
     fun getIssues(urlPrefix: String?, severity: String?): JsonArray {
-        var issues = if (urlPrefix != null) {
-            api.siteMap().issues(SiteMapFilter.prefixFilter(urlPrefix))
-        } else {
-            api.siteMap().issues()
-        }
+        var issues =
+            if (urlPrefix != null) {
+                api.siteMap().issues(SiteMapFilter.prefixFilter(urlPrefix))
+            } else {
+                api.siteMap().issues()
+            }
 
         if (severity != null) {
             val targetSeverity = parseSeverity(severity)
@@ -246,18 +363,23 @@ class SitemapBridge(private val api: MontoyaApi) {
         response: String?,
         host: String,
         port: Int,
-        useTls: Boolean
+        useTls: Boolean,
     ): JsonObject {
         val httpService = HttpService.httpService(host, port, useTls)
         // Build the request from bytes (UTF-8) rather than the lossy String overload,
         // which mangles multibyte codepoints to Latin-1 and corrupts Content-Length.
-        val httpRequest = HttpRequest.httpRequest(httpService, requestToByteArray(RequestHygiene.normalizeCrlf(request)))
+        val httpRequest =
+            HttpRequest.httpRequest(
+                httpService,
+                requestToByteArray(RequestHygiene.normalizeCrlf(request)),
+            )
 
-        val httpResponse = if (response != null) {
-            HttpResponse.httpResponse(response)
-        } else {
-            HttpResponse.httpResponse()
-        }
+        val httpResponse =
+            if (response != null) {
+                HttpResponse.httpResponse(response)
+            } else {
+                HttpResponse.httpResponse()
+            }
 
         val requestResponse = HttpRequestResponse.httpRequestResponse(httpRequest, httpResponse)
 
@@ -282,15 +404,18 @@ class SitemapBridge(private val api: MontoyaApi) {
         confidence: String,
         url: String,
         request: String?,
-        response: String?
+        response: String?,
     ): JsonObject {
         val issueSeverity = parseSeverity(severity)
 
-        val issueConfidence = try {
-            AuditIssueConfidence.valueOf(confidence.uppercase())
-        } catch (_: IllegalArgumentException) {
-            throw IllegalArgumentException("Invalid confidence '$confidence'. Allowed: certain, firm, tentative")
-        }
+        val issueConfidence =
+            try {
+                AuditIssueConfidence.valueOf(confidence.uppercase())
+            } catch (_: IllegalArgumentException) {
+                throw IllegalArgumentException(
+                    "Invalid confidence '$confidence'. Allowed: certain, firm, tentative",
+                )
+            }
 
         val requestResponses = mutableListOf<HttpRequestResponse>()
         if (request != null) {
@@ -300,28 +425,32 @@ class SitemapBridge(private val api: MontoyaApi) {
             val parts = ServiceParts.fromUrl(url)
             val httpService = HttpService.httpService(parts.host, parts.port, parts.useTls)
 
-            val httpRequest = HttpRequest.httpRequest(RequestHygiene.normalizeCrlf(request)).withService(httpService)
-            val httpResponse = if (response != null) {
-                HttpResponse.httpResponse(response)
-            } else {
-                HttpResponse.httpResponse()
-            }
+            val httpRequest =
+                HttpRequest.httpRequest(RequestHygiene.normalizeCrlf(request))
+                    .withService(httpService)
+            val httpResponse =
+                if (response != null) {
+                    HttpResponse.httpResponse(response)
+                } else {
+                    HttpResponse.httpResponse()
+                }
             val rr = HttpRequestResponse.httpRequestResponse(httpRequest, httpResponse)
             requestResponses.add(rr)
         }
 
-        val auditIssue = AuditIssue.auditIssue(
-            name,
-            detail,
-            remediation ?: "",
-            url,
-            issueSeverity,
-            issueConfidence,
-            null, // background
-            null, // remediation background
-            issueSeverity, // typicalSeverity
-            requestResponses
-        )
+        val auditIssue =
+            AuditIssue.auditIssue(
+                name,
+                detail,
+                remediation ?: "",
+                url,
+                issueSeverity,
+                issueConfidence,
+                null, // background
+                null, // remediation background
+                issueSeverity, // typicalSeverity
+                requestResponses,
+            )
 
         api.siteMap().add(auditIssue)
 
@@ -337,31 +466,42 @@ class SitemapBridge(private val api: MontoyaApi) {
 
     companion object {
         /**
+         * The note for the [urls] of entries Montoya could not read: `"1 entry could not be read
+         * (<url>)"` or `"<n> entries could not be read (<url1>, ...)"`, listing at most 5 URLs.
+         */
+        internal fun unreadableNote(urls: List<String>): String {
+            val listed = urls.take(5).joinToString(", ") + if (urls.size > 5) ", ..." else ""
+            return if (urls.size == 1) "1 entry could not be read ($listed)"
+            else "${urls.size} entries could not be read ($listed)"
+        }
+
+        /**
          * Encode a raw HTTP request String to raw bytes using UTF-8, preserving multibyte
-         * codepoints so Content-Length stays byte-accurate. This is the pure, testable core
-         * of the fix: the previous code path handed the String to the lossy
-         * HttpRequest.httpRequest(service, String) overload, which silently narrowed each
-         * character to Latin-1 and corrupted any non-ASCII body/path. UTF-8 is used to match
-         * the byte-oriented http_send_raw_bytes construction.
+         * codepoints so Content-Length stays byte-accurate. This is the pure, testable core of the
+         * fix: the previous code path handed the String to the lossy
+         * HttpRequest.httpRequest(service, String) overload, which silently narrowed each character
+         * to Latin-1 and corrupted any non-ASCII body/path. UTF-8 is used to match the
+         * byte-oriented http_send_raw_bytes construction.
          */
         fun encodeRequestBytes(request: String): kotlin.ByteArray =
             request.toByteArray(Charsets.UTF_8)
 
         /**
-         * Wrap [encodeRequestBytes] into a Montoya ByteArray for HttpRequest construction.
-         * Kept separate so the charset behaviour above can be unit-tested without the
-         * compileOnly Montoya runtime.
+         * Wrap [encodeRequestBytes] into a Montoya ByteArray for HttpRequest construction. Kept
+         * separate so the charset behaviour above can be unit-tested without the compileOnly
+         * Montoya runtime.
          */
         fun requestToByteArray(request: String): BurpByteArray =
             BurpByteArray.byteArray(*encodeRequestBytes(request))
 
         internal fun parseSeverity(severity: String): AuditIssueSeverity {
-            val normalized = severity.trim().uppercase().let { if (it == "INFO") "INFORMATION" else it }
+            val normalized =
+                severity.trim().uppercase().let { if (it == "INFO") "INFORMATION" else it }
             return try {
                 AuditIssueSeverity.valueOf(normalized)
             } catch (_: IllegalArgumentException) {
                 throw IllegalArgumentException(
-                    "Invalid severity '$severity'. Allowed: high, medium, low, info, information"
+                    "Invalid severity '$severity'. Allowed: high, medium, low, info, information",
                 )
             }
         }

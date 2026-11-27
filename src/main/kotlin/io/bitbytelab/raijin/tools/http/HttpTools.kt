@@ -180,7 +180,13 @@ Out-of-range numbers are clamped and reported in notes. Returns full response wi
                 val args = ToolArgs(request.params.arguments ?: emptyMap())
 
                 val url = args.string("url")
-                val rawRequest = args.string("raw_request")
+                // raw_request keeps an empty value (payload), but "" next to a url is a strict
+                // client's filler, not a request to send.
+                val rawRequest =
+                    args.string("raw_request")?.takeUnless { it.isEmpty() && url != null }
+                if (url != null && args.string("raw_request") == "") {
+                    args.notes += "ignored empty 'raw_request' next to 'url'"
+                }
                 val http2Fields = parseHttp2Headers(args["http2_headers"])
                 if (url == null && rawRequest == null && http2Fields == null) {
                     return@addTool toolError("Either 'url' or 'raw_request' must be provided")
@@ -285,6 +291,24 @@ Out-of-range numbers are clamped and reported in notes. Returns full response wi
                     schemeError(url)?.let {
                         return@addTool it
                     }
+                }
+                when ((result["error"] as? JsonPrimitive)?.contentOrNull) {
+                    "Failed to send request: Invalid data." ->
+                        return@addTool io.bitbytelab.raijin.tools.ToolArgs.error(
+                            "invalid_arguments",
+                            "http_send_request: Burp could not read the request to send (Invalid data.); " +
+                                "nothing was sent. Pass 'url', or a full request in 'raw_request'.",
+                        ) {
+                            put("param", "raw_request")
+                        }
+                    "Failed to send request: Invalid service." ->
+                        return@addTool io.bitbytelab.raijin.tools.ToolArgs.error(
+                            "invalid_arguments",
+                            "http_send_request: Burp refused the target (Invalid service.); nothing was sent. " +
+                                "Check 'host' and 'port'.",
+                        ) {
+                            put("param", "host")
+                        }
                 }
 
                 val augmented =

@@ -115,8 +115,8 @@ pub struct Suggestion<'a> {
 
 /// The words of a call name: [`norm`](crate::mcp::error::norm) form split on `_`, without stop
 /// words, singular, and with synonyms in one form (`list`/`show` -> `get`, `create`/`include` ->
-/// `add`, `find` -> `search`, `scanner` -> `scan`). Same rule as the extension's
-/// `ToolArgs.intentTokens`.
+/// `add`, `find` -> `search`, `delete`/`clear`/`drop` -> `remove`, `scanner` -> `scan`). Same rule
+/// as the extension's `ToolArgs.intentTokens`.
 fn intent_tokens(name: &str) -> BTreeSet<String> {
     const STOP_WORDS: [&str; 9] = ["to", "the", "a", "an", "of", "for", "in", "on", "by"];
     crate::mcp::error::norm(name)
@@ -133,6 +133,7 @@ fn intent_tokens(name: &str) -> BTreeSet<String> {
             "get" | "list" | "show" | "fetch" | "read" | "view" | "query" => "get".to_owned(),
             "add" | "create" | "new" | "include" | "insert" => "add".to_owned(),
             "find" | "search" | "grep" | "lookup" => "search".to_owned(),
+            "delete" | "clear" | "drop" | "remove" => "remove".to_owned(),
             "scanner" => "scan".to_owned(),
             other => other.to_owned(),
         })
@@ -184,6 +185,40 @@ pub fn suggest_call<'a>(
             same_words: class == 0,
         })
         .collect()
+}
+
+/// Verbs that name an action of their own: a name holding one is not a lookup ([`intent_call`]).
+const ACTION_VERBS: &[&str] = &[
+    "send", "fuzz", "scan", "remove", "delete", "clear", "drop", "import", "add",
+];
+
+/// Up to `n` call names of `names` that do what the action verb of `wanted` says (`send_payload`
+/// -> the `send` calls), fewest other words first; empty when `wanted` holds no [`ACTION_VERBS`].
+pub fn verb_calls<'a>(
+    wanted: &str,
+    names: impl IntoIterator<Item = &'a str>,
+    n: usize,
+) -> Vec<&'a str> {
+    let want = intent_tokens(wanted);
+    let verbs: BTreeSet<String> = ACTION_VERBS
+        .iter()
+        .map(|v| intent_tokens(v).into_iter().next().unwrap_or_default())
+        .filter(|v| want.contains(v))
+        .collect();
+    if verbs.is_empty() {
+        return Vec::new();
+    }
+    let mut ranked: Vec<(usize, &str)> = names
+        .into_iter()
+        .filter_map(|name| {
+            let have = intent_tokens(name);
+            (!have.is_disjoint(&verbs))
+                .then(|| (have.len() - have.intersection(&want).count(), name))
+        })
+        .collect();
+    ranked.sort_unstable();
+    ranked.dedup_by(|a, b| a.1 == b.1);
+    ranked.into_iter().take(n).map(|(_, name)| name).collect()
 }
 
 /// The call an invented name means by its words ([`intent_call`]).
@@ -238,6 +273,11 @@ pub fn intent_call(wanted: &str) -> Option<Intent> {
             none
         };
         return intent(&["util.hash"], args, true);
+    }
+    // A verb says what the call does (`remove_bcheck`, `send_payload`): a keyword after it only
+    // says where, so the lookups below would run another action.
+    if any(ACTION_VERBS) {
+        return None;
     }
     if any(&["bcheck", "bchecks"]) {
         return intent(

@@ -1,8 +1,10 @@
 //! Arguments and results of the `data_*` tools, shared by `raijin mcp` and `raijin data`.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use clap::ValueEnum;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -226,9 +228,9 @@ fn row(e: &Entry) -> Value {
 /// Most categories or browsers an `invalid_enum` of a filter lists.
 const MAX_ALLOWED: usize = 20;
 
-/// `values` for `allowed`: the ones nearest `got` first, then the rest, at most [`MAX_ALLOWED`];
-/// and the nearest ones for `did_you_mean`.
-fn allowed_and_near(got: &str, values: &BTreeSet<String>) -> (Vec<Value>, Vec<String>) {
+/// `values` for `allowed`: the ones nearest `got` first, then the rest in the order given, at most
+/// [`MAX_ALLOWED`]; and the nearest ones for `did_you_mean`.
+fn allowed_and_near(got: &str, values: &[String]) -> (Vec<Value>, Vec<String>) {
     let near: Vec<String> = suggest(got, values.iter().map(String::as_str), 3)
         .into_iter()
         .map(str::to_owned)
@@ -240,8 +242,9 @@ fn allowed_and_near(got: &str, values: &BTreeSet<String>) -> (Vec<Value>, Vec<St
 }
 
 /// `f` checked against the entries its `source` and `kind` select, for `tool`: a category in
-/// another form (`Restricted Characters`) is read as the one entries use, an id pasted as category
-/// (`events/onload`) as category + tag, a browser alias (`chromium`) as its name; a category or
+/// another form (`Restricted Characters`, `Filter/Proxy/HTTP/`) is read as the one entries use, a
+/// source name (`xss`) as `source`, `<category>/<tag>` as both ([`category_and_tag`]), a browser
+/// alias (`chromium`) as its name unless entries use the name as given (`edge`); a category or
 /// browser no entry has is `invalid_enum`. Each reading is noted. Without entries (a source not
 /// downloaded) nothing is checked.
 fn checked_filters(
@@ -249,6 +252,24 @@ fn checked_filters(
     entries: &[&Entry],
     filters: &Filters,
 ) -> Result<(Filters, Vec<String>), ToolError> {
+    // `category:"xss"`: a source name given as category.
+    if filters.source.is_none()
+        && let Some(c) = filters.category.as_deref()
+        && let Some(source) = Source::value_variants()
+            .iter()
+            .copied()
+            .find(|s| s.as_str() == c.trim().to_lowercase())
+        && !entries.iter().any(|e| category_matches(&e.category, c))
+    {
+        let as_source = Filters {
+            source: Some(source),
+            category: None,
+            ..filters.clone()
+        };
+        let (f, mut notes) = checked_filters(tool, entries, &as_source)?;
+        notes.insert(0, format!("read 'category' \"{}\" as 'source'", c.trim()));
+        return Ok((f, notes));
+    }
     let mut f = filters.clone();
     let mut notes = Vec::new();
     let pool: Vec<&Entry> = entries
@@ -264,7 +285,9 @@ fn checked_filters(
         Some(s) => json!({"do": "data_list", "source": s}),
         None => json!({"do": "data_list"}),
     };
-    if let Some(c) = f.category.clone().filter(|c| !c.trim().is_empty()) {
+    if let Some(raw) = f.category.clone().filter(|c| !c.trim().is_empty()) {
+        // `Filter/Proxy/HTTP/` is `Filter/Proxy/HTTP`.
+        let c = raw.trim().trim_end_matches('/').to_owned();
         if let Some(e) = pool.iter().find(|e| category_matches(&e.category, &c)) {
             let depth = c.split('/').count();
             let actual = e
@@ -273,46 +296,36 @@ fn checked_filters(
                 .take(depth)
                 .collect::<Vec<_>>()
                 .join("/");
-            if !actual.eq_ignore_ascii_case(c.trim()) {
-                notes.push(format!("matched 'category' \"{c}\" to \"{actual}\""));
+            if !actual.eq_ignore_ascii_case(&c) {
+                notes.push(format!("matched 'category' \"{raw}\" to \"{actual}\""));
             }
             f.category = Some(actual);
-        } else if let Some((head, _)) = c.split_once('/')
-            && let Some(e) = pool.iter().find(|e| category_matches(&e.category, head))
-        {
-            let category = e.category.split('/').next().unwrap_or_default().to_owned();
-            let tag = c.rsplit('/').next().unwrap_or_default().trim().to_owned();
+        } else {
+            let (category, tag) = category_and_tag(tool, entries, &pool, &raw, &c, see())?;
             notes.push(format!(
-                "read 'category' \"{c}\" as category \"{category}\" + tag \"{tag}\""
+                "read 'category' \"{raw}\" as category \"{category}\" + tag \"{tag}\""
             ));
             f.category = Some(category);
-            if f.tag.as_deref().is_none_or(str::is_empty) && !tag.is_empty() {
+            if f.tag.as_deref().is_none_or(str::is_empty) {
                 f.tag = Some(tag);
             }
-        } else {
-            let cats: BTreeSet<String> = pool.iter().map(|e| e.category.clone()).collect();
-            let (allowed, near) = allowed_and_near(&c, &cats);
-            return Err(ToolError::new(
-                Code::InvalidEnum,
-                format!(
-                    "{tool}: no entry has category \"{c}\"; 'allowed' lists categories of the selected data."
-                ),
-            )
-            .param("category")
-            .got(json!(c))
-            .allowed(allowed)
-            .did_you_mean(near)
-            .see(see()));
         }
     }
     if let Some(b) = f.browser.clone().filter(|b| !b.trim().is_empty()) {
-        let name = browser_name(&b);
         let browsers: BTreeSet<String> = pool
             .iter()
             .flat_map(|e| e.browsers.iter().map(|x| x.to_lowercase()))
             .collect();
+        // A name the data uses as written wins over an alias (`edge` is not `chrome`).
+        let lower = b.trim().to_lowercase();
+        let name = if browsers.contains(&lower) {
+            lower
+        } else {
+            browser_name(&b)
+        };
         if !browsers.contains(&name) {
-            let (allowed, near) = allowed_and_near(&name, &browsers);
+            let known: Vec<String> = browsers.iter().cloned().collect();
+            let (allowed, near) = allowed_and_near(&name, &known);
             let listed = if browsers.is_empty() {
                 "the selected entries name no browser"
             } else {
@@ -334,6 +347,63 @@ fn checked_filters(
         f.browser = Some(name);
     }
     Ok((f, notes))
+}
+
+/// A category `c` (`raw` as given) no entry of `pool` has, for `tool`: `<category>/.../<tag>` whose
+/// last segment is a tag of an entry in that category is read as both. An entry id
+/// (`events/onload/svg`) is `invalid_arguments` with a `data_get` retry; anything else
+/// `invalid_enum` listing the categories of `pool`, each source's together, with `see`.
+fn category_and_tag(
+    tool: &str,
+    entries: &[&Entry],
+    pool: &[&Entry],
+    raw: &str,
+    c: &str,
+    see: Value,
+) -> Result<(String, String), ToolError> {
+    if let Ok((e, _)) = find(entries, c, "data_get") {
+        return Err(ToolError::new(
+            Code::InvalidArguments,
+            format!("{tool}: 'category' \"{raw}\" is the id of an entry; get it with data_get."),
+        )
+        .param("category")
+        .got(json!(raw))
+        .retry(json!({"do": "data_get", "id": e.id})));
+    }
+    if let Some((head, tail)) = c.split_once('/') {
+        let tag = tail.rsplit('/').next().unwrap_or_default().trim();
+        let tagged = pool.iter().find(|e| {
+            category_matches(&e.category, head)
+                && e.tags.iter().any(|x| x.eq_ignore_ascii_case(tag))
+        });
+        if let Some(e) = tagged {
+            let category = e.category.split('/').next().unwrap_or_default();
+            return Ok((category.to_owned(), tag.to_owned()));
+        }
+    }
+    let order = |s: Source| Source::value_variants().iter().position(|v| *v == s);
+    let by_source: BTreeSet<(Option<usize>, &str)> = pool
+        .iter()
+        .map(|e| (order(e.source), e.category.as_str()))
+        .collect();
+    let mut cats: Vec<String> = Vec::new();
+    for (_, cat) in by_source {
+        if !cats.iter().any(|x| x == cat) {
+            cats.push(cat.to_owned());
+        }
+    }
+    let (allowed, near) = allowed_and_near(c, &cats);
+    Err(ToolError::new(
+        Code::InvalidEnum,
+        format!(
+            "{tool}: no entry has category \"{c}\"; 'allowed' lists categories of the selected data."
+        ),
+    )
+    .param("category")
+    .got(json!(c))
+    .allowed(allowed)
+    .did_you_mean(near)
+    .see(see))
 }
 
 /// Why `f` matched nothing, as notes: a tag no entry of the selected source and kind has (with the
@@ -390,20 +460,20 @@ fn zero_notes(entries: &[&Entry], f: &Filters) -> Vec<String> {
     notes
 }
 
-/// Search rows for `args`, rows whose title holds every query word first; notes say how filters
-/// were read and, without hits, why.
+/// Search rows for `args`: the target's own (`custom`) rows first, then by how many query words
+/// the title holds, most first, else in entry order; notes say how filters were read and, without
+/// hits, why.
 pub fn search(entries: &[&Entry], args: &SearchArgs) -> Result<(Value, Vec<String>), ToolError> {
     let (filters, mut notes) = checked_filters("data_search", entries, &args.filters)?;
     let (limit, clamped) = clamp(args.limit, SEARCH_LIMIT, SEARCH_MAX);
     let offset = args.offset.unwrap_or(0);
     let mut hits: Vec<&&Entry> = entries.iter().filter(|e| matches(e, &filters)).collect();
     let words = filters.query.as_deref().map_or_default(query_words);
-    if !words.is_empty() {
-        hits.sort_by_key(|e| {
-            let title = e.title.to_lowercase().replace(['-', '_'], " ");
-            !words.iter().all(|w| title.contains(w.as_str()))
-        });
-    }
+    hits.sort_by_cached_key(|e| {
+        let title = e.title.to_lowercase().replace(['-', '_'], " ");
+        let in_title = words.iter().filter(|w| title.contains(w.as_str())).count();
+        (e.source != Source::Custom, Reverse(in_title))
+    });
     let rows: Vec<Value> = hits
         .iter()
         .skip(offset)
@@ -420,8 +490,35 @@ pub fn search(entries: &[&Entry], args: &SearchArgs) -> Result<(Value, Vec<Strin
     }
     if hits.is_empty() {
         notes.extend(zero_notes(entries, &filters));
+        notes.extend(without_category_note(entries, &filters));
     }
     Ok((value, notes))
+}
+
+/// For a search with a `category` and no hit: how many entries match without it, and the
+/// category holding most of them (`"no parentheses" matches 19 without 'category'
+/// (restricted_characters: 19)`).
+fn without_category_note(entries: &[&Entry], f: &Filters) -> Option<String> {
+    f.category.as_deref().filter(|c| !c.is_empty())?;
+    let unfiltered = Filters {
+        category: None,
+        ..f.clone()
+    };
+    let mut by_category: BTreeMap<&str, usize> = BTreeMap::new();
+    let matching = entries.iter().filter(|e| matches(e, &unfiltered));
+    for e in matching {
+        *by_category.entry(e.category.as_str()).or_default() += 1;
+    }
+    let n: usize = by_category.values().sum();
+    // Most hits; on a tie the first category by name.
+    let (top, k) = by_category
+        .iter()
+        .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))?;
+    let what = match f.query.as_deref().filter(|q| !q.trim().is_empty()) {
+        Some(q) => format!("\"{q}\" matches"),
+        None => "the other filters match".to_owned(),
+    };
+    Some(format!("{what} {n} without 'category' ({top}: {k})"))
 }
 
 /// The entry `id` names, and a note when it was read leniently: in another case, or without its
@@ -737,6 +834,87 @@ mod tests {
         let (v, _) = search_of(&[&a, &b], json!({"query": "beans actuator"})).expect("search");
         assert_eq!(v["rows"][0]["id"], "xss:b");
         assert_eq!(v["rows"][1]["id"], "xss:a");
+    }
+
+    #[test]
+    fn the_title_holding_most_query_words_comes_first_and_custom_rows_lead() {
+        let words = "exposed spring boot beans actuator";
+        // Every row holds every word; only the titles differ.
+        let mut a = xss("xss:a", "c", "autoconfig actuator", &[]);
+        a.description = Some(words.to_owned());
+        let mut b = xss("xss:b", "c", "spring boot beans actuator", &[]);
+        b.description = Some(words.to_owned());
+        let (v, _) = search_of(&[&a, &b], json!({"query": words})).expect("search");
+        assert_eq!(v["rows"][0]["id"], "xss:b", "{v}");
+
+        let mut own = xss("custom:waf/svg", "waf-bypass", "svg onload", &[]);
+        own.source = Source::Custom;
+        let upstream = xss("xss:events/onload/svg", "events", "svg onload", &[]);
+        let (v, _) = search_of(&[&upstream, &own], json!({"query": "svg onload"})).expect("search");
+        assert_eq!(v["rows"][0]["id"], "custom:waf/svg", "{v}");
+    }
+
+    #[test]
+    fn a_source_category_id_or_trailing_slash_is_read_as_meant() {
+        let a = xss(
+            "xss:restricted_characters/a",
+            "restricted_characters",
+            "no parentheses",
+            &[],
+        );
+        let b = xss(
+            "xss:events/onload/svg",
+            "events",
+            "onload on svg",
+            &["onload", "svg"],
+        );
+        let mut f = xss("bambdas:f", "Filter/Proxy/HTTP", "filter", &[]);
+        f.source = Source::Bambdas;
+        let refs = [&a, &b, &f];
+
+        let (v, notes) = search_of(&refs, json!({"category": "xss"})).expect("source");
+        assert_eq!(v["total"], 2);
+        assert_eq!(notes, ["read 'category' \"xss\" as 'source'"]);
+
+        let (slash, _) =
+            search_of(&refs, json!({"category": "Filter/Proxy/HTTP/"})).expect("slash");
+        let (plain, _) = search_of(&refs, json!({"category": "Filter/Proxy/HTTP"})).expect("plain");
+        assert_eq!(slash["total"], plain["total"]);
+        assert_eq!(slash["total"], 1);
+
+        let id = search_of(&refs, json!({"category": "events/onload/svg"})).expect_err("id");
+        assert_eq!(id.code, Code::InvalidArguments);
+        assert_eq!(
+            id.retry,
+            Some(json!({"do": "data_get", "id": "xss:events/onload/svg"}))
+        );
+
+        let nope = search_of(&refs, json!({"category": "classic/ae1d2cc4"})).expect_err("no tag");
+        assert_eq!(nope.code, Code::InvalidEnum);
+
+        let (v, notes) = search_of(
+            &refs,
+            json!({"category": "events", "query": "no parentheses"}),
+        )
+        .expect("zero");
+        assert_eq!(v["total"], 0);
+        assert!(
+            notes.contains(
+                &"\"no parentheses\" matches 1 without 'category' (restricted_characters: 1)"
+                    .to_owned()
+            ),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_browser_the_data_names_is_not_read_as_an_alias() {
+        let mut e = xss("xss:e", "events", "t", &[]);
+        e.browsers = vec!["edge".into()];
+        let c = xss("xss:c", "events", "t", &[]);
+        let (v, notes) = search_of(&[&e, &c], json!({"browser": "edge"})).expect("edge");
+        assert_eq!(v["total"], 1);
+        assert_eq!(notes, Vec::<String>::new());
     }
 
     #[test]

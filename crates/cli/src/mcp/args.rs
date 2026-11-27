@@ -566,9 +566,19 @@ fn unknown_parameter(
                 by_synonym += 1;
                 return Some(t);
             }
-            suggest(&c, props.keys().map(String::as_str), 1)
-                .first()
-                .copied()
+            let near = |name: &str| {
+                suggest(name, props.keys().map(String::as_str), 1)
+                    .first()
+                    .copied()
+            };
+            // `allowed_host` names `allowed`: the suffix only says what kind of value it holds.
+            near(&c).or_else(|| {
+                ["_host", "_url", "_domain", "_name"]
+                    .iter()
+                    .find_map(|s| c.strip_suffix(s))
+                    .filter(|stem| !stem.is_empty())
+                    .and_then(near)
+            })
         })
         .collect();
     let chosen: Vec<&str> = targets.iter().flatten().copied().collect();
