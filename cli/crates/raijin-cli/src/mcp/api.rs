@@ -151,14 +151,15 @@ impl ToolApi {
         &self,
         endpoint: &Endpoint,
         name: &str,
-        arguments: Option<JsonObject>,
+        arguments: Option<&JsonObject>,
     ) -> Result<CallToolResult, ApiError> {
         let base = api_base(&endpoint.url).map_err(ApiError::Other)?;
         let mut url = url::Url::parse(&base).map_err(|e| ApiError::Other(e.to_string()))?;
         url.path_segments_mut()
             .map_err(|()| ApiError::Other(format!("bad Raijin URL {base}")))?
             .extend(["tools", name]);
-        let request = self.client.post(url).json(&arguments.unwrap_or_default());
+        let empty = JsonObject::new();
+        let request = self.client.post(url).json(arguments.unwrap_or(&empty));
         let (status, body) = self.send(endpoint, &base, request).await?;
         // An older extension answers an unknown name with a 404 instead of an `unknown_tool` result.
         if status == StatusCode::NOT_FOUND && unknown_tool(&body) {

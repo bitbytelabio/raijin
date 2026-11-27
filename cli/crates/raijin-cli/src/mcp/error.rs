@@ -83,16 +83,17 @@ pub struct Envelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<String>,
     pub retryable: bool,
+    /// A call to make first: `{"do": ...}` goes to `run`, `{"guide": {...}}` holds `guide`'s arguments.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub see: Option<String>,
+    pub see: Option<Value>,
 }
 
 impl ToolError {
-    /// An error with `code`; `error` ends as a sentence (a `.` is added when it ends in none), and
-    /// a non-retryable one says so at the end.
+    /// An error with `code`; `error` ends as a sentence (a `.` is added when it ends in none, also
+    /// after a closing parenthesis), and a non-retryable one says so at the end.
     pub fn new(code: Code, error: impl Into<String>) -> Self {
         let mut error = error.into().trim_end().to_owned();
-        if !error.ends_with(['.', '!', '?', ')']) {
+        if !error.ends_with(['.', '!', '?']) {
             error.push('.');
         }
         if !code.retryable() {
@@ -154,8 +155,16 @@ impl ToolError {
         self
     }
 
-    pub fn see(mut self, see: impl Into<String>) -> Self {
-        self.0.see = Some(see.into());
+    /// `call`: a `run` call (`{"do": ...}`) or a guide call ([`guide_call`]).
+    pub fn see(mut self, call: Value) -> Self {
+        self.0.see = Some(call);
+        self
+    }
+
+    /// Without `example` (and `retry`): for errors where no call shape helps, such as `guide`'s.
+    pub fn clear_example(mut self) -> Self {
+        self.0.example = None;
+        self.0.retry = None;
         self
     }
 
@@ -194,12 +203,111 @@ pub fn with_notes(mut result: CallToolResult, notes: &[String]) -> CallToolResul
     result
 }
 
-/// Name normal form: trimmed, lowercase, `-`, `.` and spaces as `_`.
+/// `result` with its warnings also in `notes` (the old fields stay): `scope_warning` and
+/// `headers_warning` strings, each `warnings` entry (a `{project, error}` object as
+/// `"<project>: <error>"`, another object as compact JSON) and every `<x>_clamped_to` field as
+/// `"<x> clamped to <value>"`. A note already present is not added twice. Same rule as the
+/// extension's `ToolArgs.mirrorWarnings`.
+pub fn mirror_warnings(result: CallToolResult) -> CallToolResult {
+    if result.content.len() != 1 {
+        return result;
+    }
+    // A full parse of every result (history bodies can be megabytes) only to find no warning
+    // would cost more than the warnings are worth.
+    let Some(text) = result.content[0].as_text() else {
+        return result;
+    };
+    if !["_warning", "\"warnings\"", "_clamped_to"]
+        .iter()
+        .any(|hint| text.text.contains(hint))
+    {
+        return result;
+    }
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&text.text) else {
+        return result;
+    };
+    let mut found = Vec::new();
+    for key in ["scope_warning", "headers_warning"] {
+        if let Some(Value::String(s)) = object.get(key) {
+            found.push(s.clone());
+        }
+    }
+    for warning in object
+        .get("warnings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        found.push(match warning {
+            Value::String(s) => s.clone(),
+            Value::Object(w) => match (
+                w.get("project").and_then(Value::as_str),
+                w.get("error").and_then(Value::as_str),
+            ) {
+                (Some(project), Some(error)) if w.len() == 2 => format!("{project}: {error}"),
+                _ => warning.to_string(),
+            },
+            other => other.to_string(),
+        });
+    }
+    for (key, value) in &object {
+        if let Some(what) = key.strip_suffix("_clamped_to") {
+            found.push(format!("{what} clamped to {value}"));
+        }
+    }
+    let existing: Vec<&str> = object
+        .get("notes")
+        .and_then(Value::as_array)
+        .map(|n| n.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut fresh: Vec<String> = Vec::new();
+    for note in found {
+        if !existing.contains(&note.as_str()) && !fresh.contains(&note) {
+            fresh.push(note);
+        }
+    }
+    with_notes(result, &fresh)
+}
+
+/// `{"guide":{}}`, or `{"guide":{"topic":t}}`: a `see` that points at `guide`.
+pub fn guide_call(topic: Option<&str>) -> Value {
+    match topic {
+        Some(t) => json!({"guide": {"topic": t}}),
+        None => json!({"guide": {}}),
+    }
+}
+
+/// Prefixes clients put before a tool name (`mcp__raijin__history_list`, `raijin.history_list`).
+const SERVER_PREFIXES: [&str; 5] = [
+    "mcp__raijin__",
+    "raijin.",
+    "raijin:",
+    "raijin/",
+    "functions.",
+];
+
+/// `name` without a server prefix ([`SERVER_PREFIXES`], any case), when it has one and something
+/// follows it. Same list as the extension's `ToolNames.stripServerPrefix`.
+pub fn strip_server_prefix(name: &str) -> Option<&str> {
+    SERVER_PREFIXES.iter().find_map(|prefix| {
+        let head = name.get(..prefix.len())?;
+        let rest = &name[prefix.len()..];
+        (head.eq_ignore_ascii_case(prefix) && !rest.trim().is_empty()).then_some(rest)
+    })
+}
+
+/// Name normal form: trimmed, lowercase, `-`, `.`, `/` and spaces as `_`.
 pub fn norm(name: &str) -> String {
     name.trim()
         .to_lowercase()
         .chars()
-        .map(|c| if matches!(c, '-' | '.' | ' ') { '_' } else { c })
+        .map(|c| {
+            if matches!(c, '-' | '.' | '/' | ' ') {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -224,6 +332,36 @@ mod tests {
             unpunctuated.error,
             "known: main. Do not resend this call unchanged."
         );
+        assert!(
+            ToolError::new(Code::NotFound, "x (y)")
+                .error
+                .ends_with("(y).")
+        );
+    }
+
+    #[test]
+    fn server_prefixes_are_stripped() {
+        assert_eq!(
+            strip_server_prefix("mcp__raijin__history_list"),
+            Some("history_list")
+        );
+        assert_eq!(
+            strip_server_prefix("Raijin.scope.check"),
+            Some("scope.check")
+        );
+        assert_eq!(strip_server_prefix("raijin."), None);
+        assert_eq!(strip_server_prefix("history_list"), None);
+    }
+
+    #[test]
+    fn warnings_are_mirrored_into_notes_once() {
+        let result = CallToolResult::success(vec![ContentBlock::text(
+            r#"{"warnings":[{"project":"p","error":"bad"},"w"],"limit_clamped_to":5,"notes":["w"]}"#,
+        )]);
+        let mirrored = mirror_warnings(result);
+        let value: Value =
+            serde_json::from_str(&mirrored.content[0].as_text().expect("text").text).expect("json");
+        assert_eq!(value["notes"], json!(["w", "p: bad", "limit clamped to 5"]));
     }
 
     #[test]
@@ -243,5 +381,6 @@ mod tests {
     fn names_normalise_case_and_separators() {
         assert_eq!(norm(" History.List "), "history_list");
         assert_eq!(norm("Burp-Down"), "burp_down");
+        assert_eq!(norm("history/list"), "history_list");
     }
 }

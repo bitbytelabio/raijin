@@ -25,15 +25,15 @@ use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 
 use super::api::{ApiError, Endpoint, ToolApi};
-use super::args::{parse_args, schema_of};
-use super::error::{self, Code, ToolError};
+use super::args::{call_fits, parse_args, schema_of};
+use super::error::{self, Code, ToolError, guide_call};
 use super::spill;
 use crate::burp::{instance, launch};
-use crate::catalog::{self, Catalog, SKILL_FILE, ToolSpec};
+use crate::catalog::{self, ActionSpec, Catalog, SKILL_FILE, ToolSpec};
 use crate::config::{Mode, Remote, Target, user_state_dir};
 use crate::history;
 use crate::jar::{self, Assets};
-use crate::util::{suggest, truncate_utf8};
+use crate::util::{contains_near, edit_distance, suggest, truncate_utf8};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Surface {
@@ -57,7 +57,8 @@ const INSTRUCTIONS_TAIL: &str = "offline .burp review (domain history) needs no 
 Burp when several run. An error result is JSON with 'error' and 'code': resend 'retry' when it is given, else fix \
 the call from 'usage' and 'example'; never resend a call unchanged when 'retryable' is false. Results over the \
 inline limit come back as {saved_to, preview}: parse the file with jq/python, never read it whole. Read the \
-overview playbook first: guide({\"topic\":\"overview\"}), also the prompt /overview and skill://overview/SKILL.md.";
+overview playbook first: guide({\"topic\":\"overview\"}), also the prompt /overview and skill://overview/SKILL.md. \
+'see' is a call to make first: an object with \"do\" goes to run, one with \"guide\" holds guide's arguments.";
 
 const GUIDE_HEAD: &str = "Run a tool: run {\"do\":\"<tool>\", ...its parameters}. Grouped tool: run \
 {\"do\":\"<tool>.<action>\", ...} e.g. {\"do\":\"scope.check\",\"url\":\"https://example.com\"}. Several in order: \
@@ -272,8 +273,8 @@ fn run_example() -> Value {
     serde_json::from_str(RUN_EXAMPLE).unwrap_or_default()
 }
 
-/// An error envelope's `retry` and `example` calls with `"project"` added, so resending them reaches
-/// the same Burp; any other result is returned as is.
+/// An error envelope's `retry`, `example` and `see` `run` calls with `"project"` added, so resending
+/// them reaches the same Burp; any other result is returned as is.
 fn with_project(mut result: CallToolResult, project: &str) -> CallToolResult {
     if result.is_error != Some(true) || result.content.len() != 1 {
         return result;
@@ -287,7 +288,7 @@ fn with_project(mut result: CallToolResult, project: &str) -> CallToolResult {
     if !envelope.get("code").is_some_and(Value::is_string) {
         return result;
     }
-    for key in ["retry", "example"] {
+    for key in ["retry", "example", "see"] {
         if let Some(Value::Object(call)) = envelope.get_mut(key)
             && call.contains_key("do")
         {
@@ -310,21 +311,67 @@ fn batch_type_error(kind: &str, got: Value) -> CallToolResult {
     .into_result()
 }
 
-/// `run`'s `bail`: a boolean, also as the text `"true"`/`"false"` (noted); absent or null is false.
-/// Anything else is refused: a batch that runs on after a failure is not what `bail` asked for.
+/// A failed batch step's `error`, or its whole result as text.
+fn failure_reason(failed: &Value) -> String {
+    match failed {
+        Value::String(s) => s.clone(),
+        other => other
+            .get("error")
+            .and_then(Value::as_str)
+            .map_or_else(|| other.to_string(), str::to_owned),
+    }
+}
+
+/// A failed batch step's `code`, `tool_failed` when it has none.
+fn failure_code(failed: &Value) -> String {
+    failed
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("tool_failed")
+        .to_owned()
+}
+
+/// The batch that repairs a failed one: each failed step's `retry` in order (a `retry` that is
+/// itself a batch is spliced in, its `bail` kept), then the steps `bail` left unrun. None unless
+/// every failed step has a `retry`; steps that succeeded are never repeated.
+fn batch_retry(failures: &[(usize, Value)], not_run: &[Value], bail: bool) -> Option<Value> {
+    if failures.is_empty() {
+        return None;
+    }
+    let mut steps = Vec::new();
+    let mut bail = bail;
+    for (_, failed) in failures {
+        let retry = failed.get("retry")?.as_object()?;
+        match retry.get("batch").and_then(Value::as_array) {
+            Some(inner) => {
+                steps.extend(inner.iter().cloned());
+                bail |= retry.get("bail").and_then(Value::as_bool) == Some(true);
+            }
+            None => steps.push(Value::Object(retry.clone())),
+        }
+    }
+    steps.extend(not_run.iter().cloned());
+    Some(json!({"batch": steps, "bail": bail}))
+}
+
+/// `run`'s `bail`: a boolean, also as a boolean word (`"true"`, `"yes"`, `"0"`, ...) or the integer
+/// 0 or 1 (noted); absent or null is false. Anything else is refused: a batch that runs on after a
+/// failure is not what `bail` asked for.
 fn read_bail(value: Option<Value>) -> Result<(bool, Option<String>), ToolError> {
     match value {
         None | Some(Value::Null) => Ok((false, None)),
         Some(Value::Bool(b)) => Ok((b, None)),
-        Some(Value::String(s))
-            if s.trim().eq_ignore_ascii_case("true") || s.trim().eq_ignore_ascii_case("false") =>
-        {
-            let b = s.trim().eq_ignore_ascii_case("true");
+        Some(Value::String(s)) if super::args::bool_word(&s).is_some() => {
+            let b = super::args::bool_word(&s) == Some(true);
             Ok((
                 b,
                 Some(format!("coerced 'bail' from string \"{s}\" to boolean")),
             ))
         }
+        Some(Value::Number(n)) if matches!(n.as_u64(), Some(0 | 1)) => Ok((
+            n.as_u64() == Some(1),
+            Some(format!("coerced 'bail' from {n} to boolean")),
+        )),
         Some(other) => Err(ToolError::new(
             Code::InvalidType,
             format!("run: 'bail' must be true or false, got {other}."),
@@ -352,10 +399,10 @@ fn history_error(tool: &str, e: &anyhow::Error, sent: &JsonObject) -> ToolError 
             if let Some(param) = param {
                 err = err.param(param).got(sent[param].clone());
             }
-            err.see(format!("run {list}"))
+            err.see(list)
         }
         Some(history::Problem::NotFound(message)) => {
-            ToolError::new(Code::NotFound, format!("{tool}: {message}.")).see(format!("run {list}"))
+            ToolError::new(Code::NotFound, format!("{tool}: {message}.")).see(list)
         }
         // The project came from a ref (`history_show`, `history_diff`): the ref is what to fix.
         Some(history::Problem::UnknownProject { wanted, known })
@@ -369,7 +416,7 @@ fn history_error(tool: &str, e: &anyhow::Error, sent: &JsonObject) -> ToolError 
                     known.join(", ")
                 ),
             )
-            .see(format!("run {list}"));
+            .see(list);
             if let Some(param) = ["ref", "a", "b"].into_iter().find(|k| {
                 sent.get(*k)
                     .and_then(Value::as_str)
@@ -409,6 +456,150 @@ fn history_error(tool: &str, e: &anyhow::Error, sent: &JsonObject) -> ToolError 
     }
 }
 
+/// Why a history tool gave no result: its arguments were refused, or the run failed (with what
+/// reading the arguments changed, which the error result still reports).
+enum HistoryFailure {
+    Refused(ToolError),
+    Failed(anyhow::Error, Vec<String>),
+}
+
+/// Runs history tool `local` on `target` (blocking: it reads every project).
+fn run_history(
+    target: &Target,
+    local: &LocalTool,
+    arguments: Option<JsonObject>,
+) -> Result<(Value, Vec<String>), HistoryFailure> {
+    use HistoryFailure::{Failed, Refused};
+    let to_value = |v: Result<Value, serde_json::Error>| {
+        v.map_err(|e| Refused(ToolError::new(Code::Internal, e.to_string())))
+    };
+    match local.name {
+        "history_list" => {
+            let (params, notes) = local_args(local, arguments).map_err(Refused)?;
+            let value =
+                history::list::run(target, &params).map_err(|e| Failed(e, notes.clone()))?;
+            Ok((to_value(serde_json::to_value(value))?, notes))
+        }
+        "history_show" => {
+            let (params, notes) = local_args(local, arguments).map_err(Refused)?;
+            let value =
+                history::show::run(target, &params).map_err(|e| Failed(e, notes.clone()))?;
+            Ok((value, notes))
+        }
+        "history_search" => {
+            let (params, notes) = local_args(local, arguments).map_err(Refused)?;
+            let value =
+                history::search::run(target, &params).map_err(|e| Failed(e, notes.clone()))?;
+            Ok((to_value(serde_json::to_value(value))?, notes))
+        }
+        "history_endpoints" => {
+            let (params, notes) = local_args(local, arguments).map_err(Refused)?;
+            let value =
+                history::endpoints::run(target, &params).map_err(|e| Failed(e, notes.clone()))?;
+            Ok((to_value(serde_json::to_value(value))?, notes))
+        }
+        "history_diff" => {
+            let (params, notes) = local_args(local, arguments).map_err(Refused)?;
+            let value =
+                history::diff::run(target, &params).map_err(|e| Failed(e, notes.clone()))?;
+            Ok((value, notes))
+        }
+        _ => {
+            let (params, notes) = local_args(local, arguments).map_err(Refused)?;
+            let value =
+                history::export::run(target, &params).map_err(|e| Failed(e, notes.clone()))?;
+            Ok((value, notes))
+        }
+    }
+}
+
+/// [`run_history`] on a blocking thread.
+async fn run_history_blocking(
+    target: Arc<Target>,
+    local: &'static LocalTool,
+    arguments: Option<JsonObject>,
+) -> Result<(Value, Vec<String>), HistoryFailure> {
+    tokio::task::spawn_blocking(move || run_history(&target, local, arguments))
+        .await
+        .unwrap_or_else(|e| {
+            Err(HistoryFailure::Refused(ToolError::new(
+                Code::Internal,
+                format!("{} panicked: {e}", local.name),
+            )))
+        })
+}
+
+/// Whether `s` is a ref without its project: `12`, `a3` (archive) or `i4` (issue).
+fn is_bare_ref(s: &str) -> bool {
+    let digits = s.strip_prefix(['a', 'i']).unwrap_or(s);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Bare refs among the `ref`, `a` and `b` arguments `local` declares, read as refs of the target's
+/// only project (`1` -> `main:1`); one note per rewrite. Left as given when the target has none or
+/// several projects: the ref error then says which to pick.
+fn bare_refs(
+    target: &Target,
+    local: &LocalTool,
+    arguments: Option<&mut JsonObject>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    let Some(args) = arguments else {
+        return notes;
+    };
+    let schema = (local.schema)();
+    let declared = |k: &str| {
+        schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|p| p.contains_key(k))
+    };
+    let keys: Vec<&str> = ["ref", "a", "b"]
+        .into_iter()
+        .filter(|k| declared(k) && args.contains_key(*k))
+        .collect();
+    if keys.is_empty() {
+        return notes;
+    }
+    let known = target.known_projects();
+    let [project] = known.as_slice() else {
+        return notes;
+    };
+    for key in keys {
+        let given = match &args[key] {
+            Value::String(s) => s.trim().to_owned(),
+            Value::Number(n) if n.is_u64() => n.to_string(),
+            _ => continue,
+        };
+        if is_bare_ref(&given) {
+            let full = format!("{project}:{given}");
+            notes.push(format!("read {key} \"{given}\" as \"{full}\""));
+            args.insert(key.to_owned(), json!(full));
+        }
+    }
+    notes
+}
+
+/// `sent` with project `wanted` replaced by `hit`: the `project` argument and the project part of
+/// `ref`, `a` and `b`.
+fn rematched_project(mut sent: JsonObject, wanted: &str, hit: &str) -> JsonObject {
+    if sent.get("project").and_then(Value::as_str) == Some(wanted) {
+        sent.insert("project".to_owned(), json!(hit));
+    }
+    let prefix = format!("{wanted}:");
+    for key in ["ref", "a", "b"] {
+        if let Some(rest) = sent
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|v| v.strip_prefix(&prefix))
+        {
+            let fixed = format!("{hit}:{rest}");
+            sent.insert(key.to_owned(), json!(fixed));
+        }
+    }
+    sent
+}
+
 /// The error for `run {"do":"guide"}` or `{"do":"run"}`: the gateway's own tools are not run
 /// through `run`. For `guide`, `see` is the guide call to make instead, with the topic given.
 fn gateway_tool_as_do(tool: &str, arguments: Option<&JsonObject>) -> Option<CallToolResult> {
@@ -423,7 +614,7 @@ fn gateway_tool_as_do(tool: &str, arguments: Option<&JsonObject>) -> Option<Call
                     Code::UnknownTool,
                     format!("guide is its own tool, not a run target: call guide {call}."),
                 )
-                .see(format!("guide {call}"))
+                .see(json!({ "guide": call }))
                 .into_result(),
             )
         }
@@ -434,7 +625,7 @@ fn gateway_tool_as_do(tool: &str, arguments: Option<&JsonObject>) -> Option<Call
             )
             .param("do")
             .example(run_example())
-            .see("guide {}")
+            .see(guide_call(None))
             .into_result(),
         ),
         _ => None,
@@ -449,6 +640,8 @@ struct Call {
     arguments: Option<JsonObject>,
     /// The Burp to run it on, for a tool that does not take `project` itself.
     project: Option<String>,
+    /// What reading the call changed (a prefix stripped, a key read as `do`), for the result.
+    notes: Vec<String>,
 }
 
 /// Keys a model wraps a tool's parameters in, in the order they are tried.
@@ -457,29 +650,131 @@ const ARGUMENT_KEYS: [&str; 5] = ["arguments", "args", "params", "parameters", "
 /// The wrapper key that is never a parameter name: a value that is not an object is an error.
 const WRAPPER_KEY: &str = "arguments";
 
-/// Reads a `run` call: `do` (else `tool`, else `name`) names the tool, `project` picks the Burp
-/// unless the tool takes a `project` itself, a wrapper object (`arguments`, `args`, ..., also as a
-/// JSON string) is unwrapped unless the tool declares that key (`declares(tool, key)`), and every
-/// other key is a parameter of the tool. Keys already flat win over wrapped ones. A wrapper key
-/// other than `arguments` holding a non-object (`"input":"x"`) stays a parameter.
+/// Keys that name the tool when `do` is absent, in the order they are tried (string values only).
+const NAMING_KEYS: [&str; 4] = ["tool", "name", "tool_name", "function"];
+
+/// Keys that mark a `run` call as one call rather than a batch.
+const CALL_KEYS: [&str; 6] = ["do", "tool", "name", "tool_name", "function", "batch"];
+
+/// The tool named by `raw` without `do`: a string [`NAMING_KEYS`] value, an `OpenAI` function call
+/// (`{"function":{"name":..., "arguments":...}}`, its arguments merged under flat keys), or an
+/// `action` that names a tool (`names_tool`). The key is removed from `raw`; the reading is noted.
+fn named_without_do(
+    raw: &mut JsonObject,
+    names_tool: &impl Fn(&str) -> bool,
+    notes: &mut Vec<String>,
+) -> Option<Value> {
+    if let Some(key) = NAMING_KEYS
+        .into_iter()
+        .find(|k| raw.get(*k).is_some_and(Value::is_string))
+    {
+        return raw.remove(key);
+    }
+    if let Some(Value::Object(function)) = raw.get("function")
+        && function.get("name").is_some_and(Value::is_string)
+    {
+        let Some(Value::Object(mut function)) = raw.remove("function") else {
+            return None;
+        };
+        let name = function.remove("name").unwrap_or_default();
+        let arguments = match function.remove("arguments") {
+            Some(Value::Object(o)) => Some(o),
+            Some(Value::String(s)) => serde_json::from_str::<JsonObject>(&s).ok(),
+            _ => None,
+        };
+        for (k, v) in arguments.unwrap_or_default() {
+            raw.entry(k).or_insert(v);
+        }
+        if raw.get("type").and_then(Value::as_str) == Some("function") {
+            raw.remove("type");
+        }
+        notes.push(format!(
+            "read OpenAI function call '{}'",
+            name.as_str().unwrap_or_default()
+        ));
+        return Some(name);
+    }
+    if let Some(Value::String(action)) = raw.get("action")
+        && names_tool(action)
+    {
+        notes.push("read 'action' as 'do'".to_owned());
+        return raw.remove("action");
+    }
+    None
+}
+
+/// The `k=v` arguments of a `tool(k=v, ...)` name, in order.
+type SuffixArgs = Vec<(String, Value)>;
+
+/// `tool(k=v, ...)` split into the tool and its `k=v` arguments: each value read as JSON, else as
+/// text without surrounding quotes. Pieces that are not `k=v` (`limit: integer`) are left out.
+/// The arguments are None when a quoted value holds a comma (a piece with an unmatched quote):
+/// reading it would send a cut value. None when `tool` has no parenthesised suffix.
+fn parenthesised(tool: &str) -> Option<(String, Option<SuffixArgs>)> {
+    let t = tool.trim();
+    let inner = t.strip_suffix(')')?;
+    let open = inner.find('(')?;
+    let name = inner[..open].trim();
+    if name.is_empty() || name.contains(char::is_whitespace) || name.contains(')') {
+        return None;
+    }
+    let is_key = |k: &str| {
+        let mut chars = k.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let pieces = inner[open + 1..].split(',');
+    let unmatched = |q: char| pieces.clone().any(|p| p.matches(q).count() % 2 == 1);
+    if unmatched('"') || unmatched('\'') {
+        return Some((name.to_owned(), None));
+    }
+    let args = pieces
+        .filter_map(|piece| {
+            let (k, v) = piece.split_once('=')?;
+            let (k, v) = (k.trim(), v.trim());
+            if !is_key(k) {
+                return None;
+            }
+            let value = serde_json::from_str::<Value>(v).unwrap_or_else(|_| {
+                let unquoted = v
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                    .or_else(|| v.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+                    .unwrap_or(v);
+                json!(unquoted)
+            });
+            Some((k.to_owned(), value))
+        })
+        .collect();
+    Some((name.to_owned(), Some(args)))
+}
+
+/// Reads a `run` call: `do` (else a [`NAMING_KEYS`] string, an `OpenAI` function call, or an
+/// `action` that `names_tool`) names the tool, without a server prefix (`mcp__raijin__`) and with
+/// a `(k=v, ...)` suffix read as arguments. `project` picks the Burp unless the tool takes a
+/// `project` itself, a wrapper object (`arguments`, `args`, ..., also as a JSON string) is
+/// unwrapped unless the tool declares that key (`declares(tool, key)`), and every other key is a
+/// parameter of the tool. Keys already flat win over wrapped ones. A wrapper key other than
+/// `arguments` holding a non-object (`"input":"x"`) stays a parameter. Every reading is noted.
 fn normalize_run(
     mut raw: JsonObject,
     declares: impl Fn(&str, &str) -> bool,
+    names_tool: impl Fn(&str) -> bool,
 ) -> Result<Call, ToolError> {
+    let mut notes = Vec::new();
     let named = match raw.remove("do") {
         Some(value) => Some(value),
-        None => ["tool", "name"]
-            .into_iter()
-            .find(|k| raw.get(*k).is_some_and(Value::is_string))
-            .and_then(|k| raw.remove(k)),
+        None => named_without_do(&mut raw, &names_tool, &mut notes),
     };
-    let tool = match named {
+    let mut tool = match named {
         Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_owned(),
         None | Some(Value::Null | Value::String(_)) => {
             return Err(ToolError::new(Code::MissingParameter, MISSING_DO)
                 .param("do")
                 .example(run_example())
-                .see("guide {}"));
+                .see(guide_call(None)));
         }
         Some(other) => {
             return Err(ToolError::new(
@@ -492,9 +787,35 @@ fn normalize_run(
             .got(other)
             .expected("string")
             .example(run_example())
-            .see("guide {}"));
+            .see(guide_call(None)));
         }
     };
+    if let Some(stripped) = error::strip_server_prefix(&tool) {
+        let stripped = stripped.trim().to_owned();
+        notes.push(format!("read '{tool}' as {stripped}"));
+        tool = stripped;
+    }
+    if let Some((name, args)) = parenthesised(&tool) {
+        let with = match args {
+            None => "; its arguments were not read (a quoted value holds a comma): pass them as keys next to \"do\"".to_owned(),
+            Some(args) => {
+                let mut read = Vec::new();
+                for (k, v) in args {
+                    if !raw.contains_key(&k) {
+                        read.push(format!("{k}={v}"));
+                        raw.insert(k, v);
+                    }
+                }
+                if read.is_empty() {
+                    String::new()
+                } else {
+                    format!(" with {}", read.join(", "))
+                }
+            }
+        };
+        notes.push(format!("read '{tool}' as {name}{with}"));
+        tool = name;
+    }
     let project = if declares(&tool, "project") {
         None
     } else {
@@ -539,7 +860,17 @@ fn normalize_run(
         tool,
         arguments: (!raw.is_empty()).then_some(raw),
         project,
+        notes,
     })
+}
+
+/// Whether `name` is a tool `run` can run: a local tool (in any case or separators) or a name the
+/// catalog resolves.
+fn names_a_tool(catalog: Option<&Catalog>, name: &str) -> bool {
+    local_tool(name).is_some()
+        || local_tool(&error::norm(name)).is_some()
+        || catalog
+            .is_some_and(|c| !matches!(c.resolve_call(name), catalog::Resolved::NotFound { .. }))
 }
 
 /// Whether `tool` (a local tool, or a catalog tool or alias) declares parameter `key`.
@@ -568,6 +899,73 @@ fn result_value(result: &CallToolResult) -> Value {
         .collect::<Vec<_>>()
         .join("\n");
     serde_json::from_str(&joined).unwrap_or(Value::String(joined))
+}
+
+/// The `code` of an error result's envelope.
+fn result_code(result: &CallToolResult) -> Option<String> {
+    if result.is_error != Some(true) {
+        return None;
+    }
+    result_value(result)
+        .get("code")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The schema a call of `hit` (a local tool, catalog tool or `tool.action`) is checked against,
+/// when `hit` names one exactly and the call removes or stops nothing.
+fn safe_call_schema(catalog: &Catalog, hit: &str) -> Option<JsonObject> {
+    if let Some(local) = local_tool(hit) {
+        return (!local.destructive).then(|| (local.schema)());
+    }
+    let (name, action) = catalog.resolve(hit)?;
+    if catalog.destructive(&name, action.as_deref()) {
+        return None;
+    }
+    let spec = catalog.tool(&name)?;
+    match action {
+        _ if spec.actions.is_empty() => spec.input_schema.as_object().cloned(),
+        Some(action) => Some(narrowed_action(
+            &spec.input_schema,
+            spec.actions.get(&action)?,
+        )),
+        None => None,
+    }
+}
+
+/// `unknown_tool` for `tool`: up to three near call names in `did_you_mean`, and `retry` only when
+/// exactly one is near enough to be certain (edit distance ≤ 2, or contained in `tool`, and not
+/// `tool` itself), names
+/// one call exactly (an action for a grouped tool), removes or stops nothing, and takes `arguments`
+/// as they are.
+fn unknown_tool_error(catalog: &Catalog, tool: &str, arguments: &JsonObject) -> ToolError {
+    let mut names = catalog.suggestion_names();
+    names.extend(LOCAL_TOOLS.iter().map(|t| t.name.to_owned()));
+    let hits: Vec<String> = suggest(tool, names.iter().map(String::as_str), 3)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let mut err = ToolError::new(
+        Code::UnknownTool,
+        format!("unknown tool \"{tool}\"; guide {{}} lists every tool."),
+    )
+    .see(guide_call(None));
+    if let [hit] = hits.as_slice() {
+        let (w, h) = (error::norm(tool), error::norm(hit));
+        // The same name (an extension older than the catalog lacks it) would only fail again.
+        let near =
+            w != h && (edit_distance(&w, &h) <= 2 || (w.contains(&h) && contains_near(&w, &h)));
+        if near
+            && let Some(schema) = safe_call_schema(catalog, hit)
+            && call_fits(&schema, arguments)
+        {
+            let mut call = Map::new();
+            call.insert("do".to_owned(), json!(hit));
+            call.extend(arguments.clone());
+            err = err.retry(Value::Object(call));
+        }
+    }
+    err.did_you_mean(hits)
 }
 
 /// `inputSchema.properties.action.enum` of a schema: a grouped tool's actions.
@@ -831,10 +1229,18 @@ impl Gateway {
     async fn run(&self, raw: Option<JsonObject>) -> CallToolResult {
         let mut raw = raw.unwrap_or_default();
         let mut notes = Vec::new();
-        // `steps` is what other tools call a batch.
-        if !["batch", "do", "tool", "name"]
-            .iter()
-            .any(|k| raw.get(*k).is_some_and(|v| !v.is_null()))
+        let assets = self.assets().await.ok();
+        let catalog = assets.as_deref().map(|a| &a.catalog);
+        // `steps` is what other tools call a batch, unless a tool is named (`action` naming one
+        // too: `{"action":"http_send_request_chain","steps":[...]}`).
+        let action_names_tool = raw
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|a| names_a_tool(catalog, a));
+        if !action_names_tool
+            && !CALL_KEYS
+                .iter()
+                .any(|k| raw.get(*k).is_some_and(|v| !v.is_null()))
             && let Some(steps) = raw.remove("steps")
         {
             notes.push("read 'steps' as 'batch'".to_owned());
@@ -849,7 +1255,10 @@ impl Gateway {
         };
         // A client may fill every declared property; a null `batch` means no batch.
         if let Some(batch) = raw.remove("batch").filter(|b| !b.is_null()) {
-            if ["do", "tool", "name"].iter().any(|k| raw.contains_key(*k)) {
+            if CALL_KEYS
+                .iter()
+                .any(|k| *k != "batch" && raw.contains_key(*k))
+            {
                 return ToolError::new(
                     Code::InvalidArguments,
                     "run: pass either do or batch, not both.",
@@ -873,9 +1282,12 @@ impl Gateway {
                     }
                     Err(_) => return batch_type_error("a string", Value::String(s)),
                 },
+                Value::Object(step) => {
+                    notes.push("read 'batch' object as a one-step batch".to_owned());
+                    vec![Value::Object(step)]
+                }
                 other => {
                     let kind = match &other {
-                        Value::Object(_) => "an object",
                         Value::Bool(_) => "a boolean",
                         Value::Number(_) => "a number",
                         _ => "another value",
@@ -898,16 +1310,21 @@ impl Gateway {
                 .map(str::to_owned);
             return self.batch(steps, bail, project, &notes).await;
         }
-        let assets = self.assets().await.ok();
-        let catalog = assets.as_deref().map(|a| &a.catalog);
-        let result = match normalize_run(raw, |tool, key| tool_declares(catalog, tool, key)) {
+        let result = match normalize_run(
+            raw,
+            |tool, key| tool_declares(catalog, tool, key),
+            |name| names_a_tool(catalog, name),
+        ) {
             Ok(call) => self.run_one(call).await,
             Err(e) => e.into_result(),
         };
         error::with_notes(result, &notes)
     }
 
-    /// Steps in order; each result inline (no per-step spill), the whole batch spilled once.
+    /// Steps in order; each result inline (no per-step spill), the whole batch spilled once. A
+    /// failure surfaces at the top: `failed_steps`, an error result when every step failed or
+    /// `bail` stopped the batch, and `retry` (a batch of each failed step's `retry`, then the steps
+    /// not run) when every failed step has one.
     async fn batch(
         &self,
         steps: Vec<Value>,
@@ -918,26 +1335,38 @@ impl Gateway {
         let assets = self.assets().await.ok();
         let catalog = assets.as_deref().map(|a| &a.catalog);
         let total = steps.len();
-        let mut out = Vec::with_capacity(total);
-        let mut stopped_after = None;
-        for (i, step) in steps.into_iter().enumerate() {
-            // A bare name is a step without parameters: "burp_status" is {"do":"burp_status"}.
-            let step = match step {
+        // A bare name is a step without parameters: "burp_status" is {"do":"burp_status"}.
+        let steps: Vec<Value> = steps
+            .into_iter()
+            .map(|step| match step {
                 Value::String(name) => json!({ "do": name }),
-                other => other,
-            };
-            let named = ["do", "tool", "name"]
-                .iter()
-                .find_map(|k| step.get(*k).cloned())
-                .unwrap_or(Value::Null);
-            let (ok, result) = match step {
-                Value::Object(mut step) if !step.contains_key("batch") => {
+                Value::Object(mut step) => {
                     if let Some(project) = &project
+                        && !step.contains_key("batch")
                         && !step.contains_key("project")
                     {
                         step.insert("project".to_owned(), json!(project));
                     }
-                    match normalize_run(step, |tool, key| tool_declares(catalog, tool, key)) {
+                    Value::Object(step)
+                }
+                other => other,
+            })
+            .collect();
+        let mut out = Vec::with_capacity(total);
+        let mut failures: Vec<(usize, Value)> = Vec::new();
+        let mut stopped_after = None;
+        for (i, step) in steps.iter().enumerate() {
+            let named = CALL_KEYS
+                .iter()
+                .find_map(|k| step.get(*k).cloned())
+                .unwrap_or(Value::Null);
+            let (ok, result) = match step.clone() {
+                Value::Object(step) if !step.contains_key("batch") => {
+                    match normalize_run(
+                        step,
+                        |tool, key| tool_declares(catalog, tool, key),
+                        |name| names_a_tool(catalog, name),
+                    ) {
                         Ok(call) => {
                             let (_, result) = self.run_raw(call).await;
                             (result.is_error != Some(true), result_value(&result))
@@ -967,51 +1396,18 @@ impl Gateway {
                     .to_value(),
                 ),
             };
-            let failed = (!ok).then(|| result.clone());
+            if !ok {
+                failures.push((i + 1, result.clone()));
+            }
             out.push(json!({"step": i + 1, "do": named, "ok": ok, "result": result}));
-            if let Some(failed) = failed
-                && bail
-            {
-                stopped_after = Some((i + 1, failed));
+            if !ok && bail {
+                stopped_after = Some(i + 1);
                 break;
             }
         }
-        let mut value = Map::new();
-        let result = if let Some((k, failed)) = stopped_after {
-            let reason = failed.get("error").and_then(Value::as_str).map_or_else(
-                || match &failed {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                },
-                str::to_owned,
-            );
-            let code = failed
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("tool_failed")
-                .to_owned();
-            let retryable = failed
-                .get("retryable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let mut message = format!("step {k} of {total} failed: {reason}");
-            if !retryable && !message.ends_with(error::FINAL_SENTENCE) {
-                message.push_str(error::FINAL_SENTENCE);
-            }
-            value.insert("error".to_owned(), json!(message));
-            value.insert("code".to_owned(), json!(code));
-            value.insert("steps".to_owned(), json!(out));
-            value.insert("stopped_after".to_owned(), json!(k));
-            value.insert(
-                "not_run".to_owned(),
-                json!(((k + 1)..=total).collect::<Vec<_>>()),
-            );
-            value.insert("retryable".to_owned(), json!(retryable));
-            CallToolResult::error(vec![ContentBlock::text(Value::Object(value).to_string())])
-        } else {
-            value.insert("steps".to_owned(), json!(out));
-            text(&Value::Object(value))
-        };
+        let not_run: &[Value] = stopped_after.map_or(&[], |k| &steps[k..]);
+        let retry = batch_retry(&failures, not_run, bail);
+        let result = batch_result(out, &failures, stopped_after, total, retry);
         self.spill(error::with_notes(result, notes), "batch")
     }
 
@@ -1019,15 +1415,92 @@ impl Gateway {
         let (tool, result) = self.run_raw(call).await;
         self.spill(result, &tool)
     }
+}
 
-    /// Runs one call: a local tool (also named in another case or with `-`/`.` separators) runs
-    /// here, anything else goes to Raijin under the name as given, which the extension resolves.
-    /// Returns the tool that ran and its result.
-    async fn run_raw(&self, call: Call) -> (String, CallToolResult) {
+/// A batch's result from its step results `out`: an error when `bail` stopped it after step
+/// `stopped_after` or every step failed, else the steps with `failed_steps` and `retry` when some
+/// failed.
+fn batch_result(
+    out: Vec<Value>,
+    failures: &[(usize, Value)],
+    stopped_after: Option<usize>,
+    total: usize,
+    retry: Option<Value>,
+) -> CallToolResult {
+    let mut value = Map::new();
+    let all_failed = failures.len() == total;
+    match (stopped_after, failures.first()) {
+        (Some(k), Some((_, failed))) => {
+            let mut message = format!("step {k} of {total} failed: {}", failure_reason(failed));
+            let retryable = failed.get("retryable").and_then(Value::as_bool) == Some(true);
+            if !retryable && !message.ends_with(error::FINAL_SENTENCE) {
+                message.push_str(error::FINAL_SENTENCE);
+            }
+            value.insert("error".to_owned(), json!(message));
+            value.insert("code".to_owned(), json!(failure_code(failed)));
+            value.insert("steps".to_owned(), Value::Array(out));
+            value.insert("stopped_after".to_owned(), json!(k));
+            let not_run: Vec<usize> = ((k + 1)..=total).collect();
+            value.insert("not_run".to_owned(), json!(not_run));
+            if let Some(retry) = retry {
+                value.insert("retry".to_owned(), retry);
+            }
+            value.insert("retryable".to_owned(), json!(retryable));
+            CallToolResult::error(vec![ContentBlock::text(Value::Object(value).to_string())])
+        }
+        (None, Some((_, first))) if all_failed => {
+            let retryable = failures
+                .iter()
+                .any(|(_, f)| f.get("retryable").and_then(Value::as_bool) == Some(true));
+            let mut message = format!(
+                "all {total} steps failed; step 1: {}",
+                failure_reason(first)
+            );
+            if !retryable && !message.ends_with(error::FINAL_SENTENCE) {
+                message.push_str(error::FINAL_SENTENCE);
+            }
+            let failed_steps: Vec<usize> = failures.iter().map(|(n, _)| *n).collect();
+            value.insert("error".to_owned(), json!(message));
+            value.insert("code".to_owned(), json!(failure_code(first)));
+            value.insert("failed_steps".to_owned(), json!(failed_steps));
+            value.insert("steps".to_owned(), Value::Array(out));
+            if let Some(retry) = retry {
+                value.insert("retry".to_owned(), retry);
+            }
+            value.insert("retryable".to_owned(), json!(retryable));
+            CallToolResult::error(vec![ContentBlock::text(Value::Object(value).to_string())])
+        }
+        _ => {
+            if !failures.is_empty() {
+                let failed_steps: Vec<usize> = failures.iter().map(|(n, _)| *n).collect();
+                value.insert("failed_steps".to_owned(), json!(failed_steps));
+                if let Some(retry) = retry {
+                    value.insert("retry".to_owned(), retry);
+                }
+            }
+            value.insert("steps".to_owned(), Value::Array(out));
+            text(&Value::Object(value))
+        }
+    }
+}
+
+impl Gateway {
+    /// Runs one call ([`Self::run_resolved`]) and adds what reading it changed to the result's notes.
+    async fn run_raw(&self, mut call: Call) -> (String, CallToolResult) {
+        let notes = std::mem::take(&mut call.notes);
+        let (tool, result) = self.run_resolved(call).await;
+        (tool, error::with_notes(result, &notes))
+    }
+
+    /// Runs one call: a local tool (also named in another case or with `-`/`.`/`/` separators)
+    /// runs here, anything else goes to Raijin under the name as given, which the extension
+    /// resolves. Returns the tool that ran and its result.
+    async fn run_resolved(&self, call: Call) -> (String, CallToolResult) {
         let Call {
             tool,
             mut arguments,
             project,
+            notes: _,
         } = call;
         if let Some(result) = gateway_tool_as_do(&tool, arguments.as_ref()) {
             return (tool, result);
@@ -1076,7 +1549,8 @@ impl Gateway {
             self.history(local, arguments).await
         };
         let notes: Vec<String> = note.into_iter().collect();
-        (local.name.to_owned(), error::with_notes(result, &notes))
+        let result = error::mirror_warnings(error::with_notes(result, &notes));
+        (local.name.to_owned(), result)
     }
 
     /// Whether `run` can run `name`: a local tool, a catalog tool or a resolvable alias.
@@ -1088,29 +1562,117 @@ impl Gateway {
                 .is_ok_and(|a| a.catalog.resolve(name).is_some())
     }
 
-    /// Sends `tool` to Raijin as named; the extension resolves the name and reports unknown ones.
+    /// The project of this target `wanted` means: itself when the target has it, else the one
+    /// project equal to it ignoring ASCII case (with a note), else `invalid_enum` listing the
+    /// known projects, so a misspelled project never starts a new Burp. Remote mode takes `wanted`
+    /// as given.
+    fn resolve_project(&self, wanted: &str) -> Result<(String, Option<String>), ToolError> {
+        if self.remote.is_some() {
+            return Ok((wanted.to_owned(), None));
+        }
+        let Ok(target) = self.target() else {
+            return Ok((wanted.to_owned(), None));
+        };
+        let known = target.known_projects();
+        if known.iter().any(|k| k == wanted) {
+            return Ok((wanted.to_owned(), None));
+        }
+        let hits: Vec<&String> = known
+            .iter()
+            .filter(|k| k.eq_ignore_ascii_case(wanted))
+            .collect();
+        if let [hit] = hits.as_slice() {
+            return Ok((
+                (*hit).clone(),
+                Some(format!("matched project \"{wanted}\" to \"{hit}\"")),
+            ));
+        }
+        let message = if known.is_empty() {
+            format!("no project \"{wanted}\" in this target; start one with burp_up.")
+        } else {
+            format!(
+                "no project \"{wanted}\" in this target; it has {}.",
+                known.join(", ")
+            )
+        };
+        Err(ToolError::new(Code::InvalidEnum, message)
+            .param("project")
+            .got(json!(wanted))
+            .allowed(known.iter().map(|k| json!(k)).collect()))
+    }
+
+    /// Sends `tool` to Raijin as named; the extension resolves the name. `project` is first
+    /// matched to one of this target ([`Self::resolve_project`]); an unknown name the extension
+    /// reports is answered from the catalog ([`unknown_tool_error`]).
     async fn forward(
         &self,
         tool: &str,
         arguments: Option<JsonObject>,
         project: Option<&str>,
     ) -> CallToolResult {
-        let endpoint = match self.endpoint(project).await {
-            Ok(e) => e,
-            Err(e) => return self.unreached(e, tool, arguments, project).await,
+        // A `/` would split the API path: `scope/check` means `scope.check`.
+        let dotted;
+        let tool = if tool.contains('/') {
+            dotted = tool.replace('/', ".");
+            dotted.as_str()
+        } else {
+            tool
         };
-        match self.api.call(&endpoint, tool, arguments).await {
-            Ok(result) => match project {
-                Some(project) => with_project(result, project),
-                None => result,
+        let mut notes = Vec::new();
+        let project: Option<String> = match project {
+            None => None,
+            Some(wanted) => match self.resolve_project(wanted) {
+                Ok((name, note)) => {
+                    notes.extend(note);
+                    Some(name)
+                }
+                Err(mut e) => {
+                    let safe = self.assets().await.is_ok_and(|a| {
+                        a.catalog.resolve(tool).is_some_and(|(name, action)| {
+                            !a.catalog.destructive(&name, action.as_deref())
+                        })
+                    });
+                    if let [only] = e.allowed.as_slice()
+                        && safe
+                    {
+                        let mut call = Map::new();
+                        call.insert("do".to_owned(), json!(tool));
+                        call.extend(arguments.unwrap_or_default());
+                        call.insert("project".to_owned(), only.clone());
+                        e = e.retry(Value::Object(call));
+                    }
+                    return e.into_result();
+                }
             },
-            Err(ApiError::Unreachable(msg)) => ToolError::new(
-                Code::RaijinUnreachable,
-                format!("{msg}; check run {{\"do\":\"burp_status\"}}."),
-            )
-            .into_result(),
-            Err(ApiError::Other(msg)) => ToolError::new(Code::Internal, msg).into_result(),
-        }
+        };
+        let project = project.as_deref();
+        let result = match self.endpoint(project).await {
+            Err(e) => self.unreached(e, tool, arguments, project).await,
+            Ok(endpoint) => match self.api.call(&endpoint, tool, arguments.as_ref()).await {
+                Ok(result) if result_code(&result).as_deref() == Some("unknown_tool") => match self
+                    .assets()
+                    .await
+                {
+                    Ok(assets) => {
+                        unknown_tool_error(&assets.catalog, tool, &arguments.unwrap_or_default())
+                            .into_result()
+                    }
+                    Err(_) => result,
+                },
+                Ok(result) => result,
+                Err(ApiError::Unreachable(msg)) => ToolError::new(
+                    Code::RaijinUnreachable,
+                    format!("{msg}; check run {{\"do\":\"burp_status\"}}."),
+                )
+                .into_result(),
+                Err(ApiError::Other(msg)) => ToolError::new(Code::Internal, msg).into_result(),
+            },
+        };
+        let result = match project {
+            Some(project) => with_project(result, project),
+            None => result,
+        };
+        error::with_notes(result, &notes)
     }
 
     /// The answer to a call no Burp can take (`burp_not_running`, `project_not_running`): a name
@@ -1133,22 +1695,8 @@ impl Gateway {
         let catalog = &assets.catalog;
         let arguments = arguments.unwrap_or_default();
         match catalog.resolve_call(tool) {
-            catalog::Resolved::NotFound { did_you_mean } => {
-                let mut unknown = ToolError::new(
-                    Code::UnknownTool,
-                    format!("unknown tool \"{tool}\"; guide {{}} lists every tool."),
-                )
-                .see("guide {}");
-                if let [only] = did_you_mean.as_slice()
-                    && let Some((name, action)) = catalog.resolve(only)
-                    && !catalog.destructive(&name, action.as_deref())
-                {
-                    let mut call = Map::new();
-                    call.insert("do".to_owned(), json!(only));
-                    call.extend(arguments);
-                    unknown = unknown.retry(Value::Object(call));
-                }
-                unknown.did_you_mean(did_you_mean).into_result()
+            catalog::Resolved::NotFound { .. } => {
+                unknown_tool_error(catalog, tool, &arguments).into_result()
             }
             catalog::Resolved::Found {
                 tool: name, action, ..
@@ -1205,19 +1753,27 @@ impl Gateway {
                         self.topic(same, catalog, live.as_deref(), &other)
                     })
                     .unwrap_or_else(|| {
+                        let by_words = if topic.contains(char::is_whitespace) {
+                            sentence_topics(topic, catalog)
+                        } else {
+                            Vec::new()
+                        };
+                        let did_you_mean = if by_words.is_empty() {
+                            suggest(topic, names.iter().map(String::as_str), 3)
+                                .into_iter()
+                                .map(str::to_owned)
+                                .collect()
+                        } else {
+                            by_words
+                        };
                         ToolError::new(
                             Code::UnknownTopic,
                             format!(
                                 "unknown topic \"{topic}\"; guide {{}} lists every tool, domain and playbook."
                             ),
                         )
-                        .did_you_mean(
-                            suggest(topic, names.iter().map(String::as_str), 3)
-                                .into_iter()
-                                .map(str::to_owned)
-                                .collect(),
-                        )
-                        .see("guide {}")
+                        .did_you_mean(did_you_mean)
+                        .see(guide_call(None))
                         .into_result()
                     })
             }
@@ -1514,51 +2070,44 @@ impl Gateway {
             Ok(t) => t.clone(),
             Err(e) => return e.into_result(),
         };
-        let sent = arguments.clone().unwrap_or_default();
-        let run = move || -> Result<(Value, Vec<String>), ToolError> {
-            let failed = |e: anyhow::Error| history_error(local.name, &e, &sent);
-            let to_value = |v: Result<Value, serde_json::Error>| {
-                v.map_err(|e| ToolError::new(Code::Internal, e.to_string()))
-            };
-            match local.name {
-                "history_list" => {
-                    let (params, notes) = local_args(local, arguments)?;
-                    let value = history::list::run(&target, &params).map_err(failed)?;
-                    Ok((to_value(serde_json::to_value(value))?, notes))
+        let mut arguments = arguments;
+        let mut notes = bare_refs(&target, local, arguments.as_mut());
+        let mut sent = arguments.clone().unwrap_or_default();
+        let mut outcome = run_history_blocking(target.clone(), local, arguments).await;
+        // A project named in another case (`MAIN` for `main`): run once more on the one it means.
+        let rematch = match &outcome {
+            Err(HistoryFailure::Failed(e, _)) => match history::Problem::of(e) {
+                Some(history::Problem::UnknownProject { wanted, known }) => {
+                    let hits: Vec<&String> = known
+                        .iter()
+                        .filter(|k| k.eq_ignore_ascii_case(wanted))
+                        .collect();
+                    match hits.as_slice() {
+                        [hit] => Some((wanted.clone(), (*hit).clone())),
+                        _ => None,
+                    }
                 }
-                "history_show" => {
-                    let (params, notes) = local_args(local, arguments)?;
-                    Ok((history::show::run(&target, &params).map_err(failed)?, notes))
-                }
-                "history_search" => {
-                    let (params, notes) = local_args(local, arguments)?;
-                    let value = history::search::run(&target, &params).map_err(failed)?;
-                    Ok((to_value(serde_json::to_value(value))?, notes))
-                }
-                "history_endpoints" => {
-                    let (params, notes) = local_args(local, arguments)?;
-                    let value = history::endpoints::run(&target, &params).map_err(failed)?;
-                    Ok((to_value(serde_json::to_value(value))?, notes))
-                }
-                "history_diff" => {
-                    let (params, notes) = local_args(local, arguments)?;
-                    Ok((history::diff::run(&target, &params).map_err(failed)?, notes))
-                }
-                _ => {
-                    let (params, notes) = local_args(local, arguments)?;
-                    Ok((
-                        history::export::run(&target, &params).map_err(failed)?,
-                        notes,
-                    ))
-                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((wanted, hit)) = rematch {
+            sent = rematched_project(sent, &wanted, &hit);
+            notes.push(format!("matched project \"{wanted}\" to \"{hit}\""));
+            outcome = run_history_blocking(target, local, Some(sent.clone())).await;
+        }
+        let result = match outcome {
+            Ok((value, parsed)) => {
+                notes.extend(parsed);
+                text(&value)
+            }
+            Err(HistoryFailure::Refused(e)) => e.into_result(),
+            Err(HistoryFailure::Failed(e, parsed)) => {
+                notes.extend(parsed);
+                history_error(local.name, &e, &sent).into_result()
             }
         };
-        match tokio::task::spawn_blocking(run).await {
-            Ok(Ok((value, notes))) => error::with_notes(text(&value), &notes),
-            Ok(Err(e)) => e.into_result(),
-            Err(e) => ToolError::new(Code::Internal, format!("{} panicked: {e}", local.name))
-                .into_result(),
-        }
+        error::with_notes(result, &notes)
     }
 
     fn gateway_tools() -> Vec<Tool> {
@@ -1665,7 +2214,10 @@ fn tool_topic(topic: &str, catalog: Option<&Catalog>, live: Option<&[Tool]>) -> 
     match (&action, action_spec) {
         // One action of a grouped tool: its own parameters only, with a call that works.
         (Some(action), Some(a)) => {
-            let schema = narrowed(&view.schema, &a.params, &a.required);
+            let schema = narrowed_action(&view.schema, a);
+            if let Some(description) = &a.description {
+                out["description"] = json!(description);
+            }
             out["usage"] = json!(super::args::usage(&format!("{name}.{action}"), &schema));
             out["example"] = a.example.clone();
             out["inputSchema"] = Value::Object(schema);
@@ -1677,7 +2229,7 @@ fn tool_topic(topic: &str, catalog: Option<&Catalog>, live: Option<&[Tool]>) -> 
                 .into_iter()
                 .flatten()
                 .map(|(a, aspec)| {
-                    let schema = narrowed(&view.schema, &aspec.params, &aspec.required);
+                    let schema = narrowed_action(&view.schema, aspec);
                     let signature = super::args::usage(&format!("{name}.{a}"), &schema);
                     (a.clone(), json!(signature))
                 })
@@ -1722,8 +2274,100 @@ fn narrowed(schema: &Value, params: &[String], required: &[String]) -> JsonObjec
     out
 }
 
-/// `guide` arguments with `name` or `tool` read as `topic` (when no topic is given), and the note
-/// saying so.
+/// One action's schema: its own parameter schemas from the catalog (in `params` order), else the
+/// group's merged ones for its `params` ([`narrowed`]).
+fn narrowed_action(view_schema: &Value, a: &ActionSpec) -> JsonObject {
+    let Some(props) = &a.properties else {
+        return narrowed(view_schema, &a.params, &a.required);
+    };
+    let mut kept: Map<String, Value> = a
+        .params
+        .iter()
+        .filter_map(|p| props.get(p).map(|d| (p.clone(), d.clone())))
+        .collect();
+    for (k, v) in props {
+        kept.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    let mut out = Map::new();
+    out.insert("type".to_owned(), json!("object"));
+    out.insert("properties".to_owned(), Value::Object(kept));
+    out.insert("required".to_owned(), json!(a.required));
+    out
+}
+
+/// `guide` arguments with only `topic` kept, and a note per key left out: `guide` takes nothing
+/// else, so a stray key is not worth an error.
+fn only_topic(arguments: Option<JsonObject>) -> (Option<JsonObject>, Vec<String>) {
+    let Some(mut arguments) = arguments else {
+        return (None, Vec::new());
+    };
+    let extra: Vec<String> = arguments
+        .keys()
+        .filter(|k| k.as_str() != "topic")
+        .cloned()
+        .collect();
+    let notes = extra
+        .into_iter()
+        .map(|k| {
+            arguments.remove(&k);
+            format!("ignored '{k}': guide takes only 'topic'")
+        })
+        .collect();
+    (Some(arguments), notes)
+}
+
+/// Words a sentence topic is matched by are those of 3+ letters outside this list.
+const TOPIC_STOP_WORDS: [&str; 18] = [
+    "how", "the", "and", "for", "with", "what", "which", "use", "can", "does", "from", "into",
+    "this", "that", "you", "get", "want", "need",
+];
+
+/// Up to three call names a topic written as a sentence ("send a raw request") means: each word
+/// equal to a part of the name (split at `_` and `.`) scores 2, each word in its description 1;
+/// best first, then by name. Empty when no name scores.
+fn sentence_topics(topic: &str, catalog: Option<&Catalog>) -> Vec<String> {
+    let words: Vec<String> = topic
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|w| w.chars().count() >= 3 && !TOPIC_STOP_WORDS.contains(&w.as_str()))
+        .collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates: Vec<(String, String)> = LOCAL_TOOLS
+        .iter()
+        .map(|t| (t.name.to_owned(), t.description.to_lowercase()))
+        .collect();
+    if let Some(c) = catalog {
+        for spec in &c.tools {
+            let description = spec.description.as_deref().unwrap_or_default();
+            candidates.push((spec.name.clone(), description.to_lowercase()));
+            for (action, a) in &spec.actions {
+                let own = a.description.as_deref().unwrap_or(description);
+                candidates.push((format!("{}.{action}", spec.name), own.to_lowercase()));
+            }
+        }
+    }
+    let mut scored: Vec<(usize, String)> = candidates
+        .into_iter()
+        .filter_map(|(name, description)| {
+            let parts: Vec<&str> = name.split(['_', '.']).collect();
+            let score: usize = words
+                .iter()
+                .map(|w| {
+                    2 * usize::from(parts.contains(&w.as_str()))
+                        + usize::from(description.contains(w.as_str()))
+                })
+                .sum();
+            (score > 0).then_some((score, name))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored.into_iter().take(3).map(|(_, name)| name).collect()
+}
+
+/// `guide` arguments with `name`, `tool` or `do` read as `topic` (when no topic is given), and the
+/// note saying so.
 fn topic_alias(arguments: Option<JsonObject>) -> (Option<JsonObject>, Option<String>) {
     let Some(mut arguments) = arguments else {
         return (None, None);
@@ -1731,7 +2375,7 @@ fn topic_alias(arguments: Option<JsonObject>) -> (Option<JsonObject>, Option<Str
     if arguments.get("topic").is_some_and(|t| !t.is_null()) {
         return (Some(arguments), None);
     }
-    let Some(key) = ["name", "tool"]
+    let Some(key) = ["name", "tool", "do"]
         .into_iter()
         .find(|k| arguments.contains_key(*k))
     else {
@@ -1902,6 +2546,7 @@ impl ServerHandler for Gateway {
         let result = match name.as_str() {
             "guide" => {
                 let (arguments, renamed) = topic_alias(arguments);
+                let (arguments, ignored) = only_topic(arguments);
                 match parse_args::<GuideArgs>(
                     &name,
                     arguments,
@@ -1910,9 +2555,13 @@ impl ServerHandler for Gateway {
                 ) {
                     Ok((args, mut notes)) => {
                         notes.extend(renamed);
+                        notes.extend(ignored);
                         error::with_notes(self.guide(args).await, &notes)
                     }
-                    Err(e) => e.into_result(),
+                    Err(e) => e
+                        .clear_example()
+                        .see(guide_call(Some("overview")))
+                        .into_result(),
                 }
             }
             "run" => self.run(arguments).await,
@@ -1922,6 +2571,7 @@ impl ServerHandler for Gateway {
                     tool: name,
                     arguments,
                     project: None,
+                    notes: Vec::new(),
                 })
                 .await
             }
@@ -2068,25 +2718,25 @@ mod tests {
 
     #[test]
     fn normalize_run_unwraps_and_routes_project() {
-        let declares = |tool: &str, key: &str| tool == "t" && key == "input";
-        let own = normalize_run(object(json!({"do": "t", "input": {"a": 1}})), declares)
-            .expect("normalized");
+        let read = |raw: Value| {
+            normalize_run(
+                object(raw),
+                |tool: &str, key: &str| tool == "t" && key == "input",
+                |_: &str| false,
+            )
+        };
+        let own = read(json!({"do": "t", "input": {"a": 1}})).expect("normalized");
         assert_eq!(own.arguments, Some(object(json!({"input": {"a": 1}}))));
-        let wrapped = normalize_run(object(json!({"do": "u", "input": {"a": 1}})), declares)
-            .expect("normalized");
+        let wrapped = read(json!({"do": "u", "input": {"a": 1}})).expect("normalized");
         assert_eq!(wrapped.arguments, Some(object(json!({"a": 1}))));
-        let routed = normalize_run(object(json!({"do": "t", "project": "p", "x": 1})), declares)
-            .expect("normalized");
+        let routed = read(json!({"do": "t", "project": "p", "x": 1})).expect("normalized");
         assert_eq!(routed.project.as_deref(), Some("p"));
         assert_eq!(routed.arguments, Some(object(json!({"x": 1}))));
-        let flat_wins = normalize_run(
-            object(json!({"tool": "u", "a": 2, "args": "{\"a\":1,\"b\":3}"})),
-            declares,
-        )
-        .expect("normalized");
+        let flat_wins =
+            read(json!({"tool": "u", "a": 2, "args": "{\"a\":1,\"b\":3}"})).expect("normalized");
         assert_eq!(flat_wins.tool, "u");
         assert_eq!(flat_wins.arguments, Some(object(json!({"a": 2, "b": 3}))));
-        let no_do = normalize_run(object(json!({"limit": 1})), declares).expect_err("no do");
+        let no_do = read(json!({"limit": 1})).expect_err("no do");
         assert_eq!(no_do.code, Code::MissingParameter);
         assert_eq!(no_do.param.as_deref(), Some("do"));
     }
@@ -2292,5 +2942,218 @@ mod tests {
             }
         }
         assert!(checked > 0, "the skills show no call of a CLI tool");
+    }
+}
+
+/// The calls weak models make (docs/dev/mcp-gateway-smoke-2.4.1-fixes.md, "Eval weak-model"), and
+/// what the gateway must make of them.
+#[cfg(test)]
+mod weak_model {
+    use std::path::Path;
+
+    use super::*;
+    use crate::history::list::ListParams;
+    use crate::history::search::SearchParams;
+
+    fn catalog() -> Catalog {
+        Catalog::parse(include_str!(
+            "../../../../../src/main/resources/catalog/tools.json"
+        ))
+        .expect("repo catalog")
+    }
+
+    fn object(value: Value) -> JsonObject {
+        serde_json::from_value(value).expect("object")
+    }
+
+    fn local(name: &str) -> &'static LocalTool {
+        local_tool(name).expect("local tool")
+    }
+
+    /// A gateway on a target in `dir` with one project, `main`.
+    fn gateway(dir: &Path) -> Gateway {
+        let target = Target::discover_or_init(dir).expect("target");
+        std::fs::create_dir_all(target.projects_dir()).expect("projects dir");
+        std::fs::write(target.project_file("main"), b"").expect("main.burp");
+        Gateway {
+            target: Some(Arc::new(target)),
+            target_error: None,
+            remote: None,
+            surface: Surface::Lean,
+            inline_limit: 1 << 20,
+            assets: OnceCell::new(),
+            api: ToolApi::new(),
+        }
+    }
+
+    #[test]
+    fn every_way_of_naming_a_tool_reads_as_the_tool() {
+        let catalog = catalog();
+        let cases = [
+            (json!({"do": "mcp__raijin__history_list", "limit": 1}), true),
+            (json!({"do": "raijin.history_list"}), true),
+            (json!({"do": "history_list()"}), true),
+            (json!({"do": "history_list(limit=1)"}), true),
+            (json!({"do": "history/list", "limit": 1}), false),
+            (json!({"function": "history_list"}), false),
+            (json!({"tool_name": "history_list", "limit": 1}), false),
+            (json!({"action": "history_list"}), true),
+            (
+                json!({"type": "function", "function": {"name": "history_list", "arguments": "{\"limit\":1}"}}),
+                true,
+            ),
+        ];
+        for (raw, noted) in cases {
+            let call = normalize_run(
+                object(raw.clone()),
+                |tool, key| tool_declares(Some(&catalog), tool, key),
+                |name| names_a_tool(Some(&catalog), name),
+            )
+            .unwrap_or_else(|e| panic!("{raw}: {}", e.error));
+            assert_eq!(
+                local_tool(&error::norm(&call.tool)).map(|t| t.name),
+                Some("history_list"),
+                "{raw}"
+            );
+            let wants_limit = raw.to_string().contains("limit");
+            let limit = call.arguments.as_ref().and_then(|a| a.get("limit"));
+            assert_eq!(limit.is_some(), wants_limit, "{raw}");
+            if wants_limit {
+                assert_eq!(limit, Some(&json!(1)), "{raw}");
+            }
+            assert_eq!(!call.notes.is_empty(), noted, "{raw}: {:?}", call.notes);
+        }
+    }
+
+    #[test]
+    fn unknown_names_suggest_only_near_tools() {
+        let catalog = catalog();
+        for name in ["email", "catalog", "details"] {
+            let e = unknown_tool_error(&catalog, name, &JsonObject::new());
+            assert!(
+                !e.did_you_mean.iter().any(|n| n == "ai" || n == "log"),
+                "{name}: {:?}",
+                e.did_you_mean
+            );
+            assert_eq!(e.retry, None, "{name}");
+        }
+        // A running extension older than the catalog: resending the same name fails the same way.
+        let same = unknown_tool_error(&catalog, "burp_status", &JsonObject::new());
+        assert_eq!(same.retry, None, "{same:?}");
+    }
+
+    #[test]
+    fn a_quoted_value_with_a_comma_is_not_cut() {
+        let (name, args) = parenthesised("scope.include(url=\"https://a.com/x,y\")").expect("call");
+        assert_eq!(name, "scope.include");
+        assert_eq!(args, None);
+        let (_, args) = parenthesised("history_list(limit=1, project='main')").expect("call");
+        assert_eq!(
+            args,
+            Some(vec![
+                ("limit".to_owned(), json!(1)),
+                ("project".to_owned(), json!("main"))
+            ])
+        );
+    }
+
+    #[test]
+    fn every_retry_for_a_typo_runs_as_sent() {
+        let catalog = catalog();
+        let mut retries = 0;
+        for name in [
+            "scope.chek",
+            "util.hsah",
+            "proxy_histroy",
+            "histroy_list",
+            "burp_stauts",
+        ] {
+            let e = unknown_tool_error(&catalog, name, &JsonObject::new());
+            let Some(retry) = e.retry.as_ref().and_then(Value::as_object) else {
+                continue;
+            };
+            retries += 1;
+            let tool = retry["do"].as_str().expect("string do");
+            if local_tool(tool).is_none() {
+                let (resolved, action) = catalog.resolve(tool).expect("resolves");
+                let grouped = !catalog.tool(&resolved).expect("tool").actions.is_empty();
+                assert!(
+                    !grouped || action.is_some(),
+                    "{name}: {tool} needs an action"
+                );
+            }
+            let schema = safe_call_schema(&catalog, tool).expect("a safe exact call");
+            let mut args = retry.clone();
+            args.remove("do");
+            assert!(call_fits(&schema, &args), "{name}: {retry:?}");
+        }
+        assert!(retries >= 2, "only {retries} typos got a retry");
+    }
+
+    #[test]
+    fn parameter_names_are_read_as_declared() {
+        let list = local("history_list");
+        let (plain, _): (ListParams, _) =
+            local_args(list, Some(object(json!({"limit": 2})))).expect("limit");
+        assert_eq!(plain.limit, Some(2));
+        for raw in [json!({"maxResults": 1}), json!({"Limit*": 1})] {
+            let (params, notes): (ListParams, _) =
+                local_args(list, Some(object(raw.clone()))).expect("renamed");
+            assert_eq!(params.limit, Some(1), "{raw}");
+            assert!(
+                notes.iter().any(|n| n.starts_with("read '")),
+                "{raw}: {notes:?}"
+            );
+        }
+        let both = local_args::<ListParams>(list, Some(object(json!({"count": 1, "limit": 2}))))
+            .expect_err("count and limit");
+        assert_eq!(both.code, Code::UnknownParameter);
+        assert_eq!(both.retry, None);
+
+        let (search, notes): (SearchParams, _) = local_args(
+            local("history_search"),
+            Some(object(json!({"query": "(", "regex": true}))),
+        )
+        .expect("search");
+        assert_eq!(search.pattern, "(");
+        assert!(
+            notes.contains(&"read 'query' as 'pattern'".to_owned()),
+            "{notes:?}"
+        );
+        assert!(
+            notes.contains(&"dropped 'regex': 'pattern' is always a regex here".to_owned()),
+            "{notes:?}"
+        );
+        assert!(read_bail(Some(json!(1))).expect("bail").0);
+    }
+
+    #[test]
+    fn a_project_in_another_case_is_matched_and_an_unknown_one_never_starts_burp() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let gateway = gateway(dir.path());
+        let (name, note) = gateway.resolve_project("MAIN").expect("matched");
+        assert_eq!(name, "main");
+        assert_eq!(
+            note.as_deref(),
+            Some("matched project \"MAIN\" to \"main\"")
+        );
+        let e = gateway.resolve_project("nope").expect_err("unknown");
+        assert_eq!(e.code, Code::InvalidEnum);
+        assert_eq!(e.allowed, [json!("main")]);
+        assert!(!e.to_value().to_string().contains("burp_up"), "{}", e.error);
+
+        let target = gateway.target.as_ref().expect("target");
+        let mut args = object(json!({"ref": 1}));
+        let notes = bare_refs(target, local("history_show"), Some(&mut args));
+        assert_eq!(args["ref"], json!("main:1"));
+        assert_eq!(notes, ["read ref \"1\" as \"main:1\""]);
+    }
+
+    #[test]
+    fn one_action_shows_its_own_parameters() {
+        let catalog = catalog();
+        let topic = tool_topic("util.hash", Some(&catalog), None).expect("util.hash");
+        let usage = topic["usage"].as_str().expect("usage");
+        assert!(!usage.contains("GZIP"), "{usage}");
     }
 }

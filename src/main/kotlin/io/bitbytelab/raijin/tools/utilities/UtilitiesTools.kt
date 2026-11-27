@@ -27,26 +27,57 @@ object UtilitiesTools {
     private const val MAX_RANDOM_LENGTH = 10_000
     private const val MAX_DECODE_DEPTH = 100
 
+    /**
+     * Whether [data] is standard base64, as [UtilitiesBridge.compress] and `decompress` read it.
+     */
+    private fun isBase64(data: String): Boolean = runCatching {
+        java.util.Base64.getDecoder().decode(data)
+    }
+        .isSuccess
+
+    /**
+     * `invalid_arguments` for [call] whose `data` is not base64, naming the first bad character or
+     * the length.
+     */
+    private fun notBase64(call: String, data: String): CallToolResult {
+        val bad = data.indexOfFirst { c ->
+            !c.isLetterOrDigit() && c !in "+/=-_" && !c.isWhitespace()
+        }
+        val why =
+            if (bad >= 0) "bad character '${data[bad]}' at $bad" else "wrong length or padding"
+        return ToolArgs.error("invalid_arguments", "$call: 'data' is not base64 ($why).") {
+            put("param", "data")
+            put("got", data.take(80))
+        }
+    }
+
     fun register(server: Server, bridge: UtilitiesBridge) {
 
         // 1. util_url_encode
         server.addTool(
             name = "util_url_encode",
-            description = "URL-encode a string. Parameters: data (required, the string " +
-                "to encode), encode_all (optional boolean, default false. If true, " +
-                "encodes all characters including unreserved ones).",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    string("data", "The string to encode")
-                    boolean("encode_all", "If true, encodes all characters including unreserved ones (default false)")
-                },
-                required = listOf("data")
-            )
+            description =
+                "URL-encode a string. Parameters: data (required, the string " +
+                    "to encode), encode_all (optional boolean, default false. If true, " +
+                    "encodes all characters including unreserved ones).",
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            string("data", "The string to encode")
+                            boolean(
+                                "encode_all",
+                                "If true, encodes all characters including unreserved ones (default false)",
+                            )
+                        },
+                    required = listOf("data"),
+                ),
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val data = args["data"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: data")
+                val data =
+                    args["data"]?.jsonPrimitive?.contentOrNull
+                        ?: return@addTool toolError("Missing required parameter: data")
                 val encodeAll = args["encode_all"].asBooleanSafe() ?: false
 
                 jsonKey("encoded", bridge.urlEncode(data, encodeAll))
@@ -58,19 +89,23 @@ object UtilitiesTools {
         // 2. util_url_decode
         server.addTool(
             name = "util_url_decode",
-            description = "URL-decode a string. Parameters: data (required, the " +
-                "URL-encoded string to decode).",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    string("data", "The URL-encoded string to decode")
-                },
-                required = listOf("data")
-            )
+            description =
+                "URL-decode a string. Parameters: data (required, the " +
+                    "URL-encoded string to decode).",
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            string("data", "The URL-encoded string to decode")
+                        },
+                    required = listOf("data"),
+                ),
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val data = args["data"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: data")
+                val data =
+                    args["data"]?.jsonPrimitive?.contentOrNull
+                        ?: return@addTool toolError("Missing required parameter: data")
 
                 jsonKey("decoded", bridge.urlDecode(data))
             } catch (e: Exception) {
@@ -81,21 +116,28 @@ object UtilitiesTools {
         // 3. util_base64_encode
         server.addTool(
             name = "util_base64_encode",
-            description = "Base64-encode a string. Parameters: data (required, the " +
-                "string to encode), url_safe (optional boolean, default false. If " +
-                "true, uses URL-safe base64 encoding without padding).",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    string("data", "The string to encode")
-                    boolean("url_safe", "If true, uses URL-safe base64 encoding without padding (default false)")
-                },
-                required = listOf("data")
-            )
+            description =
+                "Base64-encode a string. Parameters: data (required, the " +
+                    "string to encode), url_safe (optional boolean, default false. If " +
+                    "true, uses URL-safe base64 encoding without padding).",
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            string("data", "The string to encode")
+                            boolean(
+                                "url_safe",
+                                "If true, uses URL-safe base64 encoding without padding (default false)",
+                            )
+                        },
+                    required = listOf("data"),
+                ),
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val data = args["data"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: data")
+                val data =
+                    args["data"]?.jsonPrimitive?.contentOrNull
+                        ?: return@addTool toolError("Missing required parameter: data")
                 val urlSafe = args["url_safe"].asBooleanSafe() ?: false
 
                 jsonKey("encoded", bridge.base64Encode(data, urlSafe))
@@ -107,32 +149,31 @@ object UtilitiesTools {
         // 4. util_base64_decode
         server.addTool(
             name = "util_base64_decode",
-            description = "Base64-decode a string. Parameters: data (required, the " +
-                "base64-encoded string to decode). Supports both standard and " +
-                "URL-safe base64.",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    string("data", "The base64-encoded string to decode")
-                },
-                required = listOf("data")
-            )
+            description =
+                "Base64-decode a string. Parameters: data (required, the " +
+                    "base64-encoded string to decode). Supports both standard and " +
+                    "URL-safe base64.",
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            string("data", "The base64-encoded string to decode")
+                        },
+                    required = listOf("data"),
+                ),
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val data = args["data"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: data")
+                val data =
+                    args["data"]?.jsonPrimitive?.contentOrNull
+                        ?: return@addTool toolError("Missing required parameter: data")
 
-                val decoded = runCatching { bridge.base64Decode(data) }.getOrElse {
-                    val bad = data.indexOfFirst { c -> !c.isLetterOrDigit() && c !in "+/=-_" && !c.isWhitespace() }
-                    val why = if (bad >= 0) "bad character '${data[bad]}' at $bad" else "wrong length or padding"
-                    return@addTool ToolArgs.error(
-                        "invalid_arguments",
-                        "util.base64_decode: 'data' is not base64 ($why).",
-                    ) {
-                        put("param", "data")
-                        put("got", data.take(80))
-                    }
+                val decoded = runCatching {
+                    bridge.base64Decode(data)
                 }
+                    .getOrElse {
+                        return@addTool notBase64("util.base64_decode", data)
+                    }
                 jsonKey("decoded", decoded)
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
@@ -142,19 +183,23 @@ object UtilitiesTools {
         // 5. util_html_encode
         server.addTool(
             name = "util_html_encode",
-            description = "HTML-encode a string, escaping special characters like " +
-                "<, >, &, \", and '. Parameters: data (required, the string to encode).",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    string("data", "The string to encode")
-                },
-                required = listOf("data")
-            )
+            description =
+                "HTML-encode a string, escaping special characters like " +
+                    "<, >, &, \", and '. Parameters: data (required, the string to encode).",
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            string("data", "The string to encode")
+                        },
+                    required = listOf("data"),
+                ),
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val data = args["data"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: data")
+                val data =
+                    args["data"]?.jsonPrimitive?.contentOrNull
+                        ?: return@addTool toolError("Missing required parameter: data")
 
                 jsonKey("encoded", bridge.htmlEncode(data))
             } catch (e: Exception) {
@@ -165,23 +210,28 @@ object UtilitiesTools {
         // 6. util_hash
         server.addTool(
             name = "util_hash",
-            description = "Compute a cryptographic hash of a string. Parameters: " +
-                "data (required, the string to hash), algorithm (required, one of: " +
-                "MD5, SHA_1, SHA_256, SHA_384, SHA_512).",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    string("data", "The string to hash")
-                    enumString("algorithm", "Hash algorithm", HASH_ALGORITHMS)
-                },
-                required = listOf("data", "algorithm")
-            )
+            description =
+                "Compute a cryptographic hash of a string. Parameters: " +
+                    "data (required, the string to hash), algorithm (required, one of: " +
+                    "MD5, SHA_1, SHA_256, SHA_384, SHA_512).",
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            string("data", "The string to hash")
+                            enumString("algorithm", "Hash algorithm", HASH_ALGORITHMS)
+                        },
+                    required = listOf("data", "algorithm"),
+                ),
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val data = args["data"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: data")
-                val algorithm = args["algorithm"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: algorithm")
+                val data =
+                    args["data"]?.jsonPrimitive?.contentOrNull
+                        ?: return@addTool toolError("Missing required parameter: data")
+                val algorithm =
+                    args["algorithm"]?.jsonPrimitive?.contentOrNull
+                        ?: return@addTool toolError("Missing required parameter: algorithm")
 
                 toolJsonResult(bridge.hash(data, algorithm))
             } catch (e: Exception) {
@@ -192,25 +242,31 @@ object UtilitiesTools {
         // 7. util_compress
         server.addTool(
             name = "util_compress",
-            description = "Compress data using the specified algorithm. Parameters: " +
-                "data (required, base64-encoded input data), algorithm (required, " +
-                "one of: GZIP, DEFLATE). Returns base64-encoded compressed data. " +
-                "(BROTLI is not supported for compression by Burp; it is available " +
-                "for util_decompress only.)",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    string("data", "Base64-encoded input data")
-                    enumString("algorithm", "Compression algorithm", COMPRESS_ALGORITHMS)
-                },
-                required = listOf("data", "algorithm")
-            )
+            description =
+                "Compress data using the specified algorithm. Parameters: " +
+                    "data (required, base64-encoded input data), algorithm (required, " +
+                    "one of: GZIP, DEFLATE). Returns base64-encoded compressed data. " +
+                    "(BROTLI is not supported for compression by Burp; it is available " +
+                    "for util_decompress only.)",
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            string("data", "Base64-encoded input data")
+                            enumString("algorithm", "Compression algorithm", COMPRESS_ALGORITHMS)
+                        },
+                    required = listOf("data", "algorithm"),
+                ),
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val data = args["data"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: data")
-                val algorithm = args["algorithm"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: algorithm")
+                val data =
+                    args["data"]?.jsonPrimitive?.contentOrNull
+                        ?: return@addTool toolError("Missing required parameter: data")
+                val algorithm =
+                    args["algorithm"]?.jsonPrimitive?.contentOrNull
+                        ?: return@addTool toolError("Missing required parameter: algorithm")
+                if (!isBase64(data)) return@addTool notBase64("util.compress", data)
 
                 toolJsonResult(bridge.compress(data, algorithm))
             } catch (e: Exception) {
@@ -221,24 +277,30 @@ object UtilitiesTools {
         // 8. util_decompress
         server.addTool(
             name = "util_decompress",
-            description = "Decompress data using the specified algorithm. Parameters: " +
-                "data (required, base64-encoded compressed data), algorithm (required, " +
-                "one of: GZIP, DEFLATE, BROTLI). Returns base64-encoded decompressed " +
-                "data and a text representation if valid UTF-8.",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    string("data", "Base64-encoded compressed data")
-                    enumString("algorithm", "Compression algorithm", DECOMPRESS_ALGORITHMS)
-                },
-                required = listOf("data", "algorithm")
-            )
+            description =
+                "Decompress data using the specified algorithm. Parameters: " +
+                    "data (required, base64-encoded compressed data), algorithm (required, " +
+                    "one of: GZIP, DEFLATE, BROTLI). Returns base64-encoded decompressed " +
+                    "data and a text representation if valid UTF-8.",
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            string("data", "Base64-encoded compressed data")
+                            enumString("algorithm", "Compression algorithm", DECOMPRESS_ALGORITHMS)
+                        },
+                    required = listOf("data", "algorithm"),
+                ),
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val data = args["data"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: data")
-                val algorithm = args["algorithm"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: algorithm")
+                val data =
+                    args["data"]?.jsonPrimitive?.contentOrNull
+                        ?: return@addTool toolError("Missing required parameter: data")
+                val algorithm =
+                    args["algorithm"]?.jsonPrimitive?.contentOrNull
+                        ?: return@addTool toolError("Missing required parameter: algorithm")
+                if (!isBase64(data)) return@addTool notBase64("util.decompress", data)
 
                 toolJsonResult(bridge.decompress(data, algorithm))
             } catch (e: Exception) {
@@ -249,26 +311,40 @@ object UtilitiesTools {
         // 9. util_random_string
         server.addTool(
             name = "util_random_string",
-            description = "Generate a cryptographically random string. Parameters: " +
-                "length (required, integer length of the string, 1-$MAX_RANDOM_LENGTH), charset (optional, " +
-                "default 'alphanumeric'. Predefined sets: 'alphanumeric', 'alpha', " +
-                "'numeric', 'hex', 'ascii'. Or provide a custom string of characters).",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    integer("length", "Length of the string to generate", 1, MAX_RANDOM_LENGTH)
-                    string("charset", "Predefined set (alphanumeric, alpha, numeric, hex, ascii) or custom characters; default alphanumeric")
-                },
-                required = listOf("length")
-            )
+            description =
+                "Generate a cryptographically random string. Parameters: " +
+                    "length (required, integer length of the string, 1-$MAX_RANDOM_LENGTH), charset (optional, " +
+                    "default 'alphanumeric'. Predefined sets: 'alphanumeric', 'alpha', " +
+                    "'numeric', 'hex', 'ascii'. Or provide a custom string of characters).",
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            integer(
+                                "length",
+                                "Length of the string to generate",
+                                1,
+                                MAX_RANDOM_LENGTH,
+                            )
+                            string(
+                                "charset",
+                                "Predefined set (alphanumeric, alpha, numeric, hex, ascii) or custom characters; default alphanumeric",
+                            )
+                        },
+                    required = listOf("length"),
+                ),
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val length = args["length"].asClampedInt("length", 1, MAX_RANDOM_LENGTH)
-                    .getOrElse { return@addTool toolError(it.message ?: "Invalid length") }
-                    ?: return@addTool toolError("Missing required parameter: length")
+                val length =
+                    args["length"].asClampedInt("length", 1, MAX_RANDOM_LENGTH).getOrElse {
+                        return@addTool toolError(it.message ?: "Invalid length")
+                    } ?: return@addTool toolError("Missing required parameter: length")
                 val charset = args["charset"]?.jsonPrimitive?.contentOrNull ?: "alphanumeric"
 
-                toolJsonResult(bridge.randomString(length.value, charset).withClampReport("length", length))
+                toolJsonResult(
+                    bridge.randomString(length.value, charset).withClampReport("length", length),
+                )
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -277,21 +353,25 @@ object UtilitiesTools {
         // 10. util_random_bytes
         server.addTool(
             name = "util_random_bytes",
-            description = "Generate cryptographically random bytes. Parameters: " +
-                "length (required, integer number of bytes to generate, 1-$MAX_RANDOM_LENGTH). Returns " +
-                "hex and base64 encoded representations.",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    integer("length", "Number of bytes to generate", 1, MAX_RANDOM_LENGTH)
-                },
-                required = listOf("length")
-            )
+            description =
+                "Generate cryptographically random bytes. Parameters: " +
+                    "length (required, integer number of bytes to generate, 1-$MAX_RANDOM_LENGTH). Returns " +
+                    "hex and base64 encoded representations.",
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            integer("length", "Number of bytes to generate", 1, MAX_RANDOM_LENGTH)
+                        },
+                    required = listOf("length"),
+                ),
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val length = args["length"].asClampedInt("length", 1, MAX_RANDOM_LENGTH)
-                    .getOrElse { return@addTool toolError(it.message ?: "Invalid length") }
-                    ?: return@addTool toolError("Missing required parameter: length")
+                val length =
+                    args["length"].asClampedInt("length", 1, MAX_RANDOM_LENGTH).getOrElse {
+                        return@addTool toolError(it.message ?: "Invalid length")
+                    } ?: return@addTool toolError("Missing required parameter: length")
 
                 toolJsonResult(bridge.randomBytes(length.value).withClampReport("length", length))
             } catch (e: Exception) {
@@ -302,24 +382,31 @@ object UtilitiesTools {
         // 11. util_jwt_decode
         server.addTool(
             name = "util_jwt_decode",
-            description = "Decode a JSON Web Token (JWT) and extract its header, " +
-                "payload, and signature. Checks the exp claim for expiration. " +
-                "Parameters: token (required, the JWT string), verify_signature " +
-                "(optional boolean, default false. If true, verifies HMAC signature), " +
-                "secret (optional, the secret key for HMAC signature verification).",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    string("token", "The JWT string to decode")
-                    boolean("verify_signature", "If true, verifies the HMAC signature (default false)")
-                    string("secret", "The secret key for HMAC signature verification")
-                },
-                required = listOf("token")
-            )
+            description =
+                "Decode a JSON Web Token (JWT) and extract its header, " +
+                    "payload, and signature. Checks the exp claim for expiration. " +
+                    "Parameters: token (required, the JWT string), verify_signature " +
+                    "(optional boolean, default false. If true, verifies HMAC signature), " +
+                    "secret (optional, the secret key for HMAC signature verification).",
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            string("token", "The JWT string to decode")
+                            boolean(
+                                "verify_signature",
+                                "If true, verifies the HMAC signature (default false)",
+                            )
+                            string("secret", "The secret key for HMAC signature verification")
+                        },
+                    required = listOf("token"),
+                ),
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val token = args["token"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: token")
+                val token =
+                    args["token"]?.jsonPrimitive?.contentOrNull
+                        ?: return@addTool toolError("Missing required parameter: token")
                 val verifySignature = args["verify_signature"].asBooleanSafe() ?: false
                 val secret = args["secret"]?.jsonPrimitive?.contentOrNull
 
@@ -332,28 +419,43 @@ object UtilitiesTools {
         // 12. util_decode_smart
         server.addTool(
             name = "util_decode_smart",
-            description = "Automatically detect and decode multiple layers of encoding " +
-                "(base64, URL encoding, hex) iteratively until stable or max depth is " +
-                "reached. fully_decoded is true when no further layer could be decoded. " +
-                "Parameters: data (required, the encoded data string), " +
-                "max_depth (optional integer 0-$MAX_DECODE_DEPTH, default 10, maximum decoding iterations; " +
-                "a larger value is clamped and reported as max_depth_clamped_to).",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject {
-                    string("data", "The encoded data string")
-                    integer("max_depth", "Maximum decoding iterations (default 10)", 0, MAX_DECODE_DEPTH)
-                },
-                required = listOf("data")
-            )
+            description =
+                "Automatically detect and decode multiple layers of encoding " +
+                    "(base64, URL encoding, hex) iteratively until stable or max depth is " +
+                    "reached. fully_decoded is true when no further layer could be decoded. " +
+                    "Parameters: data (required, the encoded data string), " +
+                    "max_depth (optional integer 0-$MAX_DECODE_DEPTH, default 10, maximum decoding iterations; " +
+                    "a larger value is clamped and reported as max_depth_clamped_to).",
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            string("data", "The encoded data string")
+                            integer(
+                                "max_depth",
+                                "Maximum decoding iterations (default 10)",
+                                0,
+                                MAX_DECODE_DEPTH,
+                            )
+                        },
+                    required = listOf("data"),
+                ),
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val data = args["data"]?.jsonPrimitive?.contentOrNull
-                    ?: return@addTool toolError("Missing required parameter: data")
-                val maxDepth = args["max_depth"].asClampedInt("max_depth", 0, MAX_DECODE_DEPTH)
-                    .getOrElse { return@addTool toolError(it.message ?: "Invalid max_depth") }
+                val data =
+                    args["data"]?.jsonPrimitive?.contentOrNull
+                        ?: return@addTool toolError("Missing required parameter: data")
+                val maxDepth =
+                    args["max_depth"].asClampedInt("max_depth", 0, MAX_DECODE_DEPTH).getOrElse {
+                        return@addTool toolError(it.message ?: "Invalid max_depth")
+                    }
 
-                toolJsonResult(bridge.decodeSmart(data, maxDepth?.value ?: 10).withClampReport("max_depth", maxDepth))
+                toolJsonResult(
+                    bridge
+                        .decodeSmart(data, maxDepth?.value ?: 10)
+                        .withClampReport("max_depth", maxDepth),
+                )
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -366,20 +468,34 @@ object UtilitiesTools {
         // has no business shelling out; do not reintroduce it.
     }
 
-    private fun jsonKey(key: String, value: String): CallToolResult = toolJsonResult(buildJsonObject { put(key, value) })
+    private fun jsonKey(key: String, value: String): CallToolResult =
+        toolJsonResult(buildJsonObject { put(key, value) })
 
     private fun JsonObjectBuilder.string(name: String, description: String) =
-        putJsonObject(name) { put("type", "string"); put("description", description) }
+        putJsonObject(name) {
+            put("type", "string")
+            put("description", description)
+        }
 
     private fun JsonObjectBuilder.boolean(name: String, description: String) =
-        putJsonObject(name) { put("type", "boolean"); put("description", description) }
+        putJsonObject(name) {
+            put("type", "boolean")
+            put("description", description)
+        }
 
     private fun JsonObjectBuilder.integer(name: String, description: String, min: Int, max: Int) =
         putJsonObject(name) {
-            put("type", "integer"); put("minimum", min); put("maximum", max); put("description", description)
+            put("type", "integer")
+            put("minimum", min)
+            put("maximum", max)
+            put("description", description)
         }
 
-    private fun JsonObjectBuilder.enumString(name: String, description: String, values: List<String>) =
+    private fun JsonObjectBuilder.enumString(
+        name: String,
+        description: String,
+        values: List<String>,
+    ) =
         putJsonObject(name) {
             put("type", "string")
             putJsonArray("enum") { values.forEach { add(it) } }

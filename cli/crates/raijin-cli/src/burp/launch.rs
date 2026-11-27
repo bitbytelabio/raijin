@@ -540,8 +540,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let scaffolded = Target::discover_or_init(dir.path()).expect("auto init");
         assert_eq!(look(&scaffolded), "Dark");
-        fs::write(dir.path().join(crate::config::CONFIG_FILE), "theme = \"light\"\n")
-            .expect("config");
+        fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            "theme = \"light\"\n",
+        )
+        .expect("config");
         let light = Target::discover_or_init(dir.path()).expect("reload");
         assert_eq!(look(&light), "Light");
     }

@@ -47,17 +47,21 @@ internal class ToolArgs(private val args: Map<String, JsonElement>) {
     /** Boolean argument (`true`/`false`, also as text); null when absent. */
     fun bool(name: String): Boolean? {
         val element = get(name) ?: return null
-        return element.asBooleanSafe() ?: throw IllegalArgumentException("Parameter '$name' must be true or false")
+        return element.asBooleanSafe()
+            ?: throw IllegalArgumentException("Parameter '$name' must be true or false")
     }
 
     /** Integer argument that must lie within [range] (a port, an index); null when absent. */
     fun long(name: String, range: LongRange): Long? {
         val value = integer(name) ?: return null
-        require(value in range) { "Parameter '$name' must be between ${range.first} and ${range.last} (got $value)" }
+        require(value in range) {
+            "Parameter '$name' must be between ${range.first} and ${range.last} (got $value)"
+        }
         return value
     }
 
-    fun int(name: String, range: IntRange): Int? = long(name, range.first.toLong()..range.last.toLong())?.toInt()
+    fun int(name: String, range: IntRange): Int? =
+        long(name, range.first.toLong()..range.last.toLong())?.toInt()
 
     /** Integer argument clamped into [range]; null when absent. */
     fun clampedLong(name: String, range: LongRange): Long? {
@@ -71,12 +75,15 @@ internal class ToolArgs(private val args: Map<String, JsonElement>) {
     /** Number argument (fractions allowed) clamped into [range]; null when absent. */
     fun clampedDouble(name: String, range: ClosedFloatingPointRange<Double>): Double? {
         val element = get(name) ?: return null
-        val value = (element as? JsonPrimitive)?.contentOrNull?.trim()?.toDoubleOrNull()?.takeIf { it.isFinite() }
-            ?: throw IllegalArgumentException("Parameter '$name' must be a number")
+        val value =
+            (element as? JsonPrimitive)?.contentOrNull?.trim()?.toDoubleOrNull()?.takeIf {
+                it.isFinite()
+            } ?: throw IllegalArgumentException("Parameter '$name' must be a number")
         if (value in range) return value
         val clamped = value.coerceIn(range)
-        notes += "Parameter '$name' = ${number(value)} is outside ${number(range.start)}-${number(range.endInclusive)}; " +
-            "${number(clamped)} was used."
+        notes +=
+            "Parameter '$name' = ${number(value)} is outside ${number(range.start)}-${number(range.endInclusive)}; " +
+                "${number(clamped)} was used."
         return clamped
     }
 
@@ -94,14 +101,29 @@ internal class ToolArgs(private val args: Map<String, JsonElement>) {
         return clamp(name, value, 0, max)
     }
 
-    /** String argument from the closed set [allowed] (case-insensitive); null when absent or blank. */
-    fun enum(name: String, allowed: List<String>): String? {
+    /**
+     * String argument from the closed set [allowed] (case-insensitive); null when absent or blank.
+     * With [booleans], a JSON boolean reads as `first` (true) or `second` (false), noted.
+     */
+    fun enum(name: String, allowed: List<String>, booleans: Pair<String, String>? = null): String? {
+        val element = get(name)
+        if (booleans != null && element is JsonPrimitive && !element.isString) {
+            element.content.toBooleanStrictOrNull()?.let { b ->
+                val value = if (b) booleans.first else booleans.second
+                notes += "read $name $b as \"$value\""
+                return value
+            }
+        }
         val value = string(name) ?: return null
         EnumValidation.error(value, allowed.toSet(), name)?.let {
-            throw IllegalArgumentException(it["error"]?.jsonPrimitive?.contentOrNull ?: "Parameter '$name' has an invalid value")
+            throw IllegalArgumentException(
+                it["error"]?.jsonPrimitive?.contentOrNull
+                    ?: "Parameter '$name' has an invalid value",
+            )
         }
         val trimmed = value.trim()
-        return allowed.firstOrNull { it.equals(trimmed, ignoreCase = true) } ?: trimmed.ifEmpty { null }
+        return allowed.firstOrNull { it.equals(trimmed, ignoreCase = true) }
+            ?: trimmed.ifEmpty { null }
     }
 
     /** TLS flag from `use_tls` or its aliases `tls` / `https`; TLS by default on port 443. */
@@ -111,14 +133,19 @@ internal class ToolArgs(private val args: Map<String, JsonElement>) {
     fun explicitTls(): Boolean? = bool("use_tls") ?: bool("tls") ?: bool("https")
 
     /** The `port` argument, else 80 when TLS is explicitly off and 443 otherwise. */
-    fun portOrDefault(ports: IntRange): Int = int("port", ports) ?: if (explicitTls() == false) 80 else 443
+    fun portOrDefault(ports: IntRange): Int =
+        int("port", ports) ?: if (explicitTls() == false) 80 else 443
 
     /** Non-empty list of objects under [name]; null when absent. Every item must be an object. */
     fun objectList(name: String, what: String): List<JsonObject>? {
         val element = get(name) ?: return null
-        val items = element.asJsonObjectList() ?: throw IllegalArgumentException("'$name' must be an array of $what objects")
+        val items =
+            element.asJsonObjectList()
+                ?: throw IllegalArgumentException("'$name' must be an array of $what objects")
         val given = (element as? JsonArray)?.size ?: items.size
-        require(items.size == given) { "Every item in '$name' must be a $what object (${given - items.size} of $given are not)" }
+        require(items.size == given) {
+            "Every item in '$name' must be a $what object (${given - items.size} of $given are not)"
+        }
         require(items.isNotEmpty()) { "'$name' must contain at least one $what object" }
         return items
     }
@@ -135,7 +162,8 @@ internal class ToolArgs(private val args: Map<String, JsonElement>) {
 
     private fun integer(name: String): Long? {
         val element = get(name) ?: return null
-        return element.asLongSafe() ?: throw IllegalArgumentException("Parameter '$name' must be an integer (got $element)")
+        return element.asLongSafe()
+            ?: throw IllegalArgumentException("Parameter '$name' must be an integer (got $element)")
     }
 
     private fun clamp(name: String, value: Long, min: Long, max: Long): Long {
@@ -146,7 +174,8 @@ internal class ToolArgs(private val args: Map<String, JsonElement>) {
     }
 
     private fun number(value: Double): String =
-        if (value % 1.0 == 0.0 && kotlin.math.abs(value) < 1e15) value.toLong().toString() else value.toString()
+        if (value % 1.0 == 0.0 && kotlin.math.abs(value) < 1e15) value.toLong().toString()
+        else value.toString()
 
     companion object {
         /** Ceiling of every hard timeout (ten minutes). */
@@ -155,7 +184,11 @@ internal class ToolArgs(private val args: Map<String, JsonElement>) {
 }
 
 /** Adds a string property whose value must be one of [values]. */
-internal fun JsonObjectBuilder.enumProperty(name: String, values: List<String>, description: String) {
+internal fun JsonObjectBuilder.enumProperty(
+    name: String,
+    values: List<String>,
+    description: String,
+) {
     putJsonObject(name) {
         put("type", "string")
         putJsonArray("enum") { values.forEach { add(it) } }

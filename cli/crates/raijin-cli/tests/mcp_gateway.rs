@@ -530,7 +530,7 @@ async fn weak_model_calls_while_burp_is_down() {
             .is_some_and(|e| e.contains("guide is its own tool")),
         "{guide}"
     );
-    assert_eq!(guide["see"], "guide {\"topic\":\"util\"}");
+    assert_eq!(guide["see"], json!({"guide": {"topic": "util"}}));
     assert_eq!(
         envelope(&call(&client, "run", json!({"do": 5})).await)["code"],
         "invalid_type"
@@ -568,26 +568,18 @@ async fn weak_model_batches_synonyms_and_history_errors() {
     assert_eq!(out["steps"][1]["ok"], true, "{out}");
     assert_eq!(notes(&named), ["read 'steps' as 'batch'"]);
 
-    // Synonyms: count for limit, query for pattern.
-    let count = envelope(&call(&client, "run", json!({"do": "history_list", "count": 1})).await);
-    assert_eq!(
-        count["retry"],
-        json!({"do": "history_list", "limit": 1}),
-        "{count}"
-    );
-    let query = envelope(
-        &call(
-            &client,
-            "run",
-            json!({"do": "history_search", "query": "x"}),
-        )
-        .await,
-    );
-    assert_eq!(
-        query["retry"],
-        json!({"do": "history_search", "pattern": "x"}),
-        "{query}"
-    );
+    // Synonyms: count for limit, query for pattern, read as the declared name.
+    let count = call(&client, "run", json!({"do": "history_list", "count": 1})).await;
+    assert_eq!(rows(&count), 1);
+    assert_eq!(notes(&count), ["read 'count' as 'limit'"]);
+    let query = call(
+        &client,
+        "run",
+        json!({"do": "history_search", "query": "x"}),
+    )
+    .await;
+    assert_ne!(query.is_error, Some(true), "{}", text(&query));
+    assert_eq!(notes(&query), ["read 'query' as 'pattern'"]);
 
     // History errors the caller fixes.
     let bad_ref =

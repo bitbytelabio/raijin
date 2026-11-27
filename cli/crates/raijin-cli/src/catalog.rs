@@ -42,6 +42,12 @@ pub struct ActionSpec {
     pub required: Vec<String>,
     /// A `run` call that works: `{"do":"<tool>.<action>", ...}`.
     pub example: Value,
+    /// The action's own description (the member tool's), when the catalog has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The action's own parameter schemas (not the group's merged ones), when the catalog has them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<serde_json::Map<String, Value>>,
 }
 
 /// What a call name means in the catalog.
@@ -135,6 +141,19 @@ impl Catalog {
         names
     }
 
+    /// The names a "did you mean" offers: tools and `tool.action`, not old member names.
+    pub fn suggestion_names(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .map(|t| t.name.clone())
+            .chain(
+                self.tools
+                    .iter()
+                    .flat_map(|t| t.actions.keys().map(move |a| format!("{}.{a}", t.name))),
+            )
+            .collect()
+    }
+
     /// What `name` means as the extension resolves it (`ToolNames.resolve`): an exact tool, alias or
     /// `tool.action`, the same with other case and separators, or a hash name (`sha256`). Used to
     /// answer an unknown name while Burp is down.
@@ -178,16 +197,7 @@ impl Catalog {
             let note = format!("ran '{trimmed}' as util.hash with algorithm {algorithm}");
             return found("util".to_owned(), Some("hash".to_owned()), Some(note));
         }
-        let names: Vec<String> = self
-            .tools
-            .iter()
-            .map(|t| t.name.clone())
-            .chain(
-                self.tools
-                    .iter()
-                    .flat_map(|t| t.actions.keys().map(move |a| format!("{}.{a}", t.name))),
-            )
-            .collect();
+        let names = self.suggestion_names();
         let did_you_mean = crate::util::suggest(trimmed, names.iter().map(String::as_str), 3)
             .into_iter()
             .map(str::to_owned)
@@ -501,6 +511,20 @@ mod tests {
             .iter()
             .map(|g| g.iter().map(|s| (*s).to_owned()).collect())
             .collect();
+        assert_eq!(shipped, ours);
+    }
+
+    #[test]
+    fn the_boolean_words_match_the_extension() {
+        let text = include_str!("../../../../src/main/resources/catalog/tools.json");
+        let catalog: Value = serde_json::from_str(text).expect("catalog json");
+        let shipped: BTreeMap<String, Vec<String>> =
+            serde_json::from_value(catalog["boolean_words"].clone()).expect("boolean_words");
+        let words = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let ours = BTreeMap::from([
+            ("true".to_owned(), words(crate::mcp::args::TRUE_WORDS)),
+            ("false".to_owned(), words(crate::mcp::args::FALSE_WORDS)),
+        ]);
         assert_eq!(shipped, ours);
     }
 

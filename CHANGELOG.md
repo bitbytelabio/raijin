@@ -7,12 +7,22 @@
 - Parameter synonyms work both ways and across tools: `count`/`limit`/`max_results`, `offset`/`start_index`, `query`/`pattern`/`search_pattern`, `input`/`text`/`value`/`data`, `uri`/`url`, `raw_request`/`request`. The table ships in `catalog/tools.json` (`param_synonyms`) for the CLI.
 - `usage` reads `util.hash(data*: string, algorithm*: "MD5"|...)` and `example` is hand-picked and tested (`{"do":"http_send_request","url":"https://example.com/"}`); a grouped tool called without an action shows a read-only one (`burp.version`, not `burp.import_project_config`). Errors use `allowed`, never `available`/`available_topics`, and leave out empty `did_you_mean`.
 - JSON text read as an object or array is reported in `notes`.
+- `see` is a call to make first, not text: `{"do":"turbo_run.list"}` for `run`, `{"guide":{"topic":"util.hash"}}` for `guide`.
+- Parameter names are read as declared when the meaning is certain, with a note: `maxResults` and `Limit*` (camelCase, stray `*`), `limit` for `count`, `max_events`/`max_matches` too, and `regex:true` dropped where `pattern` is always a regex. Two names for one parameter, a value of the wrong type and destructive calls still get `unknown_parameter`.
+- Booleans also read `yes`/`no`/`on`/`off`/`1`/`0` (catalog `boolean_words`); `follow_redirects: true`/`false` reads as `"always"`/`"never"`, `search_in: "all"` as `"both"`, and JSON sent for a string parameter is noted.
+- Names with a server prefix (`mcp__raijin__proxy_history`, `raijin.`, `functions.`) or `/` (`scope/list`) resolve. Suggestions need a near name (edit distance, or containment of at least 4 chars and 60%): `email` no longer suggests `ai`. `retry` for an unknown tool or action is given only when the call it names exists, removes nothing and takes the arguments as sent.
+- Descriptions use one notation, `scope.list`, and the catalog ships each action's own description and parameter schemas, so `guide util.hash` no longer lists `GZIP`.
+- Examples hold real values; ids that come from another call are left out and point at the call that lists them. A placeholder copied from an example (`"<token>"`, `"<run_id from turbo_run.list>"`) in an id, URL or token is `placeholder_value`; elsewhere it is sent and noted.
+- `allowed` lists at most 20 values (the closest first) and `did_you_mean` at most 5. Not-found messages name the id (`turbo_run.status: no run "nope". List them with turbo_run.list.`), and every `error` ends in `.`, `!` or `?`.
+- Warnings (`scope_warning`, `headers_warning`, `warnings`, `*_clamped_to`, per step or request) are also listed in `notes`; the old fields stay for this release.
 
 ### Extension
 - `http_send_request`: `headers` takes `["X-A: 1"]`; a header entry it cannot read refuses the call and sends nothing (also per item in `http_send_requests_parallel` and `http_send_request_chain`). A raw request without a Host header and without `host` says so. A request with no response carries `no_response` with the target, and `time_request_sent` is null instead of the epoch.
 - `proxy_history` returns 20 items by default and leaves out `request_headers` unless `include_headers` is set.
 - `util.random_string`/`random_bytes` clamp `length` and report `length_clamped_to`; `util.base64_decode` names the bad character; `analyze.request` says when `request` is not a raw HTTP request.
-- Tool API: HTTP 400/415 answers and a throwing tool carry `code` and `retryable`.
+- Tool API: HTTP 400/415 answers and a throwing tool carry `code` and `retryable`. An `action` argument that differs from the one in the name is noted.
+- `http_send_request_chain` and `http_send_requests_parallel` where nothing got a response are errors (`no_response`) naming the first reason. `http_send_request` notes TLS chosen for a raw request, `url` ignored next to `raw_request`, and non-string header values sent as text.
+- `util.compress`/`util.decompress` refuse `data` that is not base64 like `util.base64_decode`; `probe.access_control` says which of `requests`/`identities` is missing or short; `scope.remove` out of range is `out_of_range` with the list size.
 
 ### raijin CLI
 - With Burp down, a name the catalog does not know is `unknown_tool` with suggestions right away; a known one gets `retry`: `{"batch":[{"do":"burp_up"},<the call>],"bail":true}` (none for a destructive call).
@@ -20,6 +30,10 @@
 - History errors: a bad ref is `invalid_arguments`, a missing entry `not_found`, an unknown project `invalid_enum` with `allowed` (and `retry` when the target has one project).
 - `guide tool.action` gives that action's parameters only, with `usage` and `example`; a grouped tool lists one call line per action; every tool topic has `usage` and, when known, `example`. `guide` takes `name`/`tool` for `topic`, hash names (`sha256`), `run`, `skill://overview/SKILL.md` and `/overview`.
 - An unknown `skill://` or `burp://` resource is MCP error `-32002` (resource not found).
+- `run` reads `tool_name`, `function` (also the OpenAI `{"function":{"name","arguments"}}` shape), an `action` that names a tool, `tool(k=v)` and a server prefix as the tool, each noted. A `batch` object is a one-step batch.
+- `project` in another case runs on the project it means (noted); an unknown one is `invalid_enum` listing the target's projects instead of a `retry` that starts a new Burp. A bare history ref (`1`) on a one-project target reads as `main:1`.
+- A batch with failures has `failed_steps`; when every step failed it is an error, and `retry` repeats only the failed steps (with their own `retry`) and the ones not run.
+- `guide` reads `do` as `topic`, ignores other keys with a note, and a topic written as a sentence is matched by its words. Its errors carry no `retry` or `example`.
 
 ## 2.4.1
 

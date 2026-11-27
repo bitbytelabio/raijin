@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Example JWT (empty claims) in ToolExamples.kt, copied into catalog/tools.json"
+regexTarget = "match"
+regexes = ['''eyJhbGciOiJIUzI1NiJ9\.e30\.ZRrHA1JJJW8opsbCGfG_HACGpVUMN_a9IV7pAx_Zmeo''']

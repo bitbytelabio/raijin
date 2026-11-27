@@ -161,17 +161,33 @@ fn coerce(
                 v = t.parse::<i64>().map_or_else(|_| json!(n), |i| json!(i));
             }
         } else if s.has("boolean")
-            && (t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("false"))
+            && let Some(b) = bool_word(t)
         {
             notes.push(format!(
                 "coerced '{name}' from string \"{text}\" to boolean"
             ));
-            v = json!(t.eq_ignore_ascii_case("true"));
+            v = json!(b);
         } else if s.has("array")
             && let Ok(Value::Array(items)) = serde_json::from_str::<Value>(t)
         {
             v = Value::Array(items);
         }
+    }
+    let numeric = s.has("integer") || s.has("number");
+    if let Value::Number(n) = &v
+        && s.has("boolean")
+        && !numeric
+        && let Some(i @ (0 | 1)) = n.as_u64()
+    {
+        notes.push(format!("coerced '{name}' from {n} to boolean"));
+        v = json!(i == 1);
+    }
+    if let Value::Number(n) = &v
+        && s.has("string")
+        && !numeric
+    {
+        notes.push(format!("coerced '{name}' from {n} to string"));
+        v = json!(n.to_string());
     }
     if let Value::Number(n) = &v
         && s.has("integer")
@@ -326,7 +342,16 @@ pub fn usage(tool: &str, schema: &JsonObject) -> String {
 /// name maps to the one member of its group a tool declares. The extension's table
 /// (`ToolArgs.PARAM_SYNONYMS`, `param_synonyms` in the catalog); a test keeps the two equal.
 pub const PARAM_SYNONYMS: &[&[&str]] = &[
-    &["count", "limit", "max", "max_results", "max_items", "size"],
+    &[
+        "count",
+        "limit",
+        "max",
+        "max_results",
+        "max_items",
+        "size",
+        "max_events",
+        "max_matches",
+    ],
     &["start_index", "offset", "skip"],
     &["pattern", "query", "q", "regex", "search", "search_pattern"],
     &["data", "input", "text", "value", "string"],
@@ -345,31 +370,153 @@ fn synonym<'a>(key: &str, props: &'a JsonObject) -> Option<&'a str> {
     fits.next().is_none().then_some(one.as_str())
 }
 
-/// What `retry` an `unknown_parameter` error may carry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Retry {
-    /// None: the tool is destructive.
-    Never,
-    /// A `run` call: `{"do": tool, ...arguments}`.
-    RunCall,
-    /// The arguments alone (a gateway tool such as `guide`).
-    Arguments,
+/// Text a boolean parameter takes for `true`; [`FALSE_WORDS`] for `false`. The extension's
+/// `ToolArgs.BOOLEAN_WORDS` (`boolean_words` in the catalog); a test keeps the two equal.
+pub const TRUE_WORDS: &[&str] = &["true", "1", "yes", "on"];
+pub const FALSE_WORDS: &[&str] = &["false", "0", "no", "off"];
+
+/// The boolean `text` means by [`TRUE_WORDS`] and [`FALSE_WORDS`], trimmed and in any case.
+pub fn bool_word(text: &str) -> Option<bool> {
+    let t = text.trim().to_lowercase();
+    if TRUE_WORDS.contains(&t.as_str()) {
+        Some(true)
+    } else if FALSE_WORDS.contains(&t.as_str()) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
-/// `unknown_parameter` for the `unknown` keys of `arguments`, each with its nearest declared name;
-/// `retry` renames them when every one has a distinct suggestion not already set.
+/// A parameter name in the form tools declare: trimmed, without surrounding `*`, camelCase split
+/// with `_`, lowercase, `-` and spaces as `_` (`maxResults` -> `max_results`, `Limit*` -> `limit`).
+/// Same rule as the extension's `ToolArgs.canonicalParam`.
+pub fn canonical_param(key: &str) -> String {
+    let t = key.trim().trim_matches('*').trim();
+    let mut out = String::with_capacity(t.len() + 4);
+    let mut prev: Option<char> = None;
+    for c in t.chars() {
+        if c.is_uppercase() && prev.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit()) {
+            out.push('_');
+        }
+        out.extend(c.to_lowercase());
+        prev = Some(c);
+    }
+    out.chars()
+        .map(|c| if matches!(c, '-' | ' ') { '_' } else { c })
+        .collect()
+}
+
+/// `args` with undeclared names that clearly mean a declared one renamed, each change noted: the
+/// canonical form of a name ([`canonical_param`]), a boolean `regex` flag dropped where `pattern` is
+/// always a regex, and a [`PARAM_SYNONYMS`] member whose value fits the target's type. A target
+/// already set, or claimed by an earlier rename, is left alone, as is every name of a `destructive`
+/// call: those go to `unknown_parameter`. Same rule as the extension's `ToolArgs.renameParams`.
+fn rename_params(
+    props: &JsonObject,
+    schema: &JsonObject,
+    args: JsonObject,
+    destructive: bool,
+) -> (JsonObject, Vec<String>) {
+    let mut notes = Vec::new();
+    if destructive || args.keys().all(|k| props.contains_key(k)) {
+        return (args, notes);
+    }
+    let given: BTreeSet<String> = args.keys().cloned().collect();
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
+    let mut out = Map::new();
+    for (k, v) in args {
+        if props.contains_key(&k) {
+            out.insert(k, v);
+            continue;
+        }
+        let c = canonical_param(&k);
+        if props.contains_key(&c) && !given.contains(&c) && !claimed.contains(&c) {
+            notes.push(format!("read '{k}' as '{c}'"));
+            claimed.insert(c.clone());
+            out.insert(c, v);
+            continue;
+        }
+        if c == "regex" && v.is_boolean() && props.contains_key("pattern") {
+            notes.push("dropped 'regex': 'pattern' is always a regex here".to_owned());
+            continue;
+        }
+        if let Some(t) = synonym(&c, props)
+            && !given.contains(t)
+            && !claimed.contains(t)
+        {
+            let s = shape(schema, &props[t]);
+            let coerced = coerce(t, &s, schema, v.clone(), &mut Vec::new());
+            if fits(&s, &coerced) {
+                notes.push(format!("read '{k}' as '{t}'"));
+                claimed.insert(t.to_owned());
+                out.insert(t.to_owned(), v);
+                continue;
+            }
+        }
+        out.insert(k, v);
+    }
+    (out, notes)
+}
+
+/// Whether `args` makes a call `schema` accepts: every required key set, every key declared, and
+/// each value of the declared type, enum and minimum once read leniently.
+pub fn call_fits(schema: &JsonObject, args: &JsonObject) -> bool {
+    let empty = Map::new();
+    let props = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    required_of(schema).iter().all(|k| args.contains_key(*k))
+        && args.iter().all(|(k, v)| {
+            props.get(k).is_some_and(|def| {
+                let s = shape(schema, def);
+                let v = coerce(k, &s, schema, v.clone(), &mut Vec::new());
+                check("", k, schema, &s, v).is_ok()
+            })
+        })
+}
+
+/// Most `allowed` values an error lists; [`MAX_DID_YOU_MEAN`] for `did_you_mean`.
+const MAX_ALLOWED: usize = 20;
+const MAX_DID_YOU_MEAN: usize = 5;
+
+/// `values` capped at [`MAX_ALLOWED`]: the 5 closest to `got` first, then the rest in declared
+/// order; true when some were left out.
+fn capped_allowed(got: &str, values: &[String]) -> (Vec<String>, bool) {
+    if values.len() <= MAX_ALLOWED {
+        return (values.to_vec(), false);
+    }
+    let mut out: Vec<String> = suggest(got, values.iter().map(String::as_str), MAX_DID_YOU_MEAN)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    for v in values {
+        if out.len() >= MAX_ALLOWED {
+            break;
+        }
+        if !out.contains(v) {
+            out.push(v.clone());
+        }
+    }
+    (out, true)
+}
+
+/// `unknown_parameter` for the `unknown` keys of `arguments`, each with its nearest declared name
+/// (looked up in [`canonical_param`] form); `retry`, a `run` call with them renamed, is offered when
+/// `offer_retry` and every one has a distinct suggestion not already set.
 fn unknown_parameter(
     tool: &str,
     props: &JsonObject,
     arguments: &JsonObject,
     unknown: &[&String],
-    retry: Retry,
+    offer_retry: bool,
 ) -> ToolError {
     let targets: Vec<Option<&str>> = unknown
         .iter()
         .map(|k| {
-            synonym(k, props).or_else(|| {
-                suggest(k, props.keys().map(String::as_str), 1)
+            let c = canonical_param(k);
+            synonym(&c, props).or_else(|| {
+                suggest(&c, props.keys().map(String::as_str), 1)
                     .first()
                     .copied()
             })
@@ -377,7 +524,7 @@ fn unknown_parameter(
         .collect();
     let chosen: Vec<&str> = targets.iter().flatten().copied().collect();
     let distinct: BTreeSet<&str> = chosen.iter().copied().collect();
-    let certain = retry != Retry::Never
+    let certain = offer_retry
         && chosen.len() == unknown.len()
         && distinct.len() == chosen.len()
         && chosen.iter().all(|t| !arguments.contains_key(*t));
@@ -401,16 +548,19 @@ fn unknown_parameter(
             )
         }
     };
-    let mut error = ToolError::new(Code::UnknownParameter, message)
-        .did_you_mean(distinct.iter().map(|t| (*t).to_owned()).collect());
+    let mut error = ToolError::new(Code::UnknownParameter, message).did_you_mean(
+        distinct
+            .iter()
+            .take(MAX_DID_YOU_MEAN)
+            .map(|t| (*t).to_owned())
+            .collect(),
+    );
     if let Some(first) = unknown.first() {
         error = error.param(first.as_str());
     }
     if certain {
         let mut call = Map::new();
-        if retry == Retry::RunCall {
-            call.insert("do".to_owned(), json!(tool));
-        }
+        call.insert("do".to_owned(), json!(tool));
         for (k, v) in arguments {
             let renamed = unknown
                 .iter()
@@ -453,14 +603,24 @@ fn check(
         && s.closed_enum()
         && !s.enums.contains(text)
     {
+        let (shown_values, cut) = capped_allowed(text, &s.enums);
+        let more = if cut {
+            format!(", ... ({} values; guide lists all)", s.enums.len())
+        } else {
+            String::new()
+        };
         let message = format!(
-            "{tool}: '{key}' must be one of {}, got \"{text}\".",
-            quoted(&s.enums)
+            "{tool}: '{key}' must be one of {}{more}, got \"{text}\".",
+            quoted(&shown_values)
         );
-        return Err(ToolError::new(Code::InvalidEnum, message)
+        let mut error = ToolError::new(Code::InvalidEnum, message)
             .param(key)
             .got(value)
-            .allowed(s.enums.iter().map(|e| json!(e)).collect()));
+            .allowed(shown_values.iter().map(|e| json!(e)).collect());
+        if cut {
+            error = error.see(super::error::guide_call(Some(tool)));
+        }
+        return Err(error);
     }
     if let (Some(min), Some(n)) = (s.minimum, value.as_f64())
         && n < min
@@ -489,8 +649,9 @@ fn required_of(schema: &JsonObject) -> BTreeSet<&str> {
 /// Reads `arguments` as `T` for `tool`: unknown keys, wrong types, values outside an enum or a
 /// minimum and missing required keys are refused with a [`ToolError`] carrying `usage` and
 /// `example`; strings that clearly mean a number or boolean, and enum values in another case, are
-/// read as such and reported in the returned notes. `retry` (a corrected call) is offered for a
-/// misspelled parameter unless the tool is `destructive`; it is a `run` call when `example` is.
+/// read as such and reported in the returned notes, as are names [`rename_params`] reads as a
+/// declared one. `retry` (a corrected `run` call) is offered for a misspelled parameter unless the
+/// tool is `destructive` or `example` is not a `run` call.
 pub fn parse_args<T: DeserializeOwned + JsonSchema>(
     tool: &str,
     arguments: Option<JsonObject>,
@@ -507,24 +668,22 @@ pub fn parse_args<T: DeserializeOwned + JsonSchema>(
     let usage_line = usage(tool, &schema);
     let fail = |e: ToolError| e.usage(usage_line.clone()).example(example.clone());
 
+    let (arguments, mut notes) = rename_params(props, &schema, arguments, destructive);
     let unknown: Vec<&String> = arguments
         .keys()
         .filter(|k| !props.contains_key(*k))
         .collect();
     if !unknown.is_empty() {
-        let retry = if destructive {
-            Retry::Never
-        } else if example.get("do").is_some() {
-            Retry::RunCall
-        } else {
-            Retry::Arguments
-        };
+        let offer_retry = !destructive && example.get("do").is_some();
         return Err(fail(unknown_parameter(
-            tool, props, &arguments, &unknown, retry,
+            tool,
+            props,
+            &arguments,
+            &unknown,
+            offer_retry,
         )));
     }
 
-    let mut notes = Vec::new();
     let mut checked = Map::new();
     let required = required_of(&schema);
     for (key, value) in arguments {

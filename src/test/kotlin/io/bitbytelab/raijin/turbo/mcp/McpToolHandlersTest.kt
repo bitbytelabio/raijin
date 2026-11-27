@@ -1,8 +1,8 @@
 package io.bitbytelab.raijin.turbo.mcp
 
-import org.junit.jupiter.api.Test
-import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Assertions.*
+import org.junit.jupiter.api.BeforeEach
+import org.junit.jupiter.api.Test
 
 class McpToolHandlersTest {
 
@@ -17,12 +17,14 @@ class McpToolHandlersTest {
 
     @Test
     fun `startRun blocks until completion and returns results`() {
-        val result = handlers.startRun(
-            script = "def queueRequests(target, wordlists):\n    pass\ndef completed(results):\n    pass",
-            baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
-            endpoint = "https://example.com:443",
-            baseInput = ""
-        )
+        val result =
+            handlers.startRun(
+                script =
+                    "def queueRequests(target, wordlists):\n    pass\ndef completed(results):\n    pass",
+                baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                endpoint = "https://example.com:443",
+                baseInput = "",
+            )
 
         assertEquals("completed", result["status"])
         assertNotNull(result["run_id"])
@@ -33,25 +35,28 @@ class McpToolHandlersTest {
 
     @Test
     fun `startRun returns running status with run details when wait exceeded`() {
-        val result = handlers.startRun(
-            script = """
-def queueRequests(target, wordlists):
-    import time
-    time.sleep(10)  # Longer than timeout
+        val result =
+            handlers.startRun(
+                script =
+                    """
+                    def queueRequests(target, wordlists):
+                        import time
+                        time.sleep(10)  # Longer than timeout
 
-def completed(results):
-    pass
-            """.trimIndent(),
-            baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
-            endpoint = "https://example.com:443",
-            baseInput = "",
-            timeoutMs = 100  // Very short timeout
-        )
+                    def completed(results):
+                        pass
+                    """
+                        .trimIndent(),
+                baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                endpoint = "https://example.com:443",
+                baseInput = "",
+                timeoutMs = 100, // Very short timeout
+            )
 
         assertEquals("running", result["status"])
         assertNotNull(result["run_id"])
         assertNotNull(result["message"])
-        assertTrue((result["message"] as String).contains("turbo_run(action=status)"))
+        assertTrue((result["message"] as String).contains("turbo_run.status"))
         assertFalse(result.containsKey("running"), "Should not contain 'running' boolean")
         assertFalse(result.containsKey("finished"), "Should not contain 'finished' boolean")
         assertNotNull(result["status_message"])
@@ -65,12 +70,14 @@ def completed(results):
 
     @Test
     fun `startRun uses default 55 second timeout`() {
-        val result = handlers.startRun(
-            script = "def queueRequests(target, wordlists):\n    pass\ndef completed(results):\n    pass",
-            baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
-            endpoint = "https://example.com:443",
-            baseInput = ""
-        )
+        val result =
+            handlers.startRun(
+                script =
+                    "def queueRequests(target, wordlists):\n    pass\ndef completed(results):\n    pass",
+                baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                endpoint = "https://example.com:443",
+                baseInput = "",
+            )
 
         // Should complete (not timeout) since script finishes immediately
         assertEquals("completed", result["status"])
@@ -78,12 +85,14 @@ def completed(results):
 
     @Test
     fun `startRunAsync returns immediately with started status`() {
-        val result = handlers.startRunAsync(
-            script = "def queueRequests(target, wordlists):\n    pass\ndef completed(results):\n    pass",
-            baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
-            endpoint = "https://example.com:443",
-            baseInput = ""
-        )
+        val result =
+            handlers.startRunAsync(
+                script =
+                    "def queueRequests(target, wordlists):\n    pass\ndef completed(results):\n    pass",
+                baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                endpoint = "https://example.com:443",
+                baseInput = "",
+            )
 
         assertEquals("started", result["status"])
         assertNotNull(result["run_id"])
@@ -91,12 +100,14 @@ def completed(results):
 
     @Test
     fun `stopRun stops a run by id`() {
-        val result = handlers.startRunAsync(
-            script = "def queueRequests(target, wordlists):\n    pass\ndef completed(results):\n    pass",
-            baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
-            endpoint = "https://example.com:443",
-            baseInput = ""
-        )
+        val result =
+            handlers.startRunAsync(
+                script =
+                    "def queueRequests(target, wordlists):\n    pass\ndef completed(results):\n    pass",
+                baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                endpoint = "https://example.com:443",
+                baseInput = "",
+            )
         val runId = result["run_id"] as String
 
         val stopResult = handlers.stopRun(runId)
@@ -112,19 +123,23 @@ def completed(results):
         // Create a run with some requests
         val run = manager.startRun()
         run.handler.code = "def queueRequests(target, wordlists):\n    pass"
-        val req1 = io.bitbytelab.raijin.turbo.Request("GET /page1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req1 =
+            io.bitbytelab.raijin.turbo.Request("GET /page1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req1.id = 1
         req1.response = "HTTP/1.1 200 OK\r\n\r\nOK"
-        val req2 = io.bitbytelab.raijin.turbo.Request("GET /page2 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req2 =
+            io.bitbytelab.raijin.turbo.Request("GET /page2 HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req2.id = 2
         req2.response = "HTTP/1.1 404 Not Found\r\n\r\nNot Found"
         run.store.add(req1)
         run.store.add(req2)
 
-        val result = handlersWithOrganizer.saveToOrganizer(
-            runId = run.id,
-            items = """[{"request_id": 1, "notes": "Interesting finding"}, {"request_id": 2, "notes": "Check this"}]"""
-        )
+        val result =
+            handlersWithOrganizer.saveToOrganizer(
+                runId = run.id,
+                items =
+                    """[{"request_id": 1, "notes": "Interesting finding"}, {"request_id": 2, "notes": "Check this"}]""",
+            )
 
         val saved = result["saved"] as List<*>
         assertEquals(listOf(1, 2), saved)
@@ -149,10 +164,12 @@ def completed(results):
         req1.response = "HTTP/1.1 200 OK\r\n\r\n"
         run.store.add(req1)
 
-        val result = handlersWithOrganizer.saveToOrganizer(
-            runId = run.id,
-            items = """[{"request_id": 1, "notes": "Good"}, {"request_id": 999, "notes": "Missing"}]"""
-        )
+        val result =
+            handlersWithOrganizer.saveToOrganizer(
+                runId = run.id,
+                items =
+                    """[{"request_id": 1, "notes": "Good"}, {"request_id": 999, "notes": "Missing"}]""",
+            )
 
         val saved = result["saved"] as List<*>
         val errors = result["errors"] as List<Map<String, Any>>
@@ -172,10 +189,12 @@ def completed(results):
         req1.response = "HTTP/1.1 200 OK\r\n\r\n"
         run.store.add(req1)
 
-        val result = handlersWithOrganizer.saveToOrganizer(
-            runId = run.id,
-            items = """["not an object", {"request_id": "abc"}, {"request_id": "1", "notes": "string id"}]"""
-        )
+        val result =
+            handlersWithOrganizer.saveToOrganizer(
+                runId = run.id,
+                items =
+                    """["not an object", {"request_id": "abc"}, {"request_id": "1", "notes": "string id"}]""",
+            )
 
         assertEquals(listOf(1), result["saved"])
         assertEquals(2, (result["errors"] as List<*>).size)
@@ -185,13 +204,16 @@ def completed(results):
     @Test
     fun `searchResponses returns matching request IDs`() {
         val run = manager.startRun()
-        val req1 = io.bitbytelab.raijin.turbo.Request("GET /page1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req1 =
+            io.bitbytelab.raijin.turbo.Request("GET /page1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req1.id = 1
         req1.response = "HTTP/1.1 200 OK\r\n\r\nHello World"
-        val req2 = io.bitbytelab.raijin.turbo.Request("GET /page2 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req2 =
+            io.bitbytelab.raijin.turbo.Request("GET /page2 HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req2.id = 2
         req2.response = "HTTP/1.1 200 OK\r\n\r\nGoodbye World"
-        val req3 = io.bitbytelab.raijin.turbo.Request("GET /page3 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req3 =
+            io.bitbytelab.raijin.turbo.Request("GET /page3 HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req3.id = 3
         req3.response = "HTTP/1.1 404 Not Found\r\n\r\nNot Found"
         run.store.add(req1)
@@ -237,13 +259,15 @@ def completed(results):
     @Test
     fun `searchResponses uses specified run`() {
         val run1 = manager.startRun()
-        val req1 = io.bitbytelab.raijin.turbo.Request("GET /run1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req1 =
+            io.bitbytelab.raijin.turbo.Request("GET /run1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req1.id = 1
         req1.response = "HTTP/1.1 200 OK\r\n\r\nFindMe"
         run1.store.add(req1)
 
         val run2 = manager.startRun()
-        val req2 = io.bitbytelab.raijin.turbo.Request("GET /run2 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req2 =
+            io.bitbytelab.raijin.turbo.Request("GET /run2 HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req2.id = 1
         req2.response = "HTTP/1.1 200 OK\r\n\r\nNotThis"
         run2.store.add(req2)
@@ -257,11 +281,13 @@ def completed(results):
     @Test
     fun `searchResponses can find entries by label`() {
         val run = manager.startRun()
-        val req1 = io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req1 =
+            io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req1.id = 1
         req1.label = "interesting"
         req1.response = "HTTP/1.1 200 OK\r\n\r\nOK"
-        val req2 = io.bitbytelab.raijin.turbo.Request("GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req2 =
+            io.bitbytelab.raijin.turbo.Request("GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req2.id = 2
         req2.label = "boring"
         req2.response = "HTTP/1.1 200 OK\r\n\r\nOK"
@@ -277,18 +303,21 @@ def completed(results):
     @Test
     fun `searchResponses with search_in labels only searches labels`() {
         val run = manager.startRun()
-        val req1 = io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req1 =
+            io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req1.id = 1
         req1.label = "interesting"
         req1.response = "HTTP/1.1 200 OK\r\n\r\ninteresting body"
-        val req2 = io.bitbytelab.raijin.turbo.Request("GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req2 =
+            io.bitbytelab.raijin.turbo.Request("GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req2.id = 2
         req2.label = "boring"
         req2.response = "HTTP/1.1 200 OK\r\n\r\ninteresting body too"
         run.store.add(req1)
         run.store.add(req2)
 
-        val result = handlers.searchResponses(runId = run.id, query = "interesting", searchIn = "labels")
+        val result =
+            handlers.searchResponses(runId = run.id, query = "interesting", searchIn = "labels")
 
         val matches = result["matches"] as List<Int>
         assertEquals(listOf(1), matches)
@@ -297,18 +326,21 @@ def completed(results):
     @Test
     fun `searchResponses with search_in responses only searches response bodies`() {
         val run = manager.startRun()
-        val req1 = io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req1 =
+            io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req1.id = 1
         req1.label = "interesting"
         req1.response = "HTTP/1.1 200 OK\r\n\r\nplain body"
-        val req2 = io.bitbytelab.raijin.turbo.Request("GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req2 =
+            io.bitbytelab.raijin.turbo.Request("GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req2.id = 2
         req2.label = "boring"
         req2.response = "HTTP/1.1 200 OK\r\n\r\ninteresting body"
         run.store.add(req1)
         run.store.add(req2)
 
-        val result = handlers.searchResponses(runId = run.id, query = "interesting", searchIn = "responses")
+        val result =
+            handlers.searchResponses(runId = run.id, query = "interesting", searchIn = "responses")
 
         val matches = result["matches"] as List<Int>
         assertEquals(listOf(2), matches)
@@ -317,18 +349,21 @@ def completed(results):
     @Test
     fun `searchResponses with search_in all searches both labels and responses`() {
         val run = manager.startRun()
-        val req1 = io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req1 =
+            io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req1.id = 1
         req1.label = "interesting"
         req1.response = "HTTP/1.1 200 OK\r\n\r\nplain body"
-        val req2 = io.bitbytelab.raijin.turbo.Request("GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req2 =
+            io.bitbytelab.raijin.turbo.Request("GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req2.id = 2
         req2.label = "boring"
         req2.response = "HTTP/1.1 200 OK\r\n\r\ninteresting body"
         run.store.add(req1)
         run.store.add(req2)
 
-        val result = handlers.searchResponses(runId = run.id, query = "interesting", searchIn = "all")
+        val result =
+            handlers.searchResponses(runId = run.id, query = "interesting", searchIn = "all")
 
         val matches = result["matches"] as List<Int>
         assertEquals(listOf(1, 2), matches.sorted())
@@ -337,11 +372,13 @@ def completed(results):
     @Test
     fun `searchResponses defaults to searching all when search_in not specified`() {
         val run = manager.startRun()
-        val req1 = io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req1 =
+            io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req1.id = 1
         req1.label = "tagged"
         req1.response = "HTTP/1.1 200 OK\r\n\r\nplain"
-        val req2 = io.bitbytelab.raijin.turbo.Request("GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req2 =
+            io.bitbytelab.raijin.turbo.Request("GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req2.id = 2
         req2.label = ""
         req2.response = "HTTP/1.1 200 OK\r\n\r\ntagged"
@@ -364,7 +401,8 @@ def completed(results):
     @Test
     fun `searchResponses notes when responses are stripped for response search`() {
         val run = manager.startRun()
-        val req1 = io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req1 =
+            io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req1.id = 1
         req1.label = "interesting"
         req1.response = "HTTP/1.1 200 OK\r\n\r\nHello"
@@ -373,7 +411,8 @@ def completed(results):
         run.store.stripResponseBodies()
         run.responsesStripped = true
 
-        val result = handlers.searchResponses(runId = run.id, query = "Hello", searchIn = "responses")
+        val result =
+            handlers.searchResponses(runId = run.id, query = "Hello", searchIn = "responses")
 
         assertTrue(result.containsKey("warning"))
         assertTrue((result["warning"] as String).contains("stripped"))
@@ -382,7 +421,8 @@ def completed(results):
     @Test
     fun `searchResponses still searches labels on stripped runs`() {
         val run = manager.startRun()
-        val req1 = io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req1 =
+            io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req1.id = 1
         req1.label = "interesting"
         req1.response = "HTTP/1.1 200 OK\r\n\r\nHello"
@@ -391,7 +431,8 @@ def completed(results):
         run.store.stripResponseBodies()
         run.responsesStripped = true
 
-        val result = handlers.searchResponses(runId = run.id, query = "interesting", searchIn = "labels")
+        val result =
+            handlers.searchResponses(runId = run.id, query = "interesting", searchIn = "labels")
 
         val matches = result["matches"] as List<Int>
         assertEquals(listOf(1), matches)
@@ -401,7 +442,8 @@ def completed(results):
     @Test
     fun `searchResponses with default searchIn warns and still matches labels on stripped run`() {
         val run = manager.startRun()
-        val req1 = io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req1 =
+            io.bitbytelab.raijin.turbo.Request("GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req1.id = 1
         req1.label = "interesting"
         req1.response = "HTTP/1.1 200 OK\r\n\r\nHello"
@@ -424,21 +466,24 @@ def completed(results):
 
         // Create two runs
         val run1 = manager.startRun()
-        val req1 = io.bitbytelab.raijin.turbo.Request("GET /run1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        val req1 =
+            io.bitbytelab.raijin.turbo.Request("GET /run1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req1.id = 1
         req1.response = "HTTP/1.1 200 OK\r\n\r\n"
         run1.store.add(req1)
 
         val run2 = manager.startRun()
-        val req2 = io.bitbytelab.raijin.turbo.Request("GET /run2 HTTP/1.1\r\nHost: example.com\r\n\r\n")
-        req2.id = 1  // Same ID but different run
+        val req2 =
+            io.bitbytelab.raijin.turbo.Request("GET /run2 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        req2.id = 1 // Same ID but different run
         req2.response = "HTTP/1.1 404 Not Found\r\n\r\n"
         run2.store.add(req2)
 
-        val result = handlersWithOrganizer.saveToOrganizer(
-            runId = run1.id,
-            items = """[{"request_id": 1, "notes": "From run1"}]"""
-        )
+        val result =
+            handlersWithOrganizer.saveToOrganizer(
+                runId = run1.id,
+                items = """[{"request_id": 1, "notes": "From run1"}]""",
+            )
 
         val saved = result["saved"] as List<*>
         assertEquals(listOf(1), saved)
@@ -449,17 +494,20 @@ def completed(results):
     @Test
     fun `startRun results include anomaly_rank field`() {
         // Start a run that completes immediately, then verify the result structure
-        val result = handlers.startRun(
-            script = "def queueRequests(target, wordlists):\n    pass\ndef completed(results):\n    pass",
-            baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
-            endpoint = "https://example.com:443",
-            baseInput = ""
-        )
+        val result =
+            handlers.startRun(
+                script =
+                    "def queueRequests(target, wordlists):\n    pass\ndef completed(results):\n    pass",
+                baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                endpoint = "https://example.com:443",
+                baseInput = "",
+            )
 
         assertEquals("completed", result["status"])
         // Verify result mapping includes anomaly_rank key in result structure
         val results = result["results"] as List<Map<String, Any?>>
-        // No requests were made, so results list is empty - but verify the mapping exists by checking a run with data
+        // No requests were made, so results list is empty - but verify the mapping exists by
+        // checking a run with data
         val run = manager.startRun()
         val req = io.bitbytelab.raijin.turbo.Request("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
         req.id = 1
@@ -467,25 +515,29 @@ def completed(results):
         req.anomalyRank = 42
         run.store.add(req)
 
-        val storeResults = run.store.getResults(io.bitbytelab.raijin.turbo.SortField.ANOMALY_RANK, true, 100, 0)
+        val storeResults =
+            run.store.getResults(io.bitbytelab.raijin.turbo.SortField.ANOMALY_RANK, true, 100, 0)
         assertEquals(1, storeResults.size)
         assertEquals(42, storeResults[0].anomalyRank)
     }
 
     @Test
     fun `startRun returns failed status when script throws error`() {
-        val result = handlers.startRun(
-            script = """
-def queueRequests(target, wordlists):
-    raise Exception("Test error message")
+        val result =
+            handlers.startRun(
+                script =
+                    """
+                    def queueRequests(target, wordlists):
+                        raise Exception("Test error message")
 
-def completed(results):
-    pass
-            """.trimIndent(),
-            baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
-            endpoint = "https://example.com:443",
-            baseInput = ""
-        )
+                    def completed(results):
+                        pass
+                    """
+                        .trimIndent(),
+                baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                endpoint = "https://example.com:443",
+                baseInput = "",
+            )
 
         assertEquals("failed", result["status"])
         assertTrue((result["error_message"] as String).contains("Test error message"))
@@ -498,7 +550,11 @@ def completed(results):
         run.handler.code = "test script"
 
         // Simulate engine with permaFails but no successful results
-        val engine = FakeRequestEngine(permaFailCount = 5, lastErrorMessage = "javax.net.ssl.SSLHandshakeException: Connection refused")
+        val engine =
+            FakeRequestEngine(
+                permaFailCount = 5,
+                lastErrorMessage = "javax.net.ssl.SSLHandshakeException: Connection refused",
+            )
         engine.finalized = true
         run.handler.setRequestEngine(engine)
         run.handler.markScriptCompleted()
@@ -513,42 +569,53 @@ def completed(results):
         assertEquals(0, resultCount)
 
         // The key assertion: lastError should be available from the handler
-        assertEquals("javax.net.ssl.SSLHandshakeException: Connection refused", run.handler.lastError())
+        assertEquals(
+            "javax.net.ssl.SSLHandshakeException: Connection refused",
+            run.handler.lastError(),
+        )
     }
 
     @Test
     fun `startRun result includes error_message when zero results and connection failures`() {
-        val result = handlers.startRun(
-            script = """
-def queueRequests(target, wordlists):
-    engine = RequestEngine(endpoint=target.endpoint, concurrentConnections=1, requestsPerConnection=1, pipeline=False, engine=Engine.BURP)
+        val result =
+            handlers.startRun(
+                script =
+                    """
+                    def queueRequests(target, wordlists):
+                        engine = RequestEngine(endpoint=target.endpoint, concurrentConnections=1, requestsPerConnection=1, pipeline=False, engine=Engine.BURP)
 
-def handleResponse(req, interesting):
-    pass
-            """.trimIndent(),
-            baseRequest = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            endpoint = "https://localhost:1",  // Will fail to connect
-            baseInput = "",
-            timeoutMs = 10000
-        )
+                    def handleResponse(req, interesting):
+                        pass
+                    """
+                        .trimIndent(),
+                baseRequest = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                endpoint = "https://localhost:1", // Will fail to connect
+                baseInput = "",
+                timeoutMs = 10000,
+            )
 
         // Should complete (or timeout) with error info
         if (result["status"] == "completed") {
             val fails = result["fails"] as Int
             if (fails > 0) {
-                assertTrue(result.containsKey("error_message"), "Should include error_message when there are connection failures but no results")
+                assertTrue(
+                    result.containsKey("error_message"),
+                    "Should include error_message when there are connection failures but no results",
+                )
             }
         }
     }
 
     @Test
     fun `startRun does not include error_message on success`() {
-        val result = handlers.startRun(
-            script = "def queueRequests(target, wordlists):\n    pass\ndef completed(results):\n    pass",
-            baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
-            endpoint = "https://example.com:443",
-            baseInput = ""
-        )
+        val result =
+            handlers.startRun(
+                script =
+                    "def queueRequests(target, wordlists):\n    pass\ndef completed(results):\n    pass",
+                baseRequest = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                endpoint = "https://example.com:443",
+                baseInput = "",
+            )
 
         assertEquals("completed", result["status"])
         assertFalse(result.containsKey("error_message"))
@@ -559,7 +626,10 @@ def handleResponse(req, interesting):
 class FakeOrganizerProvider : OrganizerProvider {
     val sentItems = mutableListOf<Pair<io.bitbytelab.raijin.turbo.Request, String>>()
 
-    override fun sendToOrganizer(request: io.bitbytelab.raijin.turbo.Request, notes: String): Boolean {
+    override fun sendToOrganizer(
+        request: io.bitbytelab.raijin.turbo.Request,
+        notes: String,
+    ): Boolean {
         sentItems.add(Pair(request, notes))
         return true
     }
@@ -567,7 +637,7 @@ class FakeOrganizerProvider : OrganizerProvider {
 
 // Collaborator test helpers
 class FakeCollaboratorProvider(
-    private val organizerProvider: OrganizerProvider? = null
+    private val organizerProvider: OrganizerProvider? = null,
 ) : CollaboratorProvider {
     private var payloadCounter = 0
     private val interactions = mutableListOf<CollaboratorInteractionData>()
@@ -579,11 +649,12 @@ class FakeCollaboratorProvider(
     }
 
     override fun getInteractions(payloads: List<String>?): List<CollaboratorInteractionData> {
-        val result = if (payloads == null) {
-            interactions.toList()
-        } else {
-            interactions.filter { it.payload in payloads }
-        }
+        val result =
+            if (payloads == null) {
+                interactions.toList()
+            } else {
+                interactions.filter { it.payload in payloads }
+            }
 
         // Simulate sending HTTP interactions to Organizer
         for (interaction in result) {
@@ -601,16 +672,16 @@ class FakeCollaboratorProvider(
     }
 }
 
-/**
- * Minimal fake RequestEngine for testing error surfacing without needing real connections.
- */
+/** Minimal fake RequestEngine for testing error surfacing without needing real connections. */
 class FakeRequestEngine(
     private val permaFailCount: Int = 0,
-    lastErrorMessage: String? = null
+    lastErrorMessage: String? = null,
 ) : io.bitbytelab.raijin.turbo.RequestEngine() {
     override val maxRetriesPerRequest: Int = 0
     override var idleTimeout: Long = 0
-    override val callback: (io.bitbytelab.raijin.turbo.Request, Boolean) -> Boolean = { _, _ -> false }
+    override val callback: (io.bitbytelab.raijin.turbo.Request, Boolean) -> Boolean = { _, _ ->
+        false
+    }
     override var readCallback: ((String) -> Boolean)? = null
 
     init {
@@ -620,14 +691,22 @@ class FakeRequestEngine(
         completedLatch = java.util.concurrent.CountDownLatch(0)
         target = java.net.URL("https://localhost")
         requestQueue = java.util.concurrent.LinkedBlockingQueue()
-        outputHandler = object : io.bitbytelab.raijin.turbo.OutputHandler {
-            override fun add(req: io.bitbytelab.raijin.turbo.Request) {}
-            override fun getAllRquests(): List<io.bitbytelab.raijin.turbo.Request> = emptyList()
-        }
+        outputHandler =
+            object : io.bitbytelab.raijin.turbo.OutputHandler {
+                override fun add(req: io.bitbytelab.raijin.turbo.Request) {}
+
+                override fun getAllRquests(): List<io.bitbytelab.raijin.turbo.Request> = emptyList()
+            }
     }
 
     override fun start(timeout: Int) {}
-    override fun buildRequest(template: String, payloads: List<String?>, learnBoring: Int?, label: String): io.bitbytelab.raijin.turbo.Request {
+
+    override fun buildRequest(
+        template: String,
+        payloads: List<String?>,
+        learnBoring: Int?,
+        label: String,
+    ): io.bitbytelab.raijin.turbo.Request {
         return io.bitbytelab.raijin.turbo.Request(template, payloads, learnBoring ?: 0, label)
     }
 }
@@ -660,14 +739,16 @@ class CollaboratorToolHandlersTest {
         handlers.generateCollaboratorPayload("SSRF test")
 
         // Add an interaction for the generated payload
-        fakeCollaborator.addInteraction(CollaboratorInteractionData(
-            payload = "test1.oastify.com",
-            metadata = "SSRF test",
-            type = "DNS",
-            timestamp = "2024-01-01T12:00:00Z",
-            clientIp = "1.2.3.4",
-            details = mapOf("query_type" to "A")
-        ))
+        fakeCollaborator.addInteraction(
+            CollaboratorInteractionData(
+                payload = "test1.oastify.com",
+                metadata = "SSRF test",
+                type = "DNS",
+                timestamp = "2024-01-01T12:00:00Z",
+                clientIp = "1.2.3.4",
+                details = mapOf("query_type" to "A"),
+            ),
+        )
 
         val interactions = handlers.getCollaboratorInteractions(null)
         val items = interactions["interactions"] as List<Map<String, Any?>>
@@ -681,22 +762,26 @@ class CollaboratorToolHandlersTest {
         val fakeCollaborator = FakeCollaboratorProvider()
         handlers = McpToolHandlers(manager, collaboratorProvider = fakeCollaborator)
 
-        fakeCollaborator.addInteraction(CollaboratorInteractionData(
-            payload = "abc.oastify.com",
-            metadata = "Test A",
-            type = "DNS",
-            timestamp = "2024-01-01T12:00:00Z",
-            clientIp = "1.2.3.4",
-            details = emptyMap()
-        ))
-        fakeCollaborator.addInteraction(CollaboratorInteractionData(
-            payload = "xyz.oastify.com",
-            metadata = "Test B",
-            type = "HTTP",
-            timestamp = "2024-01-01T12:01:00Z",
-            clientIp = "5.6.7.8",
-            details = emptyMap()
-        ))
+        fakeCollaborator.addInteraction(
+            CollaboratorInteractionData(
+                payload = "abc.oastify.com",
+                metadata = "Test A",
+                type = "DNS",
+                timestamp = "2024-01-01T12:00:00Z",
+                clientIp = "1.2.3.4",
+                details = emptyMap(),
+            ),
+        )
+        fakeCollaborator.addInteraction(
+            CollaboratorInteractionData(
+                payload = "xyz.oastify.com",
+                metadata = "Test B",
+                type = "HTTP",
+                timestamp = "2024-01-01T12:01:00Z",
+                clientIp = "5.6.7.8",
+                details = emptyMap(),
+            ),
+        )
 
         val result = handlers.getCollaboratorInteractions(listOf("abc.oastify.com"))
         val items = result["interactions"] as List<Map<String, Any?>>
@@ -710,22 +795,26 @@ class CollaboratorToolHandlersTest {
         val fakeCollaborator = FakeCollaboratorProvider()
         handlers = McpToolHandlers(manager, collaboratorProvider = fakeCollaborator)
 
-        fakeCollaborator.addInteraction(CollaboratorInteractionData(
-            payload = "abc.oastify.com",
-            metadata = "Test A",
-            type = "DNS",
-            timestamp = "2024-01-01T12:00:00Z",
-            clientIp = "1.2.3.4",
-            details = emptyMap()
-        ))
-        fakeCollaborator.addInteraction(CollaboratorInteractionData(
-            payload = "xyz.oastify.com",
-            metadata = "Test B",
-            type = "HTTP",
-            timestamp = "2024-01-01T12:01:00Z",
-            clientIp = "5.6.7.8",
-            details = emptyMap()
-        ))
+        fakeCollaborator.addInteraction(
+            CollaboratorInteractionData(
+                payload = "abc.oastify.com",
+                metadata = "Test A",
+                type = "DNS",
+                timestamp = "2024-01-01T12:00:00Z",
+                clientIp = "1.2.3.4",
+                details = emptyMap(),
+            ),
+        )
+        fakeCollaborator.addInteraction(
+            CollaboratorInteractionData(
+                payload = "xyz.oastify.com",
+                metadata = "Test B",
+                type = "HTTP",
+                timestamp = "2024-01-01T12:01:00Z",
+                clientIp = "5.6.7.8",
+                details = emptyMap(),
+            ),
+        )
 
         val result = handlers.getCollaboratorInteractions(null)
         val items = result["interactions"] as List<Map<String, Any?>>
@@ -738,14 +827,16 @@ class CollaboratorToolHandlersTest {
         val fakeCollaborator = FakeCollaboratorProvider()
         handlers = McpToolHandlers(manager, collaboratorProvider = fakeCollaborator)
 
-        fakeCollaborator.addInteraction(CollaboratorInteractionData(
-            payload = "test.oastify.com",
-            metadata = "SSRF test",
-            type = "HTTP",
-            timestamp = "2024-01-01T12:00:00Z",
-            clientIp = "10.0.0.1",
-            details = mapOf("method" to "GET", "path" to "/")
-        ))
+        fakeCollaborator.addInteraction(
+            CollaboratorInteractionData(
+                payload = "test.oastify.com",
+                metadata = "SSRF test",
+                type = "HTTP",
+                timestamp = "2024-01-01T12:00:00Z",
+                clientIp = "10.0.0.1",
+                details = mapOf("method" to "GET", "path" to "/"),
+            ),
+        )
 
         val result = handlers.getCollaboratorInteractions(null)
         val items = result["interactions"] as List<Map<String, Any?>>
@@ -763,16 +854,23 @@ class CollaboratorToolHandlersTest {
     fun `getCollaboratorInteractions sends HTTP interactions to Organizer`() {
         val fakeOrganizer = FakeOrganizerProvider()
         val fakeCollaborator = FakeCollaboratorProvider(organizerProvider = fakeOrganizer)
-        handlers = McpToolHandlers(manager, organizerProvider = fakeOrganizer, collaboratorProvider = fakeCollaborator)
+        handlers =
+            McpToolHandlers(
+                manager,
+                organizerProvider = fakeOrganizer,
+                collaboratorProvider = fakeCollaborator,
+            )
 
-        fakeCollaborator.addInteraction(CollaboratorInteractionData(
-            payload = "test.oastify.com",
-            metadata = "SSRF in webhook",
-            type = "HTTP",
-            timestamp = "2024-01-01T12:00:00Z",
-            clientIp = "10.0.0.1",
-            details = mapOf("request" to "GET / HTTP/1.1\r\nHost: test.oastify.com\r\n\r\n")
-        ))
+        fakeCollaborator.addInteraction(
+            CollaboratorInteractionData(
+                payload = "test.oastify.com",
+                metadata = "SSRF in webhook",
+                type = "HTTP",
+                timestamp = "2024-01-01T12:00:00Z",
+                clientIp = "10.0.0.1",
+                details = mapOf("request" to "GET / HTTP/1.1\r\nHost: test.oastify.com\r\n\r\n"),
+            ),
+        )
 
         handlers.getCollaboratorInteractions(null)
 
@@ -783,16 +881,23 @@ class CollaboratorToolHandlersTest {
     fun `getCollaboratorInteractions does not send DNS interactions to Organizer`() {
         val fakeOrganizer = FakeOrganizerProvider()
         val fakeCollaborator = FakeCollaboratorProvider(organizerProvider = fakeOrganizer)
-        handlers = McpToolHandlers(manager, organizerProvider = fakeOrganizer, collaboratorProvider = fakeCollaborator)
+        handlers =
+            McpToolHandlers(
+                manager,
+                organizerProvider = fakeOrganizer,
+                collaboratorProvider = fakeCollaborator,
+            )
 
-        fakeCollaborator.addInteraction(CollaboratorInteractionData(
-            payload = "test.oastify.com",
-            metadata = "DNS test",
-            type = "DNS",
-            timestamp = "2024-01-01T12:00:00Z",
-            clientIp = "10.0.0.1",
-            details = mapOf("query_type" to "A")
-        ))
+        fakeCollaborator.addInteraction(
+            CollaboratorInteractionData(
+                payload = "test.oastify.com",
+                metadata = "DNS test",
+                type = "DNS",
+                timestamp = "2024-01-01T12:00:00Z",
+                clientIp = "10.0.0.1",
+                details = mapOf("query_type" to "A"),
+            ),
+        )
 
         handlers.getCollaboratorInteractions(null)
 

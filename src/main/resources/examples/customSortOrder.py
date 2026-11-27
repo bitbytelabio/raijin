@@ -1,7 +1,7 @@
 # Sets the order of the results from the script with table.setSortOrder(column, descending).
 # Columns, numbered from 0: Row, Payload, Status, Anomaly rank, Words, Length, TTFB, TTLB, Arrival,
 # Label, Queue ID, Connection ID. The order replaces the automatic sort by anomaly rank on run
-# completion, and over MCP it is the default order of turbo_run(action=results).
+# completion, and over MCP it is the default order of turbo_run.results.
 def queueRequests(target, wordlists):
     engine = RequestEngine(endpoint=target.endpoint)
 

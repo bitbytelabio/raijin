@@ -65,9 +65,22 @@ pub fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Whether one of `wanted` and `name` (both in [`norm`](crate::mcp::error::norm) form) contains the
+/// other and the shorter is long enough to mean it: at least 4 chars and 60% of `wanted`, so `ai`
+/// is not near `email` nor `log` near `catalog`.
+pub fn contains_near(wanted: &str, name: &str) -> bool {
+    if name.is_empty() || !(name.contains(wanted) || wanted.contains(name)) {
+        return false;
+    }
+    let wanted_len = wanted.chars().count();
+    let shorter = name.chars().count().min(wanted_len);
+    shorter >= 4 && shorter * 10 >= wanted_len * 6
+}
+
 /// Up to `n` of `names` close to `wanted`, closest first: within edit distance
-/// `max(2, len / 3)` or containing / contained in it, compared in [`norm`](crate::mcp::error::norm)
-/// form (case and `-`/`.`/space separators ignored). Same rule as the extension's `ToolArgs.closest`.
+/// `max(2, len / 3)`, or one containing the other per [`contains_near`], compared in
+/// [`norm`](crate::mcp::error::norm) form (case and `-`/`.`/`/`/space separators ignored). Same rule
+/// as the extension's `ToolArgs.closest`.
 pub fn suggest<'a>(
     wanted: &str,
     names: impl IntoIterator<Item = &'a str>,
@@ -83,8 +96,7 @@ pub fn suggest<'a>(
         .filter_map(|name| {
             let normed = crate::mcp::error::norm(name);
             let d = edit_distance(&w, &normed);
-            let near =
-                d <= limit || (!normed.is_empty() && (normed.contains(&w) || w.contains(&normed)));
+            let near = d <= limit || contains_near(&w, &normed);
             near.then_some((d, name))
         })
         .collect();
@@ -200,6 +212,9 @@ mod tests {
             suggest("History.List", ["history_list"], 1),
             ["history_list"]
         );
+        let names = ["ai", "log", "findings", "scope"];
+        assert_eq!(suggest("email", names, 3), Vec::<&str>::new());
+        assert_eq!(suggest("catalog", names, 3), Vec::<&str>::new());
     }
 
     #[test]

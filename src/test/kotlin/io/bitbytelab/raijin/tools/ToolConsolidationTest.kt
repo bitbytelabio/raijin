@@ -12,8 +12,6 @@ import io.modelcontextprotocol.kotlin.sdk.types.Implementation
 import io.modelcontextprotocol.kotlin.sdk.types.ServerCapabilities
 import io.modelcontextprotocol.kotlin.sdk.types.TextContent
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
-import kotlinx.coroutines.runBlocking
-import kotlinx.serialization.json.*
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -21,27 +19,52 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.*
 
 class ToolConsolidationTest {
 
-    private fun server() = Server(
-        Implementation("t", "0"),
-        ServerOptions(ServerCapabilities(tools = ServerCapabilities.Tools(listChanged = false)))
-    )
+    private fun server() =
+        Server(
+            Implementation("t", "0"),
+            ServerOptions(
+                ServerCapabilities(tools = ServerCapabilities.Tools(listChanged = false)),
+            ),
+        )
 
-    private fun fake(s: Server, name: String, required: List<String> = emptyList(), vararg props: String) {
+    private fun fake(
+        s: Server,
+        name: String,
+        required: List<String> = emptyList(),
+        vararg props: String,
+    ) {
         s.addTool(
             name = name,
             description = "Does $name. More detail follows.",
-            inputSchema = ToolSchema(
-                properties = buildJsonObject { props.forEach { p -> putJsonObject(p) { put("type", "string"); put("description", "the $p") } } },
-                required = required
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            props.forEach { p ->
+                                putJsonObject(p) {
+                                    put("type", "string")
+                                    put("description", "the $p")
+                                }
+                            }
+                        },
+                    required = required,
+                ),
+        ) { req ->
+            CallToolResult(
+                content = listOf(TextContent("$name:" + req.params.arguments.toString())),
             )
-        ) { req -> CallToolResult(content = listOf(TextContent("$name:" + req.params.arguments.toString()))) }
+        }
     }
 
     private fun call(s: Server, tool: String, args: JsonObject) = runBlocking {
-        s.tools.getValue(tool).handler(testClientConnection, CallToolRequest(CallToolRequestParams(tool, args)))
+        s.tools
+            .getValue(tool)
+            .handler(testClientConnection, CallToolRequest(CallToolRequestParams(tool, args)))
     }
 
     private fun text(r: CallToolResult) = (r.content.first() as TextContent).text
@@ -61,13 +84,17 @@ class ToolConsolidationTest {
         val members = ToolConsolidation.GROUPS.flatMap { it.actions.values }
         assertEquals(members.size, members.toSet().size, "a tool is in two groups")
         assertTrue(members.none { it in ToolConsolidation.KEEP })
-        assertEquals(ToolConsolidation.GROUPS.size, ToolConsolidation.GROUPS.map { it.tool }.toSet().size)
+        assertEquals(
+            ToolConsolidation.GROUPS.size,
+            ToolConsolidation.GROUPS.map { it.tool }.toSet().size,
+        )
     }
 
     @Test
     fun `every registered tool is grouped or kept, and nothing refers to a missing tool`() {
         val registered = real.value.members.tools.keys
-        val assigned = ToolConsolidation.GROUPS.flatMap { it.actions.values }.toSet() + ToolConsolidation.KEEP
+        val assigned =
+            ToolConsolidation.GROUPS.flatMap { it.actions.values }.toSet() + ToolConsolidation.KEEP
         assertEquals(emptySet(), registered - assigned, "tools neither grouped nor kept")
         assertEquals(emptySet(), assigned - registered, "groups name tools that do not exist")
     }
@@ -79,12 +106,19 @@ class ToolConsolidationTest {
         fake(legacy, "scope_include", listOf("url"), "url")
         fake(legacy, "proxy_history", emptyList(), "count")
         val target = server()
-        val groups = ToolConsolidation.GROUPS // real table; only register what it needs for this assertion
-        // apply() requires every member, so use a trimmed copy of the logic via the public contract:
+        val groups =
+            ToolConsolidation.GROUPS // real table; only register what it needs for this assertion
+        // apply() requires every member, so use a trimmed copy of the logic via the public
+        // contract:
         val partial = legacy
-        listOf("scope_exclude", "scope_get_config", "scope_list", "scope_remove").forEach { fake(partial, it, emptyList(), "url") }
+        listOf("scope_exclude", "scope_get_config", "scope_list", "scope_remove").forEach {
+            fake(partial, it, emptyList(), "url")
+        }
         // register the other groups' members as empty stubs
-        groups.filter { it.tool != "scope" }.flatMap { it.actions.values }.forEach { fake(partial, it) }
+        groups
+            .filter { it.tool != "scope" }
+            .flatMap { it.actions.values }
+            .forEach { fake(partial, it) }
         ToolConsolidation.apply(partial, target)
 
         assertTrue("scope" in target.tools && "scope_check" !in target.tools)
@@ -95,33 +129,65 @@ class ToolConsolidationTest {
         assertTrue("check(url*)" in desc, desc)
         assertTrue("get_config(" in desc, desc)
         val action = scope.inputSchema.properties!!.getValue("action").jsonObject
-        assertEquals(setOf("check", "include", "exclude", "get_config", "list", "remove"),
-            action.getValue("enum").jsonArray.map { it.jsonPrimitive.content }.toSet())
+        assertEquals(
+            setOf("check", "include", "exclude", "get_config", "list", "remove"),
+            action.getValue("enum").jsonArray.map { it.jsonPrimitive.content }.toSet(),
+        )
 
-        val ok = call(target, "scope", buildJsonObject { put("action", "check"); put("url", "https://a") })
+        val ok =
+            call(
+                target,
+                "scope",
+                buildJsonObject {
+                    put("action", "check")
+                    put("url", "https://a")
+                },
+            )
         assertEquals("""scope_check:{"url":"https://a"}""", text(ok))
     }
 
     @Test
     fun `unknown action and missing parameter are reported`() {
         val legacy = server()
-        ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach {
-            fake(legacy, it, if (it == "scope_check") listOf("url") else emptyList(), "url")
-        }
+        ToolConsolidation.GROUPS.flatMap { it.actions.values }
+            .forEach {
+                fake(legacy, it, if (it == "scope_check") listOf("url") else emptyList(), "url")
+            }
         ToolConsolidation.KEEP.forEach { fake(legacy, it) }
         val target = server()
         ToolConsolidation.apply(legacy, target)
 
-        val bad = call(target, "scope", buildJsonObject { put("action", "chek") })
+        val bad =
+            call(
+                target,
+                "scope",
+                buildJsonObject {
+                    put("action", "chek")
+                    put("url", "https://a")
+                },
+            )
         assertEquals(true, bad.isError)
         val badJson = json(bad)
         assertEquals("unknown_action", badJson.str("code"))
         assertTrue("Did you mean 'check'?" in badJson.str("error")!!, text(bad))
-        assertEquals("check", badJson.getValue("did_you_mean").jsonArray.first().jsonPrimitive.content)
-        assertTrue("include" in badJson.getValue("allowed").jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(
+            "check",
+            badJson.getValue("did_you_mean").jsonArray.first().jsonPrimitive.content,
+        )
+        assertTrue(
+            "include" in badJson.getValue("allowed").jsonArray.map { it.jsonPrimitive.content },
+        )
         assertNull(badJson["available"])
-        assertEquals(buildJsonObject { put("action", "check") }, badJson.getValue("retry"))
+        assertEquals(
+            buildJsonObject {
+                put("action", "check")
+                put("url", "https://a")
+            },
+            badJson.getValue("retry"),
+        )
         assertEquals(true, badJson.getValue("retryable").jsonPrimitive.boolean)
+        // Resending check without its required url would only fail again: no retry.
+        assertNull(json(call(target, "scope", buildJsonObject { put("action", "chek") }))["retry"])
 
         val none = call(target, "scope", buildJsonObject {})
         assertEquals(true, none.isError)
@@ -132,30 +198,69 @@ class ToolConsolidationTest {
         assertEquals(true, missing.isError)
         val missingJson = json(missing)
         assertEquals("missing_parameter", missingJson.str("code"))
-        assertTrue("missing required parameter(s): 'url'" in missingJson.str("error")!!, text(missing))
+        assertTrue(
+            "missing required parameter(s): 'url'" in missingJson.str("error")!!,
+            text(missing),
+        )
         assertEquals("url", missingJson.str("param"))
         assertEquals("""scope.check(url*: string)""", missingJson.str("usage"))
-        assertEquals(buildJsonObject { put("action", "check"); put("url", "https://example.com/") }, missingJson.getValue("example"))
+        assertEquals(
+            buildJsonObject {
+                put("action", "check")
+                put("url", "https://example.com/")
+            },
+            missingJson.getValue("example"),
+        )
         assertFalse(target.tools.keys.any { it == "scope_check" })
 
-        val unknown = call(target, "scope", buildJsonObject { put("action", "check"); put("uri", "x") })
+        val unknown =
+            call(
+                target,
+                "scope",
+                buildJsonObject {
+                    put("action", "check")
+                    put("ulr", "x")
+                },
+            )
         assertEquals(true, unknown.isError)
         val unknownJson = json(unknown)
         assertEquals("unknown_parameter", unknownJson.str("code"))
         assertTrue("did you mean 'url'" in unknownJson.str("error")!!, text(unknown))
-        assertEquals("uri", unknownJson.str("param"))
+        assertEquals("ulr", unknownJson.str("param"))
         assertNull(unknownJson["unknown_parameters"])
         assertTrue(unknownJson.str("usage")!!.startsWith("scope.check(url*"), text(unknown))
-        assertEquals(buildJsonObject { put("action", "check"); put("url", "https://example.com/") }, unknownJson.getValue("example"))
-        assertEquals(buildJsonObject { put("action", "check"); put("url", "x") }, unknownJson.getValue("retry"))
+        assertEquals(
+            buildJsonObject {
+                put("action", "check")
+                put("url", "https://example.com/")
+            },
+            unknownJson.getValue("example"),
+        )
+        assertEquals(
+            buildJsonObject {
+                put("action", "check")
+                put("url", "x")
+            },
+            unknownJson.getValue("retry"),
+        )
     }
 
-    /** Every member and KEEP tool as a fake, except [name], published with [props] and [handler]. */
-    private fun withKept(name: String, props: JsonObject, handler: (JsonObject) -> CallToolResult): Server {
+    /**
+     * Every member and KEEP tool as a fake, except [name], published with [props] and [handler].
+     */
+    private fun withKept(
+        name: String,
+        props: JsonObject,
+        handler: (JsonObject) -> CallToolResult,
+    ): Server {
         val legacy = server()
         ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach { fake(legacy, it) }
         ToolConsolidation.KEEP.filter { it != name }.forEach { fake(legacy, it) }
-        legacy.addTool(name = name, description = "Kept.", inputSchema = ToolSchema(properties = props)) { req ->
+        legacy.addTool(
+            name = name,
+            description = "Kept.",
+            inputSchema = ToolSchema(properties = props),
+        ) { req ->
             handler(req.params.arguments ?: JsonObject(emptyMap()))
         }
         return server().also { ToolConsolidation.apply(legacy, it) }
@@ -164,14 +269,45 @@ class ToolConsolidationTest {
     @Test
     fun `strings become integers and booleans and enum values match their canonical spelling, with notes`() {
         val seen = mutableListOf<JsonObject>()
-        val target = withKept("http_fuzz", buildJsonObject {
-            putJsonObject("n") { put("type", "integer") }
-            putJsonObject("b") { put("type", "boolean") }
-            putJsonObject("algorithm") { put("type", "string"); putJsonArray("enum") { add("MD5"); add("SHA_256") } }
-        }) { args -> seen += args; toolJsonResult(buildJsonObject { put("ok", true) }) }
+        val target =
+            withKept(
+                "http_fuzz",
+                buildJsonObject {
+                    putJsonObject("n") { put("type", "integer") }
+                    putJsonObject("b") { put("type", "boolean") }
+                    putJsonObject("algorithm") {
+                        put("type", "string")
+                        putJsonArray("enum") {
+                            add("MD5")
+                            add("SHA_256")
+                        }
+                    }
+                },
+            ) { args ->
+                seen += args
+                toolJsonResult(buildJsonObject { put("ok", true) })
+            }
 
-        val r = json(call(target, "http_fuzz", buildJsonObject { put("n", "7"); put("b", "TRUE"); put("algorithm", "sha256") }))
-        assertEquals(buildJsonObject { put("n", 7); put("b", true); put("algorithm", "SHA_256") }, seen.single())
+        val r =
+            json(
+                call(
+                    target,
+                    "http_fuzz",
+                    buildJsonObject {
+                        put("n", "7")
+                        put("b", "TRUE")
+                        put("algorithm", "sha256")
+                    },
+                ),
+            )
+        assertEquals(
+            buildJsonObject {
+                put("n", 7)
+                put("b", true)
+                put("algorithm", "SHA_256")
+            },
+            seen.single(),
+        )
         assertEquals(
             listOf(
                 "coerced 'n' from string \"7\" to integer",
@@ -183,35 +319,94 @@ class ToolConsolidationTest {
     }
 
     @Test
-    fun `a parameter alias gets a ready retry`() {
-        val target = withKept("proxy_history", buildJsonObject { putJsonObject("count") { put("type", "integer") } }) {
-            toolJsonResult(buildJsonObject { put("ok", true) })
-        }
-        val r = json(call(target, "proxy_history", buildJsonObject { put("limit", 5) }))
-        assertEquals("unknown_parameter", r.str("code"))
-        assertEquals("limit", r.str("param"))
-        assertEquals(listOf("count"), r.getValue("did_you_mean").jsonArray.map { it.jsonPrimitive.content })
-        assertEquals(buildJsonObject { put("count", 5) }, r.getValue("retry"))
+    fun `a parameter alias is read as the declared parameter, with a note`() {
+        val seen = mutableListOf<JsonObject>()
+        val target =
+            withKept(
+                "proxy_history",
+                buildJsonObject { putJsonObject("count") { put("type", "integer") } },
+            ) { args ->
+                seen += args
+                toolJsonResult(buildJsonObject { put("ok", true) })
+            }
+        val r = json(call(target, "proxy_history", buildJsonObject { put("limit", 2) }))
+        assertEquals(buildJsonObject { put("count", 2) }, seen.single())
+        assertTrue(
+            "read 'limit' as 'count'" in
+                r.getValue("notes").jsonArray.map { it.jsonPrimitive.content },
+            r.toString(),
+        )
+
+        val camel = json(call(target, "proxy_history", buildJsonObject { put("maxResults", 3) }))
+        assertEquals(buildJsonObject { put("count", 3) }, seen.last())
+        assertTrue(
+            "read 'maxResults' as 'count'" in
+                camel.getValue("notes").jsonArray.map { it.jsonPrimitive.content },
+            camel.toString(),
+        )
     }
 
     @Test
     fun `a synonym from another tool or API maps to the declared parameter`() {
-        val target = withKept("proxy_history_search", buildJsonObject {
-            putJsonObject("pattern") { put("type", "string") }
-            putJsonObject("max_results") { put("type", "integer") }
-        }) { toolJsonResult(buildJsonObject { put("ok", true) }) }
-        val r = json(call(target, "proxy_history_search", buildJsonObject { put("query", "x"); put("count", 1) }))
-        assertEquals("unknown_parameter", r.str("code"))
-        assertEquals(buildJsonObject { put("pattern", "x"); put("max_results", 1) }, r.getValue("retry"))
+        val seen = mutableListOf<JsonObject>()
+        val target =
+            withKept(
+                "proxy_history_search",
+                buildJsonObject {
+                    putJsonObject("pattern") { put("type", "string") }
+                    putJsonObject("max_results") { put("type", "integer") }
+                },
+            ) { args ->
+                seen += args
+                toolJsonResult(buildJsonObject { put("ok", true) })
+            }
+        call(
+            target,
+            "proxy_history_search",
+            buildJsonObject {
+                put("query", "x")
+                put("count", 1)
+                put("regex", true)
+            },
+        )
+        assertEquals(
+            buildJsonObject {
+                put("pattern", "x")
+                put("max_results", 1)
+            },
+            seen.single(),
+        )
+
+        // Two names for one parameter: which one was meant is the caller's call, so no retry.
+        val both =
+            json(
+                call(
+                    target,
+                    "proxy_history_search",
+                    buildJsonObject {
+                        put("pattern", "x")
+                        put("max_results", 1)
+                        put("count", 2)
+                    },
+                ),
+            )
+        assertEquals("unknown_parameter", both.str("code"))
+        assertNull(both["retry"])
     }
 
     @Test
     fun `every handler error becomes an envelope with a code`() {
         var answer: CallToolResult = toolError("x")
-        val target = withKept("http_fuzz", buildJsonObject {
-            putJsonObject("run_id") { put("type", "string") }
-            putJsonObject("count") { put("type", "integer") }
-        }) { answer }
+        val target =
+            withKept(
+                "http_fuzz",
+                buildJsonObject {
+                    putJsonObject("run_id") { put("type", "string") }
+                    putJsonObject("count") { put("type", "integer") }
+                },
+            ) {
+                answer
+            }
         fun err(result: CallToolResult, args: JsonObject = buildJsonObject {}): JsonObject {
             answer = result
             val r = call(target, "http_fuzz", args)
@@ -222,14 +417,22 @@ class ToolConsolidationTest {
             return j
         }
 
-        val notFound = err(toolJsonResult(buildJsonObject { put("error", "not_found") }), buildJsonObject { put("run_id", "nope") })
+        val notFound =
+            err(
+                toolJsonResult(buildJsonObject { put("error", "not_found") }),
+                buildJsonObject { put("run_id", "nope") },
+            )
         assertEquals("not_found", notFound.str("code"))
         assertEquals("run_id", notFound.str("param"))
         assertEquals("nope", notFound.str("got"))
         assertTrue("\"nope\"" in notFound.str("error")!!, notFound.toString())
         assertEquals(true, notFound.getValue("retryable").jsonPrimitive.boolean)
 
-        val typed = err(toolError("Parameter 'count' must be an integer (got 2.5)"), buildJsonObject { put("count", 3) })
+        val typed =
+            err(
+                toolError("Parameter 'count' must be an integer (got 2.5)"),
+                buildJsonObject { put("count", 3) },
+            )
         assertEquals("invalid_type", typed.str("code"))
         assertEquals("count", typed.str("param"))
         assertEquals("integer", typed.str("expected"))
@@ -247,30 +450,58 @@ class ToolConsolidationTest {
     @Test
     fun `a hash name as util action runs hash with that algorithm`() {
         val target = allFakes("data", "algorithm")
-        val r = call(target, "util", buildJsonObject { put("action", "sha256"); put("data", "x") })
+        val r =
+            call(
+                target,
+                "util",
+                buildJsonObject {
+                    put("action", "sha256")
+                    put("data", "x")
+                },
+            )
         assertEquals("""util_hash:{"algorithm":"SHA_256","data":"x"}""", text(r))
     }
 
     @Test
     fun `a handler error about an argument outside its enum becomes invalid_enum`() {
-        val target = withKept("http_fuzz", buildJsonObject {
-            putJsonObject("algorithm") { put("type", "string"); putJsonArray("enum") { add("MD5"); add("SHA_256") } }
-        }) { args -> toolError("Unsupported hash algorithm: '${args["algorithm"]?.jsonPrimitive?.content}'") }
+        val target =
+            withKept(
+                "http_fuzz",
+                buildJsonObject {
+                    putJsonObject("algorithm") {
+                        put("type", "string")
+                        putJsonArray("enum") {
+                            add("MD5")
+                            add("SHA_256")
+                        }
+                    }
+                },
+            ) { args ->
+                toolError(
+                    "Unsupported hash algorithm: '${args["algorithm"]?.jsonPrimitive?.content}'",
+                )
+            }
 
         val r = json(call(target, "http_fuzz", buildJsonObject { put("algorithm", "SHA_999") }))
         assertEquals("invalid_enum", r.str("code"))
         assertEquals("algorithm", r.str("param"))
         assertEquals("SHA_999", r.str("got"))
-        assertEquals(listOf("MD5", "SHA_256"), r.getValue("allowed").jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(
+            listOf("MD5", "SHA_256"),
+            r.getValue("allowed").jsonArray.map { it.jsonPrimitive.content },
+        )
         assertEquals("http_fuzz(algorithm: \"MD5\"|\"SHA_256\")", r.str("usage"))
         assertEquals(buildJsonObject {}, r.getValue("example"))
         assertEquals(true, r.getValue("retryable").jsonPrimitive.boolean)
     }
 
-    /** Every group member and KEEP tool as a fake declaring [props]; returns the published server. */
+    /**
+     * Every group member and KEEP tool as a fake declaring [props]; returns the published server.
+     */
     private fun allFakes(vararg props: String): Server {
         val legacy = server()
-        ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach { fake(legacy, it, emptyList(), *props) }
+        ToolConsolidation.GROUPS.flatMap { it.actions.values }
+            .forEach { fake(legacy, it, emptyList(), *props) }
         ToolConsolidation.KEEP.forEach { fake(legacy, it, emptyList(), *props) }
         return server().also { ToolConsolidation.apply(legacy, it) }
     }
@@ -282,7 +513,8 @@ class ToolConsolidationTest {
             val r = call(target, "scope", buildJsonObject { put("action", raw) })
             assertEquals("scope_list:{}", text(r), raw)
         }
-        val ws = call(target, "websocket", buildJsonObject { put("action", "proxy_websocket_history") })
+        val ws =
+            call(target, "websocket", buildJsonObject { put("action", "proxy_websocket_history") })
         assertEquals("proxy_websocket_history:{}", text(ws))
         assertEquals("scope_list", ToolConsolidation.legacyName("scope", "scope_list"))
         assertEquals("scope_list", ToolConsolidation.legacyName("scope", "Scope.List"))
@@ -292,17 +524,24 @@ class ToolConsolidationTest {
     fun `kept tools reject undeclared parameters and coerce declared types`() {
         val legacy = server()
         ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach { fake(legacy, it) }
-        ToolConsolidation.KEEP.filter { it != "http_fuzz" }.forEach { fake(legacy, it, emptyList(), "url") }
+        ToolConsolidation.KEEP.filter { it != "http_fuzz" }
+            .forEach { fake(legacy, it, emptyList(), "url") }
         legacy.addTool(
             name = "http_fuzz",
             description = "Fuzz.",
-            inputSchema = ToolSchema(properties = buildJsonObject {
-                putJsonObject("s") { put("type", "string") }
-                putJsonObject("o") { put("type", "object") }
-                putJsonObject("a") { put("type", "array") }
-                putJsonObject("n") { put("type", "integer") }
-            }),
-        ) { req -> CallToolResult(content = listOf(TextContent(req.params.arguments.toString()))) }
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject {
+                            putJsonObject("s") { put("type", "string") }
+                            putJsonObject("o") { put("type", "object") }
+                            putJsonObject("a") { put("type", "array") }
+                            putJsonObject("n") { put("type", "integer") }
+                        },
+                ),
+        ) { req ->
+            CallToolResult(content = listOf(TextContent(req.params.arguments.toString())))
+        }
         val target = server()
         ToolConsolidation.apply(legacy, target)
 
@@ -312,12 +551,17 @@ class ToolConsolidationTest {
         assertTrue("did you mean 'url'" in json(bad).str("error")!!, text(bad))
         assertEquals("proxy_history(url: string)", json(bad).str("usage"))
 
-        val coerced = call(target, "http_fuzz", buildJsonObject {
-            putJsonObject("s") { put("a", 1) }
-            put("o", "{\"a\":1}")
-            put("a", "x")
-            put("n", "7")
-        })
+        val coerced =
+            call(
+                target,
+                "http_fuzz",
+                buildJsonObject {
+                    putJsonObject("s") { put("a", 1) }
+                    put("o", "{\"a\":1}")
+                    put("a", "x")
+                    put("n", "7")
+                },
+            )
         assertEquals(
             buildJsonObject {
                 put("s", "{\"a\":1}")
@@ -325,25 +569,48 @@ class ToolConsolidationTest {
                 putJsonArray("a") { add("x") }
                 put("n", 7)
                 putJsonArray("notes") {
+                    add("serialized 's' from JSON to text")
                     add("parsed 'o' from a JSON string")
                     add("coerced 'n' from string \"7\" to integer")
                 }
             },
             Json.parseToJsonElement(text(coerced)),
         )
-        val parsedArray = call(target, "http_fuzz", buildJsonObject { put("a", "[\"x\",\"y\"]"); put("o", "not json") })
+        val parsedArray =
+            call(
+                target,
+                "http_fuzz",
+                buildJsonObject {
+                    put("a", "[\"x\",\"y\"]")
+                    put("o", "not json")
+                },
+            )
         assertEquals(
             buildJsonObject {
-                putJsonArray("a") { add("x"); add("y") }
+                putJsonArray("a") {
+                    add("x")
+                    add("y")
+                }
                 put("o", "not json")
                 putJsonArray("notes") { add("parsed 'a' from a JSON string") }
             },
             Json.parseToJsonElement(text(parsedArray)),
         )
         // kotlinx would read unquoted words as literals: these stay the values sent.
-        val words = call(target, "http_fuzz", buildJsonObject { put("a", "[admin]"); put("o", "{a:b}") })
+        val words =
+            call(
+                target,
+                "http_fuzz",
+                buildJsonObject {
+                    put("a", "[admin]")
+                    put("o", "{a:b}")
+                },
+            )
         assertEquals(
-            buildJsonObject { putJsonArray("a") { add("[admin]") }; put("o", "{a:b}") },
+            buildJsonObject {
+                putJsonArray("a") { add("[admin]") }
+                put("o", "{a:b}")
+            },
             Json.parseToJsonElement(text(words)),
         )
     }
@@ -356,9 +623,15 @@ class ToolConsolidationTest {
         legacy.addTool(
             name = "proxy_history",
             description = "History.",
-            inputSchema = ToolSchema(properties = buildJsonObject { putJsonObject("count") { put("type", "integer") } }, required = listOf("count")),
+            inputSchema =
+                ToolSchema(
+                    properties =
+                        buildJsonObject { putJsonObject("count") { put("type", "integer") } },
+                    required = listOf("count"),
+                ),
         ) { req ->
-            if (req.params.arguments?.get("count")?.jsonPrimitive?.content == "0") toolError("Parameter 'count' must be positive")
+            if (req.params.arguments?.get("count")?.jsonPrimitive?.content == "0")
+                toolError("Parameter 'count' must be positive")
             else toolError("Burp is busy")
         }
         val target = server()
@@ -370,7 +643,11 @@ class ToolConsolidationTest {
 
         val other = json(call(target, "proxy_history", buildJsonObject { put("count", 2) }))
         assertEquals(
-            buildJsonObject { put("error", "Burp is busy."); put("code", "tool_failed"); put("retryable", false) },
+            buildJsonObject {
+                put("error", "Burp is busy.")
+                put("code", "tool_failed")
+                put("retryable", false)
+            },
             other,
         )
     }
@@ -378,47 +655,76 @@ class ToolConsolidationTest {
     @Test
     fun `rule action parameter is renamed so it does not clash with dispatch action`() {
         val legacy = server()
-        val ruleActionMembers = setOf(
-            "proxy_set_request_rule",
-            "proxy_set_response_rule",
-            "http_set_traffic_rule",
-            "websocket_set_intercept_rule"
-        )
-        ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach { name ->
-            if (name in ruleActionMembers) fake(legacy, name, emptyList(), "action", "pattern")
-            else fake(legacy, name, emptyList(), "pattern")
-        }
+        val ruleActionMembers =
+            setOf(
+                "proxy_set_request_rule",
+                "proxy_set_response_rule",
+                "http_set_traffic_rule",
+                "websocket_set_intercept_rule",
+            )
+        ToolConsolidation.GROUPS.flatMap { it.actions.values }
+            .forEach { name ->
+                if (name in ruleActionMembers) fake(legacy, name, emptyList(), "action", "pattern")
+                else fake(legacy, name, emptyList(), "pattern")
+            }
         ToolConsolidation.KEEP.forEach { fake(legacy, it) }
         val target = server()
         ToolConsolidation.apply(legacy, target)
 
         val proxyProps = target.tools.getValue("proxy_rule").tool.inputSchema.properties!!
         assertTrue("rule_action" in proxyProps)
-        val pr = call(target, "proxy_rule", buildJsonObject { put("action", "set_request_rule"); put("rule_action", "drop") })
+        val pr =
+            call(
+                target,
+                "proxy_rule",
+                buildJsonObject {
+                    put("action", "set_request_rule")
+                    put("rule_action", "drop")
+                },
+            )
         assertEquals("""proxy_set_request_rule:{"action":"drop"}""", text(pr))
 
         val httpProps = target.tools.getValue("http_rule").tool.inputSchema.properties!!
         assertTrue("rule_action" in httpProps)
-        val hr = call(target, "http_rule", buildJsonObject { put("action", "traffic_rule_set"); put("rule_action", "spoof_response") })
+        val hr =
+            call(
+                target,
+                "http_rule",
+                buildJsonObject {
+                    put("action", "traffic_rule_set")
+                    put("rule_action", "spoof_response")
+                },
+            )
         assertEquals("""http_set_traffic_rule:{"action":"spoof_response"}""", text(hr))
 
         val wsProps = target.tools.getValue("websocket").tool.inputSchema.properties!!
         assertTrue("rule_action" in wsProps)
-        val wr = call(target, "websocket", buildJsonObject { put("action", "set_intercept_rule"); put("rule_action", "drop") })
+        val wr =
+            call(
+                target,
+                "websocket",
+                buildJsonObject {
+                    put("action", "set_intercept_rule")
+                    put("rule_action", "drop")
+                },
+            )
         assertEquals("""websocket_set_intercept_rule:{"action":"drop"}""", text(wr))
     }
 
     @Test
     fun `apply rejects group member declaring unrenamed action parameter`() {
         val legacy = server()
-        ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach { name ->
-            if (name == "scope_check") fake(legacy, name, emptyList(), "action") else fake(legacy, name)
-        }
+        ToolConsolidation.GROUPS.flatMap { it.actions.values }
+            .forEach { name ->
+                if (name == "scope_check") fake(legacy, name, emptyList(), "action")
+                else fake(legacy, name)
+            }
         ToolConsolidation.KEEP.forEach { fake(legacy, it) }
         val target = server()
-        val ex = kotlin.test.assertFailsWith<IllegalStateException> {
-            ToolConsolidation.apply(legacy, target)
-        }
+        val ex =
+            kotlin.test.assertFailsWith<IllegalStateException> {
+                ToolConsolidation.apply(legacy, target)
+            }
         assertTrue("action" in (ex.message ?: ""), ex.message)
     }
 
@@ -434,29 +740,59 @@ class ToolConsolidationTest {
         val target = server()
         ToolConsolidation.apply(legacy, target)
 
-        val dataType = target.tools.getValue("send_to_tool").tool.inputSchema.properties!!
-            .getValue("data").jsonObject.getValue("type").jsonPrimitive.content
+        val dataType =
+            target.tools
+                .getValue("send_to_tool")
+                .tool
+                .inputSchema
+                .properties!!
+                .getValue("data")
+                .jsonObject
+                .getValue("type")
+                .jsonPrimitive
+                .content
         assertEquals("array", dataType)
 
-        val ok = call(target, "send_to_tool", buildJsonObject {
-            put("action", "decoder")
-            put("data", buildJsonArray { add("raijin-smoke"); add("second") })
-        })
+        val ok =
+            call(
+                target,
+                "send_to_tool",
+                buildJsonObject {
+                    put("action", "decoder")
+                    put(
+                        "data",
+                        buildJsonArray {
+                            add("raijin-smoke")
+                            add("second")
+                        },
+                    )
+                },
+            )
         assertFalse(ok.isError == true, text(ok))
         assertEquals(listOf("raijin-smoke", "second"), sent)
         assertTrue("items_sent" in text(ok), text(ok))
 
-        val one = call(target, "send_to_tool", buildJsonObject {
-            put("action", "decoder")
-            put("data", "plain")
-        })
+        val one =
+            call(
+                target,
+                "send_to_tool",
+                buildJsonObject {
+                    put("action", "decoder")
+                    put("data", "plain")
+                },
+            )
         assertFalse(one.isError == true, text(one))
         assertEquals(listOf("raijin-smoke", "second", "plain"), sent)
 
-        val empty = call(target, "send_to_tool", buildJsonObject {
-            put("action", "decoder")
-            put("data", buildJsonArray { })
-        })
+        val empty =
+            call(
+                target,
+                "send_to_tool",
+                buildJsonObject {
+                    put("action", "decoder")
+                    put("data", buildJsonArray {})
+                },
+            )
         assertEquals(true, empty.isError)
         assertTrue("at least one item" in text(empty), text(empty))
         assertEquals(3, sent.size)
@@ -467,11 +803,126 @@ class ToolConsolidationTest {
         val (_, target) = consolidatedWithRealTools()
         val scope = target.tools.getValue("scope").tool
         val desc = scope.description!!
-        assertTrue("scope(action=list)" in desc, desc)
+        assertTrue("scope.list" in desc, desc)
+        assertFalse("(action=" in desc, desc)
         assertFalse(Regex("\\bscope_list\\b").containsMatchIn(desc), desc)
-        assertTrue("Example: {\"action\":" in desc, desc)
+        assertTrue("Example: {\"do\":\"scope." in desc, desc)
+        assertTrue("- scope.remove(" in desc, desc)
         val index = scope.inputSchema.properties!!.getValue("index").jsonObject.str("description")!!
         assertFalse("scope_list" in index, index)
+    }
+
+    @Test
+    fun `a placeholder copied from an example is refused for an id and noted elsewhere`() {
+        val (_, target) = consolidatedWithRealTools()
+        val response =
+            json(
+                call(
+                    target,
+                    "analyze",
+                    buildJsonObject {
+                        put("action", "response")
+                        put("response", "<response>")
+                    },
+                ),
+            )
+        assertTrue(
+            "'response' is the placeholder \"<response>\" from an example; sent as written" in
+                response.getValue("notes").jsonArray.map { it.jsonPrimitive.content },
+            response.toString(),
+        )
+
+        val token =
+            json(
+                call(
+                    target,
+                    "util",
+                    buildJsonObject {
+                        put("action", "jwt_decode")
+                        put("token", "<token>")
+                    },
+                ),
+            )
+        assertEquals("placeholder_value", token.str("code"), token.toString())
+        assertEquals("token", token.str("param"))
+        assertTrue(
+            token.getValue("example").jsonObject.str("token")!!.startsWith("eyJ"),
+            token.toString(),
+        )
+
+        val run =
+            json(
+                call(
+                    target,
+                    "turbo_run",
+                    buildJsonObject {
+                        put("action", "status")
+                        put("run_id", "<run_id from turbo_run.list>")
+                    },
+                ),
+            )
+        assertEquals("placeholder_value", run.str("code"), run.toString())
+        assertEquals(buildJsonObject { put("do", "turbo_run.list") }, run.getValue("see"))
+    }
+
+    @Test
+    fun `an enum error lists only the values of the action called`() {
+        val (_, target) = consolidatedWithRealTools()
+        val r =
+            json(
+                call(
+                    target,
+                    "util",
+                    buildJsonObject {
+                        put("action", "hash")
+                        put("data", "x")
+                        put("algorithm", "GZIP")
+                    },
+                ),
+            )
+        assertEquals("invalid_enum", r.str("code"), r.toString())
+        val allowed = r.getValue("allowed").jsonArray.map { it.jsonPrimitive.content }
+        assertTrue("SHA_256" in allowed && "GZIP" !in allowed, allowed.toString())
+    }
+
+    @Test
+    fun `scope remove out of range says how many rules there are`() {
+        val export =
+            """{"target":{"scope":{"include":[{"enabled":true,"host":"a"}],"exclude":[]}}}"""
+        val suite =
+            java.lang.reflect.Proxy.newProxyInstance(
+                burp.api.montoya.burpsuite.BurpSuite::class.java.classLoader,
+                arrayOf(burp.api.montoya.burpsuite.BurpSuite::class.java),
+            ) { _, method, _ ->
+                if (method.name == "exportProjectOptionsAsJson") export else null
+            }
+        val api =
+            java.lang.reflect.Proxy.newProxyInstance(
+                burp.api.montoya.MontoyaApi::class.java.classLoader,
+                arrayOf(burp.api.montoya.MontoyaApi::class.java),
+            ) { proxy, method, args ->
+                when (method.name) {
+                    "burpSuite" -> suite
+                    "hashCode" -> System.identityHashCode(proxy)
+                    "equals" -> proxy === args?.firstOrNull()
+                    else -> null
+                }
+            } as burp.api.montoya.MontoyaApi
+        val r =
+            io.bitbytelab.raijin.bridge
+                .ScopeBridge(api, io.bitbytelab.raijin.events.EventBus())
+                .remove("include", 999)
+        assertEquals("out_of_range", r.str("code"), r.toString())
+        assertEquals(
+            "scope.remove: no include rule at index 999; the include list has 1 rule(s), valid 0..0. List them with scope.list.",
+            r.str("error"),
+        )
+        assertEquals(buildJsonObject { put("do", "scope.list") }, r.getValue("see"))
+        val empty =
+            io.bitbytelab.raijin.bridge
+                .ScopeBridge(api, io.bitbytelab.raijin.events.EventBus())
+                .remove("exclude", 0)
+        assertTrue("the exclude list is empty" in empty.str("error")!!, empty.toString())
     }
 
     @Test
@@ -481,7 +932,8 @@ class ToolConsolidationTest {
     }
 
     /** Every real member tool, and the tools [ToolConsolidation] publishes from them. */
-    private fun consolidatedWithRealTools(): Pair<Server, Server> = real.value.members to real.value.published
+    private fun consolidatedWithRealTools(): Pair<Server, Server> =
+        real.value.members to real.value.published
 
     private fun JsonObject.str(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull
 
@@ -490,10 +942,15 @@ class ToolConsolidationTest {
         val (legacy, target) = consolidatedWithRealTools()
         for (g in ToolConsolidation.GROUPS) {
             val props = target.tools.getValue(g.tool).tool.inputSchema.properties!!
-            assertEquals(g.actions.keys.toList(),
-                props.getValue("action").jsonObject.getValue("enum").jsonArray.map { it.jsonPrimitive.content })
+            assertEquals(
+                g.actions.keys.toList(),
+                props.getValue("action").jsonObject.getValue("enum").jsonArray.map {
+                    it.jsonPrimitive.content
+                },
+            )
             for ((action, member) in g.actions) {
-                val memberProps = legacy.tools.getValue(member).tool.inputSchema.properties ?: continue
+                val memberProps =
+                    legacy.tools.getValue(member).tool.inputSchema.properties ?: continue
                 val sameName = memberProps.keys.associateWith { g.renames[action]?.get(it) ?: it }
                 for ((name, rawDef) in memberProps) {
                     val pub = sameName.getValue(name)
@@ -502,16 +959,26 @@ class ToolConsolidationTest {
                     val merged = props.getValue(pub).jsonObject
                     val desc = merged.str("description").orEmpty()
                     val own = ToolConsolidation.modernize(def.str("description").orEmpty().trim())
-                    assertTrue(own in desc, "${g.tool}.$pub lost $action's description '$own': $desc")
+                    assertTrue(
+                        own in desc,
+                        "${g.tool}.$pub lost $action's description '$own': $desc",
+                    )
                     val mergedEnum = merged["enum"]?.jsonArray
                     def["enum"]?.jsonArray?.forEach { v ->
-                        assertTrue(mergedEnum?.contains(v) == true || v.jsonPrimitive.content in desc,
-                            "${g.tool}.$pub lost $action's enum value $v")
+                        assertTrue(
+                            mergedEnum?.contains(v) == true || v.jsonPrimitive.content in desc,
+                            "${g.tool}.$pub lost $action's enum value $v",
+                        )
                     }
                     if (mergedEnum != null) {
-                        assertNotNull(def["enum"], "${g.tool}.$pub enum would reject values $action accepts")
+                        assertNotNull(
+                            def["enum"],
+                            "${g.tool}.$pub enum would reject values $action accepts",
+                        )
                     }
-                    def["type"]?.let { t -> merged["type"]?.let { assertEquals(t, it, "${g.tool}.$pub type") } }
+                    def["type"]?.let { t ->
+                        merged["type"]?.let { assertEquals(t, it, "${g.tool}.$pub type") }
+                    }
                 }
             }
         }
@@ -522,20 +989,34 @@ class ToolConsolidationTest {
         val (_, target) = consolidatedWithRealTools()
         fun param(tool: String, name: String) =
             target.tools.getValue(tool).tool.inputSchema.properties!!.getValue(name).jsonObject
-        fun enumOf(p: JsonObject) = p.getValue("enum").jsonArray.map { it.jsonPrimitive.content }.toSet()
+        fun enumOf(p: JsonObject) =
+            p.getValue("enum").jsonArray.map { it.jsonPrimitive.content }.toSet()
 
         val algorithm = param("util", "algorithm")
-        assertEquals(setOf("MD5", "SHA_1", "SHA_256", "SHA_384", "SHA_512", "GZIP", "DEFLATE", "BROTLI"), enumOf(algorithm))
+        assertEquals(
+            setOf("MD5", "SHA_1", "SHA_256", "SHA_384", "SHA_512", "GZIP", "DEFLATE", "BROTLI"),
+            enumOf(algorithm),
+        )
         val algDesc = algorithm.str("description")!!
-        assertTrue("[hash]" in algDesc && "[compress]" in algDesc && "[decompress]" in algDesc, algDesc)
+        assertTrue(
+            "[hash]" in algDesc && "[compress]" in algDesc && "[decompress]" in algDesc,
+            algDesc,
+        )
 
         val level = param("log", "level")
         assertEquals(setOf("output", "error", "debug", "info", "critical"), enumOf(level))
-        assertTrue("[message]" in level.str("description")!! && "[event]" in level.str("description")!!)
+        assertTrue(
+            "[message]" in level.str("description")!! && "[event]" in level.str("description")!!,
+        )
 
         val type = param("config", "type")
-        assertTrue(setOf("request_header", "response_body", "HTTP", "SOCKS5").all { it in enumOf(type) })
-        assertTrue("[match_replace_add]" in type.str("description")!! && "[upstream_proxy_set]" in type.str("description")!!)
+        assertTrue(
+            setOf("request_header", "response_body", "HTTP", "SOCKS5").all { it in enumOf(type) },
+        )
+        assertTrue(
+            "[match_replace_add]" in type.str("description")!! &&
+                "[upstream_proxy_set]" in type.str("description")!!,
+        )
 
         val data = param("util", "data")
         assertEquals("string", data.str("type"))
@@ -545,17 +1026,33 @@ class ToolConsolidationTest {
 
     @Test
     fun `mergeParam keeps a free-form action's values and every mode of an enum action`() {
-        val jwtModes = listOf(
-            "analyze", "forge_none", "alg_confusion", "crack", "sign", "sign_key", "verify",
-            "encrypt", "decrypt", "embed_jwk", "empty_hmac", "psychic", "header_url",
-        )
-        val graphql = buildJsonObject { put("type", "string"); put("description", "probe (default) | query_templates | poi_scan") }
+        val jwtModes =
+            listOf(
+                "analyze",
+                "forge_none",
+                "alg_confusion",
+                "crack",
+                "sign",
+                "sign_key",
+                "verify",
+                "encrypt",
+                "decrypt",
+                "embed_jwk",
+                "empty_hmac",
+                "psychic",
+                "header_url",
+            )
+        val graphql = buildJsonObject {
+            put("type", "string")
+            put("description", "probe (default) | query_templates | poi_scan")
+        }
         val jwt = buildJsonObject {
             put("type", "string")
             putJsonArray("enum") { jwtModes.forEach { add(it) } }
             put("description", "JWT operation (default analyze)")
         }
-        val merged = ToolConsolidation.mergeParam(listOf("graphql" to graphql, "jwt" to jwt), groupSize = 6)
+        val merged =
+            ToolConsolidation.mergeParam(listOf("graphql" to graphql, "jwt" to jwt), groupSize = 6)
 
         assertNull(merged["enum"], "graphql accepts values outside jwt's enum")
         assertEquals("string", merged.str("type"))
@@ -567,44 +1064,105 @@ class ToolConsolidationTest {
 
     @Test
     fun `mergeParam unites enums, keeps agreed keys and drops conflicting types`() {
-        val a = buildJsonObject { put("type", "string"); putJsonArray("enum") { add("x"); add("y") }; put("description", "first") }
-        val b = buildJsonObject { put("type", "string"); putJsonArray("enum") { add("y"); add("z") }; put("description", "second") }
+        val a = buildJsonObject {
+            put("type", "string")
+            putJsonArray("enum") {
+                add("x")
+                add("y")
+            }
+            put("description", "first")
+        }
+        val b = buildJsonObject {
+            put("type", "string")
+            putJsonArray("enum") {
+                add("y")
+                add("z")
+            }
+            put("description", "second")
+        }
         val united = ToolConsolidation.mergeParam(listOf("a" to a, "b" to b), groupSize = 3)
-        assertEquals(listOf("x", "y", "z"), united.getValue("enum").jsonArray.map { it.jsonPrimitive.content })
+        assertEquals(
+            listOf("x", "y", "z"),
+            united.getValue("enum").jsonArray.map { it.jsonPrimitive.content },
+        )
         assertTrue("[a] first (one of: x, y)" in united.str("description")!!, united.toString())
         assertTrue("[b] second (one of: y, z)" in united.str("description")!!, united.toString())
 
-        val same = buildJsonObject { put("type", "integer"); put("minimum", 1); put("description", "count") }
+        val same = buildJsonObject {
+            put("type", "integer")
+            put("minimum", 1)
+            put("description", "count")
+        }
         val shared = ToolConsolidation.mergeParam(listOf("a" to same, "b" to same), groupSize = 3)
         assertEquals(1, shared.getValue("minimum").jsonPrimitive.int)
         assertEquals("count [actions: a, b]", shared.str("description"))
-        assertEquals("count", ToolConsolidation.mergeParam(listOf("a" to same, "b" to same), groupSize = 2).str("description"))
+        assertEquals(
+            "count",
+            ToolConsolidation.mergeParam(listOf("a" to same, "b" to same), groupSize = 2)
+                .str("description"),
+        )
 
-        val scalar = buildJsonObject { put("type", "string"); put("description", "one item") }
-        val list = buildJsonObject { put("type", "array"); putJsonObject("items") { put("type", "string") }; put("description", "many items") }
-        val conflict = ToolConsolidation.mergeParam(listOf("a" to scalar, "b" to list), groupSize = 2)
+        val scalar = buildJsonObject {
+            put("type", "string")
+            put("description", "one item")
+        }
+        val list = buildJsonObject {
+            put("type", "array")
+            putJsonObject("items") { put("type", "string") }
+            put("description", "many items")
+        }
+        val conflict =
+            ToolConsolidation.mergeParam(listOf("a" to scalar, "b" to list), groupSize = 2)
         assertNull(conflict["type"])
         assertNull(conflict["items"])
         val desc = conflict.str("description")!!
-        assertTrue("any JSON value" in desc && "one item (type: string)" in desc && "many items (type: array)" in desc, desc)
+        assertTrue(
+            "any JSON value" in desc &&
+                "one item (type: string)" in desc &&
+                "many items (type: array)" in desc,
+            desc,
+        )
 
-        val d1 = buildJsonObject { put("type", "integer"); put("default", 10); put("description", "depth") }
-        val d2 = buildJsonObject { put("type", "integer"); put("default", 5); put("description", "depth") }
+        val d1 = buildJsonObject {
+            put("type", "integer")
+            put("default", 10)
+            put("description", "depth")
+        }
+        val d2 = buildJsonObject {
+            put("type", "integer")
+            put("default", 5)
+            put("description", "depth")
+        }
         val defaults = ToolConsolidation.mergeParam(listOf("a" to d1, "b" to d2), groupSize = 2)
         assertNull(defaults["default"])
-        assertTrue("[a] depth (default: 10)" in defaults.str("description")!! && "[b] depth (default: 5)" in defaults.str("description")!!)
+        assertTrue(
+            "[a] depth (default: 10)" in defaults.str("description")!! &&
+                "[b] depth (default: 5)" in defaults.str("description")!!,
+        )
     }
 
     @Test
     fun `summary does not cut at abbreviations`() {
-        assertEquals("Send it to a tool (e.g. Repeater) for replay.",
-            ToolConsolidation.summary("Send it to a tool (e.g. Repeater) for replay. More text."))
-        assertEquals("Pick an encoding, i.e. base64 or hex, and decode.",
-            ToolConsolidation.summary("Pick an encoding, i.e. base64 or hex, and decode. Then stop."))
+        assertEquals(
+            "Send it to a tool (e.g. Repeater) for replay.",
+            ToolConsolidation.summary("Send it to a tool (e.g. Repeater) for replay. More text."),
+        )
+        assertEquals(
+            "Pick an encoding, i.e. base64 or hex, and decode.",
+            ToolConsolidation.summary(
+                "Pick an encoding, i.e. base64 or hex, and decode. Then stop.",
+            ),
+        )
         assertEquals("Does it.", ToolConsolidation.summary("Does it. Next sentence."))
-        assertEquals("Version 1.2 is fine!", ToolConsolidation.summary("Version 1.2 is fine! Really."))
+        assertEquals(
+            "Version 1.2 is fine!",
+            ToolConsolidation.summary("Version 1.2 is fine! Really."),
+        )
         assertEquals("No terminator", ToolConsolidation.summary("No terminator"))
         val long = "word ".repeat(60)
-        assertTrue(ToolConsolidation.summary(long).endsWith("...") && ToolConsolidation.summary(long).length == 160)
+        assertTrue(
+            ToolConsolidation.summary(long).endsWith("...") &&
+                ToolConsolidation.summary(long).length == 160,
+        )
     }
 }
