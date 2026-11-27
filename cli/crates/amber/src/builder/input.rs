@@ -324,12 +324,13 @@ fn scan_headers(
             scan = line_end + 2;
             continue;
         }
-        if want_host && !has_host {
-            if let Some(colon) = header.iter().position(|byte| *byte == b':') {
-                if colon > 0 && equal_fold_ascii(&header[..colon], b"host") {
-                    has_host = true;
-                }
-            }
+        if want_host
+            && !has_host
+            && let Some(colon) = header.iter().position(|byte| *byte == b':')
+            && colon > 0
+            && equal_fold_ascii(&header[..colon], b"host")
+        {
+            has_host = true;
         }
         kept.push(header);
         scan = line_end + 2;

@@ -109,7 +109,9 @@ fn unhex(text: &str) -> Result<Vec<u8>> {
         ));
     }
     digits
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let text = std::str::from_utf8(pair)
                 .map_err(|_| Error::Malformed("model hex blob is not ascii".to_owned()))?;

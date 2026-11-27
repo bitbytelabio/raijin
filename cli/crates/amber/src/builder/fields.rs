@@ -126,10 +126,10 @@ pub(crate) fn url_extension(path: &[u8]) -> &[u8] {
         return b"";
     };
     let tail = &path[dot + 1..];
-    if let Some(slash) = tail.iter().position(|b| *b == b'/') {
-        if slash != tail.len() - 1 {
-            return b"";
-        }
+    if let Some(slash) = tail.iter().position(|b| *b == b'/')
+        && slash != tail.len() - 1
+    {
+        return b"";
     }
     tail
 }
