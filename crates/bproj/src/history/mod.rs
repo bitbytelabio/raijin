@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::binary::{FileSource, hex};
-use crate::diagnostic::{Error, Result};
+use crate::binary::{FileSource, frame, hex};
+use crate::diagnostic::{Error, Result, SourceRange};
 use crate::filter::HistoryFilter;
 use crate::model::history::{HistoryEntry, SourceInfo};
 
+use decode::Decoded;
 use layout::tag;
 
 const SCAN_CHUNK: usize = 32 * 1024 * 1024;
@@ -25,7 +26,6 @@ pub struct StreamSummary {
 pub struct Project {
     path: PathBuf,
     source: FileSource,
-    sha256: String,
     header: [u8; 8],
     rows: Vec<(u64, u64)>,
 }
@@ -40,23 +40,25 @@ impl Project {
     }
 
     fn from_source(path: &Path, source: FileSource) -> Result<Self> {
-        let (sha256, offsets) = scan(&source)?;
+        let offsets = scan(&source)?;
         let mut header = [0u8; 8];
         if source.len() >= 8 {
             source.read_into_at(0, &mut header)?;
         }
         let mut rows = Vec::with_capacity(offsets.len());
         for offset in offsets {
-            let Some(record) = decode::row_at(&source, offset)? else {
+            if decode::row_at(&source, offset)?.is_none() {
                 continue;
-            };
-            rows.push((record.slices(&source)?[&tag::ENTRY_ID].unsigned, offset));
+            }
+            rows.push((
+                decode::row_fields(&source, offset)?[&tag::ENTRY_ID].unsigned,
+                offset,
+            ));
         }
         rows.sort_unstable();
         Ok(Self {
             path: path.to_path_buf(),
             source,
-            sha256,
             header,
             rows,
         })
@@ -78,14 +80,24 @@ impl Project {
         self.header == layout::PROJECT_HEADER
     }
 
-    pub fn info(&self) -> SourceInfo {
-        SourceInfo {
+    /// Reads the whole file to hash it, so call it only when the hash is needed.
+    pub fn info(&self) -> Result<SourceInfo> {
+        let mut hasher = Sha256::new();
+        frame::stream(
+            &self.source,
+            SourceRange::new(0, self.source.len()),
+            |window| {
+                hasher.update(window);
+                Ok(())
+            },
+        )?;
+        Ok(SourceInfo {
             path: self.path.display().to_string(),
             bytes: self.source.len(),
-            sha256: self.sha256.clone(),
+            sha256: hex(&hasher.finalize()),
             header_hex: hex(&self.header),
             header_match: self.header_match(),
-        }
+        })
     }
 
     pub fn for_each(
@@ -99,19 +111,20 @@ impl Project {
             ..StreamSummary::default()
         };
         for (ordinal, (_, offset)) in self.rows.iter().enumerate() {
-            let Some(record) = decode::row_at(&self.source, *offset)? else {
-                summary.complete = false;
-                continue;
-            };
-            let fields = record.slices(&self.source)?;
+            let fields = decode::row_fields(&self.source, *offset)?;
             if !filter.accepts_row(&fields) {
                 continue;
             }
-            let Some(entry) = decode::decode_entry(&self.source, &fields, *offset, ordinal as u64)?
-            else {
-                summary.complete = false;
-                continue;
-            };
+            let entry =
+                match decode::decode_entry(&self.source, &fields, *offset, ordinal as u64, filter)?
+                {
+                    Decoded::Entry(entry) => *entry,
+                    Decoded::Rejected => continue,
+                    Decoded::Undecodable => {
+                        summary.complete = false;
+                        continue;
+                    }
+                };
             summary.complete = summary.complete && entry.validation.is_complete();
             if !filter.accepts(&entry) {
                 continue;
@@ -167,11 +180,10 @@ impl Project {
     }
 }
 
-fn scan(source: &FileSource) -> Result<(String, Vec<u64>)> {
+fn scan(source: &FileSource) -> Result<Vec<u64>> {
     let needle: &[u8] = &layout::ROW_HEADER;
     let finder = memchr::memmem::Finder::new(needle);
     let carry_length = needle.len() - 1;
-    let mut hasher = Sha256::new();
     let mut offsets = Vec::new();
     let mut buffer = vec![0u8; carry_length + SCAN_CHUNK];
     let mut carried = 0usize;
@@ -181,7 +193,6 @@ fn scan(source: &FileSource) -> Result<(String, Vec<u64>)> {
         let amount = usize::try_from((source.len() - consumed).min(SCAN_CHUNK as u64))
             .map_err(|_| Error::OffsetOverflow)?;
         source.read_into_at(consumed, &mut buffer[carried..carried + amount])?;
-        hasher.update(&buffer[carried..carried + amount]);
 
         let filled = carried + amount;
         let origin = consumed - carried as u64;
@@ -200,5 +211,5 @@ fn scan(source: &FileSource) -> Result<(String, Vec<u64>)> {
         carried = filled - tail;
         consumed += amount as u64;
     }
-    Ok((hex(&hasher.finalize()), offsets))
+    Ok(offsets)
 }

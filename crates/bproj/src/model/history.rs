@@ -121,11 +121,15 @@ pub struct Message {
     pub frame_offset: u64,
     pub payload_offset: u64,
     pub length: u64,
-    pub sha256: String,
+    /// Set by [`crate::history::decode::hash_message`]; reading history leaves it `None`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sha256: Option<String>,
     pub headers: Vec<HttpHeader>,
     pub body_offset: u64,
     pub body_length: u64,
-    pub body_sha256: String,
+    /// Set together with `sha256`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub body_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]

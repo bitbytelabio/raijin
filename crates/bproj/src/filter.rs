@@ -83,6 +83,25 @@ impl HistoryFilter {
         )
     }
 
+    /// The host, method and URL checks, which need only the service and the request line, so a
+    /// row can be rejected before its response and comment are decoded.
+    pub fn accepts_request(
+        &self,
+        host: Option<&str>,
+        method: Option<&str>,
+        url: Option<&str>,
+    ) -> bool {
+        self.host.as_ref().is_none_or(|wanted| equals(host, wanted))
+            && self
+                .url_contains
+                .as_ref()
+                .is_none_or(|needle| contains(url.unwrap_or_default(), needle))
+            && self
+                .method
+                .as_ref()
+                .is_none_or(|wanted| equals(method, wanted))
+    }
+
     pub fn accepts(&self, entry: &HistoryEntry) -> bool {
         if !self.accepts_scalars(
             entry.entry_id,
@@ -92,25 +111,14 @@ impl HistoryFilter {
         ) {
             return false;
         }
-        if let Some(host) = &self.host
-            && !equals(
-                entry
-                    .service
-                    .as_ref()
-                    .map(|service| service.host.text.value.as_str()),
-                host,
-            )
-        {
-            return false;
-        }
-        if let Some(needle) = &self.url_contains
-            && !contains(entry.request.url.as_deref().unwrap_or_default(), needle)
-        {
-            return false;
-        }
-        if let Some(method) = &self.method
-            && !equals(entry.request.method.as_deref(), method)
-        {
+        if !self.accepts_request(
+            entry
+                .service
+                .as_ref()
+                .map(|service| service.host.text.value.as_str()),
+            entry.request.method.as_deref(),
+            entry.request.url.as_deref(),
+        ) {
             return false;
         }
         if let Some(needle) = &self.mime_contains

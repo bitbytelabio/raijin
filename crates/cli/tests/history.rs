@@ -190,4 +190,26 @@ fn export_writes_amber_json_and_the_archive() {
             .is_file()
     );
     assert!(fixture.root().join("out/p2/history.json").is_file());
+
+    let exported: Value = serde_json::from_slice(
+        &std::fs::read(fixture.root().join("out/p1/history.json")).expect("history.json"),
+    )
+    .expect("history.json parses");
+    let is_sha256 = |value: &Value| {
+        value.as_str().is_some_and(|text| {
+            text.len() == 64
+                && text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    };
+    let request = &exported["proxy_http_history"]["entries"][0]["request"];
+    assert!(is_sha256(&exported["source"]["sha256"]), "{exported}");
+    assert!(is_sha256(&request["sha256"]), "{request}");
+    assert!(is_sha256(&request["body_sha256"]), "{request}");
+    let blob = format!(
+        "out/p1/blobs/{}.request.bin",
+        request["sha256"].as_str().expect("request hash")
+    );
+    assert!(fixture.root().join(blob).is_file());
 }

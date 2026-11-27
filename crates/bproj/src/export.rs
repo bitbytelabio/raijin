@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::binary::{FileSource, frame};
 use crate::diagnostic::{Error, Result, SourceRange};
 use crate::filter::HistoryFilter;
-use crate::history::Project;
+use crate::history::{Project, decode};
 use crate::model::history::{Coverage, DOCUMENT_TYPE, HistoryEntry, Message, ORDERING, SCAN_MODE};
 
 pub const HISTORY_FILE: &str = "history.json";
@@ -61,13 +61,17 @@ pub fn export(project: &Path, output: &Path, options: &ExportOptions) -> Result<
         writer,
         "{{\"document_type\":\"{DOCUMENT_TYPE}\",\"source\":"
     )?;
-    serde_json::to_writer(&mut writer, &project.info())?;
+    serde_json::to_writer(&mut writer, &project.info()?)?;
     write!(
         writer,
         ",\"proxy_http_history\":{{\"ordering\":\"{ORDERING}\",\"entries\":["
     )?;
 
     let stream = project.for_each(&options.filter, |mut entry| {
+        decode::hash_message(project.source(), &mut entry.request)?;
+        if let Some(response) = entry.response.as_mut() {
+            decode::hash_message(project.source(), response)?;
+        }
         if options.write_blobs {
             let (count, bytes) = write_blobs(project.source(), &mut entry, &blob_directory)?;
             blob_count += count;
@@ -125,7 +129,11 @@ fn copy_blob(
     role: &str,
     directory: &Path,
 ) -> Result<u64> {
-    let name = format!("{}.{role}.bin", message.sha256);
+    let hash = message
+        .sha256
+        .as_deref()
+        .ok_or_else(|| Error::Malformed("message hash missing".to_owned()))?;
+    let name = format!("{hash}.{role}.bin");
     let path = directory.join(&name);
     message.blob = Some(name);
     if path

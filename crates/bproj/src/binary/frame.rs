@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::diagnostic::{Error, Result, SourceRange};
 
@@ -76,15 +75,6 @@ pub fn frame_at(source: &FileSource, frame_offset: u64) -> Result<Option<HttpFra
         payload_length,
         kind,
     }))
-}
-
-pub fn digest(source: &FileSource, range: SourceRange) -> Result<String> {
-    let mut hasher = Sha256::new();
-    stream(source, range, |window| {
-        hasher.update(window);
-        Ok(())
-    })?;
-    Ok(hex(&hasher.finalize()))
 }
 
 pub fn stream(

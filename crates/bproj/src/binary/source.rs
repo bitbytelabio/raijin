@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::ErrorKind;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,6 @@ pub struct TextFrame {
 pub struct FileSource {
     file: File,
     length: Cell<u64>,
-    cursor: Cell<Option<u64>>,
 }
 
 impl FileSource {
@@ -35,11 +35,7 @@ impl FileSource {
 
     fn from_file(file: File) -> Result<Self> {
         let length = Cell::new(file.metadata()?.len());
-        Ok(Self {
-            file,
-            length,
-            cursor: Cell::new(Some(0)),
-        })
+        Ok(Self { file, length })
     }
 
     pub fn len(&self) -> u64 {
@@ -68,55 +64,44 @@ impl FileSource {
         Ok(())
     }
 
-    fn seek(&self, offset: u64) -> Result<()> {
-        if self.cursor.replace(None) != Some(offset) {
-            (&self.file).seek(SeekFrom::Start(offset))?;
-        }
-        Ok(())
-    }
-
-    pub fn read_into_at(&self, offset: u64, mut output: &mut [u8]) -> Result<()> {
+    pub fn read_into_at(&self, offset: u64, output: &mut [u8]) -> Result<()> {
         let expected = output.len();
-        self.seek(offset)?;
-        let mut handle = &self.file;
-        while !output.is_empty() {
-            match handle.read(output) {
+        let mut done = 0usize;
+        while done < expected {
+            match self.file.read_at(&mut output[done..], offset + done as u64) {
                 Ok(0) => {
                     return Err(Error::ShortRead {
                         offset,
                         expected,
-                        actual: expected - output.len(),
+                        actual: done,
                     });
                 }
-                Ok(read) => output = &mut output[read..],
+                Ok(read) => done += read,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Err(error) => return Err(error.into()),
             }
         }
-        self.cursor.set(offset.checked_add(expected as u64));
         Ok(())
     }
 
-    pub fn write_all_at(&self, offset: u64, mut bytes: &[u8]) -> Result<()> {
+    pub fn write_all_at(&self, offset: u64, bytes: &[u8]) -> Result<()> {
         let expected = bytes.len();
         self.check(SourceRange::new(offset, expected as u64))?;
-        self.seek(offset)?;
-        let mut handle = &self.file;
-        while !bytes.is_empty() {
-            match handle.write(bytes) {
+        let mut done = 0usize;
+        while done < expected {
+            match self.file.write_at(&bytes[done..], offset + done as u64) {
                 Ok(0) => {
                     return Err(Error::ShortRead {
                         offset,
                         expected,
-                        actual: expected - bytes.len(),
+                        actual: done,
                     });
                 }
-                Ok(written) => bytes = &bytes[written..],
+                Ok(written) => done += written,
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Err(error) => return Err(error.into()),
             }
         }
-        self.cursor.set(offset.checked_add(expected as u64));
         Ok(())
     }
 
@@ -138,9 +123,10 @@ impl FileSource {
     }
 
     fn scalar<const N: usize>(&self, offset: u64) -> Result<[u8; N]> {
-        self.bytes(offset, N as u64)?
-            .try_into()
-            .map_err(|_| Error::OffsetOverflow)
+        self.check(SourceRange::new(offset, N as u64))?;
+        let mut out = [0u8; N];
+        self.read_into_at(offset, &mut out)?;
+        Ok(out)
     }
 
     pub fn u8(&self, offset: u64) -> Result<u8> {

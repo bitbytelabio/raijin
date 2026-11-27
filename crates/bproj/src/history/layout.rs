@@ -43,6 +43,9 @@ pub const ROW: [(u8, u16); 31] = [
     (30, 274),
 ];
 
+/// Bytes from a row's start to the end of its last field (`ROW`'s last offset plus its 8-byte width).
+pub const ROW_BYTES: usize = 282;
+
 pub const ROW_WIDTHS: [(u8, u8); 31] = [
     (127, 4),
     (0, 4),
