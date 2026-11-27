@@ -147,6 +147,25 @@ class ToolConsolidationTest {
     }
 
     @Test
+    fun `an inexact spelling of a destructive action does not run it`() {
+        val legacy = server()
+        ToolConsolidation.GROUPS.flatMap { it.actions.values }.forEach { fake(legacy, it) }
+        ToolConsolidation.KEEP.forEach { fake(legacy, it) }
+        val target = server()
+        ToolConsolidation.apply(legacy, target)
+
+        val bad = call(target, "burp", buildJsonObject { put("action", "SHUTDOWN") })
+        assertEquals(true, bad.isError)
+        val badJson = json(bad)
+        assertEquals("unknown_action", badJson.str("code"))
+        assertEquals(
+            "shutdown",
+            badJson.getValue("did_you_mean").jsonArray.single().jsonPrimitive.content,
+        )
+        assertNull(badJson["retry"])
+    }
+
+    @Test
     fun `unknown action and missing parameter are reported`() {
         val legacy = server()
         ToolConsolidation.GROUPS.flatMap { it.actions.values }

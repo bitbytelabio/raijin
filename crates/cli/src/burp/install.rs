@@ -110,14 +110,12 @@ pub fn discover(burp: &Burp, root: &Path) -> Result<Launcher> {
             vec![dir.join("Contents/vmoptions.txt")]
         }
         Some(dir) => {
-            let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-                .map(|rd| {
-                    rd.flatten()
-                        .map(|e| e.path())
-                        .filter(|p| p.extension().is_some_and(|e| e == "vmoptions"))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let mut files: Vec<PathBuf> = std::fs::read_dir(dir).map_or_default(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|e| e == "vmoptions"))
+                    .collect()
+            });
             files.sort();
             files
         }

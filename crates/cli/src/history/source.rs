@@ -62,14 +62,12 @@ pub fn discover(target: &Target, selection: &Selection) -> Result<Vec<Source>> {
 
     if selection.file.is_empty() {
         let projects_dir = target.projects_dir();
-        let mut own: Vec<PathBuf> = std::fs::read_dir(&projects_dir)
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().is_some_and(|e| e == "burp"))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut own: Vec<PathBuf> = std::fs::read_dir(&projects_dir).map_or_default(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "burp"))
+                .collect()
+        });
         own.sort();
         add_files(own, &mut by_name);
         if let Ok(rd) = std::fs::read_dir(target.state_dir().join("archive")) {

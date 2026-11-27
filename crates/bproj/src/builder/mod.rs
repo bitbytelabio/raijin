@@ -368,8 +368,7 @@ pub fn write_entry(writer: &mut Writer<'_>, entry: &Entry, entry_id: u64) -> Res
     let title_text: Vec<u8> = entry
         .response
         .as_deref()
-        .map(fields::extract_title)
-        .unwrap_or_default();
+        .map_or_default(fields::extract_title);
     let title = write_text_record(writer, &title_text)?;
 
     let target = fields::request_target(&entry.request);

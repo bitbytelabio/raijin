@@ -289,9 +289,7 @@ fn read_from(path: &Path, offset: &mut u64) -> String {
 }
 
 fn log_tail(path: &Path) -> String {
-    let text = fs::read(path)
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default();
+    let text = fs::read(path).map_or_default(|b| String::from_utf8_lossy(&b).into_owned());
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(LOG_TAIL_LINES)..].join("\n")
 }

@@ -266,8 +266,7 @@ pub fn mirror_warnings(result: CallToolResult) -> CallToolResult {
     let existing: Vec<&str> = object
         .get("notes")
         .and_then(Value::as_array)
-        .map(|n| n.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
+        .map_or_default(|n| n.iter().filter_map(Value::as_str).collect());
     let mut fresh: Vec<String> = Vec::new();
     for note in found {
         if !existing.contains(&note.as_str()) && !fresh.contains(&note) {

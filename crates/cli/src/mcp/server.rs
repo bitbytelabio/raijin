@@ -1134,13 +1134,12 @@ fn actions_of(schema: &Value) -> Vec<String> {
     schema
         .pointer("/properties/action/enum")
         .and_then(Value::as_array)
-        .map(|a| {
+        .map_or_default(|a| {
             a.iter()
                 .filter_map(Value::as_str)
                 .map(str::to_owned)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// The first line of `description`, cut at [`SUMMARY_BYTES`].
@@ -2046,14 +2045,14 @@ impl Gateway {
         let live_names: Option<BTreeSet<&str>> =
             live.map(|l| l.iter().map(|t| t.name.as_ref()).collect());
         let entry = |name: &str, view: Option<ToolView>| {
-            let actions = view.map(|v| actions_of(&v.schema)).unwrap_or_default();
+            let actions = view.map_or_default(|v| actions_of(&v.schema));
             if actions.is_empty() {
                 name.to_owned()
             } else {
                 format!("{name}({})", actions.join("|"))
             }
         };
-        for d in catalog.map(|c| c.domains.as_slice()).unwrap_or_default() {
+        for d in catalog.map_or_default(|c| c.domains.as_slice()) {
             let tools: Vec<String> = d
                 .tools
                 .iter()

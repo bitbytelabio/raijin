@@ -146,6 +146,6 @@ fn ref_of(v: &Value) -> &str {
 }
 
 fn dedupe_key(row: &super::Row, request: Option<&[u8]>) -> String {
-    let body = request.map(|r| split_message(r).1).unwrap_or_default();
+    let body = request.map_or_default(|r| split_message(r).1);
     json!([row.method, row.url, hex(&Sha256::digest(body))]).to_string()
 }

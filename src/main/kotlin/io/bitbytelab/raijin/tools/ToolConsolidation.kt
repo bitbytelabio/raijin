@@ -950,9 +950,23 @@ object ToolConsolidation {
                 }
             }
         }
+        val destructive = ToolNames.destructive(g.tool, resolved, null)
+        // `"action":"SHUTDOWN"` would run burp.shutdown: an inexact spelling of a destructive
+        // action only suggests it, as ToolNames.resolveName does for `burp.Shutdown`.
+        if (destructive && resolved != raw.trim()) {
+            return ToolArgs.error(
+                "unknown_action",
+                "${g.tool} has no action '$raw'. Did you mean '$resolved'? It is destructive: " +
+                    "spell it exactly to run it.",
+            ) {
+                put("param", "action")
+                put("got", raw)
+                putJsonArray("allowed") { g.actions.keys.forEach { add(it) } }
+                putJsonArray("did_you_mean") { add(resolved) }
+            }
+        }
         val spec = specs.getValue(resolved)
         val call = ToolArgs.callName(g.tool, resolved)
-        val destructive = ToolNames.destructive(g.tool, resolved, null)
 
         val renamed = ToolArgs.renameParams(spec.props, args, setOf("action"), destructive)
         args = renamed.args

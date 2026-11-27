@@ -251,14 +251,11 @@ async fn run(cli: Cli) -> Result<()> {
                         "{:<16} {:<9} {:<9} {:>7}  {:<32} {:<16} {}",
                         s.project,
                         json_str(&s.state),
-                        s.mode.map(|m| m.to_string()).unwrap_or_default(),
-                        s.pid.map(|p| p.to_string()).unwrap_or_default(),
+                        s.mode.map_or_default(|m| m.to_string()),
+                        s.pid.map_or_default(|p| p.to_string()),
                         s.mcp_url.clone().unwrap_or_default(),
                         s.proxy.clone().unwrap_or_default(),
-                        s.log
-                            .as_ref()
-                            .map(|l| l.display().to_string())
-                            .unwrap_or_default()
+                        s.log.as_ref().map_or_default(|l| l.display().to_string())
                     );
                 }
             }
@@ -388,12 +385,8 @@ fn str_at<'v>(value: &'v Value, key: &str) -> &'v str {
 fn list_line(row: &Value) -> String {
     let time = row["time_epoch_ms"]
         .as_u64()
-        .map(|ms| util::utc_stamp_at(ms / 1000))
-        .unwrap_or_default();
-    let status = row["status"]
-        .as_u64()
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+        .map_or_default(|ms| util::utc_stamp_at(ms / 1000));
+    let status = row["status"].as_u64().map_or_default(|s| s.to_string());
     // Issue rows have severity and name where exchanges have method and URL.
     let method = row["method"].as_str().unwrap_or(str_at(row, "severity"));
     let url = row["url"].as_str().unwrap_or(str_at(row, "name"));

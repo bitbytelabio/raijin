@@ -662,8 +662,7 @@ fn required_of(schema: &JsonObject) -> BTreeSet<&str> {
     schema
         .get("required")
         .and_then(Value::as_array)
-        .map(|r| r.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default()
+        .map_or_default(|r| r.iter().filter_map(Value::as_str).collect())
 }
 
 /// Reads `arguments` as `T` for `tool`: unknown keys, wrong types, values outside an enum or a

@@ -42,8 +42,7 @@ fn entry_bytes(entry: &Entry) -> u64 {
     let title_text: Vec<u8> = entry
         .response
         .as_deref()
-        .map(fields::extract_title)
-        .unwrap_or_default();
+        .map_or_default(fields::extract_title);
     let title = if title_text.is_empty() {
         0
     } else {
