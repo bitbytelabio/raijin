@@ -378,21 +378,40 @@ pub const PARAM_SYNONYMS: &[&[&str]] = &[
         "max_matches",
     ],
     &["start_index", "offset", "skip"],
-    &["pattern", "query", "q", "regex", "search", "search_pattern"],
+    &[
+        "pattern",
+        "query",
+        "q",
+        "regex",
+        "search",
+        "search_pattern",
+        "keyword",
+        "keywords",
+        "term",
+        "terms",
+        "search_query",
+        "text",
+    ],
     &["data", "input", "text", "value", "string"],
     &["url", "uri"],
     &["request", "raw_request"],
     &["response", "raw_response"],
 ];
 
-/// The parameter of `props` that `key` means by [`PARAM_SYNONYMS`], when exactly one fits.
+/// The parameter of `props` that `key` means by [`PARAM_SYNONYMS`]: in the first group holding
+/// `key` where exactly one other member is declared, in table order (`text` is `query` where a
+/// tool takes `query`, else `data`).
 fn synonym<'a>(key: &str, props: &'a JsonObject) -> Option<&'a str> {
-    let group = PARAM_SYNONYMS.iter().find(|g| g.contains(&key))?;
-    let mut fits = props
-        .keys()
-        .filter(|p| p.as_str() != key && group.contains(&p.as_str()));
-    let one = fits.next()?;
-    fits.next().is_none().then_some(one.as_str())
+    PARAM_SYNONYMS
+        .iter()
+        .filter(|g| g.contains(&key))
+        .find_map(|group| {
+            let mut fits = props
+                .keys()
+                .filter(|p| p.as_str() != key && group.contains(&p.as_str()));
+            let one = fits.next()?;
+            fits.next().is_none().then_some(one.as_str())
+        })
 }
 
 /// Text a boolean parameter takes for `true`; [`FALSE_WORDS`] for `false`. The extension's
@@ -528,7 +547,9 @@ fn capped_allowed(got: &str, values: &[String]) -> (Vec<String>, bool) {
 
 /// `unknown_parameter` for the `unknown` keys of `arguments`, each with its nearest declared name
 /// (looked up in [`canonical_param`] form); `retry`, a `run` call with them renamed, is offered when
-/// `offer_retry` and every one has a distinct suggestion not already set.
+/// `offer_retry` and every one has a distinct [`PARAM_SYNONYMS`] target not already set. A name
+/// only spelled near a declared one (`text` near `context`) may mean something else: it is
+/// suggested, never retried.
 fn unknown_parameter(
     tool: &str,
     props: &JsonObject,
@@ -536,20 +557,24 @@ fn unknown_parameter(
     unknown: &[&String],
     offer_retry: bool,
 ) -> ToolError {
+    let mut by_synonym = 0;
     let targets: Vec<Option<&str>> = unknown
         .iter()
         .map(|k| {
             let c = canonical_param(k);
-            synonym(&c, props).or_else(|| {
-                suggest(&c, props.keys().map(String::as_str), 1)
-                    .first()
-                    .copied()
-            })
+            if let Some(t) = synonym(&c, props) {
+                by_synonym += 1;
+                return Some(t);
+            }
+            suggest(&c, props.keys().map(String::as_str), 1)
+                .first()
+                .copied()
         })
         .collect();
     let chosen: Vec<&str> = targets.iter().flatten().copied().collect();
     let distinct: BTreeSet<&str> = chosen.iter().copied().collect();
     let certain = offer_retry
+        && by_synonym == unknown.len()
         && chosen.len() == unknown.len()
         && distinct.len() == chosen.len()
         && chosen.iter().all(|t| !arguments.contains_key(*t));
@@ -633,10 +658,15 @@ fn check(
             "{tool}: '{key}' is not one of the {} allowed values (see 'allowed'), got \"{text}\".",
             s.enums.len()
         );
+        let near: Vec<String> = suggest(text, s.enums.iter().map(String::as_str), 3)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         let mut error = ToolError::new(Code::InvalidEnum, message)
             .param(key)
             .got(value)
-            .allowed(shown_values.iter().map(|e| json!(e)).collect());
+            .allowed(shown_values.iter().map(|e| json!(e)).collect())
+            .did_you_mean(near);
         if cut {
             error = error.see(super::error::guide_call(Some(tool)));
         }
@@ -656,6 +686,28 @@ fn check(
         .got(value));
     }
     Ok(value)
+}
+
+/// Parameters whose `""` is a value to send, never "not set". Same set as the extension's
+/// `ToolArgs.PAYLOAD_KEYS`.
+const PAYLOAD_KEYS: [&str; 6] = [
+    "body",
+    "data",
+    "raw_request",
+    "payload",
+    "script",
+    "headers",
+];
+
+/// Whether `value` is what a strict-mode client sends for a property it has nothing for: a blank
+/// string, `[]` or `{}`.
+pub(crate) fn is_empty_value(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        _ => false,
+    }
 }
 
 fn required_of(schema: &JsonObject) -> BTreeSet<&str> {
@@ -705,17 +757,33 @@ pub fn parse_args<T: DeserializeOwned + JsonSchema>(
 
     let mut checked = Map::new();
     let required = required_of(&schema);
+    let mut ignored = Vec::new();
     for (key, value) in arguments {
         let s = shape(&schema, &props[&key]);
+        let optional = !required.contains(key.as_str());
         // Clients that fill every declared property send null for the ones they leave unset.
-        if value.is_null() && !s.has("null") && !required.contains(key.as_str()) {
+        if value.is_null() && !s.has("null") && optional {
             continue;
+        }
+        // ... or "", [], {}, and 0 where the least value is 1. A payload keeps its "".
+        if optional && !PAYLOAD_KEYS.contains(&key.as_str()) {
+            if is_empty_value(&value) {
+                ignored.push(format!("'{key}'"));
+                continue;
+            }
+            if value.as_i64() == Some(0) && s.minimum.is_some_and(|m| m >= 1.0) {
+                ignored.push(format!("'{key}' 0"));
+                continue;
+            }
         }
         let value = coerce(&key, &s, &schema, value, &mut notes);
         checked.insert(
             key.clone(),
             check(tool, &key, &schema, &s, value).map_err(fail)?,
         );
+    }
+    if !ignored.is_empty() {
+        notes.push(format!("ignored empty optional {}", ignored.join(", ")));
     }
 
     if let Some(missing) = required_of(&schema)
@@ -736,4 +804,63 @@ pub fn parse_args<T: DeserializeOwned + JsonSchema>(
                 format!("{tool}: these arguments do not fit its parameters ({e}); see 'usage'."),
             ))
         })
+}
+
+/// What a strict-mode client sends for `schema` when it has nothing to say: every declared
+/// property set to the empty value of its type (`""`, `[]`, `{}`, `0`, `false`).
+#[cfg(test)]
+pub(crate) fn strict_fill(schema: &JsonObject) -> JsonObject {
+    let empty = Map::new();
+    let props = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+    props
+        .iter()
+        .map(|(k, def)| {
+            let s = shape(schema, def);
+            let v = if s.has("string") {
+                json!("")
+            } else if s.has("array") {
+                json!([])
+            } else if s.has("object") {
+                json!({})
+            } else if s.has("integer") || s.has("number") {
+                json!(0)
+            } else if s.has("boolean") {
+                json!(false)
+            } else {
+                Value::Null
+            };
+            (k.clone(), v)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn props(v: Value) -> JsonObject {
+        serde_json::from_value(v).expect("props")
+    }
+
+    #[test]
+    fn only_a_synonym_gives_a_retry() {
+        let args = props(json!({"text": "svg onload"}));
+        let text = "text".to_owned();
+        let query = props(json!({"query": {"type": "string"}, "context": {"type": "string"}}));
+        let e = unknown_parameter("data_search", &query, &args, &[&text], true);
+        assert_eq!(
+            e.retry,
+            Some(json!({"do": "data_search", "query": "svg onload"}))
+        );
+        let near = props(json!({"context": {"type": "string"}}));
+        let e = unknown_parameter("t", &near, &args, &[&text], true);
+        assert_eq!(e.retry, None);
+        assert_eq!(e.did_you_mean, ["context"]);
+        let data = props(json!({"data": {"type": "string"}}));
+        assert_eq!(synonym("text", &data), Some("data"));
+        assert_eq!(synonym("keywords", &query), Some("query"));
+    }
 }

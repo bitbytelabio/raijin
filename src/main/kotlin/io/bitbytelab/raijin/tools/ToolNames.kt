@@ -43,10 +43,19 @@ internal object ToolNames {
 
     /**
      * Prefixes clients put before a tool name (`mcp__raijin__proxy_history`,
-     * `raijin.proxy_history`).
+     * `raijin.proxy_history`, Gemini's `default_api.proxy_history`).
      */
     private val SERVER_PREFIXES =
-        listOf("mcp__raijin__", "raijin.", "raijin:", "raijin/", "functions.")
+        listOf(
+            "mcp__raijin__",
+            "mcp_raijin_",
+            "raijin__",
+            "raijin.",
+            "raijin:",
+            "raijin/",
+            "functions.",
+            "default_api.",
+        )
 
     /**
      * [raw] without a server prefix ([SERVER_PREFIXES], any case) when it has one and something

@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.bridge
 
 import burp.api.montoya.MontoyaApi
+import burp.api.montoya.core.ByteArray as BurpByteArray
 import burp.api.montoya.http.HttpMode
 import burp.api.montoya.http.HttpService
 import burp.api.montoya.http.message.HttpRequestResponse
@@ -8,13 +9,6 @@ import burp.api.montoya.http.message.requests.HttpRequest
 import io.bitbytelab.raijin.core.BodyText
 import io.bitbytelab.raijin.safety.RequestHygiene
 import io.bitbytelab.raijin.safety.ScopeGate
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.add
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonArray
 import java.net.Socket
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
@@ -25,7 +19,13 @@ import java.util.concurrent.atomic.AtomicIntegerArray
 import java.util.concurrent.atomic.AtomicReferenceArray
 import kotlin.math.max
 import kotlin.math.roundToLong
-import burp.api.montoya.core.ByteArray as BurpByteArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 
 /**
  * `http_race`: releases a batch of requests at once behind a real synchronisation barrier, then
@@ -53,12 +53,15 @@ internal class HttpRace(
         companion object {
             val ids: List<String> = entries.map { it.id }
 
-            fun of(id: String?): Sync? = entries.firstOrNull { it.id.equals(id?.trim(), ignoreCase = true) }
+            fun of(id: String?): Sync? = entries.firstOrNull {
+                it.id.equals(id?.trim(), ignoreCase = true)
+            }
         }
     }
 
     /**
-     * @param texts the request texts (Content-Length already fixed), sent in [RequestHygiene.wireCharset].
+     * @param texts the request texts (Content-Length already fixed), sent in
+     *   [RequestHygiene.wireCharset].
      * @param payloads the payload of each request when the batch was built from payloads.
      * @param mode for single_packet, [HttpMode.HTTP_2_IGNORE_ALPN] forces HTTP/2 without ALPN; any
      *   other mode sends HTTP/2.
@@ -79,19 +82,48 @@ internal class HttpRace(
         timeoutMs: Long?,
         similarity: Double,
     ): JsonObject {
-        val scope = scopeGate.checkRequests(host, port, useTls, texts.asSequence().ifEmpty { sequenceOf("") })
+        val scope =
+            scopeGate.checkRequests(
+                host,
+                port,
+                useTls,
+                texts.asSequence().ifEmpty { sequenceOf("") },
+            )
         if (scope.blocked) return scope.denyJson()
-        val result = try {
-            when (sync) {
-                Sync.SINGLE_PACKET -> singlePacket(texts, payloads, host, port, useTls, mode, maxBodyLength, timeoutMs, similarity)
-                Sync.LAST_BYTE -> lastByte(texts, payloads, host, port, useTls, sni, maxBodyLength, timeoutMs, similarity)
+        val result =
+            try {
+                when (sync) {
+                    Sync.SINGLE_PACKET ->
+                        singlePacket(
+                            texts,
+                            payloads,
+                            host,
+                            port,
+                            useTls,
+                            mode,
+                            maxBodyLength,
+                            timeoutMs,
+                            similarity,
+                        )
+                    Sync.LAST_BYTE ->
+                        lastByte(
+                            texts,
+                            payloads,
+                            host,
+                            port,
+                            useTls,
+                            sni,
+                            maxBodyLength,
+                            timeoutMs,
+                            similarity,
+                        )
+                }
+            } catch (e: Exception) {
+                buildJsonObject {
+                    put("error", "Race condition test failed: ${e.message}")
+                    put("is_timeout", e is HttpRequestTimeoutException)
+                }
             }
-        } catch (e: Exception) {
-            buildJsonObject {
-                put("error", "Race condition test failed: ${e.message}")
-                put("is_timeout", e is HttpRequestTimeoutException)
-            }
-        }
         return scope.annotate(result)
     }
 
@@ -107,14 +139,21 @@ internal class HttpRace(
         similarity: Double,
     ): JsonObject {
         val service = HttpService.httpService(host, port, useTls)
-        val h2Mode = if (mode == HttpMode.HTTP_2_IGNORE_ALPN) HttpMode.HTTP_2_IGNORE_ALPN else HttpMode.HTTP_2
-        // As Turbo's gated BURP2 engine does: the request line names HTTP/2, the version the batch goes out in.
+        val h2Mode =
+            if (mode == HttpMode.HTTP_2_IGNORE_ALPN) HttpMode.HTTP_2_IGNORE_ALPN
+            else HttpMode.HTTP_2
+        // As Turbo's gated BURP2 engine does: the request line names HTTP/2, the version the batch
+        // goes out in.
         val batch = texts.map { text ->
             val h2Text = text.replaceFirst("HTTP/1.1\r\n", "HTTP/2\r\n")
-            HttpRequest.httpRequest(service, BurpByteArray.byteArray(*h2Text.toByteArray(RequestHygiene.wireCharset(h2Text))))
+            HttpRequest.httpRequest(
+                service,
+                BurpByteArray.byteArray(*h2Text.toByteArray(RequestHygiene.wireCharset(h2Text))),
+            )
         }
         val start = System.nanoTime()
-        val exchanges: List<HttpRequestResponse?> = timeouts.run(timeoutMs) { api.http().sendRequests(batch, h2Mode) }
+        val exchanges: List<HttpRequestResponse?> =
+            timeouts.run(timeoutMs) { api.http().sendRequests(batch, h2Mode) }
         val totalMs = (System.nanoTime() - start) / 1_000_000
 
         val clusters = HttpResponseClusters.Builder(similarity)
@@ -124,10 +163,20 @@ internal class HttpRace(
             val exchange = exchanges.getOrNull(index)
             val payload = payloads?.getOrNull(index)
             val response = exchange?.takeIf { it.hasResponse() }?.response()
-            if (response != null && !response.httpVersion().orEmpty().startsWith("HTTP/2")) http1Responses++
-            val ttfbMs = exchange?.let { ex ->
-                runCatching { ex.timingData().orElse(null)?.timeBetweenRequestSentAndStartOfResponse()?.toNanos() }.getOrNull()
-            }?.let { it / 1_000_000.0 }
+            if (response != null && !response.httpVersion().orEmpty().startsWith("HTTP/2"))
+                http1Responses++
+            val ttfbMs =
+                exchange
+                    ?.let { ex ->
+                        runCatching {
+                            ex.timingData()
+                                .orElse(null)
+                                ?.timeBetweenRequestSentAndStartOfResponse()
+                                ?.toNanos()
+                        }
+                            .getOrNull()
+                    }
+                    ?.let { it / 1_000_000.0 }
             clusters.add(
                 HttpResponseClusters.Sample(
                     index,
@@ -136,14 +185,21 @@ internal class HttpRace(
                     response?.bodyToString() ?: "",
                     ttfbMs,
                     payload,
-                )
+                ),
             )
-            if (exchange != null) api.recordToolExchange(exchange, "[MCP] Race single_packet #$index via Raijin", "http_race")
+            if (exchange != null)
+                api.recordToolExchange(
+                    exchange,
+                    "[MCP] Race single_packet #$index via Raijin",
+                    "http_race",
+                )
             results += buildJsonObject {
                 put("index", index)
                 if (payload != null) put("payload", payload)
                 if (exchange != null) {
-                    HttpExchangeJson.serialize(exchange, null, maxBodyLength).forEach { (k, v) -> put(k, v) }
+                    HttpExchangeJson.serialize(exchange, null, maxBodyLength).forEach { (k, v) ->
+                        put(k, v)
+                    }
                 } else {
                     put("has_response", false)
                     put("error", "Burp returned no exchange for this request")
@@ -152,23 +208,42 @@ internal class HttpRace(
         }
         val summary = clusters.build()
         val notes = ArrayList<String>()
-        if (summary.clusterCount == 0) {
-            notes += "No request was answered. single_packet needs a target that speaks HTTP/2 (http_mode HTTP_2_IGNORE_ALPN " +
-                "forces it without ALPN); for an HTTP/1.1 target use sync=last_byte."
+        // A request that was sent has timing data; one refused at connect has none. Only then can
+        // the silence come from a target that does not speak HTTP/2.
+        val connected = exchanges.any { ex ->
+            ex != null && runCatching { ex.timingData().isPresent }.getOrDefault(false)
+        }
+        if (summary.clusterCount == 0 && connected) {
+            notes +=
+                "No request was answered. single_packet needs a target that speaks HTTP/2 (http_mode HTTP_2_IGNORE_ALPN " +
+                    "forces it without ALPN); for an HTTP/1.1 target use sync=last_byte."
         }
         if (http1Responses > 0) {
-            notes += "$http1Responses response(s) came back over HTTP/1.x, so those requests were not part of a single packet; " +
-                "use sync=last_byte for an HTTP/1.1 target."
+            notes +=
+                "$http1Responses response(s) came back over HTTP/1.x, so those requests were not part of a single packet; " +
+                    "use sync=last_byte for an HTTP/1.1 target."
         }
-        return buildJsonObject {
-            put("sync", Sync.SINGLE_PACKET.id)
-            put("http_mode", h2Mode.name)
-            put("total_requests", texts.size)
-            put("total_elapsed_ms", totalMs)
-            put("analysis", HttpResponseClusters.raceAnalysis(summary, payloads == null, similarity))
-            put("results", buildJsonArray { results.forEach { result -> add(withCluster(result, summary)) } })
-            if (notes.isNotEmpty()) putJsonArray("notes") { notes.forEach { add(it) } }
-        }
+        return noResponse(
+            summary,
+            results,
+            buildJsonObject {
+                put("sync", Sync.SINGLE_PACKET.id)
+                put("http_mode", h2Mode.name)
+                put("total_requests", texts.size)
+                put("total_elapsed_ms", totalMs)
+                put(
+                    "analysis",
+                    HttpResponseClusters.raceAnalysis(summary, payloads == null, similarity),
+                )
+                put(
+                    "results",
+                    buildJsonArray {
+                        results.forEach { result -> add(withCluster(result, summary)) }
+                    },
+                )
+                if (notes.isNotEmpty()) putJsonArray("notes") { notes.forEach { add(it) } }
+            },
+        )
     }
 
     private fun lastByte(
@@ -183,70 +258,135 @@ internal class HttpRace(
         similarity: Double,
     ): JsonObject {
         val notes = ArrayList<String>()
-        val sent = if (texts.size > MAX_LAST_BYTE_CONNECTIONS) {
-            notes += "last_byte opens one connection per request: the first $MAX_LAST_BYTE_CONNECTIONS of ${texts.size} requests were sent."
-            texts.take(MAX_LAST_BYTE_CONNECTIONS)
-        } else {
-            texts
-        }
+        val sent =
+            if (texts.size > MAX_LAST_BYTE_CONNECTIONS) {
+                notes +=
+                    "last_byte opens one connection per request: the first $MAX_LAST_BYTE_CONNECTIONS of ${texts.size} requests were sent."
+                texts.take(MAX_LAST_BYTE_CONNECTIONS)
+            } else {
+                texts
+            }
         val budgetMs = timeoutMs?.takeIf { it > 0 } ?: LAST_BYTE_MAX_MS
         val connectTimeoutMs = budgetMs.coerceIn(1, CONNECT_TIMEOUT_MS).toInt()
-        val sync = LastByteSync { RawHttpConnector.connect(host, port, useTls, connectTimeoutMs, sni) }
-        val result = sync.run(
-            requests = sent.map { it.toByteArray(RequestHygiene.wireCharset(it)) },
-            expectNoBody = sent.map { it.startsWith("HEAD ", ignoreCase = true) },
-            totalTimeoutMs = budgetMs,
-        )
+        val sync = LastByteSync {
+            RawHttpConnector.connect(host, port, useTls, connectTimeoutMs, sni)
+        }
+        val result =
+            sync.run(
+                requests = sent.map { it.toByteArray(RequestHygiene.wireCharset(it)) },
+                expectNoBody = sent.map { it.startsWith("HEAD ", ignoreCase = true) },
+                totalTimeoutMs = budgetMs,
+            )
 
         val clusters = HttpResponseClusters.Builder(similarity)
-        val entries = result.outcomes.map { outcome ->
-            val payload = payloads?.getOrNull(outcome.index)
-            val ok = outcome.response as? HttpPipelineFraming.Outcome.Ok
-            val response = ok?.response
-            val bodyBytes = response?.body?.length ?: 0
-            // The framing reader holds bytes one char each; show them as UTF-8 text when they are UTF-8.
-            val bodyText = response?.let { HttpContentDecoding.text(it.body.toByteArray(Charsets.ISO_8859_1)) }.orEmpty()
-            val ttfbMs = if (ok != null && outcome.releasedAtNanos != null) millis(ok.firstByteAtNanos - outcome.releasedAtNanos) else null
-            clusters.add(HttpResponseClusters.Sample(outcome.index, response?.statusCode ?: 0, bodyBytes, bodyText, ttfbMs, payload))
-            buildJsonObject {
-                put("index", outcome.index)
-                if (payload != null) put("payload", payload)
-                put("has_response", response != null)
-                outcome.releasedAtNanos?.let { put("released_at_us", (it - result.releaseStartNanos) / 1000) }
-                if (response != null) {
-                    put("status_code", response.statusCode)
-                    put("status_line", response.statusLine)
-                    put("response_headers", buildJsonArray {
-                        response.headers.forEach { (name, value) -> add(buildJsonObject { put("name", name); put("value", value) }) }
-                    })
-                    put("response_body_length", bodyBytes)
-                    val rendered = BodyText.render(bodyText, maxBodyLength)
-                    put("response_body", rendered.text)
-                    if (rendered.binary) put("response_body_binary", true)
-                    if (rendered.truncated) put("response_body_truncated", true)
-                    put("framing", response.framing)
-                    if (response.warnings.isNotEmpty()) putJsonArray("warnings") { response.warnings.forEach { add(it) } }
-                    ttfbMs?.let { put("ttfb_ms", it) }
-                    outcome.releasedAtNanos?.let { put("ttlb_ms", millis(ok.lastByteAtNanos - it)) }
-                } else {
-                    put("error", outcome.error ?: failure(outcome.response))
+        val entries =
+            result.outcomes.map { outcome ->
+                val payload = payloads?.getOrNull(outcome.index)
+                val ok = outcome.response as? HttpPipelineFraming.Outcome.Ok
+                val response = ok?.response
+                val bodyBytes = response?.body?.length ?: 0
+                // The framing reader holds bytes one char each; show them as UTF-8 text when they
+                // are UTF-8.
+                val bodyText =
+                    response
+                        ?.let { HttpContentDecoding.text(it.body.toByteArray(Charsets.ISO_8859_1)) }
+                        .orEmpty()
+                val ttfbMs =
+                    if (ok != null && outcome.releasedAtNanos != null)
+                        millis(ok.firstByteAtNanos - outcome.releasedAtNanos)
+                    else null
+                clusters.add(
+                    HttpResponseClusters.Sample(
+                        outcome.index,
+                        response?.statusCode ?: 0,
+                        bodyBytes,
+                        bodyText,
+                        ttfbMs,
+                        payload,
+                    ),
+                )
+                buildJsonObject {
+                    put("index", outcome.index)
+                    if (payload != null) put("payload", payload)
+                    put("has_response", response != null)
+                    outcome.releasedAtNanos?.let {
+                        put("released_at_us", (it - result.releaseStartNanos) / 1000)
+                    }
+                    if (response != null) {
+                        put("status_code", response.statusCode)
+                        put("status_line", response.statusLine)
+                        put(
+                            "response_headers",
+                            buildJsonArray {
+                                response.headers.forEach { (name, value) ->
+                                    add(
+                                        buildJsonObject {
+                                            put("name", name)
+                                            put("value", value)
+                                        },
+                                    )
+                                }
+                            },
+                        )
+                        put("response_body_length", bodyBytes)
+                        val rendered = BodyText.render(bodyText, maxBodyLength)
+                        put("response_body", rendered.text)
+                        if (rendered.binary) put("response_body_binary", true)
+                        if (rendered.truncated) put("response_body_truncated", true)
+                        put("framing", response.framing)
+                        if (response.warnings.isNotEmpty())
+                            putJsonArray("warnings") { response.warnings.forEach { add(it) } }
+                        ttfbMs?.let { put("ttfb_ms", it) }
+                        outcome.releasedAtNanos?.let {
+                            put("ttlb_ms", millis(ok.lastByteAtNanos - it))
+                        }
+                    } else {
+                        put("error", outcome.error ?: failure(outcome.response))
+                    }
                 }
             }
-        }
         val summary = clusters.build()
         if (result.primed < sent.size) {
-            notes += "${sent.size - result.primed} of ${sent.size} connections were not ready at the barrier and were not released."
+            notes +=
+                "${sent.size - result.primed} of ${sent.size} connections were not ready at the barrier and were not released."
         }
-        return buildJsonObject {
-            put("sync", Sync.LAST_BYTE.id)
-            put("total_requests", sent.size)
-            put("primed_connections", result.primed)
-            put("release_spread_us", (result.releaseEndNanos - result.releaseStartNanos) / 1000)
-            put("total_elapsed_ms", result.elapsedMs)
-            put("analysis", HttpResponseClusters.raceAnalysis(summary, payloads == null, similarity))
-            put("results", buildJsonArray { entries.forEach { add(withCluster(it, summary)) } })
-            if (notes.isNotEmpty()) putJsonArray("notes") { notes.forEach { add(it) } }
+        return noResponse(
+            summary,
+            entries,
+            buildJsonObject {
+                put("sync", Sync.LAST_BYTE.id)
+                put("total_requests", sent.size)
+                put("primed_connections", result.primed)
+                put("release_spread_us", (result.releaseEndNanos - result.releaseStartNanos) / 1000)
+                put("total_elapsed_ms", result.elapsedMs)
+                put(
+                    "analysis",
+                    HttpResponseClusters.raceAnalysis(summary, payloads == null, similarity),
+                )
+                put("results", buildJsonArray { entries.forEach { add(withCluster(it, summary)) } })
+                if (notes.isNotEmpty()) putJsonArray("notes") { notes.forEach { add(it) } }
+            },
+        )
+    }
+
+    /**
+     * [body] led by `error` and `code: no_response` when no request of the batch was answered
+     * ([results] serialized in request order), so the caller reads the run as failed; else [body].
+     */
+    private fun noResponse(
+        summary: HttpResponseClusters.Summary,
+        results: List<JsonObject>,
+        body: JsonObject,
+    ): JsonObject {
+        if (summary.clusterCount > 0 || results.isEmpty()) return body
+        val head = buildJsonObject {
+            put(
+                "error",
+                noResponseError("http_race", "request", results.size, 1, noResponseReason(results)),
+            )
+            put("code", "no_response")
         }
+        return JsonObject(head + body)
     }
 
     private fun withCluster(result: JsonObject, summary: HttpResponseClusters.Summary): JsonObject {
@@ -255,19 +395,23 @@ internal class HttpRace(
         return JsonObject(result + ("cluster" to JsonPrimitive(cluster)))
     }
 
-    private fun failure(outcome: HttpPipelineFraming.Outcome?): String = when (outcome) {
-        null -> "not sent"
-        is HttpPipelineFraming.Outcome.Ok -> "no response"
-        is HttpPipelineFraming.Outcome.Eof -> "connection closed (fin) before a response"
-        is HttpPipelineFraming.Outcome.TimedOut -> "timed out (${outcome.kind}) waiting for the response"
-        is HttpPipelineFraming.Outcome.Reset -> "connection reset: ${outcome.message}"
-        is HttpPipelineFraming.Outcome.Malformed -> "malformed response: ${outcome.reason}"
-    }
+    private fun failure(outcome: HttpPipelineFraming.Outcome?): String =
+        when (outcome) {
+            null -> "not sent"
+            is HttpPipelineFraming.Outcome.Ok -> "no response"
+            is HttpPipelineFraming.Outcome.Eof -> "connection closed (fin) before a response"
+            is HttpPipelineFraming.Outcome.TimedOut ->
+                "timed out (${outcome.kind}) waiting for the response"
+            is HttpPipelineFraming.Outcome.Reset -> "connection reset: ${outcome.message}"
+            is HttpPipelineFraming.Outcome.Malformed -> "malformed response: ${outcome.reason}"
+        }
 
     private fun millis(nanos: Long): Double = (nanos / 1000.0).roundToLong() / 1000.0
 
     companion object {
-        /** last_byte opens one connection per request; beyond this the batch is cut (with a note). */
+        /**
+         * last_byte opens one connection per request; beyond this the batch is cut (with a note).
+         */
         const val MAX_LAST_BYTE_CONNECTIONS = 256
 
         /** Budget of a last_byte batch when no timeout was given. */
@@ -300,7 +444,10 @@ internal class LastByteSync(private val connect: (Int) -> Socket) {
         val releasedAtNanos: Long?,
     )
 
-    /** @param primed connections that reached the barrier; releases ran from [releaseStartNanos] to [releaseEndNanos]. */
+    /**
+     * @param primed connections that reached the barrier; releases ran from [releaseStartNanos] to
+     *   [releaseEndNanos].
+     */
     class Result(
         val outcomes: List<Outcome>,
         val primed: Int,
@@ -322,12 +469,14 @@ internal class LastByteSync(private val connect: (Int) -> Socket) {
 
         val sockets = AtomicReferenceArray<Socket?>(n)
         val errors = AtomicReferenceArray<String?>(n)
-        // PENDING -> PRIMED by the worker, PENDING -> ABANDONED by the barrier: whichever comes first wins.
+        // PENDING -> PRIMED by the worker, PENDING -> ABANDONED by the barrier: whichever comes
+        // first wins.
         val state = AtomicIntegerArray(n)
         val primedLatch = CountDownLatch(n)
-        val pool: ExecutorService = Executors.newFixedThreadPool(n) { runnable ->
-            Thread(runnable, "raijin-race-${System.nanoTime()}").apply { isDaemon = true }
-        }
+        val pool: ExecutorService =
+            Executors.newFixedThreadPool(n) { runnable ->
+                Thread(runnable, "raijin-race-${System.nanoTime()}").apply { isDaemon = true }
+            }
         val released = arrayOfNulls<Long>(n)
         val responses = arrayOfNulls<HttpPipelineFraming.Outcome>(n)
         try {
@@ -336,7 +485,8 @@ internal class LastByteSync(private val connect: (Int) -> Socket) {
                     var socket: Socket? = null
                     try {
                         socket = connect(i)
-                        // Registered at once, so the cleanup closes it even if priming hangs past the run.
+                        // Registered at once, so the cleanup closes it even if priming hangs past
+                        // the run.
                         sockets.set(i, socket)
                         val bytes = requests[i]
                         if (bytes.size > 1) {
@@ -349,7 +499,10 @@ internal class LastByteSync(private val connect: (Int) -> Socket) {
                             runCatching { socket.close() }
                         }
                     } catch (e: Exception) {
-                        errors.set(i, "connect or write failed: ${e.message ?: e.javaClass.simpleName}")
+                        errors.set(
+                            i,
+                            "connect or write failed: ${e.message ?: e.javaClass.simpleName}",
+                        )
                         sockets.set(i, null)
                         runCatching { socket?.close() }
                         state.compareAndSet(i, PENDING, ABANDONED)
@@ -361,10 +514,15 @@ internal class LastByteSync(private val connect: (Int) -> Socket) {
 
             // The barrier: every connection primed, or the budget for priming used up.
             primedLatch.await(remaining(deadlineMs), TimeUnit.MILLISECONDS)
-            // A connection still pending is abandoned here (its worker closes it when it gets that far).
-            val ready = (0 until n).filter { i -> !state.compareAndSet(i, PENDING, ABANDONED) && state.get(i) == PRIMED }
+            // A connection still pending is abandoned here (its worker closes it when it gets that
+            // far).
+            val ready =
+                (0 until n).filter { i ->
+                    !state.compareAndSet(i, PENDING, ABANDONED) && state.get(i) == PRIMED
+                }
             for (i in 0 until n) {
-                if (i !in ready && errors.get(i) == null) errors.set(i, "not connected and primed before the barrier deadline")
+                if (i !in ready && errors.get(i) == null)
+                    errors.set(i, "not connected and primed before the barrier deadline")
             }
 
             // The release: the withheld final bytes, back to back from this one thread.
@@ -379,7 +537,10 @@ internal class LastByteSync(private val connect: (Int) -> Socket) {
                     }
                     released[i] = System.nanoTime()
                 } catch (e: Exception) {
-                    errors.set(i, "final byte could not be written: ${e.message ?: e.javaClass.simpleName}")
+                    errors.set(
+                        i,
+                        "final byte could not be written: ${e.message ?: e.javaClass.simpleName}",
+                    )
                 }
             }
             val releaseEnd = System.nanoTime()
@@ -390,21 +551,40 @@ internal class LastByteSync(private val connect: (Int) -> Socket) {
             for (i in ready) {
                 if (released[i] == null) continue
                 val socket = sockets.get(i)!!
-                reads[i] = pool.submit<HttpPipelineFraming.Outcome> {
-                    val idle = max(1L, readDeadlineMs - System.currentTimeMillis())
-                    HttpPipelineFraming.readOne(socket, StringBuilder(), idle, readDeadlineMs, maxResponseBytes, expectNoBody.getOrElse(i) { false })
-                }
+                reads[i] =
+                    pool.submit<HttpPipelineFraming.Outcome> {
+                        val idle = max(1L, readDeadlineMs - System.currentTimeMillis())
+                        HttpPipelineFraming.readOne(
+                            socket,
+                            StringBuilder(),
+                            idle,
+                            readDeadlineMs,
+                            maxResponseBytes,
+                            expectNoBody.getOrElse(i) { false },
+                        )
+                    }
             }
             for ((i, future) in reads) {
-                responses[i] = try {
-                    future.get(remaining(readDeadlineMs) + READ_GRACE_MS, TimeUnit.MILLISECONDS)
-                } catch (e: Exception) {
-                    errors.set(i, "reading the response failed: ${e.message ?: e.javaClass.simpleName}")
-                    null
-                }
+                responses[i] =
+                    try {
+                        future.get(remaining(readDeadlineMs) + READ_GRACE_MS, TimeUnit.MILLISECONDS)
+                    } catch (e: Exception) {
+                        errors.set(
+                            i,
+                            "reading the response failed: ${e.message ?: e.javaClass.simpleName}",
+                        )
+                        null
+                    }
             }
-            val outcomes = (0 until n).map { i -> Outcome(i, responses[i], errors.get(i), released[i]) }
-            return Result(outcomes, ready.size, releaseStart, releaseEnd, (System.nanoTime() - started) / 1_000_000)
+            val outcomes =
+                (0 until n).map { i -> Outcome(i, responses[i], errors.get(i), released[i]) }
+            return Result(
+                outcomes,
+                ready.size,
+                releaseStart,
+                releaseEnd,
+                (System.nanoTime() - started) / 1_000_000,
+            )
         } finally {
             for (i in 0 until n) runCatching { sockets.get(i)?.close() }
             pool.shutdownNow()
@@ -418,7 +598,10 @@ internal class LastByteSync(private val connect: (Int) -> Socket) {
         const val PRIMED = 1
         const val ABANDONED = 2
 
-        /** Reads are bounded by the deadline themselves; this only covers a reader slow to notice it. */
+        /**
+         * Reads are bounded by the deadline themselves; this only covers a reader slow to notice
+         * it.
+         */
         const val READ_GRACE_MS = 1_000L
 
         /** Least time released requests get to answer, whatever priming took. */

@@ -79,6 +79,12 @@ internal class HttpRequestChain(
         prepare: (HttpRequest) -> HttpRequest = { it },
         siteMapNote: ((Int) -> String)? = { "[MCP] Chain step ${it + 1} via Raijin" },
     ): Result {
+        // A step that cannot be built would stop the chain anyway: send nothing. With
+        // stop_on_error false it fails alone and the other steps still go out.
+        if (stopOnError)
+            buildFailure(steps)?.let {
+                return Result(listOf(it), emptyMap())
+            }
         val variables = LinkedHashMap<String, String>()
         val results = ArrayList<StepResult>()
         for ((index, step) in steps.withIndex()) {
@@ -150,6 +156,42 @@ internal class HttpRequestChain(
             if (!result.success && stopOnError) break
         }
         return Result(results, variables)
+    }
+
+    /**
+     * The first step that cannot be built, checked before anything is sent: its extract rules and
+     * its request, with every `{{name}}` read as `x`. A step with placeholders only fails here for
+     * a missing target; any other error waits for the real values, at its turn.
+     */
+    private fun buildFailure(steps: List<JsonObject>): StepResult? {
+        for ((index, step) in steps.withIndex()) {
+            val fixReport = LinkedHashMap<String, JsonElement>()
+            // Extract rules included: a rule may take its pattern from an earlier step too.
+            val placeholders =
+                PLACEHOLDER.findAll(step.toString()).map { it.groupValues[1] }.toSet()
+            val error =
+                try {
+                    val trial = substituteVariables(step, placeholders.associateWith { "x" })
+                    parseExtractRules(trial["extract"])
+                    HttpRequestBuilder.fromObject(trial, fixReport)
+                    null
+                } catch (e: Exception) {
+                    (e.message ?: "Unknown error").takeIf {
+                        placeholders.isEmpty() || it == HttpRequestBuilder.MISSING_TARGET
+                    }
+                }
+            if (error != null)
+                return StepResult(
+                    index,
+                    null,
+                    null,
+                    emptyMap(),
+                    fixReport,
+                    error = error,
+                    phase = "build",
+                )
+        }
+        return null
     }
 
     /**

@@ -186,6 +186,113 @@ pub fn suggest_call<'a>(
         .collect()
 }
 
+/// The call an invented name means by its words ([`intent_call`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Intent {
+    /// Calls to suggest, the one meant first.
+    pub names: &'static [&'static str],
+    /// Arguments the first call takes for this intent (`{"source":"xss"}`).
+    pub args: serde_json::Map<String, serde_json::Value>,
+    /// Whether the first call is certain enough to offer as `retry`.
+    pub certain: bool,
+}
+
+/// The call an invented tool name or guide topic means by its words, for names no tool is near:
+/// `burp_start` is `burp_up`, `md5.compute` is `util.hash` with MD5, `xss.find` is `data_search`
+/// on the XSS cheat sheet, `bchecks` is `data_search` on `BChecks`, `url_bypass` is
+/// `data_payloads` on the URL cheat sheet, `data` lists the data tools.
+pub fn intent_call(wanted: &str) -> Option<Intent> {
+    let normed = crate::mcp::error::norm(wanted);
+    let tokens: Vec<&str> = normed.split('_').filter(|t| !t.is_empty()).collect();
+    let any = |words: &[&str]| tokens.iter().any(|t| words.contains(t));
+    let intent = |names: &'static [&'static str], args: serde_json::Value, certain: bool| {
+        Some(Intent {
+            names,
+            args: match args {
+                serde_json::Value::Object(o) => o,
+                _ => serde_json::Map::new(),
+            },
+            certain,
+        })
+    };
+    let none = serde_json::json!({});
+    if any(&["burp"]) {
+        if any(&["start", "launch", "up", "run", "open", "boot"]) {
+            return intent(&["burp_up"], none, true);
+        }
+        if any(&["stop", "down", "kill", "quit", "close", "shutdown"]) {
+            return intent(&["burp_down"], none, false);
+        }
+    }
+    if normed == "status" || normed == "get_status" {
+        return intent(&["burp_status"], none, true);
+    }
+    let sha = |t: &&str| {
+        t.strip_prefix("sha")
+            .is_some_and(|rest| rest.is_empty() || rest.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if any(&["md5", "hash"]) || tokens.iter().any(sha) {
+        let args = if any(&["md5"]) {
+            serde_json::json!({"algorithm": "MD5"})
+        } else {
+            none
+        };
+        return intent(&["util.hash"], args, true);
+    }
+    if any(&["bcheck", "bchecks"]) {
+        return intent(
+            &["data_search"],
+            serde_json::json!({"source": "bchecks"}),
+            true,
+        );
+    }
+    if any(&["bambda", "bambdas"]) {
+        return intent(
+            &["data_search"],
+            serde_json::json!({"source": "bambdas"}),
+            true,
+        );
+    }
+    if any(&["ssrf", "allow", "allowlist", "bypass", "validation"]) {
+        return intent(
+            &["data_payloads", "data_search"],
+            serde_json::json!({"source": "url"}),
+            true,
+        );
+    }
+    if any(&["xss"]) {
+        return intent(
+            &["data_search", "data_payloads"],
+            serde_json::json!({"source": "xss"}),
+            true,
+        );
+    }
+    if any(&[
+        "payload",
+        "payloads",
+        "vector",
+        "vectors",
+        "cheat",
+        "cheatsheet",
+    ]) {
+        return intent(&["data_search", "data_payloads"], none, true);
+    }
+    if normed == "data" {
+        return intent(
+            &[
+                "data_search",
+                "data_list",
+                "data_payloads",
+                "data_get",
+                "data_add",
+            ],
+            none,
+            false,
+        );
+    }
+    None
+}
+
 /// Creates `dir` and any missing parents as owner-only (0700): `.raijin/` and `~/.raijin/` hold
 /// tool results, archives, tokens and logs. Existing directories keep their mode.
 pub fn private_dir(dir: &Path) -> Result<()> {

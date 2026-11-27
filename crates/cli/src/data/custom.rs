@@ -117,10 +117,22 @@ fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-fn checked_name(param: &str, value: Option<&str>) -> Result<Option<String>, ToolError> {
+/// `value` as a file or folder name: lowercase, so the id names the file on a case-insensitive
+/// filesystem too (noted when that changed it).
+fn checked_name(
+    param: &str,
+    value: Option<&str>,
+    notes: &mut Vec<String>,
+) -> Result<Option<String>, ToolError> {
     match value {
         None => Ok(None),
-        Some(v) if valid_name(v) => Ok(Some(v.to_owned())),
+        Some(v) if valid_name(v) => {
+            let lower = v.to_ascii_lowercase();
+            if lower != v {
+                notes.push(format!("lowercased '{param}' \"{v}\" to \"{lower}\""));
+            }
+            Ok(Some(lower))
+        }
         Some(v) => Err(invalid(format!(
             "invalid {param} {v:?}: use letters, digits, '_' and '-'"
         ))
@@ -173,8 +185,8 @@ fn shown(path: &Path) -> String {
 }
 
 /// Saves a payload, `BCheck` or Bambda under `dir` (see [`AddArgs`]). Calls run one at a time, so
-/// two payloads saved at once to one category both land.
-pub fn add(dir: &Path, args: &AddArgs) -> Result<Value, ToolError> {
+/// two payloads saved at once to one category both land. Notes say how the arguments were read.
+pub fn add(dir: &Path, args: &AddArgs) -> Result<(Value, Vec<String>), ToolError> {
     static LOCK: Mutex<()> = Mutex::new(());
     let _held = LOCK.lock().map_err(|_| {
         ToolError::new(
@@ -182,19 +194,57 @@ pub fn add(dir: &Path, args: &AddArgs) -> Result<Value, ToolError> {
             "an earlier data_add failed mid-write; restart raijin mcp",
         )
     })?;
-    match args.kind.unwrap_or(Kind::Payload) {
-        Kind::Payload => add_payload(dir, args),
-        kind => add_script(dir, kind, args),
-    }
+    let mut notes = Vec::new();
+    let given = |v: Option<&str>| v.is_some_and(|s| !s.trim().is_empty());
+    let value = match args.kind.unwrap_or(Kind::Payload) {
+        Kind::Payload => {
+            if given(args.script.as_deref()) {
+                notes.push("ignored 'script': a payload entry stores only 'payload'".to_owned());
+            }
+            add_payload(dir, args, &mut notes)
+        }
+        kind => {
+            if given(args.payload.as_deref()) {
+                notes.push(format!(
+                    "ignored 'payload': a {} entry stores only 'script'",
+                    if kind == Kind::Bcheck {
+                        "bcheck"
+                    } else {
+                        "bambda"
+                    }
+                ));
+            }
+            add_script(dir, kind, args, &mut notes)
+        }
+    }?;
+    Ok((value, notes))
 }
 
-fn add_payload(dir: &Path, args: &AddArgs) -> Result<Value, ToolError> {
+/// `tags` with comma-separated items split into one tag each (noted), trimmed, empty ones dropped.
+fn split_tags(tags: &[String], notes: &mut Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for t in tags {
+        let parts: Vec<String> = t
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if t.contains(',') {
+            notes.push(format!("split 'tags' {t:?} into {} tags", parts.len()));
+        }
+        out.extend(parts);
+    }
+    out
+}
+
+fn add_payload(dir: &Path, args: &AddArgs, notes: &mut Vec<String>) -> Result<Value, ToolError> {
     let payload = args
         .payload
         .as_deref()
         .filter(|p| !p.is_empty())
         .ok_or_else(|| invalid("data_add needs a non-empty 'payload'").param("payload"))?;
-    let category = checked_name("category", args.category.as_deref())?
+    let category = checked_name("category", args.category.as_deref(), notes)?
         .ok_or_else(|| invalid("data_add needs 'category' for a payload").param("category"))?;
     let file = dir.join("payloads").join(format!("{category}.json"));
     let id = format!("custom:{category}/{}", id_hash(payload));
@@ -223,8 +273,9 @@ fn add_payload(dir: &Path, args: &AddArgs) -> Result<Value, ToolError> {
     if let Some(d) = args.description.as_deref().filter(|d| !d.is_empty()) {
         item.insert("description".to_owned(), json!(d));
     }
-    if let Some(t) = args.tags.as_ref().filter(|t| !t.is_empty()) {
-        item.insert("tags".to_owned(), json!(t));
+    let tags = split_tags(args.tags.as_deref().unwrap_or_default(), notes);
+    if !tags.is_empty() {
+        item.insert("tags".to_owned(), json!(tags));
     }
     if let Some(c) = args.context.as_deref().filter(|c| !c.is_empty()) {
         item.insert("context".to_owned(), json!(c));
@@ -236,15 +287,20 @@ fn add_payload(dir: &Path, args: &AddArgs) -> Result<Value, ToolError> {
     Ok(json!({"added": true, "id": id, "file": shown(&file)}))
 }
 
-fn add_script(dir: &Path, kind: Kind, args: &AddArgs) -> Result<Value, ToolError> {
+fn add_script(
+    dir: &Path,
+    kind: Kind,
+    args: &AddArgs,
+    notes: &mut Vec<String>,
+) -> Result<Value, ToolError> {
     let (sub, ext) = if kind == Kind::Bcheck {
         ("bchecks", "bcheck")
     } else {
         ("bambdas", "bambda")
     };
-    let name = checked_name("name", args.name.as_deref())?
+    let name = checked_name("name", args.name.as_deref(), notes)?
         .ok_or_else(|| invalid(format!("data_add needs 'name' for a {ext}")).param("name"))?;
-    let category = checked_name("category", args.category.as_deref())?;
+    let category = checked_name("category", args.category.as_deref(), notes)?;
     let script = args
         .script
         .as_deref()
@@ -275,6 +331,41 @@ mod tests {
 
     fn args(v: Value) -> AddArgs {
         serde_json::from_value(v).expect("args")
+    }
+
+    /// [`super::add`] without its notes.
+    fn add(dir: &Path, args: &AddArgs) -> Result<Value, ToolError> {
+        super::add(dir, args).map(|(value, _)| value)
+    }
+
+    #[test]
+    fn names_are_lowercased_and_tags_split_so_the_id_finds_the_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (saved, notes) = super::add(
+            dir.path(),
+            &args(json!({
+                "category": "WAF-Bypass",
+                "payload": "<x>",
+                "tags": ["svg,onload"],
+                "script": "ignored"
+            })),
+        )
+        .expect("add");
+        assert_eq!(
+            notes,
+            [
+                "ignored 'script': a payload entry stores only 'payload'",
+                "lowercased 'category' \"WAF-Bypass\" to \"waf-bypass\"",
+                "split 'tags' \"svg,onload\" into 2 tags",
+            ]
+        );
+        let id = saved["id"].as_str().expect("id");
+        assert!(id.starts_with("custom:waf-bypass/"), "{id}");
+        let lib = load_custom(dir.path());
+        let entries: Vec<&Entry> = lib.entries.iter().collect();
+        let (found, note) = super::super::tools::find(&entries, id, "data_get").expect("found");
+        assert_eq!(note, None);
+        assert_eq!(found.tags, ["svg", "onload"]);
     }
 
     #[test]

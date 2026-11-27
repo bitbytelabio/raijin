@@ -1,6 +1,7 @@
 package io.bitbytelab.raijin.tools.events
 
 import io.bitbytelab.raijin.core.ClampedInt
+import io.bitbytelab.raijin.core.asBooleanSafe
 import io.bitbytelab.raijin.core.asClampedInt
 import io.bitbytelab.raijin.core.asLongSafe
 import io.bitbytelab.raijin.core.asStringList
@@ -53,6 +54,13 @@ object EventsTools {
                                     "Poll this subscription (from events_subscribe) from its own cursor",
                                 )
                             }
+                            putJsonObject("include_results") {
+                                put("type", "boolean")
+                                put(
+                                    "description",
+                                    "Include each tool call's result summary (default false: only is_error and its size in bytes)",
+                                )
+                            }
                         },
                     required = emptyList(),
                 ),
@@ -61,6 +69,7 @@ object EventsTools {
                 val args = request.params.arguments ?: emptyMap()
                 val maxEventsArg = maxEventsArg(args)
                 val maxEvents = maxEventsArg?.value ?: DEFAULT_MAX_EVENTS
+                val includeResults = args["include_results"].asBooleanSafe() ?: false
 
                 val subscriptionId = (args["subscription_id"] as? JsonPrimitive)?.contentOrNull
                 if (subscriptionId != null) {
@@ -81,7 +90,7 @@ object EventsTools {
                                 put("cursor", page.cursor)
                                 put("last_id", eventBus.lastId())
                                 put("missed_events", page.missed)
-                                put("events", serializeEvents(page.events))
+                                put("events", serializeEvents(page.events, includeResults))
                             }
                             .withClampReport("max_events", maxEventsArg),
                     )
@@ -95,7 +104,7 @@ object EventsTools {
                             put("returned", events.size)
                             put("last_id", eventBus.lastId())
                             put("buffer_size", eventBus.size())
-                            put("events", serializeEvents(events))
+                            put("events", serializeEvents(events, includeResults))
                         }
                         .withClampReport("max_events", maxEventsArg),
                 )
@@ -289,17 +298,37 @@ object EventsTools {
 
     private const val MAX_EVENTS = 10_000
 
-    /** Serializes a list of BurpEvent objects to a JsonArray. */
-    private fun serializeEvents(events: List<BurpEvent>): JsonArray {
+    /**
+     * Serializes a list of BurpEvent objects to a JsonArray. Without [includeResults], a tool
+     * call's `result_summary` becomes `result: {is_error, bytes}` (its UTF-8 size), which keeps a
+     * page of events small.
+     */
+    private fun serializeEvents(
+        events: List<BurpEvent>,
+        includeResults: Boolean = true,
+    ): JsonArray {
         return buildJsonArray {
             for (event in events) {
                 addJsonObject {
                     put("id", event.id)
                     put("type", event.type)
                     put("timestamp", event.timestamp)
-                    put("data", event.data)
+                    put("data", if (includeResults) event.data else compactResult(event.data))
                 }
             }
         }
+    }
+
+    private fun compactResult(data: JsonElement): JsonElement {
+        val obj = data as? JsonObject ?: return data
+        val summary = (obj["result_summary"] as? JsonPrimitive)?.contentOrNull ?: return data
+        return JsonObject(
+            obj.filterKeys { it != "result_summary" } +
+                ("result" to
+                    buildJsonObject {
+                        obj["is_error"]?.let { put("is_error", it) }
+                        put("bytes", summary.toByteArray(Charsets.UTF_8).size)
+                    }),
+        )
     }
 }

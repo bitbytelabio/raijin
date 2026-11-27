@@ -11,6 +11,7 @@ import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.core.asStringMap
 import io.bitbytelab.raijin.state.ProxyRule
 import io.bitbytelab.raijin.state.StateManager
+import io.bitbytelab.raijin.tools.ToolArgs
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.server.Server
@@ -141,22 +142,48 @@ object ProxyTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
+                // A strict client fills every filter: 0 and "" mean "not set", not a filter.
+                val ignored = mutableListOf<String>()
+                fun filter(name: String): String? {
+                    val v = args.string(name)
+                    if (v == null || v.isNotEmpty()) return v
+                    ignored += name
+                    return null
+                }
+                val host = filter("host")
+                val method = filter("method")
+                val mimeType = filter("mime_type")
+                val statusCode =
+                    args.int("status_code", 0..999)?.let {
+                        if (it != 0) it
+                        else {
+                            ignored += "status_code"
+                            null
+                        }
+                    }
                 val result =
                     bridge.getHistory(
                         startIndex = args.integer("start_index") ?: 0,
                         count = args.integer("count") ?: DEFAULT_HISTORY_COUNT,
                         includeHeaders = args.bool("include_headers", false),
-                        host = args.string("host"),
-                        method = args.string("method"),
-                        statusCode = args.int("status_code", 0..999),
-                        mimeType = args.string("mime_type"),
+                        host = host,
+                        method = method,
+                        statusCode = statusCode,
+                        mimeType = mimeType,
                         inScopeOnly = args.bool("in_scope_only", false),
                         includeRequest = args.bool("include_request", false),
                         includeResponse = args.bool("include_response", false),
                         statusCodeRange = args.string("status_code_range"),
                         maxResponseLength = args.int("max_response_length", 1..Int.MAX_VALUE),
                     )
-                toolJsonResult(result)
+                val notes =
+                    if (ignored.isEmpty()) emptyList()
+                    else
+                        listOf(
+                            "ignored ${ignored.joinToString(", ") { "'$it'" }}: " +
+                                "0 and \"\" mean no filter",
+                        )
+                ToolArgs.withNotes(toolJsonResult(result), notes)
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }

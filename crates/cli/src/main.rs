@@ -71,7 +71,7 @@ enum Command {
     History(HistoryCommand),
     /// stdio MCP server for coding agents (guide / run).
     Mcp {
-        /// lean: guide and run; full: also every Raijin tool directly.
+        /// lean: guide and run; full: also every Raijin tool directly. lean (default) suits weak or small models; full lists every tool (~176 KB tools/list), which some clients truncate.
         #[arg(long, value_enum, default_value_t = mcp::server::Surface::Lean)]
         surface: mcp::server::Surface,
         /// Use an already-running Raijin at this URL, e.g. `http://127.0.0.1:9876`; the CLI calls its tool API at /api/v1 (overrides [remote] url).

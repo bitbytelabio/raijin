@@ -3043,7 +3043,7 @@
     },
     {
       "name": "events",
-      "description": "Event feed: subscribe, read recent or typed events, clear.\nCall one action as events.<action> (MCP clients put the action in the \"action\" parameter); * marks a required parameter. Example: {\"do\":\"events.get\",\"max_events\":20}\n- events.subscribe(types): Open a poll subscription: a type filter plus a cursor starting after the latest event.\n- events.unsubscribe(subscription_id*): Unsubscribe from event bus notifications.\n- events.get(since_id, max_events, subscription_id): Retrieve events from the event bus using cursor-based polling.\n- events.get_by_type(types*, since_id, max_events): Retrieve events from the event bus filtered by event type(s).\n- events.clear(): Clear all buffered events and drop every subscription opened with events.subscribe.",
+      "description": "Event feed: subscribe, read recent or typed events, clear.\nCall one action as events.<action> (MCP clients put the action in the \"action\" parameter); * marks a required parameter. Example: {\"do\":\"events.get\",\"max_events\":20,\"include_results\":false}\n- events.subscribe(types): Open a poll subscription: a type filter plus a cursor starting after the latest event.\n- events.unsubscribe(subscription_id*): Unsubscribe from event bus notifications.\n- events.get(since_id, max_events, subscription_id, include_results): Retrieve events from the event bus using cursor-based polling.\n- events.get_by_type(types*, since_id, max_events): Retrieve events from the event bus filtered by event type(s).\n- events.clear(): Clear all buffered events and drop every subscription opened with events.subscribe.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -3077,6 +3077,10 @@
             "type": "integer",
             "minimum": 0,
             "description": "Maximum events to return (default 20) [actions: get, get_by_type]"
+          },
+          "include_results": {
+            "type": "boolean",
+            "description": "Include each tool call's result summary (default false: only is_error and its size in bytes) [actions: get]"
           }
         },
         "required": [
@@ -3126,12 +3130,14 @@
           "params": [
             "since_id",
             "max_events",
-            "subscription_id"
+            "subscription_id",
+            "include_results"
           ],
           "required": [],
           "example": {
             "do": "events.get",
-            "max_events": 20
+            "max_events": 20,
+            "include_results": false
           },
           "description": "Retrieve events from the event bus using cursor-based polling. Returns events whose ID is strictly greater than since_id. Use the last event's ID as the cursor for subsequent polls. With subscription_id (from events.subscribe) it returns the subscription's matching events since its previous poll instead, and advances that cursor; since_id is then ignored. Parameters: since_id (number, return events after this ID; defaults to 0 for all events), max_events (number, maximum events to return; defaults to 20), subscription_id (string, optional).",
           "properties": {
@@ -3147,6 +3153,10 @@
             "subscription_id": {
               "type": "string",
               "description": "Poll this subscription (from events.subscribe) from its own cursor"
+            },
+            "include_results": {
+              "type": "boolean",
+              "description": "Include each tool call's result summary (default false: only is_error and its size in bytes)"
             }
           }
         },
@@ -12179,7 +12189,13 @@
       "q",
       "regex",
       "search",
-      "search_pattern"
+      "search_pattern",
+      "keyword",
+      "keywords",
+      "term",
+      "terms",
+      "search_query",
+      "text"
     ],
     [
       "data",

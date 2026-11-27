@@ -22,6 +22,7 @@ pub enum Code {
     InvalidType,
     InvalidEnum,
     OutOfRange,
+    PlaceholderValue,
     InvalidArguments,
     NotFound,
     BurpNotRunning,
@@ -284,13 +285,17 @@ pub fn guide_call(topic: Option<&str>) -> Value {
     }
 }
 
-/// Prefixes clients put before a tool name (`mcp__raijin__history_list`, `raijin.history_list`).
-const SERVER_PREFIXES: [&str; 5] = [
+/// Prefixes clients put before a tool name (`mcp__raijin__history_list`, `raijin.history_list`),
+/// longest first where one starts another.
+const SERVER_PREFIXES: [&str; 8] = [
     "mcp__raijin__",
+    "mcp_raijin_",
+    "raijin__",
     "raijin.",
     "raijin:",
     "raijin/",
     "functions.",
+    "default_api.",
 ];
 
 /// `name` without a server prefix ([`SERVER_PREFIXES`], any case), when it has one and something
@@ -365,6 +370,13 @@ mod tests {
             strip_server_prefix("Raijin.scope.check"),
             Some("scope.check")
         );
+        for name in [
+            "default_api.history_list",
+            "mcp_raijin_history_list",
+            "raijin__history_list",
+        ] {
+            assert_eq!(strip_server_prefix(name), Some("history_list"), "{name}");
+        }
         assert_eq!(strip_server_prefix("raijin."), None);
         assert_eq!(strip_server_prefix("history_list"), None);
     }

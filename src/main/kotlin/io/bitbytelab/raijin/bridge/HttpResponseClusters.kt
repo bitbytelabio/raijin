@@ -277,6 +277,7 @@ internal object HttpResponseClusters {
      * How the responses of a race batch read. `race_condition_likely` is only claimed for identical
      * requests that were answered in more than one way: with a payload per request the requests
      * differ, so different answers are expected and the clusters must be read against the payloads.
+     * `race_condition_likely` and `variation` are left out below two responses.
      */
     fun raceAnalysis(
         summary: Summary,
@@ -299,9 +300,13 @@ internal object HttpResponseClusters {
                     "The responses fall into ${summary.clusterCount} clusters, but the requests carried different payloads: " +
                         "compare each cluster with its payloads before reading this as a race."
             }
+        // One response or none cannot show a race either way.
+        val answered = summary.clusterOf.size - summary.unanswered
         return buildJsonObject {
-            put("race_condition_likely", variation && identicalRequests)
-            put("variation", variation)
+            if (answered >= 2) {
+                put("race_condition_likely", variation && identicalRequests)
+                put("variation", variation)
+            }
             summary.json.forEach { (key, value) -> put(key, value) }
             if (summary.unanswered > 0) put("unanswered", summary.unanswered)
             put("verdict", verdict)

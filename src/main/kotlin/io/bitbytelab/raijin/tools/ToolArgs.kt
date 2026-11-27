@@ -432,6 +432,65 @@ internal object ToolArgs {
         .getOrNull()
         ?.takeIf { it.isStrictJson() }
 
+    /**
+     * Parameters whose empty value (`""`, `[]`, `{}`) is sent as written. Same list as the CLI's
+     * `PAYLOAD_KEYS`.
+     */
+    private val EMPTY_KEPT = setOf("body", "data", "raw_request", "payload", "script", "headers")
+
+    private fun isEmptyValue(v: JsonElement): Boolean =
+        when (v) {
+            is JsonNull -> true
+            is JsonArray -> v.isEmpty()
+            is JsonObject -> v.isEmpty()
+            is JsonPrimitive -> v.isString && v.content.isEmpty()
+        }
+
+    /**
+     * Whether `""` for the parameter [def] declares can only mean "not set": an enum, where `""` is
+     * no value. A free-form string keeps its `""` (`modify_body_replacement: ""` deletes matches,
+     * `comment: ""` clears a note).
+     */
+    private fun emptyStringIsUnset(def: JsonElement?): Boolean =
+        (def as? JsonObject)?.containsKey("enum") == true
+
+    /**
+     * [args] without the empty values (`""`, `[]`, `{}`, `null`) a strict client fills in for every
+     * property of the schema: those of keys outside [props] and [ignore] (another action's
+     * parameters in a grouped tool), and those of optional keys of [props] that are not payloads
+     * ([EMPTY_KEPT]): `[]`, `{}`, `null`, and `""` for an enum ([emptyStringIsUnset]). Each kind
+     * gets one note. A [destructive] call keeps everything, so its checks see what was sent.
+     */
+    fun dropEmptyUnknown(
+        props: JsonObject?,
+        args: JsonObject,
+        ignore: Set<String>,
+        destructive: Boolean,
+        required: Set<String> = emptySet(),
+    ): Coerced {
+        if (destructive || args.isEmpty()) return Coerced(args, emptyList())
+        val foreign = mutableListOf<String>()
+        val optional = mutableListOf<String>()
+        for ((k, v) in args) {
+            if (k in ignore || !isEmptyValue(v)) continue
+            val freeString = v is JsonPrimitive && v.isString && !emptyStringIsUnset(props?.get(k))
+            when {
+                props == null || k !in props -> foreign += k
+                k !in required && k !in EMPTY_KEPT && !freeString -> optional += k
+            }
+        }
+        if (foreign.isEmpty() && optional.isEmpty()) return Coerced(args, emptyList())
+        val notes = mutableListOf<String>()
+        if (foreign.isNotEmpty())
+            notes +=
+                "ignored ${foreign.size} empty parameter${if (foreign.size == 1) "" else "s"} " +
+                    "of other actions"
+        if (optional.isNotEmpty())
+            notes += "ignored empty optional ${optional.joinToString(", ") { "'$it'" }}"
+        val dropped = (foreign + optional).toSet()
+        return Coerced(JsonObject(args.filterKeys { it !in dropped }), notes)
+    }
+
     /** Keys of [args] that are neither declared in [props] nor in [ignore], in argument order. */
     fun unknownParams(props: JsonObject?, args: JsonObject, ignore: Set<String>): List<String> =
         args.keys.filter { it !in ignore && (props == null || it !in props) }
@@ -561,6 +620,17 @@ internal object ToolArgs {
         return null
     }
 
+    /**
+     * Per member tool (`http_cookie_jar_delete`), the values of a call's arguments that exist as
+     * written in Burp, for [placeholderCheck]'s `allowLiteral`; set where the tool is registered.
+     */
+    val literalValues: MutableMap<String, (JsonObject) -> Set<String>> =
+        java.util.concurrent.ConcurrentHashMap()
+
+    /** [literalValues] of [tool] for [args]; empty when it has none or Burp cannot be asked. */
+    fun literalValuesOf(tool: String, args: JsonObject): Set<String> =
+        literalValues[tool]?.let { runCatching { it(args) }.getOrNull() } ?: emptySet()
+
     private val PLACEHOLDER_FROM = Regex("^<[^<>]* from [^<>]*>$")
     private val ID_LIKE = setOf("id", "url", "uri", "token", "base_url")
 
@@ -575,7 +645,8 @@ internal object ToolArgs {
      * [args]: a `placeholder_value` error, since such a call cannot do what was meant, for any
      * parameter of a [destructive] call and for an id, URL, token, target or request parameter
      * (also any listed in [ToolExamples.ids]); for any other parameter a note, and the value is
-     * sent as written. Returns (error or null, notes).
+     * sent as written. A value in [allowLiteral] exists as written (a cookie really named `<name>`)
+     * and is never a placeholder. Returns (error or null, notes).
      */
     fun placeholderCheck(
         call: String,
@@ -585,6 +656,7 @@ internal object ToolArgs {
         args: JsonObject,
         example: JsonObject,
         destructive: Boolean,
+        allowLiteral: Set<String> = emptySet(),
     ): Pair<CallToolResult?, List<String>> {
         val notes = mutableListOf<String>()
         val ids = ToolExamples.ids(tool, action)
@@ -596,7 +668,7 @@ internal object ToolArgs {
                     (item as? JsonPrimitive)
                         ?.takeIf { it.isString }
                         ?.content
-                        ?.takeIf { isPlaceholder(param, it) }
+                        ?.takeIf { isPlaceholder(param, it) && it !in allowLiteral }
                 } ?: continue
             val strict =
                 destructive ||
@@ -648,6 +720,7 @@ internal object ToolArgs {
             "project_not_running",
             "project_required",
             "placeholder_value",
+            "no_response",
         )
 
     /**
@@ -733,18 +806,37 @@ internal object ToolArgs {
                 "max_matches",
             ),
             listOf("start_index", "offset", "skip"),
-            listOf("pattern", "query", "q", "regex", "search", "search_pattern"),
+            listOf(
+                "pattern",
+                "query",
+                "q",
+                "regex",
+                "search",
+                "search_pattern",
+                "keyword",
+                "keywords",
+                "term",
+                "terms",
+                "search_query",
+                "text",
+            ),
             listOf("data", "input", "text", "value", "string"),
             listOf("url", "uri"),
             listOf("request", "raw_request"),
             listOf("response", "raw_response"),
         )
 
-    /** The parameter of [props] that [key] means by [PARAM_SYNONYMS], when exactly one fits. */
+    /**
+     * The parameter of [props] that [key] means by [PARAM_SYNONYMS]: of the groups holding [key],
+     * in table order, the first where exactly one other member is declared (`text` is `query` for a
+     * search tool, `data` for a tool without a search parameter). Same rule as the CLI.
+     */
     fun synonym(key: String, props: JsonObject): String? =
-        PARAM_SYNONYMS.firstOrNull { key in it }
-            ?.filter { it != key && it in props }
-            ?.singleOrNull()
+        PARAM_SYNONYMS.asSequence()
+            .filter { key in it }
+            .firstNotNullOfOrNull { group ->
+                group.filter { it != key && it in props }.singleOrNull()
+            }
 
     /** Tool -> the call that lists what a `not_found` error of that tool refers to. */
     private val LIST_CALLS: Map<String, String> =

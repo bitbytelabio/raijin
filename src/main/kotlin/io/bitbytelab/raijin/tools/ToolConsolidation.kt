@@ -661,7 +661,10 @@ object ToolConsolidation {
                     emptySet(),
                     destructive,
                 )
-            val args = renamed.args
+            val emptied =
+                ToolArgs.dropEmptyUnknown(props, renamed.args, emptySet(), destructive, required)
+            val args = emptied.args
+            val argNotes = renamed.notes + emptied.notes
             if (ToolArgs.unknownParams(props, args, emptySet()).isNotEmpty()) {
                 return@addTool ToolArgs.unknownParameterError(
                     name,
@@ -675,12 +678,12 @@ object ToolConsolidation {
             }
             val c = ToolArgs.coerce(props, args)
             ToolArgs.rangeCheck(name, props, c.args, usage, example, destructive)?.let {
-                return@addTool ToolArgs.withNotes(it, renamed.notes + c.notes)
+                return@addTool ToolArgs.withNotes(it, argNotes + c.notes)
             }
             val (placeholder, placeholderNotes) =
                 ToolArgs.placeholderCheck(name, name, null, props, c.args, example, destructive)
             if (placeholder != null)
-                return@addTool ToolArgs.withNotes(placeholder, renamed.notes + c.notes)
+                return@addTool ToolArgs.withNotes(placeholder, argNotes + c.notes)
             val forwarded =
                 if (c.args === request.params.arguments) request
                 else CallToolRequest(request.params.copy(arguments = c.args))
@@ -694,7 +697,7 @@ object ToolConsolidation {
                     props,
                     c.args,
                 ),
-                renamed.notes + c.notes + placeholderNotes,
+                argNotes + c.notes + placeholderNotes,
             )
         }
     }
@@ -971,6 +974,10 @@ object ToolConsolidation {
         val renamed = ToolArgs.renameParams(spec.props, args, setOf("action"), destructive)
         args = renamed.args
         notes.addAll(0, renamed.notes)
+        val emptied =
+            ToolArgs.dropEmptyUnknown(spec.props, args, setOf("action"), destructive, spec.required)
+        args = emptied.args
+        notes += emptied.notes
         if (ToolArgs.unknownParams(spec.props, args, setOf("action")).isNotEmpty()) {
             return ToolArgs.unknownParameterError(
                 call,
@@ -1031,6 +1038,7 @@ object ToolConsolidation {
                 c.args,
                 spec.example,
                 destructive,
+                ToolArgs.literalValuesOf(spec.member.tool.name, c.args),
             )
         if (placeholder != null) return ToolArgs.withNotes(placeholder, notes)
         notes += placeholderNotes

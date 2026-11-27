@@ -78,6 +78,61 @@ class ToolArgsTest {
     }
 
     @Test
+    fun `an empty free-form string is a value, an empty enum or list is unset`() {
+        val ruleProps = buildJsonObject {
+            put("modify_body_replacement", buildJsonObject { put("type", "string") })
+            put(
+                "mode",
+                buildJsonObject {
+                    put("type", "string")
+                    putJsonArray("enum") { add("a") }
+                },
+            )
+            put("tags", buildJsonObject { put("type", "array") })
+        }
+        val c =
+            ToolArgs.dropEmptyUnknown(
+                ruleProps,
+                buildJsonObject {
+                    put("modify_body_replacement", "")
+                    put("mode", "")
+                    putJsonArray("tags") {}
+                },
+                emptySet(),
+                destructive = false,
+            )
+        assertEquals(buildJsonObject { put("modify_body_replacement", "") }, c.args)
+        assertEquals(listOf("ignored empty optional 'mode', 'tags'"), c.notes)
+    }
+
+    @Test
+    fun `a value that exists as written is not a placeholder`() {
+        val cookieProps = buildJsonObject {
+            put("name", buildJsonObject { put("type", "string") })
+            put("domain", buildJsonObject { put("type", "string") })
+        }
+        val args = buildJsonObject {
+            put("name", "<name>")
+            put("domain", "a.b")
+        }
+        val check = { literal: Set<String> ->
+            ToolArgs.placeholderCheck(
+                    "http_state.cookie_jar_delete",
+                    "http_state",
+                    "cookie_jar_delete",
+                    cookieProps,
+                    args,
+                    JsonObject(emptyMap()),
+                    destructive = true,
+                    allowLiteral = literal,
+                )
+                .first
+        }
+        assertNotNull(check(emptySet()))
+        assertEquals(null, check(setOf("<name>", "a.b")))
+    }
+
+    @Test
     fun `a negative count below a zero minimum is out of range and the retry drops it`() {
         val args = buildJsonObject {
             put("count", -1)

@@ -14,8 +14,8 @@ import io.bitbytelab.raijin.safety.ScopeGate
 import kotlinx.serialization.json.*
 
 /**
- * `auth_diff` for [AnalysisBridge]: one request sent as each identity, scope-gated and marked as
- * an internal replay ([BoundedHttp.sendInternal]), and the answers compared.
+ * `auth_diff` for [AnalysisBridge]: one request sent as each identity, scope-gated and marked as an
+ * internal replay ([BoundedHttp.sendInternal]), and the answers compared.
  */
 internal class AnalysisAuthDiff(private val api: MontoyaApi) {
 
@@ -44,31 +44,47 @@ internal class AnalysisAuthDiff(private val api: MontoyaApi) {
         useTls: Boolean,
         authLevels: List<JsonObject>,
         compareFields: List<String>?,
-        deniedRegex: String?
+        deniedRegex: String?,
     ): JsonObject {
         if (request.isBlank()) {
             return buildJsonObject {
-                put("error", "Empty request: provide a raw HTTP request (e.g. 'GET /api/resource HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n').")
+                put(
+                    "error",
+                    "Empty request: provide a raw HTTP request (e.g. 'GET /api/resource HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n').",
+                )
             }
         }
         if (authLevels.size < 2) {
             return buildJsonObject {
-                put("error", "Provide at least 2 auth levels to compare, e.g. an authenticated level plus {\"name\":\"none\"}.")
+                put(
+                    "error",
+                    "Provide at least 2 auth levels to compare, e.g. an authenticated level plus {\"name\":\"none\"}.",
+                )
             }
         }
-        val fields = compareFields?.map { it.trim().lowercase() }?.filter { it.isNotEmpty() }?.takeIf { it.isNotEmpty() }
-            ?: AUTH_DIFF_FIELDS
-        fields.firstOrNull { it !in AUTH_DIFF_FIELDS }?.let { bad ->
-            return buildJsonObject {
-                put("error", "Parameter 'compare_fields' has invalid value '$bad'. Allowed: ${AUTH_DIFF_FIELDS.joinToString(", ")}")
+        val fields =
+            compareFields
+                ?.map { it.trim().lowercase() }
+                ?.filter { it.isNotEmpty() }
+                ?.takeIf { it.isNotEmpty() } ?: AUTH_DIFF_FIELDS
+        fields
+            .firstOrNull { it !in AUTH_DIFF_FIELDS }
+            ?.let { bad ->
+                return buildJsonObject {
+                    put(
+                        "error",
+                        "Parameter 'compare_fields' has invalid value '$bad'. Allowed: ${AUTH_DIFF_FIELDS.joinToString(", ")}",
+                    )
+                }
             }
-        }
         deniedRegex?.let { pattern ->
             SafeRegex.validate(pattern, ignoreCase = true)?.let { err ->
                 return buildJsonObject { put("error", "Invalid denied_regex: $err") }
             }
         }
-        val identities = authLevels.mapIndexed { i, level -> AuthIdentityApplier.parse(level, defaultName = "level_${i + 1}") }
+        val identities = authLevels.mapIndexed { i, level ->
+            AuthIdentityApplier.parse(level, defaultName = "level_${i + 1}")
+        }
         AuthIdentityApplier.indistinguishableError(identities)?.let { err ->
             return buildJsonObject { put("error", err) }
         }
@@ -81,7 +97,12 @@ internal class AnalysisAuthDiff(private val api: MontoyaApi) {
 
             // Every level hits the same path (only headers vary across the loop below): the scope
             // check's URL, and AuthDiffVerdict's static-asset downgrade (file-extension fallback).
-            val sharedUrl = try { HttpRequest.httpRequest(service, baseRequest).url() } catch (_: Exception) { null }
+            val sharedUrl =
+                try {
+                    HttpRequest.httpRequest(service, baseRequest).url()
+                } catch (_: Exception) {
+                    null
+                }
             val check = scopeGate.checkRequest(host, port, useTls, baseRequest)
             if (check.blocked) return check.denyJson()
             scope = check
@@ -92,32 +113,50 @@ internal class AnalysisAuthDiff(private val api: MontoyaApi) {
             for (identity in identities) {
                 try {
                     val applied = AuthIdentityApplier.apply(baseRequest, identity, identityHeaders)
-                    val httpRequest = HttpRequest.httpRequest(
-                        service, BurpByteArray.byteArray(*AuthIdentityApplier.wireBytes(applied.request))
-                    )
+                    val httpRequest =
+                        HttpRequest.httpRequest(
+                            service,
+                            BurpByteArray.byteArray(
+                                *AuthIdentityApplier.wireBytes(applied.request),
+                            ),
+                        )
 
                     val startTime = System.nanoTime()
                     val resp = BoundedHttp.sendInternal(api, httpRequest)?.response()
                     val elapsed = (System.nanoTime() - startTime) / 1_000_000
 
                     val status = resp?.statusCode()?.toInt() ?: 0
-                    // No response, or one without a status: a failed level, not a level that answered "0".
+                    // No response, or one without a status: a failed level, not a level that
+                    // answered "0".
                     if (resp == null || status == 0) {
                         errors.add(levelFailure(identity.name, elapsed))
                         continue
                     }
-                    results.add(AuthLevelResponse(
-                        level = identity.name,
-                        statusCode = status,
-                        bodyLength = resp.body()?.length() ?: 0,
-                        body = resp.bodyToString() ?: "",
-                        headers = resp.headers()?.associate { it.name() to it.value() } ?: emptyMap(),
-                        responseTimeMs = elapsed,
-                        contentType = try { resp.headerValue("Content-Type") } catch (_: Exception) { null },
-                        location = try { resp.headerValue("Location") } catch (_: Exception) { null },
-                        applied = applied,
-                        sentUnchanged = identity.sendsRequestUnchanged
-                    ))
+                    results.add(
+                        AuthLevelResponse(
+                            level = identity.name,
+                            statusCode = status,
+                            bodyLength = resp.body()?.length() ?: 0,
+                            body = resp.bodyToString() ?: "",
+                            headers =
+                                resp.headers()?.associate { it.name() to it.value() } ?: emptyMap(),
+                            responseTimeMs = elapsed,
+                            contentType =
+                                try {
+                                    resp.headerValue("Content-Type")
+                                } catch (_: Exception) {
+                                    null
+                                },
+                            location =
+                                try {
+                                    resp.headerValue("Location")
+                                } catch (_: Exception) {
+                                    null
+                                },
+                            applied = applied,
+                            sentUnchanged = identity.sendsRequestUnchanged,
+                        ),
+                    )
                 } catch (e: Exception) {
                     errors.add("Level '${identity.name}' failed: ${describeException(e)}")
                 }
@@ -125,7 +164,9 @@ internal class AnalysisAuthDiff(private val api: MontoyaApi) {
 
             check.annotate(authDiffReport(results, errors, fields, sharedUrl, deniedRegex))
         } catch (e: Exception) {
-            val error = buildJsonObject { put("error", "Auth diff failed: ${describeException(e)}") }
+            val error = buildJsonObject {
+                put("error", "Auth diff failed: ${describeException(e)}")
+            }
             scope?.annotate(error) ?: error
         }
     }
@@ -137,7 +178,11 @@ internal class AnalysisAuthDiff(private val api: MontoyaApi) {
         private const val PREVIEW_CHARS = 500
 
         /** The `errors` entry for a level that produced no HTTP response within [elapsedMs]. */
-        fun levelFailure(levelName: String, elapsedMs: Long, timeoutMs: Long = BoundedHttp.DEFAULT_TIMEOUT_MS): String =
+        fun levelFailure(
+            levelName: String,
+            elapsedMs: Long,
+            timeoutMs: Long = BoundedHttp.DEFAULT_TIMEOUT_MS,
+        ): String =
             if (elapsedMs >= timeoutMs) {
                 "Level '$levelName' failed: timed out after $elapsedMs ms without a response"
             } else {
@@ -157,7 +202,7 @@ internal class AnalysisAuthDiff(private val api: MontoyaApi) {
             errors: List<String>,
             fields: List<String> = AUTH_DIFF_FIELDS,
             url: String? = null,
-            deniedRegex: String? = null
+            deniedRegex: String? = null,
         ): JsonObject {
             val differences = mutableListOf<JsonObject>()
 
@@ -169,97 +214,161 @@ internal class AnalysisAuthDiff(private val api: MontoyaApi) {
                     val diffs = mutableListOf<JsonObject>()
 
                     if ("status_code" in fields && a.statusCode != b.statusCode) {
-                        diffs.add(buildJsonObject {
-                            put("field", "status_code")
-                            put(a.level, a.statusCode)
-                            put(b.level, b.statusCode)
-                        })
+                        diffs.add(
+                            buildJsonObject {
+                                put("field", "status_code")
+                                put(a.level, a.statusCode)
+                                put(b.level, b.statusCode)
+                            },
+                        )
                     }
                     if ("body_length" in fields && a.bodyLength != b.bodyLength) {
-                        diffs.add(buildJsonObject {
-                            put("field", "body_length")
-                            put(a.level, a.bodyLength)
-                            put(b.level, b.bodyLength)
-                            put("length_diff", kotlin.math.abs(a.bodyLength - b.bodyLength))
-                        })
+                        diffs.add(
+                            buildJsonObject {
+                                put("field", "body_length")
+                                put(a.level, a.bodyLength)
+                                put(b.level, b.bodyLength)
+                                put("length_diff", kotlin.math.abs(a.bodyLength - b.bodyLength))
+                            },
+                        )
                     }
                     if ("body" in fields && a.body != b.body) {
-                        diffs.add(buildJsonObject {
-                            put("field", "body_content")
-                            put("similarity_percent", TextSimilarity.dice(a.body, b.body))
-                            put("bodies_identical", false)
-                        })
+                        diffs.add(
+                            buildJsonObject {
+                                put("field", "body_content")
+                                put("similarity_percent", TextSimilarity.dice(a.body, b.body))
+                                put("bodies_identical", false)
+                            },
+                        )
                     }
                     if ("headers" in fields) {
-                        val diffHeaders = (a.headers.keys + b.headers.keys).distinct().filter { a.headers[it] != b.headers[it] }
+                        val diffHeaders =
+                            (a.headers.keys + b.headers.keys).distinct().filter {
+                                a.headers[it] != b.headers[it]
+                            }
                         if (diffHeaders.isNotEmpty()) {
-                            diffs.add(buildJsonObject {
-                                put("field", "headers")
-                                put("different_headers", buildJsonArray { diffHeaders.forEach { add(it) } })
-                            })
+                            diffs.add(
+                                buildJsonObject {
+                                    put("field", "headers")
+                                    put(
+                                        "different_headers",
+                                        buildJsonArray { diffHeaders.forEach { add(it) } },
+                                    )
+                                },
+                            )
                         }
                     }
 
                     if (diffs.isNotEmpty()) {
-                        differences.add(buildJsonObject {
-                            put("level_a", a.level)
-                            put("level_b", b.level)
-                            put("differences", buildJsonArray { diffs.forEach { add(it) } })
-                        })
+                        differences.add(
+                            buildJsonObject {
+                                put("level_a", a.level)
+                                put("level_b", b.level)
+                                put("differences", buildJsonArray { diffs.forEach { add(it) } })
+                            },
+                        )
                     }
                 }
             }
 
             // Security analysis
-            val verdict = AuthDiffVerdict.assess(
-                results.map { AuthDiffVerdict.LevelResult(it.level, it.statusCode, it.body, it.contentType, it.location) },
-                similarity = TextSimilarity::dice,
-                url = url,
-                denied = { level ->
-                    AuthDenialHeuristic.looksDenied(level.body) || (
-                        deniedRegex != null && SafeRegex.containsMatchIn(
-                            deniedRegex, level.body, ignoreCase = true,
-                            maxInputLen = AnalysisResponseSearch.SEARCH_MAX_BODY_CHARS
+            val verdict =
+                AuthDiffVerdict.assess(
+                    results.map {
+                        AuthDiffVerdict.LevelResult(
+                            it.level,
+                            it.statusCode,
+                            it.body,
+                            it.contentType,
+                            it.location,
                         )
-                        )
-                }
-            )
+                    },
+                    similarity = TextSimilarity::dice,
+                    url = url,
+                    denied = { level ->
+                        AuthDenialHeuristic.looksDenied(level.body) ||
+                            (deniedRegex != null &&
+                                SafeRegex.containsMatchIn(
+                                    deniedRegex,
+                                    level.body,
+                                    ignoreCase = true,
+                                    maxInputLen = AnalysisResponseSearch.SEARCH_MAX_BODY_CHARS,
+                                ))
+                    },
+                )
 
             val notes = mutableListOf<String>()
-            results.filter { it.sentUnchanged }.forEach {
-                notes += "Level '${it.level}' sets no header and is not named none/unauth/anonymous: it was sent with the request's own credentials."
-            }
-            if (results.size < 2) notes += "Fewer than two levels answered, so nothing could be compared: see errors."
+            results
+                .filter { it.sentUnchanged }
+                .forEach {
+                    notes +=
+                        "Level '${it.level}' sets no header and is not named none/unauth/anonymous: it was sent with the request's own credentials."
+                }
+            if (results.size < 2)
+                notes += "Fewer than two levels answered, so nothing could be compared: see errors."
 
             return buildJsonObject {
+                if (results.isEmpty()) {
+                    put(
+                        "error",
+                        "auth_diff: no auth level got a response (${errors.firstOrNull()?.trimEnd('.') ?: "nothing was sent"}).",
+                    )
+                    put("code", "no_response")
+                }
                 put("auth_levels_tested", results.size)
-                put("responses", buildJsonArray {
-                    results.forEach { r ->
-                        add(buildJsonObject {
-                            put("level", r.level)
-                            put("status_code", r.statusCode)
-                            put("body_length", r.bodyLength)
-                            put("response_time_ms", r.responseTimeMs)
-                            r.location?.takeIf { it.isNotBlank() }?.let { put("redirect_location", it) }
-                            r.applied?.let { applied ->
-                                if (applied.set.isNotEmpty()) put("headers_set", strings(applied.set))
-                                if (applied.removed.isNotEmpty()) put("headers_removed", strings(applied.removed))
-                                if (applied.keptCredentials.isNotEmpty()) put("credential_headers_kept", strings(applied.keptCredentials))
-                            }
-                            put("body_preview", BodyText.render(r.body, PREVIEW_CHARS, label = "response body").text)
-                        })
-                    }
-                })
+                put(
+                    "responses",
+                    buildJsonArray {
+                        results.forEach { r ->
+                            add(
+                                buildJsonObject {
+                                    put("level", r.level)
+                                    put("status_code", r.statusCode)
+                                    put("body_length", r.bodyLength)
+                                    put("response_time_ms", r.responseTimeMs)
+                                    r.location
+                                        ?.takeIf { it.isNotBlank() }
+                                        ?.let { put("redirect_location", it) }
+                                    r.applied?.let { applied ->
+                                        if (applied.set.isNotEmpty())
+                                            put("headers_set", strings(applied.set))
+                                        if (applied.removed.isNotEmpty())
+                                            put("headers_removed", strings(applied.removed))
+                                        if (applied.keptCredentials.isNotEmpty())
+                                            put(
+                                                "credential_headers_kept",
+                                                strings(applied.keptCredentials),
+                                            )
+                                    }
+                                    put(
+                                        "body_preview",
+                                        BodyText.render(
+                                                r.body,
+                                                PREVIEW_CHARS,
+                                                label = "response body",
+                                            )
+                                            .text,
+                                    )
+                                },
+                            )
+                        }
+                    },
+                )
                 put("differences", buildJsonArray { differences.forEach { add(it) } })
-                put("findings", buildJsonArray {
-                    verdict.forEach {
-                        add(buildJsonObject {
-                            put("severity", it.severity)
-                            put("id", it.id)
-                            put("detail", it.detail)
-                        })
-                    }
-                })
+                put(
+                    "findings",
+                    buildJsonArray {
+                        verdict.forEach {
+                            add(
+                                buildJsonObject {
+                                    put("severity", it.severity)
+                                    put("id", it.id)
+                                    put("detail", it.detail)
+                                },
+                            )
+                        }
+                    },
+                )
                 put("all_same_status", results.map { it.statusCode }.distinct().size == 1)
                 put("all_same_body", results.map { it.body }.distinct().size == 1)
                 if (notes.isNotEmpty()) put("notes", strings(notes))
@@ -267,7 +376,9 @@ internal class AnalysisAuthDiff(private val api: MontoyaApi) {
             }
         }
 
-        private fun strings(values: List<String>): JsonArray = buildJsonArray { values.forEach { add(it) } }
+        private fun strings(values: List<String>): JsonArray = buildJsonArray {
+            values.forEach { add(it) }
+        }
     }
 }
 
@@ -275,7 +386,8 @@ internal class AnalysisAuthDiff(private val api: MontoyaApi) {
  * One auth level's answer, as [AnalysisAuthDiff.authDiffReport] compares it.
  *
  * @param applied what [AuthIdentityApplier] did to the request for this level.
- * @param sentUnchanged the level changed nothing about the request (it carries the captured credentials).
+ * @param sentUnchanged the level changed nothing about the request (it carries the captured
+ *   credentials).
  */
 internal data class AuthLevelResponse(
     val level: String,
@@ -287,5 +399,5 @@ internal data class AuthLevelResponse(
     val contentType: String? = null,
     val location: String? = null,
     val applied: AuthIdentityApplier.Applied? = null,
-    val sentUnchanged: Boolean = false
+    val sentUnchanged: Boolean = false,
 )

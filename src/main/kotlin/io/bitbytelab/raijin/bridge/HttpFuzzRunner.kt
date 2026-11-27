@@ -1,18 +1,20 @@
 package io.bitbytelab.raijin.bridge
 
 import io.bitbytelab.raijin.safety.SafeRegex
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonObjectBuilder
-import kotlinx.serialization.json.add
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonArray
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.LockSupport
 import kotlin.math.min
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonObjectBuilder
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 
 /**
  * Spaces out calls to [await] so that no more than [ratePerSecond] start per second, across every
@@ -23,19 +25,21 @@ internal class RatePacer(
     private val nanoTime: () -> Long = System::nanoTime,
     private val sleepNanos: (Long) -> Unit = { LockSupport.parkNanos(it) },
 ) {
-    private val intervalNanos: Long = if (ratePerSecond > 0) (1_000_000_000.0 / ratePerSecond).toLong() else 0L
+    private val intervalNanos: Long =
+        if (ratePerSecond > 0) (1_000_000_000.0 / ratePerSecond).toLong() else 0L
     private var nextSlot = 0L // guarded by this
     private var started = false // guarded by this
 
     fun await() {
         if (intervalNanos <= 0) return
-        val slot = synchronized(this) {
-            val now = nanoTime()
-            val mine = if (!started || nextSlot < now) now else nextSlot
-            started = true
-            nextSlot = mine + intervalNanos
-            mine
-        }
+        val slot =
+            synchronized(this) {
+                val now = nanoTime()
+                val mine = if (!started || nextSlot < now) now else nextSlot
+                started = true
+                nextSlot = mine + intervalNanos
+                mine
+            }
         // parkNanos may return early, so wait until the slot has really come.
         while (true) {
             val remaining = slot - nanoTime()
@@ -46,10 +50,10 @@ internal class RatePacer(
 }
 
 /**
- * Runs a planned fuzz attack: sends the requests (in order, or several at a time), applies the
- * rate limit, stop condition and response filter, and reports the kept results together with a
- * cluster summary of every response. How a request is actually sent is left to [send], so the
- * run logic is testable without Burp.
+ * Runs a planned fuzz attack: sends the requests (in order, or several at a time), applies the rate
+ * limit, stop condition and response filter, and reports the kept results together with a cluster
+ * summary of every response. How a request is actually sent is left to [send], so the run logic is
+ * testable without Burp.
  *
  * @param send sends one planned request; an exception is recorded as a failed request.
  */
@@ -78,7 +82,8 @@ internal class HttpFuzzRunner(private val send: (HttpFuzzPlan.AttackRequest) -> 
      * @param concurrency requests in flight at once; 1 sends them one after the other.
      * @param ratePerSecond most requests started per second; 0 = no limit.
      * @param report [REPORT_ALL] lists every kept exchange in full, [REPORT_CLUSTERS] lists one
-     *   line per kept request plus the first exchange of each cluster, [REPORT_SUMMARY] lists nothing.
+     *   line per kept request plus the first exchange of each cluster, [REPORT_SUMMARY] lists
+     *   nothing.
      * @param payloadsCount size of the first payload set, reported as `payloads_count`.
      */
     class Options(
@@ -118,65 +123,108 @@ internal class HttpFuzzRunner(private val send: (HttpFuzzPlan.AttackRequest) -> 
         val keepLeaderJson = options.report == REPORT_CLUSTERS
         val workerFailures = ArrayList<String>()
 
-        fun take(): Pair<Int, HttpFuzzPlan.AttackRequest>? = synchronized(feed) {
-            if (stop.get() || !iterator.hasNext()) null else (nextIndex++ to iterator.next())
-        }
+        fun take(): Pair<Int, HttpFuzzPlan.AttackRequest>? =
+            synchronized(feed) {
+                if (stop.get() || !iterator.hasNext()) null else (nextIndex++ to iterator.next())
+            }
 
         fun work() {
             while (!Thread.currentThread().isInterrupted) {
                 val (index, request) = take() ?: return
                 pacer.await()
                 if (stop.get()) return
-                val sent = try {
-                    send(request)
-                } catch (e: Exception) {
-                    Sent.Failed(e.message ?: "send failed", timeout = false)
-                }
-                val record = when (sent) {
-                    is Sent.Failed -> {
-                        val leader = clusters.add(HttpResponseClusters.Sample(index, 0, 0, "", label = request.label)) == index
-                        Record(
-                            index, request, status = 0, bodyLength = 0, elapsedMs = null,
-                            kept = options.filter.keeps(0, 0) { "" }, leader = leader, json = null,
-                            error = sent.error, timeout = sent.timeout,
-                        )
+                val sent =
+                    try {
+                        send(request)
+                    } catch (e: Exception) {
+                        Sent.Failed(e.message ?: "send failed", timeout = false)
                     }
-                    is Sent.Answered -> {
-                        val leader = clusters.add(
-                            HttpResponseClusters.Sample(index, sent.status, sent.bodyLength, sent.body, sent.elapsedMs.toDouble(), request.label)
-                        ) == index
-                        val kept = options.filter.keeps(sent.status, sent.bodyLength) { sent.head + "\r\n\r\n" + sent.body }
-                        if (sent.status != 0 && stopMatches(sent, options)) stop.set(true)
-                        Record(
-                            index, request, sent.status, sent.bodyLength, sent.elapsedMs,
-                            kept = kept, leader = leader,
-                            json = if ((keepJson && kept) || (keepLeaderJson && leader)) {
-                                try {
-                                    sent.json()
-                                } catch (e: Exception) {
-                                    buildJsonObject {
-                                        put("index", index)
-                                        put("serialize_error", e.message ?: e.javaClass.simpleName)
-                                    }
+                val record =
+                    when (sent) {
+                        is Sent.Failed -> {
+                            val leader =
+                                clusters.add(
+                                    HttpResponseClusters.Sample(
+                                        index,
+                                        0,
+                                        0,
+                                        "",
+                                        label = request.label,
+                                    ),
+                                ) == index
+                            Record(
+                                index,
+                                request,
+                                status = 0,
+                                bodyLength = 0,
+                                elapsedMs = null,
+                                kept = options.filter.keeps(0, 0) { "" },
+                                leader = leader,
+                                json = null,
+                                error = sent.error,
+                                timeout = sent.timeout,
+                            )
+                        }
+                        is Sent.Answered -> {
+                            val leader =
+                                clusters.add(
+                                    HttpResponseClusters.Sample(
+                                        index,
+                                        sent.status,
+                                        sent.bodyLength,
+                                        sent.body,
+                                        sent.elapsedMs.toDouble(),
+                                        request.label,
+                                    ),
+                                ) == index
+                            val kept =
+                                options.filter.keeps(sent.status, sent.bodyLength) {
+                                    sent.head + "\r\n\r\n" + sent.body
                                 }
-                            } else {
-                                null
-                            },
-                            error = null, timeout = false,
-                        )
+                            if (sent.status != 0 && stopMatches(sent, options)) stop.set(true)
+                            Record(
+                                index,
+                                request,
+                                sent.status,
+                                sent.bodyLength,
+                                sent.elapsedMs,
+                                kept = kept,
+                                leader = leader,
+                                json =
+                                    if ((keepJson && kept) || (keepLeaderJson && leader)) {
+                                        try {
+                                            sent.json()
+                                        } catch (e: Exception) {
+                                            buildJsonObject {
+                                                put("index", index)
+                                                put(
+                                                    "serialize_error",
+                                                    e.message ?: e.javaClass.simpleName,
+                                                )
+                                            }
+                                        }
+                                    } else {
+                                        null
+                                    },
+                                error = null,
+                                timeout = false,
+                            )
+                        }
                     }
-                }
                 synchronized(records) { records += record }
             }
         }
 
-        val workers = min(options.concurrency.coerceAtLeast(1).toLong(), plan.planned.coerceAtLeast(1)).toInt()
+        val workers =
+            min(options.concurrency.coerceAtLeast(1).toLong(), plan.planned.coerceAtLeast(1))
+                .toInt()
         if (workers <= 1) {
             work()
         } else {
-            val pool = Executors.newFixedThreadPool(workers) { runnable ->
-                Thread(runnable, "raijin-fuzz-${System.nanoTime()}").apply { isDaemon = true }
-            }
+            val pool =
+                Executors.newFixedThreadPool(workers) { runnable ->
+                    Thread(runnable, "raijin-fuzz-${System.nanoTime()}").apply { isDaemon = true }
+                }
             try {
                 val running = List(workers) { pool.submit { work() } }
                 for (future in running) {
@@ -201,6 +249,19 @@ internal class HttpFuzzRunner(private val send: (HttpFuzzPlan.AttackRequest) -> 
         val failed = done.count { it.error != null }
         val hidden = done.count { !it.kept }
         return buildJsonObject {
+            // Nothing answered: the run failed, whatever the clusters say.
+            val first = done.firstOrNull()
+            if (first != null && done.all { it.status == 0 }) {
+                val reason =
+                    first.error
+                        ?: (first.json?.get("no_response") as? JsonPrimitive)?.contentOrNull
+                        ?: "no response"
+                put(
+                    "error",
+                    noResponseError("http_fuzz", "request", done.size, first.index + 1, reason),
+                )
+                put("code", "no_response")
+            }
             put("total_requests", done.size)
             put("payloads_count", options.payloadsCount)
             put("mode", plan.positionMode)
@@ -215,16 +276,32 @@ internal class HttpFuzzRunner(private val send: (HttpFuzzPlan.AttackRequest) -> 
             when (options.report) {
                 REPORT_SUMMARY -> Unit
                 REPORT_CLUSTERS -> {
-                    put("representatives", buildJsonArray {
-                        done.filter { it.leader }.forEach { add(fullEntry(it, plan.mode, summary)) }
-                    })
-                    put("results", buildJsonArray {
-                        done.filter { it.kept }.forEach { add(lineEntry(it, plan.mode, summary)) }
-                    })
+                    put(
+                        "representatives",
+                        buildJsonArray {
+                            done
+                                .filter { it.leader }
+                                .forEach { add(fullEntry(it, plan.mode, summary)) }
+                        },
+                    )
+                    put(
+                        "results",
+                        buildJsonArray {
+                            done
+                                .filter { it.kept }
+                                .forEach { add(lineEntry(it, plan.mode, summary)) }
+                        },
+                    )
                 }
-                else -> put("results", buildJsonArray {
-                    done.filter { it.kept }.forEach { add(fullEntry(it, plan.mode, summary)) }
-                })
+                else ->
+                    put(
+                        "results",
+                        buildJsonArray {
+                            done
+                                .filter { it.kept }
+                                .forEach { add(fullEntry(it, plan.mode, summary)) }
+                        },
+                    )
             }
             val notes = plan.notes + workerFailures
             if (notes.isNotEmpty()) putJsonArray("notes") { notes.forEach { add(it) } }
@@ -232,19 +309,25 @@ internal class HttpFuzzRunner(private val send: (HttpFuzzPlan.AttackRequest) -> 
     }
 
     private fun stopMatches(sent: Sent.Answered, options: Options): Boolean {
-        val statusMatch = options.stopOnStatusCodes != null && sent.status in options.stopOnStatusCodes
-        val boundedBody = if (sent.body.length > SafeRegex.DEFAULT_MAX_INPUT_LEN) {
-            sent.body.substring(0, SafeRegex.DEFAULT_MAX_INPUT_LEN)
-        } else {
-            sent.body
-        }
-        val bodyMatch = options.stopOnBodyRegex != null && SafeRegex.find(options.stopOnBodyRegex, boundedBody) != null
+        val statusMatch =
+            options.stopOnStatusCodes != null && sent.status in options.stopOnStatusCodes
+        val boundedBody =
+            if (sent.body.length > SafeRegex.DEFAULT_MAX_INPUT_LEN) {
+                sent.body.substring(0, SafeRegex.DEFAULT_MAX_INPUT_LEN)
+            } else {
+                sent.body
+            }
+        val bodyMatch =
+            options.stopOnBodyRegex != null &&
+                SafeRegex.find(options.stopOnBodyRegex, boundedBody) != null
         return statusMatch || bodyMatch
     }
 
     private fun JsonObjectBuilder.payloadFields(record: Record, mode: HttpFuzzPlan.AttackMode) {
         val request = record.request
-        if (mode == HttpFuzzPlan.AttackMode.SNIPER || mode == HttpFuzzPlan.AttackMode.BATTERING_RAM) {
+        if (
+            mode == HttpFuzzPlan.AttackMode.SNIPER || mode == HttpFuzzPlan.AttackMode.BATTERING_RAM
+        ) {
             put("payload", request.payloads.firstOrNull { it != null } ?: "")
             if (request.position >= 0) put("position", request.position)
         } else {
@@ -258,29 +341,35 @@ internal class HttpFuzzRunner(private val send: (HttpFuzzPlan.AttackRequest) -> 
     }
 
     /** A result with the whole exchange, as http_fuzz has always listed it. */
-    private fun fullEntry(record: Record, mode: HttpFuzzPlan.AttackMode, summary: HttpResponseClusters.Summary): JsonObject =
-        buildJsonObject {
-            put("index", record.index)
-            payloadFields(record, mode)
-            if (record.error != null) failureFields(record)
-            record.json?.forEach { (key, value) -> put(key, value) }
-            summary.clusterOf[record.index]?.let { put("cluster", it) }
-        }
+    private fun fullEntry(
+        record: Record,
+        mode: HttpFuzzPlan.AttackMode,
+        summary: HttpResponseClusters.Summary,
+    ): JsonObject = buildJsonObject {
+        put("index", record.index)
+        payloadFields(record, mode)
+        if (record.error != null) failureFields(record)
+        record.json?.forEach { (key, value) -> put(key, value) }
+        summary.clusterOf[record.index]?.let { put("cluster", it) }
+    }
 
     /** A result reduced to what tells responses apart. */
-    private fun lineEntry(record: Record, mode: HttpFuzzPlan.AttackMode, summary: HttpResponseClusters.Summary): JsonObject =
-        buildJsonObject {
-            put("index", record.index)
-            payloadFields(record, mode)
-            if (record.error != null) {
-                failureFields(record)
-            } else {
-                put("status_code", record.status)
-                put("response_body_length", record.bodyLength)
-                record.elapsedMs?.let { put("elapsed_ms", it) }
-            }
-            summary.clusterOf[record.index]?.let { put("cluster", it) }
+    private fun lineEntry(
+        record: Record,
+        mode: HttpFuzzPlan.AttackMode,
+        summary: HttpResponseClusters.Summary,
+    ): JsonObject = buildJsonObject {
+        put("index", record.index)
+        payloadFields(record, mode)
+        if (record.error != null) {
+            failureFields(record)
+        } else {
+            put("status_code", record.status)
+            put("response_body_length", record.bodyLength)
+            record.elapsedMs?.let { put("elapsed_ms", it) }
         }
+        summary.clusterOf[record.index]?.let { put("cluster", it) }
+    }
 
     companion object {
         const val REPORT_ALL = "all"

@@ -566,6 +566,14 @@ Returns array of results in original order, plus group_timings_ms and groups_dis
         // ---------------------------------------------------------------
         // http_cookie_jar_delete
         // ---------------------------------------------------------------
+        // A cookie really named `<name>` (an example run as written) stays deletable.
+        io.bitbytelab.raijin.tools.ToolArgs.literalValues["http_cookie_jar_delete"] =
+            { a: JsonObject ->
+                (a["domain"] as? JsonPrimitive)
+                    ?.takeIf { it.isString }
+                    ?.content
+                    ?.let(bridge::cookieLiterals) ?: emptySet()
+            }
         server.addTool(
             name = "http_cookie_jar_delete",
             description =

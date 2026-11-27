@@ -122,11 +122,31 @@ class HttpResponseClustersTest {
 
         val uniform =
             HttpResponseClusters.raceAnalysis(
-                HttpResponseClusters.cluster(listOf(Sample(0, 200, 2, "ok"))),
+                HttpResponseClusters.cluster(
+                    listOf(Sample(0, 200, 2, "ok"), Sample(1, 200, 2, "ok")),
+                ),
                 identicalRequests = true,
             )
         assertFalse(uniform.getValue("race_condition_likely").jsonPrimitive.boolean)
         assertTrue("application state" in uniform.getValue("verdict").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `race analysis makes no race claim below two responses`() {
+        val single =
+            HttpResponseClusters.raceAnalysis(
+                HttpResponseClusters.cluster(listOf(Sample(0, 200, 2, "ok"), Sample(1, 0, 0, ""))),
+                identicalRequests = true,
+            )
+        assertFalse("race_condition_likely" in single, single.toString())
+        assertFalse("variation" in single, single.toString())
+        val none =
+            HttpResponseClusters.raceAnalysis(
+                HttpResponseClusters.cluster(listOf(Sample(0, 0, 0, ""), Sample(1, 0, 0, ""))),
+                identicalRequests = true,
+            )
+        assertFalse("race_condition_likely" in none, none.toString())
+        assertEquals("No response was received.", none.getValue("verdict").jsonPrimitive.content)
     }
 
     @Test

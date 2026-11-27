@@ -42,12 +42,17 @@ internal object HttpRequestBuilder {
 
     /**
      * [url] with `https://` and with `http://`, for a URL written without a scheme (`example.com`,
-     * `//example.com`); empty for a path (`/admin`), which names no host to guess.
+     * `//example.com`); empty for a path (`/admin`), which names no host to guess, and for text
+     * that would not parse as a URL with a host (`not a url`), so no guess fails again.
      */
     fun schemeGuesses(url: String): List<String> {
         val t = url.trim()
         if (t.isEmpty() || (t.startsWith('/') && !t.startsWith("//"))) return emptyList()
-        return t.trimStart('/').let { listOf("https://$it", "http://$it") }
+        if (t.any { it.isWhitespace() || it.isISOControl() }) return emptyList()
+        val rest = t.trimStart('/')
+        val host = runCatching { java.net.URI("https://$rest").host }.getOrNull()
+        if (host.isNullOrBlank()) return emptyList()
+        return listOf("https://$rest", "http://$rest")
     }
 
     /**

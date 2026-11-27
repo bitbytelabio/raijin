@@ -255,7 +255,11 @@ internal object ToolExamples {
             "scanner_task.list" to EMPTY,
             "scanner_task.status" to EMPTY,
             "scanner_task.issues" to EMPTY,
-            "events.get" to buildJsonObject { put("max_events", 20) },
+            "events.get" to
+                buildJsonObject {
+                    put("max_events", 20)
+                    put("include_results", false)
+                },
             "events.get_by_type" to
                 buildJsonObject {
                     putJsonArray("types") { add("proxy.request") }

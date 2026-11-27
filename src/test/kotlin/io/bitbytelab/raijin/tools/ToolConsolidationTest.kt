@@ -889,6 +889,33 @@ class ToolConsolidationTest {
     }
 
     @Test
+    fun `empty parameters of other actions are dropped with a note`() {
+        val (_, target) = consolidatedWithRealTools()
+        val result =
+            call(
+                target,
+                "util",
+                buildJsonObject {
+                    put("action", "hash")
+                    put("data", "x")
+                    put("algorithm", "MD5")
+                    putJsonArray("messages") {}
+                    put("context", "")
+                },
+            )
+        // Reached the hash handler (which needs Burp's object factory, absent here): not refused.
+        val r = json(result)
+        assertTrue(r.str("code") != "unknown_parameter", r.toString())
+        assertTrue("MontoyaObjectFactory" in r.toString() || r.str("code") == null, r.toString())
+        assertTrue(
+            r.getValue("notes").jsonArray.any {
+                "ignored 2 empty parameters of other actions" in it.jsonPrimitive.content
+            },
+            r.toString(),
+        )
+    }
+
+    @Test
     fun `an enum error lists only the values of the action called`() {
         val (_, target) = consolidatedWithRealTools()
         val r =

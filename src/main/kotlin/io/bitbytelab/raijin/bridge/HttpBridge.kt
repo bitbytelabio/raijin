@@ -559,6 +559,21 @@ class HttpBridge(
     }
 
     /**
+     * The names of the cookies the jar holds for [domain] (any case), plus [domain] itself when it
+     * holds any: values that exist as written, even when shaped like a placeholder (`<name>`).
+     */
+    fun cookieLiterals(domain: String): Set<String> {
+        val names =
+            api.http()
+                .cookieJar()
+                .cookies()
+                .filter { it.domain().equals(domain, ignoreCase = true) }
+                .mapTo(mutableSetOf()) { it.name() }
+        if (names.isNotEmpty()) names += domain
+        return names
+    }
+
+    /**
      * Deletes a cookie from Burp's cookie jar. Montoya's `CookieJar` has no delete method — only
      * `setCookie(name, value, path, domain, expiration)` — so this sets an empty value with an
      * expiration a year in the past, the standard cookie-expiry idiom. Whether Burp's jar actually

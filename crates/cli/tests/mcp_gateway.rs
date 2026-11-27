@@ -270,13 +270,10 @@ async fn run_accepts_common_wrong_shapes() {
         text(&bad)
     );
 
-    let typo = call(&client, "run", json!({"do": "history_list", "limt": 1})).await;
-    assert_eq!(
-        json_of(&typo)["retry"],
-        json!({"do": "history_list", "limit": 1}),
-        "{}",
-        text(&typo)
-    );
+    // A name only spelled near `limit` is suggested; a retry comes from the synonym table only.
+    let typo = json_of(&call(&client, "run", json!({"do": "history_list", "limt": 1})).await);
+    assert_eq!(typo["did_you_mean"], json!(["limit"]), "{typo}");
+    assert_eq!(typo["retry"], Value::Null, "{typo}");
 
     let legacy = call(
         &client,
@@ -652,7 +649,8 @@ async fn weak_model_calls_get_json_errors_or_run() {
 
     let down = envelope(&call(&client, "run", json!({"do": "Burp-Down", "project": "p2"})).await);
     assert_eq!(down["code"], "unknown_tool");
-    assert_eq!(down["retry"], json!({"do": "burp_down", "project": "p2"}));
+    assert_eq!(down["did_you_mean"], json!(["burp_down"]));
+    assert_eq!(down["retry"], Value::Null, "destructive: no retry");
 
     let filled = call(
         &client,

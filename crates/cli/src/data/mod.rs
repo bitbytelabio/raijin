@@ -151,27 +151,87 @@ pub struct Filters {
     pub no_interaction: Option<bool>,
 }
 
+/// A category segment or word in one form: lowercase, `-`, ` ` and `_` as `_`, one trailing `s`
+/// dropped (`Restricted Characters` and `restricted_character` -> `restricted_character`).
+pub fn norm_term(s: &str) -> String {
+    let mut t: String = s
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if matches!(c, '-' | ' ' | '_') { '_' } else { c })
+        .collect();
+    if t.len() > 1 && t.ends_with('s') {
+        t.pop();
+    }
+    t
+}
+
+/// A category path with each `/` segment in [`norm_term`] form.
+pub fn norm_category(s: &str) -> String {
+    s.split('/').map(norm_term).collect::<Vec<_>>().join("/")
+}
+
+/// Whether category `cat` is `wanted` or one of its subfolders, both in [`norm_category`] form.
+pub fn category_matches(cat: &str, wanted: &str) -> bool {
+    let cat = norm_category(cat);
+    let wanted = norm_category(wanted);
+    cat == wanted || cat.starts_with(&format!("{wanted}/"))
+}
+
+/// The browser name entries use for `b`: `chromium` and `edge` are `chrome`, `ff` is `firefox`.
+pub fn browser_name(b: &str) -> String {
+    let b = b.trim().to_lowercase();
+    match b.as_str() {
+        "chromium" | "edge" => "chrome".to_owned(),
+        "ff" => "firefox".to_owned(),
+        _ => b,
+    }
+}
+
+/// The words of a query: lowercase, split on spaces, `-` and `_`.
+pub fn query_words(q: &str) -> Vec<String> {
+    q.to_lowercase()
+        .split([' ', '\t', '\n', '-', '_'])
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The text a query searches in `e`: title, description, payload, category and tags, lowercase,
+/// with `-` and `_` as spaces.
+pub fn haystack(e: &Entry) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        e.title,
+        e.description.as_deref().unwrap_or_default(),
+        e.payload,
+        e.category,
+        e.tags.join(" ")
+    )
+    .to_lowercase()
+    .replace(['-', '_'], " ")
+}
+
 /// Whether `e` passes every filter of `f`.
 pub fn matches(e: &Entry, f: &Filters) -> bool {
     if f.source.is_some_and(|s| s != e.source) || f.kind.is_some_and(|k| k != e.kind) {
         return false;
     }
-    if let Some(c) = f.category.as_deref().filter(|c| !c.is_empty()) {
-        let cat = e.category.to_lowercase();
-        let c = c.to_lowercase();
-        if cat != c && !cat.starts_with(&format!("{c}/")) {
-            return false;
-        }
+    if let Some(c) = f.category.as_deref().filter(|c| !c.is_empty())
+        && !category_matches(&e.category, c)
+    {
+        return false;
     }
     if let Some(t) = f.tag.as_deref().filter(|t| !t.is_empty())
         && !e.tags.iter().any(|x| x.eq_ignore_ascii_case(t))
     {
         return false;
     }
-    if let Some(b) = f.browser.as_deref().filter(|b| !b.is_empty())
-        && !e.browsers.iter().any(|x| x.eq_ignore_ascii_case(b))
-    {
-        return false;
+    if let Some(b) = f.browser.as_deref().filter(|b| !b.is_empty()) {
+        let b = browser_name(b);
+        if !e.browsers.iter().any(|x| x.eq_ignore_ascii_case(&b)) {
+            return false;
+        }
     }
     if let Some(c) = f.context.as_deref().filter(|c| !c.is_empty())
         && !e
@@ -185,20 +245,12 @@ pub fn matches(e: &Entry, f: &Filters) -> bool {
         return false;
     }
     if let Some(q) = f.query.as_deref() {
-        let hay = format!(
-            "{}\n{}\n{}\n{}\n{}",
-            e.title,
-            e.description.as_deref().unwrap_or_default(),
-            e.payload,
-            e.category,
-            e.tags.join(" ")
-        )
-        .to_lowercase();
-        if !q
-            .split_whitespace()
-            .all(|w| hay.contains(&w.to_lowercase()))
-        {
-            return false;
+        let words = query_words(q);
+        if !words.is_empty() {
+            let hay = haystack(e);
+            if !words.iter().all(|w| hay.contains(w.as_str())) {
+                return false;
+            }
         }
     }
     true
@@ -239,7 +291,13 @@ mod tests {
             &e,
             &f(serde_json::json!({"category": "EVENTS", "tag": "SVG"}))
         ));
-        assert!(!matches(&e, &f(serde_json::json!({"category": "event"}))));
+        assert!(matches(&e, &f(serde_json::json!({"category": "Event"}))));
+        assert!(!matches(&e, &f(serde_json::json!({"category": "even"}))));
+        assert!(matches(&e, &f(serde_json::json!({"browser": "Chromium"}))));
+        assert!(matches(
+            &e,
+            &f(serde_json::json!({"query": "onload-on_svg"}))
+        ));
         assert!(!matches(&e, &f(serde_json::json!({"browser": "safari"}))));
         assert!(!matches(&e, &f(serde_json::json!({"source": "url"}))));
         assert!(matches(&e, &f(serde_json::json!({"no_interaction": true}))));

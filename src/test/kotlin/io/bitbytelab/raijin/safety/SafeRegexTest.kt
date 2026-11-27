@@ -21,6 +21,12 @@ class SafeRegexTest {
     }
 
     @Test
+    fun `an invalid pattern is described on one line`() {
+        assertEquals("Unclosed group at 2", SafeRegex.validate("(."))
+        assertNull(SafeRegex.validate("a+"))
+    }
+
+    @Test
     fun `invalid pattern is treated as no-match, never throws`() {
         // unclosed group → PatternSyntaxException must be swallowed
         assertFalse(SafeRegex.containsMatchIn("(", "anything"))
@@ -82,15 +88,20 @@ class SafeRegexTest {
     fun `findAll and replaceOrNull bound oversize and timing-out inputs`() {
         assertEquals(emptyList(), SafeRegex.findAll(Regex("a"), "a".repeat(20), maxInputLen = 10))
         assertEquals(listOf("1", "2"), SafeRegex.findAll(Regex("\\d"), "a1b2").map { it.value })
-        val slow = object : CharSequence {
-            private val backing = "ababababab"
-            override val length: Int get() = backing.length
-            override fun get(index: Int): Char {
-                if (index == 0) Thread.sleep(20)
-                return backing[index]
+        val slow =
+            object : CharSequence {
+                private val backing = "ababababab"
+                override val length: Int
+                    get() = backing.length
+
+                override fun get(index: Int): Char {
+                    if (index == 0) Thread.sleep(20)
+                    return backing[index]
+                }
+
+                override fun subSequence(startIndex: Int, endIndex: Int): CharSequence =
+                    backing.subSequence(startIndex, endIndex)
             }
-            override fun subSequence(startIndex: Int, endIndex: Int): CharSequence = backing.subSequence(startIndex, endIndex)
-        }
         assertEquals(emptyList(), SafeRegex.findAll(Regex("[ab]{2}"), slow, timeoutMs = 5))
         assertNull(SafeRegex.replaceOrNull("[ab]{2}", slow, timeoutMs = 5) { "x" })
         assertNull(SafeRegex.replaceOrNull("a", "aaa", maxInputLen = 2) { "b" })

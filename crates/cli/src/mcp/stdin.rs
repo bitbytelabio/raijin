@@ -12,7 +12,8 @@ pub const NOTES_META_KEY: &str = "io.bitbytelab.raijin/notes";
 
 /// A repaired `line` (with a trailing newline) when it is a `tools/call` request whose
 /// `params.arguments` is a string, else None. A string holding a JSON object becomes that object;
-/// any other string becomes `guide`'s topic or `run`'s `do`, and for another tool
+/// any other string becomes `guide`'s topic or `run`'s `do` (broken JSON stays `run`'s
+/// `arguments`, which `run` refuses with where it breaks), and for another tool
 /// `{"arguments": s}`, so the call fails as a parameter error and never runs without arguments.
 /// Each reading is noted in `params._meta` under [`NOTES_META_KEY`].
 pub fn repair(line: &[u8]) -> Option<Vec<u8>> {
@@ -35,6 +36,8 @@ pub fn repair(line: &[u8]) -> Option<Vec<u8>> {
                 one("topic", s.trim()),
                 Some("read string 'arguments' as guide's topic"),
             ),
+            // Broken JSON stays `arguments`, so `run` says where it breaks.
+            "run" if s.trim_start().starts_with(['{', '[']) => (one("arguments", s), None),
             "run" => (
                 one("do", s.trim()),
                 Some("read string 'arguments' as \"do\""),
@@ -138,6 +141,14 @@ mod tests {
         .expect("repaired");
         assert_eq!(other["params"]["arguments"], json!({"arguments": "x"}));
         assert!(other["params"].get("_meta").is_none());
+        let broken = repaired(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"run","arguments":"{bad json"}}"#,
+        )
+        .expect("repaired");
+        assert_eq!(
+            broken["params"]["arguments"],
+            json!({"arguments": "{bad json"})
+        );
     }
 
     #[test]

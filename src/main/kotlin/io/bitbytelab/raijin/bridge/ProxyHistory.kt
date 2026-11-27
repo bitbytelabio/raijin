@@ -15,10 +15,13 @@ import io.bitbytelab.raijin.core.SensitiveHeaders
 import io.bitbytelab.raijin.core.StatusCodeRange
 import io.bitbytelab.raijin.core.WebSocketHistoryCriteria
 import io.bitbytelab.raijin.safety.SafeRegex
-import kotlinx.serialization.json.*
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.serialization.json.*
 
-/** Longest request, response or URL text a history search runs its regex over; longer ones are counted as skipped_oversize. */
+/**
+ * Longest request, response or URL text a history search runs its regex over; longer ones are
+ * counted as skipped_oversize.
+ */
 private const val MAX_SEARCH_INPUT = 5_000_000
 
 /**
@@ -32,7 +35,8 @@ internal class ProxyHistory(private val api: MontoyaApi) {
      * Returns a slice of the HTTP proxy history with optional filtering.
      *
      * @param startIndex Zero-based offset into the filtered history.
-     * @param count Maximum number of items to return; clamped to 0..[MAX_PAGE_SIZE] with a note in the result.
+     * @param count Maximum number of items to return; clamped to 0..[MAX_PAGE_SIZE] with a note in
+     *   the result.
      * @param host Optional hostname filter (case-insensitive substring match).
      * @param method Optional HTTP method filter (exact, case-insensitive).
      * @param statusCode Optional exact status code filter.
@@ -60,37 +64,43 @@ internal class ProxyHistory(private val api: MontoyaApi) {
         // Resolve the optional MIME type filter up front so an unrecognized value
         // produces a clear error instead of silently dropping the filter (which
         // would return ALL history as if it matched).
-        val resolvedMimeType: MimeType? = if (mimeType != null) {
-            resolveMimeType(mimeType)
-                ?: return buildJsonObject {
-                    put(
-                        "error",
-                        "Unknown mime_type: $mimeType. Valid values: ${mimeTypeValidValues()}"
-                    )
-                }
-        } else {
-            null
-        }
+        val resolvedMimeType: MimeType? =
+            if (mimeType != null) {
+                resolveMimeType(mimeType)
+                    ?: return buildJsonObject {
+                        put(
+                            "error",
+                            "Unknown mime_type: $mimeType. Valid values: ${mimeTypeValidValues()}",
+                        )
+                    }
+            } else {
+                null
+            }
 
         // Validate the status-code range ONCE, up front — a malformed range now
         // returns a clear error instead of silently dropping the filter (which used
         // to return items outside the caller's intended range).
-        val resolvedRange: StatusCodeRange.Range? = when (val r = StatusCodeRange.parse(statusCodeRange)) {
-            is StatusCodeRange.Result.None -> null
-            is StatusCodeRange.Result.Ok -> r.range
-            is StatusCodeRange.Result.Invalid -> return buildJsonObject { put("error", r.message) }
-        }
+        val resolvedRange: StatusCodeRange.Range? =
+            when (val r = StatusCodeRange.parse(statusCodeRange)) {
+                is StatusCodeRange.Result.None -> null
+                is StatusCodeRange.Result.Ok -> r.range
+                is StatusCodeRange.Result.Invalid ->
+                    return buildJsonObject { put("error", r.message) }
+            }
 
         val criteria = HistoryCriteria(host, method, statusCode, resolvedRange)
         val filter = ProxyHistoryFilter { item ->
             try {
                 if (inScopeOnly && !item.request().isInScope()) return@ProxyHistoryFilter false
-                if (resolvedMimeType != null && item.mimeType() != resolvedMimeType) return@ProxyHistoryFilter false
+                if (resolvedMimeType != null && item.mimeType() != resolvedMimeType)
+                    return@ProxyHistoryFilter false
                 // Each value is read only when its criterion is set, and guarded: a malformed
                 // request throws from host()/method() and must not abort the whole read.
                 criteria.matches(
                     host = if (criteria.host != null) safe { item.httpService().host() } else null,
-                    method = if (criteria.method != null) safe { item.finalRequest().method() } else null,
+                    method =
+                        if (criteria.method != null) safe { item.finalRequest().method() }
+                        else null,
                     status = if (criteria.needsStatus) responseStatus(item) else null,
                 )
             } catch (_: Exception) {
@@ -101,18 +111,31 @@ internal class ProxyHistory(private val api: MontoyaApi) {
         val allItems = api.proxy().history(filter)
         val notes = mutableListOf<String>()
         val safeStart = ProxyLimits.clamp("start_index", startIndex, 0, Int.MAX_VALUE, notes)
-        val slice = page(allItems, safeStart, ProxyLimits.clamp("count", count, 0, MAX_PAGE_SIZE, notes))
+        val slice =
+            page(allItems, safeStart, ProxyLimits.clamp("count", count, 0, MAX_PAGE_SIZE, notes))
 
         return buildJsonObject {
             put("total_filtered", allItems.size)
             put("start_index", safeStart)
             put("returned", slice.size)
             nextStart(safeStart, slice.size, allItems.size)?.let { put("next_start_index", it) }
-            put("items", buildJsonArray {
-                slice.forEachIndexed { i, item ->
-                    add(serializeHistoryItem(item, safeStart + i, includeRequest, includeResponse, maxResponseLength ?: 200_000, includeHeaders))
-                }
-            })
+            put(
+                "items",
+                buildJsonArray {
+                    slice.forEachIndexed { i, item ->
+                        add(
+                            serializeHistoryItem(
+                                item,
+                                safeStart + i,
+                                includeRequest,
+                                includeResponse,
+                                maxResponseLength ?: 200_000,
+                                includeHeaders,
+                            ),
+                        )
+                    }
+                },
+            )
             putNotes(notes)
         }
     }
@@ -123,7 +146,8 @@ internal class ProxyHistory(private val api: MontoyaApi) {
      * @param pattern Regex pattern to match.
      * @param searchIn Where to search: "request", "response", or "both".
      * @param caseSensitive Whether the regex is case-sensitive.
-     * @param maxResults Maximum number of matching items to return; clamped to 0..[MAX_PAGE_SIZE] with a note in the result.
+     * @param maxResults Maximum number of matching items to return; clamped to 0..[MAX_PAGE_SIZE]
+     *   with a note in the result.
      * @param inScopeOnly When true, only search in-scope items.
      * @param includeRequest Whether to include the full request text.
      * @param includeResponse Whether to include the full response text.
@@ -142,7 +166,9 @@ internal class ProxyHistory(private val api: MontoyaApi) {
     ): JsonObject {
         val ignoreCase = !caseSensitive
         SafeRegex.validate(pattern, ignoreCase = ignoreCase)?.let { err ->
-            return buildJsonObject { put("error", "Invalid regex pattern: $err") }
+            return buildJsonObject {
+                put("error", "proxy_history_search: 'pattern' is not a valid regex ($err).")
+            }
         }
         val t = ProxyHistorySearch.targets(searchIn)
         val oversize = AtomicInteger()
@@ -151,7 +177,12 @@ internal class ProxyHistory(private val api: MontoyaApi) {
                 oversize.incrementAndGet()
                 return false
             }
-            return SafeRegex.containsMatchIn(pattern, text, ignoreCase = ignoreCase, maxInputLen = MAX_SEARCH_INPUT)
+            return SafeRegex.containsMatchIn(
+                pattern,
+                text,
+                ignoreCase = ignoreCase,
+                maxInputLen = MAX_SEARCH_INPUT,
+            )
         }
 
         val filter = ProxyHistoryFilter { item ->
@@ -180,7 +211,12 @@ internal class ProxyHistory(private val api: MontoyaApi) {
         val matches = api.proxy().history(filter)
         val notes = mutableListOf<String>()
         val safeStart = ProxyLimits.clamp("start_index", startIndex, 0, Int.MAX_VALUE, notes)
-        val limited = page(matches, safeStart, ProxyLimits.clamp("max_results", maxResults, 0, MAX_PAGE_SIZE, notes))
+        val limited =
+            page(
+                matches,
+                safeStart,
+                ProxyLimits.clamp("max_results", maxResults, 0, MAX_PAGE_SIZE, notes),
+            )
 
         return buildJsonObject {
             put("total_matches", matches.size)
@@ -190,16 +226,29 @@ internal class ProxyHistory(private val api: MontoyaApi) {
             if (oversize.get() > 0) put("skipped_oversize", oversize.get())
             put("pattern", pattern)
             put("search_in", searchIn)
-            put("items", buildJsonArray {
-                limited.forEachIndexed { i, item ->
-                    add(serializeHistoryItem(item, safeStart + i, includeRequest, includeResponse, maxResponseLength ?: 200_000))
-                }
-            })
+            put(
+                "items",
+                buildJsonArray {
+                    limited.forEachIndexed { i, item ->
+                        add(
+                            serializeHistoryItem(
+                                item,
+                                safeStart + i,
+                                includeRequest,
+                                includeResponse,
+                                maxResponseLength ?: 200_000,
+                            ),
+                        )
+                    }
+                },
+            )
             putNotes(notes)
         }
     }
 
-    /** The start_index of the next page, or null when [returned] items from [start] reach [total]. */
+    /**
+     * The start_index of the next page, or null when [returned] items from [start] reach [total].
+     */
     private fun nextStart(start: Int, returned: Int, total: Int): Int? =
         (start.toLong() + returned).takeIf { returned > 0 && it < total }?.toInt()
 
@@ -207,9 +256,11 @@ internal class ProxyHistory(private val api: MontoyaApi) {
      * Returns WebSocket proxy history with optional filtering.
      *
      * @param startIndex Zero-based offset.
-     * @param count Maximum number of items; clamped to 0..[MAX_PAGE_SIZE] with a note in the result.
+     * @param count Maximum number of items; clamped to 0..[MAX_PAGE_SIZE] with a note in the
+     *   result.
      * @param host Optional hostname filter.
-     * @param direction Optional direction filter: "client_to_server", "server_to_client" or "both" (any case).
+     * @param direction Optional direction filter: "client_to_server", "server_to_client" or "both"
+     *   (any case).
      * @param webSocketId Optional Burp id of one proxied connection (`websocket_id` of an item).
      * @param url Optional case-insensitive substring of the upgrade request's URL.
      * @return JSON object with items array.
@@ -222,25 +273,31 @@ internal class ProxyHistory(private val api: MontoyaApi) {
         webSocketId: Int?,
         url: String?,
     ): JsonObject {
-        val dirName = when (val d = WebSocketHistoryCriteria.parseDirection(direction)) {
-            is WebSocketHistoryCriteria.DirectionFilter.All -> null
-            is WebSocketHistoryCriteria.DirectionFilter.Only -> d.name
-            is WebSocketHistoryCriteria.DirectionFilter.Invalid -> return buildJsonObject { put("error", d.message) }
-        }
+        val dirName =
+            when (val d = WebSocketHistoryCriteria.parseDirection(direction)) {
+                is WebSocketHistoryCriteria.DirectionFilter.All -> null
+                is WebSocketHistoryCriteria.DirectionFilter.Only -> d.name
+                is WebSocketHistoryCriteria.DirectionFilter.Invalid ->
+                    return buildJsonObject { put("error", d.message) }
+            }
         val criteria = WebSocketHistoryCriteria(host, dirName, webSocketId, url)
 
         val allItems = api.proxy().webSocketHistory { item -> matchesCriteria(criteria, item) }
         val notes = mutableListOf<String>()
         val safeStart = ProxyLimits.clamp("start_index", startIndex, 0, Int.MAX_VALUE, notes)
-        val slice = page(allItems, safeStart, ProxyLimits.clamp("count", count, 0, MAX_PAGE_SIZE, notes))
+        val slice =
+            page(allItems, safeStart, ProxyLimits.clamp("count", count, 0, MAX_PAGE_SIZE, notes))
 
         return buildJsonObject {
             put("total_filtered", allItems.size)
             put("start_index", safeStart)
             put("returned", slice.size)
-            put("items", buildJsonArray {
-                slice.forEach { item -> add(serializeWebSocketItem(item)) }
-            })
+            put(
+                "items",
+                buildJsonArray {
+                    slice.forEach { item -> add(serializeWebSocketItem(item)) }
+                },
+            )
             putNotes(notes)
         }
     }
@@ -264,13 +321,20 @@ internal class ProxyHistory(private val api: MontoyaApi) {
         startIndex: Int = 0,
     ): JsonObject {
         SafeRegex.validate(pattern, ignoreCase = true)?.let { err ->
-            return buildJsonObject { put("error", "Invalid regex pattern: $err") }
+            return buildJsonObject {
+                put(
+                    "error",
+                    "proxy_websocket_history_search: 'pattern' is not a valid regex ($err).",
+                )
+            }
         }
-        val dirName = when (val d = WebSocketHistoryCriteria.parseDirection(direction)) {
-            is WebSocketHistoryCriteria.DirectionFilter.All -> null
-            is WebSocketHistoryCriteria.DirectionFilter.Only -> d.name
-            is WebSocketHistoryCriteria.DirectionFilter.Invalid -> return buildJsonObject { put("error", d.message) }
-        }
+        val dirName =
+            when (val d = WebSocketHistoryCriteria.parseDirection(direction)) {
+                is WebSocketHistoryCriteria.DirectionFilter.All -> null
+                is WebSocketHistoryCriteria.DirectionFilter.Only -> d.name
+                is WebSocketHistoryCriteria.DirectionFilter.Invalid ->
+                    return buildJsonObject { put("error", d.message) }
+            }
         val criteria = WebSocketHistoryCriteria(null, dirName, webSocketId, url)
         val oversize = AtomicInteger()
 
@@ -282,7 +346,12 @@ internal class ProxyHistory(private val api: MontoyaApi) {
                     oversize.incrementAndGet()
                     return@ProxyWebSocketHistoryFilter false
                 }
-                SafeRegex.containsMatchIn(pattern, payloadText, ignoreCase = true, maxInputLen = MAX_SEARCH_INPUT)
+                SafeRegex.containsMatchIn(
+                    pattern,
+                    payloadText,
+                    ignoreCase = true,
+                    maxInputLen = MAX_SEARCH_INPUT,
+                )
             } catch (_: Exception) {
                 false
             }
@@ -291,7 +360,12 @@ internal class ProxyHistory(private val api: MontoyaApi) {
         val matches = api.proxy().webSocketHistory(filter)
         val notes = mutableListOf<String>()
         val safeStart = ProxyLimits.clamp("start_index", startIndex, 0, Int.MAX_VALUE, notes)
-        val limited = page(matches, safeStart, ProxyLimits.clamp("max_results", maxResults, 0, MAX_PAGE_SIZE, notes))
+        val limited =
+            page(
+                matches,
+                safeStart,
+                ProxyLimits.clamp("max_results", maxResults, 0, MAX_PAGE_SIZE, notes),
+            )
 
         return buildJsonObject {
             put("total_matches", matches.size)
@@ -300,9 +374,12 @@ internal class ProxyHistory(private val api: MontoyaApi) {
             nextStart(safeStart, limited.size, matches.size)?.let { put("next_start_index", it) }
             if (oversize.get() > 0) put("skipped_oversize", oversize.get())
             put("pattern", pattern)
-            put("items", buildJsonArray {
-                limited.forEach { item -> add(serializeWebSocketItem(item)) }
-            })
+            put(
+                "items",
+                buildJsonArray {
+                    limited.forEach { item -> add(serializeWebSocketItem(item)) }
+                },
+            )
             putNotes(notes)
         }
     }
@@ -311,16 +388,25 @@ internal class ProxyHistory(private val api: MontoyaApi) {
      * Whether [item] passes [criteria]. Each value is read only when its criterion is set, and
      * guarded: a message Burp cannot describe never matches a criterion that needs the value.
      */
-    private fun matchesCriteria(criteria: WebSocketHistoryCriteria, item: ProxyWebSocketMessage): Boolean = try {
-        criteria.matches(
-            upgradeHost = if (criteria.host != null) safe { item.upgradeRequest()?.httpService()?.host() } else null,
-            direction = if (criteria.direction != null) safe { item.direction().name } else null,
-            webSocketId = if (criteria.webSocketId != null) safe { item.webSocketId() } else null,
-            upgradeUrl = if (criteria.url != null) safe { item.upgradeRequest()?.url() } else null,
-        )
-    } catch (_: Exception) {
-        false
-    }
+    private fun matchesCriteria(
+        criteria: WebSocketHistoryCriteria,
+        item: ProxyWebSocketMessage,
+    ): Boolean =
+        try {
+            criteria.matches(
+                upgradeHost =
+                    if (criteria.host != null) safe { item.upgradeRequest()?.httpService()?.host() }
+                    else null,
+                direction =
+                    if (criteria.direction != null) safe { item.direction().name } else null,
+                webSocketId =
+                    if (criteria.webSocketId != null) safe { item.webSocketId() } else null,
+                upgradeUrl =
+                    if (criteria.url != null) safe { item.upgradeRequest()?.url() } else null,
+            )
+        } catch (_: Exception) {
+            false
+        }
 
     // ---------------------------------------------------------------
     // Serialization helpers
@@ -328,8 +414,8 @@ internal class ProxyHistory(private val api: MontoyaApi) {
 
     /**
      * Serializes a [ProxyHttpRequestResponse] to a [JsonObject]. Every accessor is guarded: a
-     * request Burp cannot parse (MalformedRequestException from method()/url()/path()) is
-     * reported with `malformed_request` instead of failing the whole history read.
+     * request Burp cannot parse (MalformedRequestException from method()/url()/path()) is reported
+     * with `malformed_request` instead of failing the whole history read.
      */
     private fun serializeHistoryItem(
         item: ProxyHttpRequestResponse,
@@ -340,14 +426,16 @@ internal class ProxyHistory(private val api: MontoyaApi) {
         includeHeaders: Boolean = true,
     ): JsonObject {
         return buildJsonObject {
-            // id: Burp's own message id (stable); index: the item's place in this filtered list (pages with start_index).
+            // id: Burp's own message id (stable); index: the item's place in this filtered list
+            // (pages with start_index).
             safe { item.id() }?.let { put("id", it) }
             put("index", position)
-            safe { item.httpService() }?.let { service ->
-                put("host", service.host())
-                put("port", service.port())
-                put("secure", service.secure())
-            }
+            safe { item.httpService() }
+                ?.let { service ->
+                    put("host", service.host())
+                    put("port", service.port())
+                    put("secure", service.secure())
+                }
             val method = safe { item.finalRequest().method() }
             val url = safe { item.finalRequest().url() }
             val path = safe { item.finalRequest().path() }
@@ -364,18 +452,27 @@ internal class ProxyHistory(private val api: MontoyaApi) {
             try {
                 val time = item.time()
                 if (time != null) put("time", time.toString())
-            } catch (_: Exception) { }
+            } catch (_: Exception) {}
 
             // Timing data
             try {
                 val td = item.timingData()
                 if (td != null) {
-                    put("timing", buildJsonObject {
-                        put("time_to_first_byte_ms", td.timeBetweenRequestSentAndStartOfResponse().toMillis())
-                        put("time_to_complete_ms", td.timeBetweenRequestSentAndEndOfResponse().toMillis())
-                    })
+                    put(
+                        "timing",
+                        buildJsonObject {
+                            put(
+                                "time_to_first_byte_ms",
+                                td.timeBetweenRequestSentAndStartOfResponse().toMillis(),
+                            )
+                            put(
+                                "time_to_complete_ms",
+                                td.timeBetweenRequestSentAndEndOfResponse().toMillis(),
+                            )
+                        },
+                    )
                 }
-            } catch (_: Exception) { }
+            } catch (_: Exception) {}
 
             // Response metadata
             if (hasResponse) {
@@ -384,7 +481,7 @@ internal class ProxyHistory(private val api: MontoyaApi) {
                     put("status_code", resp.statusCode().toInt())
                     put("response_length", resp.body().length())
                     put("response_mime_type", resp.mimeType().name)
-                } catch (_: Exception) { }
+                } catch (_: Exception) {}
             }
 
             // Annotations
@@ -392,27 +489,45 @@ internal class ProxyHistory(private val api: MontoyaApi) {
                 val ann = item.annotations()
                 if (ann.hasNotes()) put("comment", ann.notes())
                 if (ann.hasHighlightColor()) put("highlight", ann.highlightColor().name)
-            } catch (_: Exception) { }
+            } catch (_: Exception) {}
 
             // Request headers — names/shape always preserved for recon; the VALUES of
             // credential-bearing headers (Cookie, Authorization, …) are redacted unless the
             // caller explicitly requested full request material (issue #20).
-            if (includeHeaders) try {
-                put("request_headers", buildJsonArray {
-                    item.request().headers().forEach { h ->
-                        add(buildJsonObject {
-                            put("name", h.name())
-                            put("value", SensitiveHeaders.value(h.name(), h.value(), includeRequest))
-                        })
-                    }
-                })
-            } catch (_: Exception) { }
+            if (includeHeaders)
+                try {
+                    put(
+                        "request_headers",
+                        buildJsonArray {
+                            item.request().headers().forEach { h ->
+                                add(
+                                    buildJsonObject {
+                                        put("name", h.name())
+                                        put(
+                                            "value",
+                                            SensitiveHeaders.value(
+                                                h.name(),
+                                                h.value(),
+                                                includeRequest,
+                                            ),
+                                        )
+                                    },
+                                )
+                            }
+                        },
+                    )
+                } catch (_: Exception) {}
 
             // Full request text. Routed through BodyText so a binary body (a file upload) can
             // never put an unencodable lone surrogate into the JSON — see issue #12.
             if (includeRequest) {
                 try {
-                    val r = BodyText.render(item.request().toString(), maxResponseLength, label = "request body")
+                    val r =
+                        BodyText.render(
+                            item.request().toString(),
+                            maxResponseLength,
+                            label = "request body",
+                        )
                     put("request", r.text)
                     if (r.binary) put("request_binary", true)
                     if (r.truncated) put("request_truncated", true)
@@ -427,7 +542,13 @@ internal class ProxyHistory(private val api: MontoyaApi) {
             if (includeResponse && hasResponse) {
                 try {
                     val mime = safe { item.response().mimeType().name }
-                    val r = BodyText.render(item.response().toString(), maxResponseLength, mime, "response body")
+                    val r =
+                        BodyText.render(
+                            item.response().toString(),
+                            maxResponseLength,
+                            mime,
+                            "response body",
+                        )
                     put("response", r.text)
                     if (r.binary) put("response_binary", true)
                     if (r.truncated) put("response_truncated", true)
@@ -438,9 +559,7 @@ internal class ProxyHistory(private val api: MontoyaApi) {
         }
     }
 
-    /**
-     * Serializes a [ProxyWebSocketMessage] to a [JsonObject].
-     */
+    /** Serializes a [ProxyWebSocketMessage] to a [JsonObject]. */
     private fun serializeWebSocketItem(item: ProxyWebSocketMessage): JsonObject {
         return buildJsonObject {
             safe { item.id() }?.let { put("id", it) }
@@ -451,11 +570,12 @@ internal class ProxyHistory(private val api: MontoyaApi) {
             try {
                 val time = item.time()
                 if (time != null) put("time", time.toString())
-            } catch (_: Exception) { }
+            } catch (_: Exception) {}
 
             try {
                 val payload = item.payload()
-                // Binary WebSocket frames are the same JSON hazard as binary HTTP bodies (issue #12).
+                // Binary WebSocket frames are the same JSON hazard as binary HTTP bodies (issue
+                // #12).
                 val r = BodyText.render(payload.toString(), label = "payload")
                 put("payload", r.text)
                 if (r.binary) put("payload_binary", true)
@@ -469,15 +589,18 @@ internal class ProxyHistory(private val api: MontoyaApi) {
             try {
                 val editedPayload = item.editedPayload()
                 if (editedPayload != null) {
-                    put("edited_payload", BodyText.render(editedPayload.toString(), label = "payload").text)
+                    put(
+                        "edited_payload",
+                        BodyText.render(editedPayload.toString(), label = "payload").text,
+                    )
                 }
-            } catch (_: Exception) { }
+            } catch (_: Exception) {}
 
             try {
                 val ann = item.annotations()
                 if (ann.hasNotes()) put("comment", ann.notes())
                 if (ann.hasHighlightColor()) put("highlight", ann.highlightColor().name)
-            } catch (_: Exception) { }
+            } catch (_: Exception) {}
 
             try {
                 val upgradeReq = item.upgradeRequest()
@@ -485,7 +608,7 @@ internal class ProxyHistory(private val api: MontoyaApi) {
                     put("upgrade_url", upgradeReq.url())
                     put("upgrade_host", upgradeReq.httpService().host())
                 }
-            } catch (_: Exception) { }
+            } catch (_: Exception) {}
         }
     }
 
@@ -493,10 +616,15 @@ internal class ProxyHistory(private val api: MontoyaApi) {
     private fun responseStatus(item: ProxyHttpRequestResponse): Int? =
         if (item.hasResponse()) safe { item.response().statusCode().toInt() } else null
 
-    /** Up to [count] (capped at [MAX_PAGE_SIZE]) items from [from], as a view (no copy of the list). */
+    /**
+     * Up to [count] (capped at [MAX_PAGE_SIZE]) items from [from], as a view (no copy of the list).
+     */
     private fun <T> page(items: List<T>, from: Int, count: Int): List<T> {
         val start = from.coerceIn(0, items.size)
-        val end = (start.toLong() + count.coerceIn(0, MAX_PAGE_SIZE)).coerceAtMost(items.size.toLong()).toInt()
+        val end =
+            (start.toLong() + count.coerceIn(0, MAX_PAGE_SIZE))
+                .coerceAtMost(items.size.toLong())
+                .toInt()
         return items.subList(start, end)
     }
 
@@ -507,9 +635,9 @@ internal class ProxyHistory(private val api: MontoyaApi) {
     /**
      * Resolves a caller-supplied MIME type string to a [MimeType] enum constant.
      *
-     * Accepts both the Montoya enum constant names (e.g. "JSON", "HTML") and a
-     * set of common content-type / alias spellings (e.g. "application/json",
-     * "text/html", "javascript"). Returns null if it cannot be resolved.
+     * Accepts both the Montoya enum constant names (e.g. "JSON", "HTML") and a set of common
+     * content-type / alias spellings (e.g. "application/json", "text/html", "javascript"). Returns
+     * null if it cannot be resolved.
      */
     private fun resolveMimeType(input: String): MimeType? {
         val normalized = input.trim()
@@ -523,28 +651,55 @@ internal class ProxyHistory(private val api: MontoyaApi) {
 
         // Common content-type strings and short aliases mapped to enum constants.
         return when (normalized.lowercase()) {
-            "application/json", "json", "text/json" -> MimeType.JSON
-            "text/html", "html", "application/xhtml+xml", "xhtml" -> MimeType.HTML
-            "text/plain", "plain", "text" -> MimeType.PLAIN_TEXT
-            "text/css", "css" -> MimeType.CSS
-            "application/javascript", "text/javascript", "javascript", "js", "script" -> MimeType.SCRIPT
-            "application/xml", "text/xml", "xml" -> MimeType.XML
-            "application/yaml", "text/yaml", "yaml", "yml" -> MimeType.YAML
-            "text/event-stream", "sse" -> MimeType.SSE
-            "application/rtf", "text/rtf", "rtf" -> MimeType.RTF
-            "image/svg+xml", "svg" -> MimeType.IMAGE_SVG_XML
-            "image/png", "png" -> MimeType.IMAGE_PNG
-            "image/jpeg", "image/jpg", "jpeg", "jpg" -> MimeType.IMAGE_JPEG
-            "image/gif", "gif" -> MimeType.IMAGE_GIF
-            "image/bmp", "bmp" -> MimeType.IMAGE_BMP
-            "image/tiff", "tiff", "tif" -> MimeType.IMAGE_TIFF
+            "application/json",
+            "json",
+            "text/json" -> MimeType.JSON
+            "text/html",
+            "html",
+            "application/xhtml+xml",
+            "xhtml" -> MimeType.HTML
+            "text/plain",
+            "plain",
+            "text" -> MimeType.PLAIN_TEXT
+            "text/css",
+            "css" -> MimeType.CSS
+            "application/javascript",
+            "text/javascript",
+            "javascript",
+            "js",
+            "script" -> MimeType.SCRIPT
+            "application/xml",
+            "text/xml",
+            "xml" -> MimeType.XML
+            "application/yaml",
+            "text/yaml",
+            "yaml",
+            "yml" -> MimeType.YAML
+            "text/event-stream",
+            "sse" -> MimeType.SSE
+            "application/rtf",
+            "text/rtf",
+            "rtf" -> MimeType.RTF
+            "image/svg+xml",
+            "svg" -> MimeType.IMAGE_SVG_XML
+            "image/png",
+            "png" -> MimeType.IMAGE_PNG
+            "image/jpeg",
+            "image/jpg",
+            "jpeg",
+            "jpg" -> MimeType.IMAGE_JPEG
+            "image/gif",
+            "gif" -> MimeType.IMAGE_GIF
+            "image/bmp",
+            "bmp" -> MimeType.IMAGE_BMP
+            "image/tiff",
+            "tiff",
+            "tif" -> MimeType.IMAGE_TIFF
             else -> null
         }
     }
 
-    /**
-     * A human-readable hint listing the accepted MIME type values, for error messages.
-     */
+    /** A human-readable hint listing the accepted MIME type values, for error messages. */
     private fun mimeTypeValidValues(): String {
         val constants = MimeType.values().joinToString(", ") { it.name }
         return "$constants (also accepts common aliases such as application/json, text/html, " +

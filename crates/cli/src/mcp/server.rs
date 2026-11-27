@@ -25,7 +25,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 
 use super::api::{ApiError, Endpoint, ToolApi};
-use super::args::{call_fits, parse_args, schema_of};
+use super::args::{call_fits, is_empty_value, parse_args, schema_of};
 use super::error::{self, Code, ToolError, guide_call};
 use super::{spill, stdin};
 use crate::burp::{instance, launch};
@@ -34,13 +34,15 @@ use crate::config::{Mode, Remote, Target, user_state_dir};
 use crate::data::{self, store};
 use crate::history;
 use crate::jar::{self, Assets};
-use crate::util::{contains_near, edit_distance, suggest, suggest_call, truncate_utf8};
+use crate::util::{
+    Intent, contains_near, edit_distance, intent_call, suggest, suggest_call, truncate_utf8,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Surface {
-    /// guide and run only.
+    /// guide and run only. lean (default) suits weak or small models.
     Lean,
-    /// Also every Raijin tool, callable directly.
+    /// Also every Raijin tool, callable directly: full lists every tool (~176 KB tools/list), which some clients truncate.
     Full,
 }
 
@@ -57,9 +59,13 @@ const INSTRUCTIONS_REMOTE: &str =
 const INSTRUCTIONS_TAIL: &str = "offline .burp review (domain history) needs no Burp. Pass \"project\" to pick the \
 Burp when several run. An error result is JSON with 'error' and 'code': resend 'retry' when it is given, else fix \
 the call from 'usage' and 'example'; never resend a call unchanged when 'retryable' is false. Results over the \
-inline limit come back as {saved_to, preview}: parse the file with jq/python, never read it whole. Read the \
-overview playbook first: guide({\"topic\":\"overview\"}), also the prompt /overview and skill://overview/SKILL.md. \
-'see' is a call to make first: an object with \"do\" goes to run, one with \"guide\" holds guide's arguments.";
+inline limit come back as {saved_to, preview}: parse the file with jq/python, never read it whole. Call guide() \
+first: it lists every tool by domain; then read the overview playbook: guide({\"topic\":\"overview\"}), also the \
+prompt /overview and skill://overview/SKILL.md. 'see' is a call to make first: an object with \"do\" goes to run, \
+one with \"guide\" holds guide's arguments.";
+
+/// Why a destructive tool named in another form is not run.
+const DESTRUCTIVE_EXACT: &str = "It is destructive, so it runs only under its exact name.";
 
 const GUIDE_HEAD: &str = "Run a tool: run {\"do\":\"<tool>\", ...its parameters}. Grouped tool: run \
 {\"do\":\"<tool>.<action>\", ...} e.g. {\"do\":\"scope.check\",\"url\":\"https://example.com\"}. Several in order: \
@@ -369,15 +375,20 @@ fn with_project(mut result: CallToolResult, project: &str) -> CallToolResult {
     result
 }
 
-/// Whether `value` is what a strict-mode client sends for a property it has nothing for: a blank
-/// string, `[]` or `{}`.
-fn is_empty_value(value: &Value) -> bool {
-    match value {
-        Value::String(s) => s.trim().is_empty(),
-        Value::Array(a) => a.is_empty(),
-        Value::Object(o) => o.is_empty(),
-        _ => false,
+/// An error envelope's `retry` set to `call`; any other result is returned as is.
+fn with_retry(mut result: CallToolResult, call: Value) -> CallToolResult {
+    if result.is_error != Some(true) || result.content.len() != 1 {
+        return result;
     }
+    let Some(Ok(Value::Object(mut envelope))) = result.content[0]
+        .as_text()
+        .map(|t| serde_json::from_str::<Value>(&t.text))
+    else {
+        return result;
+    };
+    envelope.insert("retry".to_owned(), call);
+    result.content[0] = ContentBlock::text(Value::Object(envelope).to_string());
+    result
 }
 
 /// Reads what a `run` call holds besides the call itself, each reading noted: an empty `do`,
@@ -398,19 +409,9 @@ fn read_pasted_calls(raw: &mut JsonObject, notes: &mut Vec<String>) -> Option<Js
             _ => {}
         }
     }
+    unwrap_call(raw, notes);
     if CALL_KEYS.iter().any(|k| raw.contains_key(*k)) {
         return None;
-    }
-    if let Some(Value::Object(_)) = raw.get("see")
-        && let Some(Value::Object(see)) = raw.remove("see")
-    {
-        for (k, v) in see {
-            raw.entry(k).or_insert(v);
-        }
-        notes.push("read 'see' as the call to make".to_owned());
-        if CALL_KEYS.iter().any(|k| raw.contains_key(*k)) {
-            return None;
-        }
     }
     let guide = raw.remove("guide")?;
     let args = match guide {
@@ -429,6 +430,90 @@ fn read_pasted_calls(raw: &mut JsonObject, notes: &mut Vec<String>) -> Option<Js
     );
     notes.push("ran guide; tool calls go in \"do\"".to_owned());
     Some(args)
+}
+
+/// Keys of an error envelope that hold a call, as models paste them back whole.
+const PASTED_KEYS: [&str; 3] = ["retry", "see", "example"];
+
+/// Reads a call pasted in another shape into `raw`, when `raw` names no tool ([`CALL_KEYS`]):
+/// `{"retry":{...}}`, `{"see":...}` or `{"example":...}` (an object is the call, a string its
+/// tool), a JSON string in `arguments` holding the call, or one `tool_calls`/`tool_uses` item
+/// (`{"function":{"name":...,"arguments":...}}`, `{"recipient_name":"functions.x","parameters":...}`).
+/// Keys already in `raw` win. Each reading is noted.
+fn unwrap_call(raw: &mut JsonObject, notes: &mut Vec<String>) {
+    let names_tool = |raw: &JsonObject| CALL_KEYS.iter().any(|k| raw.contains_key(*k));
+    if names_tool(raw) {
+        return;
+    }
+    let merge = |raw: &mut JsonObject, call: JsonObject| {
+        for (k, v) in call {
+            raw.entry(k).or_insert(v);
+        }
+    };
+    for key in PASTED_KEYS {
+        match raw.get(key) {
+            Some(Value::Object(_)) => {
+                if let Some(Value::Object(call)) = raw.remove(key) {
+                    merge(raw, call);
+                }
+            }
+            Some(Value::String(s)) if !s.trim().is_empty() => {
+                let tool = s.trim().to_owned();
+                raw.remove(key);
+                raw.insert("do".to_owned(), json!(tool));
+            }
+            _ => continue,
+        }
+        notes.push(format!("read '{key}' as the call"));
+        if names_tool(raw) {
+            return;
+        }
+    }
+    if let Some(Value::String(s)) = raw.get(WRAPPER_KEY)
+        && let Ok(call) = serde_json::from_str::<JsonObject>(s)
+        && CALL_KEYS.iter().any(|k| call.contains_key(*k))
+    {
+        raw.remove(WRAPPER_KEY);
+        merge(raw, call);
+        notes.push(format!("read '{WRAPPER_KEY}' as the call"));
+        return;
+    }
+    for key in ["tool_calls", "tool_uses"] {
+        let Some(Value::Array(items)) = raw.get(key) else {
+            continue;
+        };
+        let [Value::Object(item)] = items.as_slice() else {
+            continue;
+        };
+        let function = item.get("function").and_then(Value::as_object);
+        let name = function
+            .and_then(|f| f.get("name"))
+            .or_else(|| item.get("recipient_name"))
+            .or_else(|| item.get("name"))
+            .and_then(Value::as_str);
+        let Some(name) = name else {
+            continue;
+        };
+        let name = error::strip_server_prefix(name)
+            .unwrap_or(name)
+            .trim()
+            .to_owned();
+        let args = function
+            .and_then(|f| f.get("arguments"))
+            .or_else(|| item.get("parameters"))
+            .or_else(|| item.get("arguments"))
+            .or_else(|| item.get("input"));
+        let args = match args {
+            Some(Value::Object(o)) => o.clone(),
+            Some(Value::String(s)) => serde_json::from_str::<JsonObject>(s).unwrap_or_default(),
+            _ => JsonObject::new(),
+        };
+        raw.remove(key);
+        raw.insert("do".to_owned(), json!(name));
+        merge(raw, args);
+        notes.push(format!("read '{key}' as the call"));
+        return;
+    }
 }
 
 /// `batch` given as `kind` ("a string", "an object", ...) instead of an array.
@@ -567,7 +652,7 @@ fn history_error(tool: &str, e: &anyhow::Error, sent: &JsonObject) -> ToolError 
         Some(history::Problem::BadPattern { pattern, reason }) => ToolError::new(
             Code::InvalidArguments,
             format!(
-                "{tool}: 'pattern' is not a valid regex ({reason}); escape regex characters such as [ ( . * with a backslash to match them literally."
+                "{tool}: 'pattern' is not a valid regex ({reason}); escape regex characters such as [ ( . * with a backslash to match them literally. {tool} uses Rust regex (no look-around); proxy_history_search accepts it on live data."
             ),
         )
         .param("pattern")
@@ -810,6 +895,9 @@ struct Call {
     project: Option<String>,
     /// What reading the call changed (a prefix stripped, a key read as `do`), for the result.
     notes: Vec<String>,
+    /// Pieces of a `tool(k: integer)` name left out (types copied from `usage`, or a suffix that
+    /// could not be read): a call that writes is not made without them.
+    dropped: Vec<String>,
 }
 
 /// Keys a model wraps a tool's parameters in, in the order they are tried.
@@ -875,11 +963,126 @@ fn named_without_do(
 /// The `k=v` arguments of a `tool(k=v, ...)` name, in order.
 type SuffixArgs = Vec<(String, Value)>;
 
-/// `tool(k=v, ...)` split into the tool and its `k=v` arguments: each value read as JSON, else as
-/// text without surrounding quotes. Pieces that are not `k=v` (`limit: integer`) are left out.
-/// The arguments are None when a quoted value holds a comma (a piece with an unmatched quote):
-/// reading it would send a cut value. None when `tool` has no parenthesised suffix.
-fn parenthesised(tool: &str) -> Option<(String, Option<SuffixArgs>)> {
+/// Whether `v` is a type `usage` prints (`integer`, `integer ≥ 0`, `list of string`,
+/// `"MD5"|"SHA-256"`, `true or false`) rather than a value.
+fn is_type_words(v: &str) -> bool {
+    const TYPES: [&str; 9] = [
+        "string",
+        "integer",
+        "number",
+        "boolean",
+        "object",
+        "array",
+        "true or false",
+        "any value",
+        "values",
+    ];
+    let v = v.trim();
+    if v.contains('|')
+        && v.split('|').all(|p| {
+            let p = p.trim();
+            p.len() >= 2 && p.starts_with('"') && p.ends_with('"')
+        })
+    {
+        return true;
+    }
+    let l = v.to_lowercase();
+    TYPES.contains(&l.as_str())
+        || l.starts_with("list of ")
+        || l.starts_with("integer ≥")
+        || l.starts_with("one of ")
+        || (l.contains(" or ")
+            && l.split(" or ")
+                .all(|p| TYPES.contains(&p.trim()) || p.trim().starts_with("list of ")))
+}
+
+/// `k=v, k: v, k*: v` pieces (a `tool(...)` suffix, or the text after `tool `) read as arguments:
+/// the key without a trailing `*`, each value as JSON, else as text without surrounding quotes.
+/// A value that is a type copied from `usage` (`limit: integer`) is dropped and returned as
+/// `k: v`. The arguments are None when a piece cannot be read whole: a quoted value holding a
+/// comma (a piece with an unmatched quote), or a piece without a key (`a=1,2` cut at the comma):
+/// reading the rest would send a cut value.
+fn piece_args(body: &str) -> (Option<SuffixArgs>, Vec<String>) {
+    let pieces = body.split(',');
+    let unmatched = |q: char| pieces.clone().any(|p| p.matches(q).count() % 2 == 1);
+    if unmatched('"') || unmatched('\'') {
+        return (None, Vec::new());
+    }
+    read_pieces(pieces.filter(|p| !p.trim().is_empty()))
+}
+
+/// Whether `k` is a parameter name: a letter or `_`, then letters, digits and `_`.
+fn is_param_key(k: &str) -> bool {
+    let mut chars = k.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `pieces`, each `k=v` or `k: v`, read as [`piece_args`] says; None when one has no key.
+fn read_pieces<'a>(pieces: impl Iterator<Item = &'a str>) -> (Option<SuffixArgs>, Vec<String>) {
+    let mut args = Vec::new();
+    let mut dropped = Vec::new();
+    for piece in pieces {
+        let Some(at) = piece.find(['=', ':']) else {
+            return (None, Vec::new());
+        };
+        let k = piece[..at].trim().trim_end_matches('*').trim();
+        let v = piece[at + 1..].trim();
+        // `https://a.com` is a bare value, not `https: //a.com`.
+        if !is_param_key(k) || (piece.as_bytes()[at] == b':' && v.starts_with("//")) {
+            return (None, Vec::new());
+        }
+        if is_type_words(v) {
+            dropped.push(format!("{k}: {v}"));
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(v).unwrap_or_else(|_| {
+            let unquoted = v
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+                .or_else(|| v.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+                .unwrap_or(v);
+            json!(unquoted)
+        });
+        args.push((k.to_owned(), value));
+    }
+    (Some(args), dropped)
+}
+
+/// Byte offsets in `text` where a `key=` or `key:` token starts: at the start or after
+/// whitespace, outside quotes, and not a URL scheme (`https://`).
+fn key_starts(text: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut prev_space = true;
+    for (i, c) in text.char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else if c == '"' || c == '\'' {
+            quote = Some(c);
+        } else if prev_space && (c.is_ascii_alphabetic() || c == '_') {
+            let rest = &text[i..];
+            let end = rest
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .unwrap_or(rest.len());
+            let after = rest[end..].trim_start_matches('*').trim_start();
+            if after.starts_with('=') || (after.starts_with(':') && !after[1..].starts_with("//")) {
+                starts.push(i);
+            }
+        }
+        prev_space = c.is_whitespace();
+    }
+    starts
+}
+
+/// `tool(k=v, ...)`, `tool(k: v, ...)` or `tool({...})` split into the tool, its arguments
+/// ([`piece_args`]; a JSON object gives them all) and the pieces dropped as types. None when
+/// `tool` has no parenthesised suffix.
+fn parenthesised(tool: &str) -> Option<(String, Option<SuffixArgs>, Vec<String>)> {
     let t = tool.trim();
     let inner = t.strip_suffix(')')?;
     let open = inner.find('(')?;
@@ -887,37 +1090,37 @@ fn parenthesised(tool: &str) -> Option<(String, Option<SuffixArgs>)> {
     if name.is_empty() || name.contains(char::is_whitespace) || name.contains(')') {
         return None;
     }
-    let is_key = |k: &str| {
-        let mut chars = k.chars();
-        chars
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-    };
-    let pieces = inner[open + 1..].split(',');
-    let unmatched = |q: char| pieces.clone().any(|p| p.matches(q).count() % 2 == 1);
-    if unmatched('"') || unmatched('\'') {
-        return Some((name.to_owned(), None));
+    let body = inner[open + 1..].trim();
+    if body.starts_with('{') {
+        let args = serde_json::from_str::<JsonObject>(body)
+            .ok()
+            .map(|o| o.into_iter().collect());
+        return Some((name.to_owned(), args, Vec::new()));
     }
-    let args = pieces
-        .filter_map(|piece| {
-            let (k, v) = piece.split_once('=')?;
-            let (k, v) = (k.trim(), v.trim());
-            if !is_key(k) {
-                return None;
-            }
-            let value = serde_json::from_str::<Value>(v).unwrap_or_else(|_| {
-                let unquoted = v
-                    .strip_prefix('\'')
-                    .and_then(|s| s.strip_suffix('\''))
-                    .or_else(|| v.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-                    .unwrap_or(v);
-                json!(unquoted)
-            });
-            Some((k.to_owned(), value))
-        })
-        .collect();
-    Some((name.to_owned(), Some(args)))
+    let (args, dropped) = piece_args(body);
+    Some((name.to_owned(), args, dropped))
+}
+
+/// `tool k=v k2: v2 ...` (a name, a space, then pieces that each start with `key=` or `key:`)
+/// split like [`parenthesised`]; a value runs to the next key, so it may hold spaces and commas
+/// (a trailing `,` between pieces is dropped). None unless the text after the name starts with a
+/// key.
+fn spaced(tool: &str) -> Option<(String, Option<SuffixArgs>, Vec<String>)> {
+    let (name, rest) = tool.trim().split_once(char::is_whitespace)?;
+    let rest = rest.trim();
+    if name.contains(['(', ')', '=', ':']) {
+        return None;
+    }
+    let mut starts = key_starts(rest);
+    if starts.first() != Some(&0) {
+        return None;
+    }
+    starts.push(rest.len());
+    let pieces = starts
+        .windows(2)
+        .map(|w| rest[w[0]..w[1]].trim().trim_end_matches(',').trim_end());
+    let (args, dropped) = read_pieces(pieces);
+    Some((name.to_owned(), args, dropped))
 }
 
 /// What names the tool of a `run` call, removed from `raw`: `do`, else [`named_without_do`]. A
@@ -929,6 +1132,10 @@ fn named_tool(
     notes: &mut Vec<String>,
 ) -> Option<Value> {
     let mut named = match raw.remove("do") {
+        Some(Value::Object(call)) => {
+            notes.push("read 'do' as a call object".to_owned());
+            Some(Value::Object(call))
+        }
         Some(value) => Some(value),
         None => named_without_do(raw, names_tool, notes),
     };
@@ -954,6 +1161,46 @@ fn named_tool(
         }
     }
     tool
+}
+
+/// `tool` without a `(k=v, ...)` or ` k=v` suffix ([`parenthesised`], [`spaced`]), its arguments
+/// added to `raw` where `raw` lacks them, and the pieces dropped as types; each reading noted.
+fn suffix_args(
+    tool: String,
+    raw: &mut JsonObject,
+    notes: &mut Vec<String>,
+) -> (String, Vec<String>) {
+    let Some((name, args, mut dropped)) = parenthesised(&tool).or_else(|| spaced(&tool)) else {
+        return (tool, Vec::new());
+    };
+    let with = match args {
+        None => {
+            // Left out whole, like a type: a call that writes is not made without them.
+            dropped.push(tool[name.len()..].trim().to_owned());
+            "; its arguments were not read (a value holds a comma or a piece has no key): pass them as keys next to \"do\"".to_owned()
+        }
+        Some(args) => {
+            let mut read = Vec::new();
+            for (k, v) in args {
+                if !raw.contains_key(&k) {
+                    read.push(k.clone());
+                    raw.insert(k, v);
+                }
+            }
+            if read.is_empty() {
+                String::new()
+            } else {
+                format!(" with {}", read.join(", "))
+            }
+        }
+    };
+    notes.push(format!("read '{tool}' as {name}{with}"));
+    notes.extend(
+        dropped
+            .iter()
+            .map(|piece| format!("dropped '{piece}': a type from usage, not a value")),
+    );
+    (name, dropped)
 }
 
 /// `tool` without surrounding quotes (`` `history_list` ``) and a server prefix (`mcp__raijin__`),
@@ -997,6 +1244,21 @@ fn normalize_run(
         }
         _ => {}
     }
+    // JSON cut or mistyped: reading it as a tool name would only say the tool is unknown.
+    for key in ["do", WRAPPER_KEY] {
+        if let Some(Value::String(s)) = raw.get(key)
+            && s.trim_start().starts_with(['{', '['])
+            && let Err(e) = serde_json::from_str::<Value>(s)
+        {
+            return Err(ToolError::new(
+                Code::InvalidArguments,
+                format!("'{key}' is not valid JSON ({e})."),
+            )
+            .param(key)
+            .got(json!(s))
+            .example(run_example()));
+        }
+    }
     let mut tool = match named_tool(&mut raw, &names_tool, &mut notes) {
         Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_owned(),
         None | Some(Value::Null | Value::String(_)) => {
@@ -1020,27 +1282,7 @@ fn normalize_run(
         }
     };
     tool = bare_tool_name(tool, &mut notes);
-    if let Some((name, args)) = parenthesised(&tool) {
-        let with = match args {
-            None => "; its arguments were not read (a quoted value holds a comma): pass them as keys next to \"do\"".to_owned(),
-            Some(args) => {
-                let mut read = Vec::new();
-                for (k, v) in args {
-                    if !raw.contains_key(&k) {
-                        read.push(format!("{k}={v}"));
-                        raw.insert(k, v);
-                    }
-                }
-                if read.is_empty() {
-                    String::new()
-                } else {
-                    format!(" with {}", read.join(", "))
-                }
-            }
-        };
-        notes.push(format!("read '{tool}' as {name}{with}"));
-        tool = name;
-    }
+    let (tool, dropped) = suffix_args(tool, &mut raw, &mut notes);
     let project = if declares(&tool, "project") {
         None
     } else {
@@ -1087,6 +1329,7 @@ fn normalize_run(
         arguments: (!raw.is_empty()).then_some(raw),
         project,
         notes,
+        dropped,
     })
 }
 
@@ -1168,12 +1411,7 @@ fn unknown_tool_error(catalog: &Catalog, tool: &str, arguments: &JsonObject) -> 
     let mut names = catalog.suggestion_names();
     names.extend(LOCAL_TOOLS.iter().map(|t| t.name.to_owned()));
     let found = suggest_call(tool, names.iter().map(String::as_str), 3);
-    let hits: Vec<String> = found.iter().map(|s| s.name.to_owned()).collect();
-    let mut err = ToolError::new(
-        Code::UnknownTool,
-        format!("unknown tool \"{tool}\"; guide {{}} lists every tool."),
-    )
-    .see(guide_call(None));
+    let mut hits: Vec<String> = found.iter().map(|s| s.name.to_owned()).collect();
     let w = error::norm(tool);
     let near = match found.as_slice() {
         [only] => {
@@ -1184,9 +1422,34 @@ fn unknown_tool_error(catalog: &Catalog, tool: &str, arguments: &JsonObject) -> 
     };
     let same_words = found.first().is_some_and(|s| s.same_words)
         && found.iter().filter(|s| s.same_words).count() == 1;
+    let certain = found.first().map(|s| s.name).filter(|_| near || same_words);
+    if let Some(hit) = certain
+        && hit != tool.trim()
+        && is_destructive(catalog, hit)
+    {
+        return ToolError::new(
+            Code::UnknownTool,
+            format!("unknown tool \"{tool}\"; did you mean {hit}? {DESTRUCTIVE_EXACT}"),
+        )
+        .did_you_mean(hits)
+        .see(guide_call(Some(hit)));
+    }
+    // Words that say what the model wants (`xss.find`, `burp_start`), when no tool is near.
+    if certain.is_none()
+        && let Some(intent) = intent_call(tool)
+    {
+        return intent_error(catalog, tool, arguments, &intent, hits);
+    }
+    if hits.is_empty() {
+        return no_tool_error(catalog, tool);
+    }
+    let mut err = ToolError::new(
+        Code::UnknownTool,
+        format!("unknown tool \"{tool}\"; guide {{}} lists every tool."),
+    )
+    .see(guide_call(None));
     // The same name (an extension older than the catalog lacks it) would only fail again.
-    if let Some(hit) = found.first().map(|s| s.name)
-        && (near || same_words)
+    if let Some(hit) = certain
         && error::norm(hit) != w
         && let Some(schema) = safe_call_schema(catalog, hit)
         && call_fits(&schema, arguments)
@@ -1196,7 +1459,111 @@ fn unknown_tool_error(catalog: &Catalog, tool: &str, arguments: &JsonObject) -> 
         call.extend(arguments.clone());
         err = err.retry(Value::Object(call));
     }
+    hits.truncate(MAX_SUGGESTED);
     err.did_you_mean(hits)
+}
+
+/// Most names an `unknown_tool` error suggests.
+const MAX_SUGGESTED: usize = 5;
+
+/// Whether `name` (a local tool, catalog tool or `tool.action`) removes or stops something.
+fn is_destructive(catalog: &Catalog, name: &str) -> bool {
+    local_tool(name).map_or_else(
+        || {
+            catalog
+                .resolve(name)
+                .is_some_and(|(tool, action)| catalog.destructive(&tool, action.as_deref()))
+        },
+        |local| local.destructive,
+    )
+}
+
+/// The domain `name` (a local tool, catalog tool or `tool.action`) belongs to.
+fn domain_of_call(catalog: &Catalog, name: &str) -> Option<String> {
+    if let Some(local) = local_tool(name) {
+        return Some(local.domain.to_owned());
+    }
+    let (tool, _) = catalog.resolve(name)?;
+    catalog.domain_of(&tool).map(|d| d.name.clone())
+}
+
+/// `unknown_tool` for a name whose words say what it wants ([`intent_call`]): the intended call
+/// first in `did_you_mean`, then the near names; `retry` with its arguments when it is certain,
+/// removes or stops nothing and takes `arguments`; `see` is its domain.
+fn intent_error(
+    catalog: &Catalog,
+    tool: &str,
+    arguments: &JsonObject,
+    intent: &Intent,
+    hits: Vec<String>,
+) -> ToolError {
+    let first = intent.names[0];
+    let mut names: Vec<String> = intent.names.iter().map(|n| (*n).to_owned()).collect();
+    for hit in hits {
+        if !names.contains(&hit) {
+            names.push(hit);
+        }
+    }
+    names.truncate(MAX_SUGGESTED);
+    let with = if intent.args.is_empty() {
+        String::new()
+    } else {
+        format!(" with {}", Value::Object(intent.args.clone()))
+    };
+    let mut err = ToolError::new(
+        Code::UnknownTool,
+        format!("unknown tool \"{tool}\". Did you mean {first}{with}?"),
+    )
+    .did_you_mean(names);
+    let domain = domain_of_call(catalog, first);
+    err = err.see(guide_call(domain.as_deref()));
+    if intent.certain
+        && let Some(schema) = safe_call_schema(catalog, first)
+    {
+        let mut args = intent.args.clone();
+        args.extend(arguments.clone());
+        if call_fits(&schema, &args) {
+            let mut call = Map::new();
+            call.insert("do".to_owned(), json!(first));
+            call.extend(args);
+            err = err.retry(Value::Object(call));
+        }
+    }
+    err
+}
+
+/// Every domain `guide` knows: the catalog's, then the CLI's own.
+fn domain_names(catalog: &Catalog) -> Vec<String> {
+    let mut domains: Vec<String> = catalog.domains.iter().map(|d| d.name.clone()).collect();
+    domains.extend([LIFECYCLE, HISTORY, DATA].map(str::to_owned));
+    domains
+}
+
+/// `unknown_tool` for a name nothing is near: the domains to look in, `see` the nearest one.
+fn no_tool_error(catalog: &Catalog, tool: &str) -> ToolError {
+    let domains = domain_names(catalog);
+    let nearest = suggest(tool, domains.iter().map(String::as_str), 1)
+        .first()
+        .map_or(DATA, |d| *d)
+        .to_owned();
+    let listed: Vec<String> = domains
+        .iter()
+        .map(|d| {
+            if d == DATA {
+                format!("{DATA} (XSS/SSRF payloads, BChecks)")
+            } else {
+                d.clone()
+            }
+        })
+        .collect();
+    ToolError::new(
+        Code::UnknownTool,
+        format!(
+            "unknown tool \"{tool}\". Domains: {}; call guide {{\"topic\":\"<domain>\"}}.",
+            listed.join(", ")
+        ),
+    )
+    .see(guide_call(Some(&nearest)))
 }
 
 /// `inputSchema.properties.action.enum` of a schema: a grouped tool's actions.
@@ -1641,17 +2008,28 @@ impl Gateway {
                 .find_map(|k| step.get(*k).cloned())
                 .unwrap_or(Value::Null);
             let (ok, result) = match step.clone() {
-                Value::Object(step) if !step.contains_key("batch") => {
-                    match normalize_run(
-                        step,
-                        |tool, key| tool_declares(catalog, tool, key),
-                        |name| names_a_tool(catalog, name),
-                    ) {
-                        Ok(call) => {
-                            let (_, result) = self.run_raw(call).await;
-                            (result.is_error != Some(true), result_value(&result))
+                Value::Object(mut step) if !step.contains_key("batch") => {
+                    let mut read = Vec::new();
+                    if let Some(guide) = read_pasted_calls(&mut step, &mut read) {
+                        let result = error::with_notes(self.guide_tool(Some(guide)).await, &read);
+                        (result.is_error != Some(true), result_value(&result))
+                    } else {
+                        match normalize_run(
+                            step,
+                            |tool, key| tool_declares(catalog, tool, key),
+                            |name| names_a_tool(catalog, name),
+                        ) {
+                            Ok(mut call) => {
+                                read.append(&mut call.notes);
+                                call.notes = read;
+                                let (_, result) = self.run_raw(call).await;
+                                (result.is_error != Some(true), result_value(&result))
+                            }
+                            Err(e) => (
+                                false,
+                                result_value(&error::with_notes(e.into_result(), &read)),
+                            ),
                         }
-                        Err(e) => (false, e.to_value()),
                     }
                 }
                 Value::Object(_) => (
@@ -1781,26 +2159,37 @@ impl Gateway {
             mut arguments,
             project,
             notes: _,
+            dropped,
         } = call;
         if let Some(result) = gateway_tool_as_do(&tool, arguments.as_ref()) {
+            return (tool, result);
+        }
+        if !dropped.is_empty() && !self.reads_only(&tool).await {
+            let listed: Vec<String> = dropped.iter().map(|d| format!("'{d}'")).collect();
+            let result = ToolError::new(
+                Code::InvalidArguments,
+                format!(
+                    "{tool}: {} could not be read as arguments; this call writes, so it was not made. Put each value as a key next to \"do\".",
+                    listed.join(", ")
+                ),
+            )
+            .example(run_example())
+            .see(guide_call(Some(&tool)))
+            .into_result();
             return (tool, result);
         }
         let (local, note) = match local_tool(&tool) {
             Some(local) => (Some(local), None),
             None => match LOCAL_TOOLS.iter().find(|t| t.name == error::norm(&tool)) {
                 Some(local) if local.destructive => {
-                    let mut retry = Map::new();
-                    retry.insert("do".to_owned(), json!(local.name));
-                    retry.extend(arguments.unwrap_or_default());
                     let result = ToolError::new(
                         Code::UnknownTool,
                         format!(
-                            "unknown tool \"{tool}\"; did you mean {}? It is destructive, so it runs only under its exact name.",
+                            "unknown tool \"{tool}\"; did you mean {}? {DESTRUCTIVE_EXACT}",
                             local.name
                         ),
                     )
                     .did_you_mean(vec![local.name.to_owned()])
-                    .retry(Value::Object(retry))
                     .into_result();
                     return (tool, result);
                 }
@@ -1812,25 +2201,53 @@ impl Gateway {
             let result = self.forward(&tool, arguments, project.as_deref()).await;
             return (tool, result);
         };
-        if let Some(project) = project
-            && (local.schema)()
+        let mut notes: Vec<String> = note.into_iter().collect();
+        if let Some(project) = project {
+            if (local.schema)()
                 .get("properties")
                 .and_then(Value::as_object)
                 .is_some_and(|p| p.contains_key("project"))
-        {
-            arguments
-                .get_or_insert_with(JsonObject::new)
-                .entry("project")
-                .or_insert_with(|| json!(project));
+            {
+                arguments
+                    .get_or_insert_with(JsonObject::new)
+                    .entry("project")
+                    .or_insert_with(|| json!(project));
+            } else if local.domain == DATA {
+                notes.push(format!(
+                    "ignored 'project': {} does not use Burp",
+                    local.name
+                ));
+            }
         }
         let result = match local.domain {
             LIFECYCLE => self.lifecycle(local, arguments).await,
             DATA => self.data(local, arguments).await,
             _ => self.history(local, arguments).await,
         };
-        let notes: Vec<String> = note.into_iter().collect();
         let result = error::mirror_warnings(error::with_notes(result, &notes));
         (local.name.to_owned(), result)
+    }
+
+    /// Whether a call of `name` only reads: a read-only local tool, or a catalog call marked
+    /// `readOnlyHint` that removes or stops nothing. Unknown names count as writes.
+    async fn reads_only(&self, name: &str) -> bool {
+        if let Some(local) = local_tool(name.trim()).or_else(|| local_tool(&error::norm(name))) {
+            return local.read_only;
+        }
+        let Ok(assets) = self.assets().await else {
+            return false;
+        };
+        let catalog = &assets.catalog;
+        catalog.resolve(name).is_some_and(|(tool, action)| {
+            !catalog.destructive(&tool, action.as_deref())
+                && catalog.tool(&tool).is_some_and(|spec| {
+                    spec.annotations
+                        .as_ref()
+                        .and_then(|a| a.get("readOnlyHint"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                })
+        })
     }
 
     /// Whether `run` can run `name`: a local tool, a catalog tool or a resolvable alias.
@@ -2057,7 +2474,7 @@ impl Gateway {
                         } else {
                             Vec::new()
                         };
-                        let did_you_mean = if by_words.is_empty() {
+                        let mut did_you_mean: Vec<String> = if by_words.is_empty() {
                             suggest(topic, names.iter().map(String::as_str), 3)
                                 .into_iter()
                                 .map(str::to_owned)
@@ -2065,6 +2482,15 @@ impl Gateway {
                         } else {
                             by_words
                         };
+                        // Words that say what the model wants (`xss`, `BCheck`): their domain first.
+                        let domain = catalog.and_then(|c| {
+                            let intent = intent_call(topic)?;
+                            domain_of_call(c, intent.names[0])
+                        });
+                        if let Some(d) = &domain {
+                            did_you_mean.retain(|n| n != d);
+                            did_you_mean.insert(0, d.clone());
+                        }
                         ToolError::new(
                             Code::UnknownTopic,
                             format!(
@@ -2072,7 +2498,7 @@ impl Gateway {
                             ),
                         )
                         .did_you_mean(did_you_mean)
-                        .see(guide_call(None))
+                        .see(guide_call(domain.as_deref()))
                         .into_result()
                     })
             }
@@ -2268,19 +2694,14 @@ impl Gateway {
                     ),
                 )
             };
-        // `notes` is an array, as in every result, so the call's own notes join it.
-        let notes: Vec<String> = if notes.is_empty() {
-            Vec::new()
-        } else {
-            vec![notes]
-        };
-        Some(json!({
-            "domain": domain,
-            "description": description,
-            "notes": notes,
-            "playbook": playbook,
-            "tools": tools,
-        }))
+        // The domain's own advice is `hint`: `notes` holds only what the server read differently.
+        let mut value = json!({"domain": domain, "description": description});
+        if !notes.is_empty() {
+            value["hint"] = json!(notes);
+        }
+        value["playbook"] = json!(playbook);
+        value["tools"] = json!(tools);
+        Some(value)
     }
 
     async fn lifecycle(&self, local: &LocalTool, arguments: Option<JsonObject>) -> CallToolResult {
@@ -2318,12 +2739,29 @@ impl Gateway {
             return Ok((value, notes));
         }
         let target = self.target_or_error()?.clone();
+        // A host given as project (`example.com`) is the usual mistake: say what a project is.
+        let project_of = |requested: Option<&str>| {
+            target.project_or_default(requested).map_err(|e| {
+                let known = target.known_projects();
+                let names = if known.is_empty() {
+                    target.config.default_project.clone()
+                } else {
+                    known.join(", ")
+                };
+                ToolError::new(
+                    Code::InvalidArguments,
+                    format!(
+                        "{e:#}. project is a Burp project name of this target ({names}), not a host; scope.include takes hosts."
+                    ),
+                )
+                .param("project")
+                .got(json!(requested.unwrap_or_default()))
+            })
+        };
         match tool {
             "burp_up" => {
                 let (args, notes): (UpArgs, _) = local_args(local, arguments)?;
-                let project = target
-                    .project_or_default(args.project.as_deref())
-                    .map_err(err)?;
+                let project = project_of(args.project.as_deref())?;
                 let requested = args.wait_seconds.unwrap_or(DEFAULT_WAIT);
                 let wait = requested.min(MAX_WAIT);
                 let report = launch::up(
@@ -2346,11 +2784,7 @@ impl Gateway {
                 let projects = if args.all {
                     target.known_projects()
                 } else {
-                    vec![
-                        target
-                            .project_or_default(args.project.as_deref())
-                            .map_err(err)?,
-                    ]
+                    vec![project_of(args.project.as_deref())?]
                 };
                 let mut stopped = Vec::new();
                 for project in projects {
@@ -2479,16 +2913,19 @@ impl Gateway {
         let root = self.data_root()?;
         let value = match local.name {
             "data_add" => {
-                let (args, notes): (tools::AddArgs, _) = local_args(local, arguments)?;
+                let (args, mut notes): (tools::AddArgs, _) = local_args(local, arguments)?;
                 let dir = self.target_or_error()?.data_dir();
-                let value = tokio::task::spawn_blocking(move || data::custom::add(&dir, &args))
-                    .await
-                    .map_err(|e| ToolError::new(Code::Internal, e.to_string()))??;
+                let (value, more) =
+                    tokio::task::spawn_blocking(move || data::custom::add(&dir, &args))
+                        .await
+                        .map_err(|e| ToolError::new(Code::Internal, e.to_string()))??;
+                notes.extend(more);
                 return Ok((text(&value), notes));
             }
             "data_update" => {
                 let (args, notes): (tools::UpdateArgs, _) = local_args(local, arguments)?;
-                return Ok((text(&self.data_update(root, args.source).await?), notes));
+                let source = args.source.map(data::Source::from);
+                return Ok((text(&self.data_update(root, source).await?), notes));
             }
             "data_list" => {
                 let (args, mut notes): (tools::ListArgs, _) = local_args(local, arguments)?;
@@ -2510,7 +2947,8 @@ impl Gateway {
                 notes.extend(self.data_refresh(root).await);
                 let (upstream, custom) = self.data_libraries(root).await?;
                 let entries = data_view(&upstream, &custom);
-                let mut value = tools::search(&entries, &args);
+                let (mut value, more) = tools::search(&entries, &args)?;
+                notes.extend(more);
                 if let Some(source) = args.filters.source
                     && source != data::Source::Custom
                     && store::manifest(root, source).is_none()
@@ -2523,7 +2961,9 @@ impl Gateway {
                 let (args, mut notes): (tools::GetArgs, _) = local_args(local, arguments)?;
                 notes.extend(self.data_refresh(root).await);
                 let (upstream, custom) = self.data_libraries(root).await?;
-                (tools::get(&data_view(&upstream, &custom), &args.id)?, notes)
+                let (value, note) = tools::get(&data_view(&upstream, &custom), &args.id)?;
+                notes.extend(note);
+                (value, notes)
             }
             _ => {
                 let (args, mut notes): (tools::PayloadsArgs, _) = local_args(local, arguments)?;
@@ -2548,7 +2988,8 @@ impl Gateway {
         notes.extend(self.data_refresh(root).await);
         let (upstream, custom) = self.data_libraries(root).await?;
         let entries = data_view(&upstream, &custom);
-        let entry = data::tools::find(&entries, &args.id)?;
+        let (entry, note) = data::tools::find(&entries, &args.id, "data_import")?;
+        notes.extend(note);
         let tool = match entry.kind {
             data::Kind::Bcheck => "custom_check.bcheck_import",
             data::Kind::Bambda => "bambda_import",
@@ -2566,11 +3007,29 @@ impl Gateway {
         };
         let mut call = JsonObject::new();
         call.insert("script".to_owned(), json!(entry.payload));
-        let result = self
+        let mut result = self
             .forward(tool, Some(call), args.project.as_deref())
             .await;
+        if matches!(
+            result_code(&result).as_deref(),
+            Some("burp_not_running" | "project_not_running")
+        ) {
+            // Burp's own retry would resend the whole script under the import tool's name.
+            let mut up = json!({"do": "burp_up"});
+            let mut again = json!({"do": "data_import", "id": entry.id});
+            if let Some(project) = &args.project {
+                up["project"] = json!(project);
+                again["project"] = json!(project);
+            }
+            result = with_retry(result, json!({"batch": [up, again], "bail": true}));
+        }
         if result.is_error != Some(true) {
             notes.push(format!("imported {}", entry.id));
+            notes.push(if entry.kind == data::Kind::Bcheck {
+                "remove it with custom_check.bcheck_remove, then delete it in Extensions > Custom scan checks".to_owned()
+            } else {
+                "no MCP action removes a Bambda; delete it in Burp's Bambda library".to_owned()
+            });
         }
         Ok((result, notes))
     }
@@ -2581,18 +3040,10 @@ impl Gateway {
         root: &Path,
         source: Option<data::Source>,
     ) -> Result<Value, ToolError> {
-        let ups: Vec<&'static store::Upstream> = match source {
-            None => store::UPSTREAM.iter().collect(),
-            Some(s) => vec![store::upstream(s).ok_or_else(|| {
-                ToolError::new(
-                    Code::InvalidEnum,
-                    "custom is this target's own data; nothing to download",
-                )
-                .param("source")
-                .got(json!(s))
-                .allowed(store::UPSTREAM.iter().map(|u| json!(u.source)).collect())
-            })?],
-        };
+        let ups: Vec<&'static store::Upstream> = store::UPSTREAM
+            .iter()
+            .filter(|u| source.is_none_or(|s| s == u.source))
+            .collect();
         // Held across the downloads, so an automatic refresh never installs the same source at once.
         let mut checked = self.data_checked.lock().await;
         let previous: Vec<Option<store::Manifest>> = ups
@@ -3192,6 +3643,7 @@ impl ServerHandler for Gateway {
                     arguments,
                     project: None,
                     notes,
+                    dropped: Vec::new(),
                 })
                 .await
             }
@@ -3425,9 +3877,11 @@ mod tests {
         let negative = args_err::<history::list::ListParams>("history_list", json!({"limit": -1}));
         assert_eq!(negative.code, Code::OutOfRange);
 
+        // Only spelled near `limit`: suggested, never retried.
         let typo = args_err::<history::list::ListParams>("history_list", json!({"lmit": 1}));
         assert_eq!(typo.code, Code::UnknownParameter);
-        assert_eq!(typo.retry, Some(json!({"do": "history_list", "limit": 1})));
+        assert_eq!(typo.did_you_mean, ["limit"]);
+        assert_eq!(typo.retry, None);
 
         let destructive = args_err::<DownArgs>("burp_down", json!({"al": true}));
         assert_eq!(destructive.code, Code::UnknownParameter);
@@ -3469,6 +3923,31 @@ mod tests {
             "data_update" => local_args::<data::tools::UpdateArgs>(local, arguments).map(drop),
             other => panic!("no parser for local tool {other}"),
         }
+    }
+
+    #[test]
+    fn a_strict_client_filling_every_property_is_read_as_unset() {
+        for local in LOCAL_TOOLS {
+            let mut call = super::super::args::strict_fill(&(local.schema)());
+            call.insert("do".to_owned(), json!(local.name));
+            if let Err(e) = local_call_fits(&call) {
+                assert!(
+                    !matches!(
+                        e.code,
+                        Code::InvalidEnum | Code::UnknownParameter | Code::OutOfRange
+                    ),
+                    "{}: {}",
+                    local.name,
+                    e.error
+                );
+            }
+        }
+        let (_, notes): (data::tools::PayloadsArgs, _) = local_args(
+            local("data_payloads"),
+            Some(object(json!({"attacker": "", "kind": "", "limit": 5}))),
+        )
+        .expect("read");
+        assert_eq!(notes, ["ignored empty optional 'attacker', 'kind'"]);
     }
 
     #[test]
@@ -3695,10 +4174,11 @@ mod weak_model {
 
     #[test]
     fn a_quoted_value_with_a_comma_is_not_cut() {
-        let (name, args) = parenthesised("scope.include(url=\"https://a.com/x,y\")").expect("call");
+        let (name, args, _) =
+            parenthesised("scope.include(url=\"https://a.com/x,y\")").expect("call");
         assert_eq!(name, "scope.include");
         assert_eq!(args, None);
-        let (_, args) = parenthesised("history_list(limit=1, project='main')").expect("call");
+        let (_, args, _) = parenthesised("history_list(limit=1, project='main')").expect("call");
         assert_eq!(
             args,
             Some(vec![
@@ -3706,6 +4186,164 @@ mod weak_model {
                 ("project".to_owned(), json!("main"))
             ])
         );
+    }
+
+    #[test]
+    fn usage_shaped_names_are_read_and_types_dropped() {
+        let (name, args, dropped) =
+            parenthesised("util.hash(data: \"x\", algorithm*: \"MD5\")").expect("call");
+        assert_eq!(name, "util.hash");
+        assert_eq!(
+            args,
+            Some(vec![
+                ("data".to_owned(), json!("x")),
+                ("algorithm".to_owned(), json!("MD5"))
+            ])
+        );
+        assert_eq!(dropped, Vec::<String>::new());
+        let (_, args, dropped) = parenthesised("history_list(limit: integer)").expect("call");
+        assert_eq!(args, Some(Vec::new()));
+        assert_eq!(dropped, ["limit: integer"]);
+        let (_, args, _) = parenthesised("history_list({\"limit\":1})").expect("call");
+        assert_eq!(args, Some(vec![("limit".to_owned(), json!(1))]));
+        let (_, args, _) =
+            parenthesised("util.hash(algorithm: \"MD5\"|\"SHA-256\", data: \"x\")").expect("call");
+        assert_eq!(args, Some(vec![("data".to_owned(), json!("x"))]));
+        let (name, args, _) = spaced("history_list limit=1 offset: 2").expect("spaced");
+        assert_eq!(name, "history_list");
+        assert_eq!(
+            args,
+            Some(vec![
+                ("limit".to_owned(), json!(1)),
+                ("offset".to_owned(), json!(2))
+            ])
+        );
+        let (_, args, _) = spaced("scope.include url=https://a.com/?a=1,2 note=x y").expect("url");
+        assert_eq!(
+            args,
+            Some(vec![
+                ("url".to_owned(), json!("https://a.com/?a=1,2")),
+                ("note".to_owned(), json!("x y"))
+            ])
+        );
+        assert_eq!(spaced("history list"), None);
+        // Cut at a comma: not read at all, rather than sent cut.
+        let (_, args, _) = parenthesised("scope.include(url=https://a.com/?a=1,2)").expect("call");
+        assert_eq!(args, None);
+
+        let catalog = catalog();
+        let call = normalize_run(
+            object(json!({"do": "history_list(limit: integer)"})),
+            |tool, key| tool_declares(Some(&catalog), tool, key),
+            |name| names_a_tool(Some(&catalog), name),
+        )
+        .expect("read");
+        assert_eq!(call.tool, "history_list");
+        assert_eq!(call.arguments, None);
+        assert_eq!(call.dropped, ["limit: integer"]);
+        assert!(
+            call.notes
+                .contains(&"dropped 'limit: integer': a type from usage, not a value".to_owned()),
+            "{:?}",
+            call.notes
+        );
+    }
+
+    #[test]
+    fn calls_pasted_in_other_shapes_run() {
+        let catalog = catalog();
+        let read = |raw: Value| {
+            let mut raw = object(raw);
+            let mut notes = Vec::new();
+            assert_eq!(read_pasted_calls(&mut raw, &mut notes), None, "{raw:?}");
+            let call = normalize_run(
+                raw,
+                |tool, key| tool_declares(Some(&catalog), tool, key),
+                |name| names_a_tool(Some(&catalog), name),
+            )
+            .expect("call");
+            assert_ne!(notes, Vec::<String>::new());
+            call
+        };
+        let retry = read(json!({"retry": {"do": "history_list", "limit": 1}}));
+        assert_eq!(
+            (retry.tool.as_str(), retry.arguments),
+            ("history_list", Some(object(json!({"limit": 1}))))
+        );
+        assert_eq!(read(json!({"see": "history_list"})).tool, "history_list");
+        assert_eq!(
+            read(json!({"example": {"do": "burp_status"}})).tool,
+            "burp_status"
+        );
+        assert_eq!(
+            read(json!({"arguments": "{\"do\":\"burp_status\"}"})).tool,
+            "burp_status"
+        );
+        let openai = read(json!({"tool_calls": [{"function": {
+            "name": "functions.history_list", "arguments": "{\"limit\":1}"}}]}));
+        assert_eq!(openai.tool, "history_list");
+        assert_eq!(openai.arguments, Some(object(json!({"limit": 1}))));
+        let uses = read(
+            json!({"tool_uses": [{"recipient_name": "functions.history_list",
+            "parameters": {"limit": 1}}]}),
+        );
+        assert_eq!(uses.tool, "history_list");
+
+        let mut step = object(json!({"guide": {"topic": "util.hash"}}));
+        assert_eq!(
+            read_pasted_calls(&mut step, &mut Vec::new()),
+            Some(object(json!({"topic": "util.hash"})))
+        );
+
+        let broken = normalize_run(
+            object(json!({"arguments": "{bad json"})),
+            |_: &str, _: &str| false,
+            |_: &str| false,
+        )
+        .expect_err("broken");
+        assert_eq!(
+            (broken.code, broken.param.as_deref()),
+            (Code::InvalidArguments, Some("arguments"))
+        );
+        assert!(broken.error.contains("line 1 column"), "{}", broken.error);
+    }
+
+    #[test]
+    fn invented_names_suggest_the_call_they_mean() {
+        let catalog = catalog();
+        let first = |name: &str| {
+            let e = unknown_tool_error(&catalog, name, &JsonObject::new());
+            (e.did_you_mean.first().cloned().unwrap_or_default(), e)
+        };
+        let (hit, xss) = first("xss.find");
+        assert_eq!(hit, "data_search");
+        assert_eq!(
+            xss.retry,
+            Some(json!({"do": "data_search", "source": "xss"}))
+        );
+        assert_eq!(xss.see, Some(guide_call(Some(DATA))));
+        let (hit, up) = first("burp_start");
+        assert_eq!(hit, "burp_up");
+        assert_eq!(up.retry, Some(json!({"do": "burp_up"})));
+        assert_eq!(
+            first("stop_burp").1.retry,
+            None,
+            "burp_down is never retried"
+        );
+        assert_eq!(first("md5.compute").0, "util.hash");
+        assert_eq!(first("bchecks").0, "data_search");
+        assert_eq!(first("url_bypass").0, "data_payloads");
+        assert_eq!(first("get_status").0, "burp_status");
+        let (hit, data) = first("data");
+        assert_eq!(hit, "data_search");
+        assert_eq!(data.retry, None);
+        let (_, nothing) = first("qwertyzxcv");
+        assert!(nothing.error.contains("Domains:"), "{}", nothing.error);
+        assert!(nothing.see.is_some());
+        let (hit, remove) = first("Scope.Remove");
+        assert_eq!(hit, "scope.remove");
+        assert_eq!(remove.retry, None);
+        assert!(remove.error.contains(DESTRUCTIVE_EXACT), "{}", remove.error);
     }
 
     #[test]
@@ -3838,6 +4476,7 @@ mod weak_model {
                     arguments: Some(arguments),
                     project: None,
                     notes: Vec::new(),
+                    dropped: Vec::new(),
                 };
                 let (_, result) = gateway.run_resolved(call).await;
                 (result.is_error == Some(true), result_value(&result))
@@ -3848,6 +4487,21 @@ mod weak_model {
         assert!(!failed, "{found}");
         assert_eq!(found["total"], 1, "{found}");
         assert_eq!(found["rows"][0]["id"], "xss:events/onload/svg");
+
+        let (failed, plural) = call(json!({"do": "data_search", "category": "Event"})).await;
+        assert!(!failed, "{plural}");
+        assert_eq!(plural["total"], 1, "{plural}");
+        assert_eq!(
+            plural["notes"],
+            json!(["matched 'category' \"Event\" to \"events\""])
+        );
+        let (failed, nope) = call(json!({"do": "data_search", "category": "nope"})).await;
+        assert!(failed);
+        assert_eq!(nope["code"], "invalid_enum", "{nope}");
+        assert_eq!(nope["allowed"], json!(["events"]));
+        let (failed, got) = call(json!({"do": "data_get", "id": "events/onload/svg"})).await;
+        assert!(!failed, "{got}");
+        assert_eq!(got["id"], "xss:events/onload/svg");
 
         let (failed, added) =
             call(json!({"do": "data_add", "category": "waf", "payload": "<x>"})).await;

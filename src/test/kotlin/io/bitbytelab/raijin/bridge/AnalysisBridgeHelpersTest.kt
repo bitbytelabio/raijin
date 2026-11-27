@@ -1,28 +1,28 @@
 package io.bitbytelab.raijin.bridge
 
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import kotlin.test.Test
-import kotlin.test.assertEquals
-import kotlin.test.assertNotNull
-import kotlin.test.assertNull
-import kotlin.test.assertTrue
 
 /**
  * Unit tests for the pure, Burp-independent helpers in [AnalysisBridge].
  *
  * These cover the regressions fixed for:
- *  - BUG #3  analyze_request: missing CRLF normalization (LF-delimited headers dropped)
- *  - BUG #4  analyze_insertion_points: query string appended to final path segment
- *  - BUG #5/#6 empty-input parser exception leakage (via describeException)
- *  - BUG #18 auth_diff: bare-null / raw JVM exception leakage
+ * - BUG #3 analyze_request: missing CRLF normalization (LF-delimited headers dropped)
+ * - BUG #4 analyze_insertion_points: query string appended to final path segment
+ * - BUG #5/#6 empty-input parser exception leakage (via describeException)
+ * - BUG #18 auth_diff: bare-null / raw JVM exception leakage
  *
- * The full bridge cannot be instantiated here (the Montoya API is compileOnly),
- * so we exercise the extracted pure logic directly through the internal companion.
+ * The full bridge cannot be instantiated here (the Montoya API is compileOnly), so we exercise the
+ * extracted pure logic directly through the internal companion.
  */
 class AnalysisBridgeHelpersTest {
 
@@ -147,7 +147,9 @@ class AnalysisBridgeHelpersTest {
         AuthLevelResponse(level = name, statusCode = status, body = body, location = location)
 
     private fun findings(report: JsonObject, field: String): List<String> =
-        report.getValue("findings").jsonArray.map { it.jsonObject.getValue(field).jsonPrimitive.content }
+        report.getValue("findings").jsonArray.map {
+            it.jsonObject.getValue(field).jsonPrimitive.content
+        }
 
     private fun strings(report: JsonObject, key: String): List<String> =
         report[key]?.jsonArray?.map { it.jsonPrimitive.content }.orEmpty()
@@ -163,65 +165,121 @@ class AnalysisBridgeHelpersTest {
     @Test
     fun `a level that never answered is an error entry and takes no part in the comparison`() {
         // What authDiff hands over when 'none' timed out: two answers and one error.
-        val report = AnalysisBridge.authDiffReport(
-            listOf(level("admin", 200, "secret"), level("user", 403, "denied")),
-            listOf(AnalysisBridge.levelFailure("none", 30_001))
-        )
+        val report =
+            AnalysisBridge.authDiffReport(
+                listOf(level("admin", 200, "secret"), level("user", 403, "denied")),
+                listOf(AnalysisBridge.levelFailure("none", 30_001)),
+            )
 
         assertEquals(2, report.getValue("auth_levels_tested").jsonPrimitive.int)
         val responses = report.getValue("responses").jsonArray.map { it.jsonObject }
-        assertEquals(listOf("admin", "user"), responses.map { it.getValue("level").jsonPrimitive.content })
+        assertEquals(
+            listOf("admin", "user"),
+            responses.map { it.getValue("level").jsonPrimitive.content },
+        )
         assertTrue(responses.none { it.getValue("status_code").jsonPrimitive.int == 0 })
         assertTrue(strings(report, "errors").single().contains("timed out"))
-        assertTrue(findings(report, "severity").none { it == "critical" || it == "high" }, report.toString())
+        assertTrue(
+            findings(report, "severity").none { it == "critical" || it == "high" },
+            report.toString(),
+        )
+        assertNull(report["code"])
+    }
+
+    @Test
+    fun `no level answering is a no_response error that keeps the report`() {
+        val report =
+            AnalysisBridge.authDiffReport(
+                emptyList(),
+                listOf(
+                    AnalysisBridge.levelFailure("admin", 12),
+                    AnalysisBridge.levelFailure("none", 12),
+                ),
+            )
+        assertEquals(listOf("error", "code"), report.keys.take(2), report.toString())
+        assertEquals("no_response", report.getValue("code").jsonPrimitive.content)
+        assertTrue(
+            "Level 'admin' failed" in report.getValue("error").jsonPrimitive.content,
+            report.toString(),
+        )
+        assertEquals(0, report.getValue("auth_levels_tested").jsonPrimitive.int)
+        assertEquals(2, strings(report, "errors").size)
     }
 
     @Test
     fun `uniform denials and login redirects report no high or critical finding`() {
         for (status in listOf(401, 403, 404, 500)) {
-            val report = AnalysisBridge.authDiffReport(
-                listOf(level("admin", status, "denied"), level("user", status, "denied"), level("none", status, "denied")),
-                emptyList()
+            val report =
+                AnalysisBridge.authDiffReport(
+                    listOf(
+                        level("admin", status, "denied"),
+                        level("user", status, "denied"),
+                        level("none", status, "denied"),
+                    ),
+                    emptyList(),
+                )
+            assertEquals(
+                listOf("all_identical_non_success"),
+                findings(report, "id"),
+                "status $status",
             )
-            assertEquals(listOf("all_identical_non_success"), findings(report, "id"), "status $status")
             assertEquals(listOf("info"), findings(report, "severity"), "status $status")
             assertEquals(true, report.getValue("all_same_status").jsonPrimitive.boolean)
             assertEquals(true, report.getValue("all_same_body").jsonPrimitive.boolean)
         }
 
-        val bounced = AnalysisBridge.authDiffReport(
-            listOf(level("admin", 302, "", "/login?next=%2Fadmin"), level("none", 302, "", "/login")),
-            emptyList()
-        )
+        val bounced =
+            AnalysisBridge.authDiffReport(
+                listOf(
+                    level("admin", 302, "", "/login?next=%2Fadmin"),
+                    level("none", 302, "", "/login"),
+                ),
+                emptyList(),
+            )
         assertEquals(listOf("info"), findings(bounced, "severity"))
         val first = bounced.getValue("responses").jsonArray[0].jsonObject
-        assertEquals("/login?next=%2Fadmin", first.getValue("redirect_location").jsonPrimitive.content)
+        assertEquals(
+            "/login?next=%2Fadmin",
+            first.getValue("redirect_location").jsonPrimitive.content,
+        )
     }
 
     @Test
     fun `a denied_regex marks a 200 refusal the built-in detection does not know`() {
-        val levels = listOf(level("admin", 200, "<html>Bitte anmelden</html>"), level("none", 200, "<html>Bitte anmelden</html>"))
+        val levels =
+            listOf(
+                level("admin", 200, "<html>Bitte anmelden</html>"),
+                level("none", 200, "<html>Bitte anmelden</html>"),
+            )
 
-        assertEquals(listOf("all_identical"), findings(AnalysisBridge.authDiffReport(levels, emptyList()), "id"))
+        assertEquals(
+            listOf("all_identical"),
+            findings(AnalysisBridge.authDiffReport(levels, emptyList()), "id"),
+        )
 
-        val tuned = AnalysisBridge.authDiffReport(levels, emptyList(), deniedRegex = "bitte ANMELDEN")
+        val tuned =
+            AnalysisBridge.authDiffReport(levels, emptyList(), deniedRegex = "bitte ANMELDEN")
         assertEquals(listOf("all_identical_soft_denial"), findings(tuned, "id"))
         assertEquals(listOf("info"), findings(tuned, "severity"))
     }
 
     @Test
     fun `each response shows how its identity was applied and an unchanged level is noted`() {
-        val applied = AuthIdentityApplier.Applied(
-            "GET / HTTP/1.1\r\n\r\n",
-            removed = listOf("Cookie"), set = listOf("Authorization"), keptCredentials = listOf("X-API-Key")
-        )
-        val report = AnalysisBridge.authDiffReport(
-            listOf(
-                AuthLevelResponse("user", 200, "a", applied = applied),
-                AuthLevelResponse("captured", 200, "b", sentUnchanged = true)
-            ),
-            emptyList()
-        )
+        val applied =
+            AuthIdentityApplier.Applied(
+                "GET / HTTP/1.1\r\n\r\n",
+                removed = listOf("Cookie"),
+                set = listOf("Authorization"),
+                keptCredentials = listOf("X-API-Key"),
+            )
+        val report =
+            AnalysisBridge.authDiffReport(
+                listOf(
+                    AuthLevelResponse("user", 200, "a", applied = applied),
+                    AuthLevelResponse("captured", 200, "b", sentUnchanged = true),
+                ),
+                emptyList(),
+            )
 
         val user = report.getValue("responses").jsonArray[0].jsonObject
         assertEquals(listOf("Authorization"), strings(user, "headers_set"))
@@ -232,29 +290,46 @@ class AnalysisBridgeHelpersTest {
 
     @Test
     fun `compare fields limit the pairwise differences`() {
-        val levels = listOf(
-            AuthLevelResponse("a", 200, "one", headers = mapOf("X" to "1")),
-            AuthLevelResponse("b", 403, "two!", headers = mapOf("X" to "2"))
-        )
-        fun fields(report: JsonObject) = report.getValue("differences").jsonArray.flatMap { pair ->
-            pair.jsonObject.getValue("differences").jsonArray.map { it.jsonObject.getValue("field").jsonPrimitive.content }
-        }.toSet()
+        val levels =
+            listOf(
+                AuthLevelResponse("a", 200, "one", headers = mapOf("X" to "1")),
+                AuthLevelResponse("b", 403, "two!", headers = mapOf("X" to "2")),
+            )
+        fun fields(report: JsonObject) =
+            report
+                .getValue("differences")
+                .jsonArray
+                .flatMap { pair ->
+                    pair.jsonObject.getValue("differences").jsonArray.map {
+                        it.jsonObject.getValue("field").jsonPrimitive.content
+                    }
+                }
+                .toSet()
 
         assertEquals(
             setOf("status_code", "body_length", "body_content", "headers"),
-            fields(AnalysisBridge.authDiffReport(levels, emptyList()))
+            fields(AnalysisBridge.authDiffReport(levels, emptyList())),
         )
         assertEquals(
             setOf("status_code"),
-            fields(AnalysisBridge.authDiffReport(levels, emptyList(), fields = listOf("status_code")))
+            fields(
+                AnalysisBridge.authDiffReport(levels, emptyList(), fields = listOf("status_code")),
+            ),
         )
     }
 
     @Test
     fun `one answering level cannot be compared and the report says so`() {
-        val report = AnalysisBridge.authDiffReport(listOf(level("admin", 200, "x")), listOf("Level 'none' failed: boom"))
+        val report =
+            AnalysisBridge.authDiffReport(
+                listOf(level("admin", 200, "x")),
+                listOf("Level 'none' failed: boom"),
+            )
         assertTrue(findings(report, "id").isEmpty())
-        assertTrue(strings(report, "notes").any { it.contains("Fewer than two levels") }, report.toString())
+        assertTrue(
+            strings(report, "notes").any { it.contains("Fewer than two levels") },
+            report.toString(),
+        )
         assertEquals(listOf("Level 'none' failed: boom"), strings(report, "errors"))
     }
 
