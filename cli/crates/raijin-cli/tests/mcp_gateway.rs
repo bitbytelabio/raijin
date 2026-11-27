@@ -141,15 +141,12 @@ async fn run_runs_local_tools_and_reports_routing_errors() {
         text(&proxy)
     );
 
-    // Names Raijin does not know are resolved (or refused) by the extension, so they need Burp.
+    // While Burp is down the catalog answers for names it does not know: no Burp start for a typo.
     let unknown = call(&client, "run", json!({"do": "proxy_histroy"})).await;
     assert_eq!(unknown.is_error, Some(true));
-    assert_eq!(
-        json_of(&unknown)["code"],
-        "burp_not_running",
-        "{}",
-        text(&unknown)
-    );
+    let unknown = json_of(&unknown);
+    assert_eq!(unknown["code"], "unknown_tool", "{unknown}");
+    assert_eq!(unknown["did_you_mean"][0], "proxy_history", "{unknown}");
 
     let wrong_param = call(
         &client,
@@ -476,6 +473,213 @@ async fn weak_model_calls_get_json_errors_or_run() {
         "{bailed}"
     );
     assert_eq!(bailed["code"], "missing_parameter");
+    client.cancel().await.expect("close");
+}
+
+/// Routing answers to weak-model calls from the 2.4.1 smoke test, with Burp down.
+#[tokio::test]
+async fn weak_model_calls_while_burp_is_down() {
+    let fixture = common::target("");
+    let client = connect(&fixture).await;
+
+    // Burp down: a name nobody has is unknown_tool at once; a known one starts Burp in `retry`.
+    let typo = envelope(
+        &call(
+            &client,
+            "run",
+            json!({"do": "scope.chek", "url": "https://a.b"}),
+        )
+        .await,
+    );
+    assert_eq!(typo["code"], "unknown_tool", "{typo}");
+    assert_eq!(typo["did_you_mean"][0], "scope.check", "{typo}");
+    let nope = envelope(&call(&client, "run", json!({"do": "nope_tool"})).await);
+    assert_eq!(nope["code"], "unknown_tool", "{nope}");
+    let hash = envelope(
+        &call(
+            &client,
+            "run",
+            json!({"do": "util.hash", "data": "x", "algorithm": "MD5"}),
+        )
+        .await,
+    );
+    assert_eq!(hash["code"], "burp_not_running", "{hash}");
+    assert_eq!(
+        hash["retry"],
+        json!({"batch": [{"do": "burp_up"}, {"do": "util.hash", "data": "x", "algorithm": "MD5"}], "bail": true})
+    );
+    let shutdown = envelope(&call(&client, "run", json!({"do": "burp.shutdown"})).await);
+    assert!(shutdown.get("retry").is_none(), "destructive: {shutdown}");
+
+    // `input` holding a value is a parameter, not a wrapper.
+    let input = envelope(
+        &call(
+            &client,
+            "run",
+            json!({"do": "util.hash", "input": "x", "algorithm": "MD5"}),
+        )
+        .await,
+    );
+    assert_eq!(input["code"], "burp_not_running", "{input}");
+
+    // do=guide / do=run.
+    let guide = envelope(&call(&client, "run", json!({"do": "guide", "topic": "util"})).await);
+    assert!(
+        guide["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("guide is its own tool")),
+        "{guide}"
+    );
+    assert_eq!(guide["see"], "guide {\"topic\":\"util\"}");
+    assert_eq!(
+        envelope(&call(&client, "run", json!({"do": 5})).await)["code"],
+        "invalid_type"
+    );
+
+    client.cancel().await.expect("close");
+}
+
+/// Batch shapes, parameter synonyms and history errors from the 2.4.1 smoke test.
+#[tokio::test]
+async fn weak_model_batches_synonyms_and_history_errors() {
+    let fixture = common::target("");
+    let client = connect(&fixture).await;
+
+    // bail as a string still stops the batch.
+    let steps = json!([{"do": "history_show"}, {"do": "burp_status"}]);
+    let bailed = envelope(&call(&client, "run", json!({"batch": steps, "bail": "true"})).await);
+    assert_eq!(bailed["not_run"], json!([2]), "{bailed}");
+    assert_eq!(
+        notes(&call(&client, "run", json!({"batch": steps, "bail": "true"})).await),
+        ["coerced 'bail' from string \"true\" to boolean"]
+    );
+    let maybe = envelope(&call(&client, "run", json!({"batch": steps, "bail": "maybe"})).await);
+    assert_eq!(maybe["code"], "invalid_type", "{maybe}");
+
+    // Steps as names, and `steps` for `batch`.
+    let named = call(
+        &client,
+        "run",
+        json!({"steps": ["burp_status", "history_list"]}),
+    )
+    .await;
+    let out = json_of(&named);
+    assert_eq!(out["steps"][0]["ok"], true, "{out}");
+    assert_eq!(out["steps"][1]["ok"], true, "{out}");
+    assert_eq!(notes(&named), ["read 'steps' as 'batch'"]);
+
+    // Synonyms: count for limit, query for pattern.
+    let count = envelope(&call(&client, "run", json!({"do": "history_list", "count": 1})).await);
+    assert_eq!(
+        count["retry"],
+        json!({"do": "history_list", "limit": 1}),
+        "{count}"
+    );
+    let query = envelope(
+        &call(
+            &client,
+            "run",
+            json!({"do": "history_search", "query": "x"}),
+        )
+        .await,
+    );
+    assert_eq!(
+        query["retry"],
+        json!({"do": "history_search", "pattern": "x"}),
+        "{query}"
+    );
+
+    // History errors the caller fixes.
+    let bad_ref =
+        envelope(&call(&client, "run", json!({"do": "history_show", "ref": "nope"})).await);
+    assert_eq!(bad_ref["code"], "invalid_arguments", "{bad_ref}");
+    assert_eq!(bad_ref["retryable"], true);
+    let missing = envelope(
+        &call(
+            &client,
+            "run",
+            json!({"do": "history_show", "ref": "p1:999999"}),
+        )
+        .await,
+    );
+    assert_eq!(missing["code"], "not_found", "{missing}");
+    let project = envelope(
+        &call(
+            &client,
+            "run",
+            json!({"do": "history_list", "project": "nope"}),
+        )
+        .await,
+    );
+    assert_eq!(project["code"], "invalid_enum", "{project}");
+    assert_eq!(project["param"], "project");
+    let ref_project = envelope(
+        &call(
+            &client,
+            "run",
+            json!({"do": "history_show", "ref": "nope:1"}),
+        )
+        .await,
+    );
+    assert_eq!(ref_project["code"], "not_found", "{ref_project}");
+    assert_eq!(ref_project["param"], "ref", "{ref_project}");
+    assert!(
+        project["allowed"].as_array().is_some_and(|a| !a.is_empty()),
+        "{project}"
+    );
+
+    client.cancel().await.expect("close");
+}
+
+/// `guide` answers from the 2.4.1 smoke test.
+#[tokio::test]
+async fn weak_model_guide_topics() {
+    let fixture = common::target("");
+    let client = connect(&fixture).await;
+
+    // guide: one action, hash names, run/guide, resource paths and `name`.
+    let hash_topic = json_of(&call(&client, "guide", json!({"topic": "util.hash"})).await);
+    assert_eq!(hash_topic["action"], "hash");
+    assert_eq!(
+        hash_topic["inputSchema"]["properties"]
+            .as_object()
+            .map(serde_json::Map::len),
+        Some(2),
+        "{hash_topic}"
+    );
+    assert!(
+        hash_topic["usage"]
+            .as_str()
+            .is_some_and(|u| u.starts_with("util.hash(data*: string")),
+        "{hash_topic}"
+    );
+    assert_eq!(hash_topic["example"]["do"], "util.hash");
+    assert_eq!(
+        json_of(&call(&client, "guide", json!({"topic": "sha256"})).await)["action"],
+        "hash"
+    );
+    assert_eq!(
+        json_of(&call(&client, "guide", json!({"name": "history_list"})).await)["do"],
+        "history_list"
+    );
+    let send = json_of(&call(&client, "guide", json!({"topic": "http_send_request"})).await);
+    assert_eq!(
+        send["example"],
+        json!({"do": "http_send_request", "url": "https://example.com/"})
+    );
+    for topic in ["run", "skill://overview/SKILL.md", "/overview"] {
+        let r = call(&client, "guide", json!({"topic": topic})).await;
+        assert_ne!(r.is_error, Some(true), "{topic}: {}", text(&r));
+    }
+
+    let unknown_skill = client
+        .read_resource(ReadResourceRequestParams::new("skill://nope/SKILL.md"))
+        .await
+        .expect_err("unknown resource");
+    assert!(
+        format!("{unknown_skill:?}").contains("-32002"),
+        "{unknown_skill:?}"
+    );
     client.cancel().await.expect("close");
 }
 

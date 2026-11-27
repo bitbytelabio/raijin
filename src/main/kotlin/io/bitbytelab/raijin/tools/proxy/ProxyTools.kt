@@ -43,6 +43,9 @@ object ProxyTools {
     private const val MODIFY_SET_HEADER_DESCRIPTION =
         "Map of header names to values when action is 'modify': each replaces the header (every occurrence, so it is never sent twice) or is added when absent"
 
+    /** proxy_history's page size when `count` is not given: small enough to stay inline in the CLI. */
+    private const val DEFAULT_HISTORY_COUNT = 20
+
     fun register(server: Server, bridge: ProxyBridge, stateManager: StateManager) {
 
         // ---------------------------------------------------------------
@@ -55,12 +58,13 @@ object ProxyTools {
             inputSchema = ToolSchema(
                 properties = buildJsonObject {
                     intProp("start_index", "Start index of history entries (default 0)", min = 0)
-                    intProp("count", "Maximum number of entries to return (default 100; above ${ProxyBridge.MAX_PAGE_SIZE} is served as ${ProxyBridge.MAX_PAGE_SIZE} with a note; 0 returns only total_filtered)", min = 0)
+                    intProp("count", "Maximum number of entries to return (default $DEFAULT_HISTORY_COUNT; above ${ProxyBridge.MAX_PAGE_SIZE} is served as ${ProxyBridge.MAX_PAGE_SIZE} with a note; 0 returns only total_filtered)", min = 0)
                     putJsonObject("host") { put("type", "string"); put("description", "Filter by host (case-insensitive substring)") }
                     putJsonObject("method") { put("type", "string"); put("description", "Filter by HTTP method") }
                     intProp("status_code", "Filter by exact status code; items without a response never match", min = 0, max = 999)
                     putJsonObject("status_code_range") { put("type", "string"); put("description", "Filter by status code range: '200-299', '400-', '-399' or '404'; items without a response never match") }
                     putJsonObject("mime_type") { put("type", "string"); put("description", "Filter by MIME type") }
+                    putJsonObject("include_headers") { put("type", "boolean"); put("description", "Include each item's request_headers (default false)") }
                     putJsonObject("include_request") { put("type", "boolean"); put("description", "Include full request text (default false). Also unmasks sensitive request header values (Cookie, Authorization, …) which are otherwise redacted in request_headers") }
                     putJsonObject("include_response") { put("type", "boolean"); put("description", "Include full response text (default false)") }
                     putJsonObject("in_scope_only") { put("type", "boolean"); put("description", "Restrict to in-scope items (default false)") }
@@ -73,7 +77,8 @@ object ProxyTools {
                 val args = request.params.arguments ?: emptyMap()
                 val result = bridge.getHistory(
                     startIndex = args.integer("start_index") ?: 0,
-                    count = args.integer("count") ?: 100,
+                    count = args.integer("count") ?: DEFAULT_HISTORY_COUNT,
+                    includeHeaders = args.bool("include_headers", false),
                     host = args.string("host"),
                     method = args.string("method"),
                     statusCode = args.int("status_code", 0..999),

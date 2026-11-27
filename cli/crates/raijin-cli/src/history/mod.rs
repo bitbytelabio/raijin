@@ -15,6 +15,38 @@ use amber::HistoryFilter;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// A history failure the caller fixes by changing the call; `raijin mcp` gives each its own error
+/// code. Raised through `anyhow` and found again with [`Problem::of`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Problem {
+    /// A ref that does not parse.
+    BadRef(String),
+    /// A ref with nothing behind it.
+    NotFound(String),
+    /// A project the target does not have.
+    UnknownProject { wanted: String, known: Vec<String> },
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadRef(message) | Self::NotFound(message) => f.write_str(message),
+            Self::UnknownProject { wanted, known } => {
+                write!(f, "no project {wanted:?}; known: {}", known.join(", "))
+            }
+        }
+    }
+}
+
+impl std::error::Error for Problem {}
+
+impl Problem {
+    /// The [`Problem`] in `error`'s chain, if any.
+    pub fn of(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|e| e.downcast_ref::<Self>())
+    }
+}
+
 /// Which files to read: `project` names (default: every project) or `file` globs (replace discovery).
 #[derive(Debug, Clone, Default, clap::Args, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -223,15 +255,15 @@ pub struct Ref {
 
 impl Ref {
     pub fn parse(text: &str) -> Result<Self> {
+        let bad = || {
+            Problem::BadRef(format!(
+                "bad ref {text:?}: expected <project>:<id>, <project>:a<seq> or <project>:i<seq>, e.g. main:1"
+            ))
+        };
         let Some((project, id)) = text.rsplit_once(':') else {
-            bail!(
-                "bad ref {text:?}: expected <project>:<id>, <project>:a<seq> or <project>:i<seq>"
-            );
+            bail!(bad());
         };
-        let number = |s: &str| {
-            s.parse::<u64>()
-                .map_err(|_| anyhow::anyhow!("bad ref {text:?}"))
-        };
+        let number = |s: &str| s.parse::<u64>().map_err(|_| bad());
         let kind = if let Some(seq) = id.strip_prefix('a') {
             RefKind::Archive(number(seq)?)
         } else if let Some(seq) = id.strip_prefix('i') {

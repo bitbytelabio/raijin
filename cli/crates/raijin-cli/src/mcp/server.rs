@@ -310,6 +310,137 @@ fn batch_type_error(kind: &str, got: Value) -> CallToolResult {
     .into_result()
 }
 
+/// `run`'s `bail`: a boolean, also as the text `"true"`/`"false"` (noted); absent or null is false.
+/// Anything else is refused: a batch that runs on after a failure is not what `bail` asked for.
+fn read_bail(value: Option<Value>) -> Result<(bool, Option<String>), ToolError> {
+    match value {
+        None | Some(Value::Null) => Ok((false, None)),
+        Some(Value::Bool(b)) => Ok((b, None)),
+        Some(Value::String(s))
+            if s.trim().eq_ignore_ascii_case("true") || s.trim().eq_ignore_ascii_case("false") =>
+        {
+            let b = s.trim().eq_ignore_ascii_case("true");
+            Ok((
+                b,
+                Some(format!("coerced 'bail' from string \"{s}\" to boolean")),
+            ))
+        }
+        Some(other) => Err(ToolError::new(
+            Code::InvalidType,
+            format!("run: 'bail' must be true or false, got {other}."),
+        )
+        .param("bail")
+        .got(other)
+        .expected("true or false")
+        .example(json!({"batch": [run_example()], "bail": true}))),
+    }
+}
+
+/// A history tool's failure as an envelope: a bad ref is `invalid_arguments`, a ref with nothing
+/// behind it `not_found`, an unknown project `invalid_enum` with the known ones (and `retry` when
+/// there is only one); anything else `tool_failed`.
+fn history_error(tool: &str, e: &anyhow::Error, sent: &JsonObject) -> ToolError {
+    let list = json!({"do": "history_list"});
+    match history::Problem::of(e) {
+        Some(history::Problem::BadRef(message)) => {
+            let param = ["ref", "a", "b"].into_iter().find(|k| {
+                sent.get(*k)
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| message.contains(v))
+            });
+            let mut err = ToolError::new(Code::InvalidArguments, format!("{tool}: {message}."));
+            if let Some(param) = param {
+                err = err.param(param).got(sent[param].clone());
+            }
+            err.see(format!("run {list}"))
+        }
+        Some(history::Problem::NotFound(message)) => {
+            ToolError::new(Code::NotFound, format!("{tool}: {message}.")).see(format!("run {list}"))
+        }
+        // The project came from a ref (`history_show`, `history_diff`): the ref is what to fix.
+        Some(history::Problem::UnknownProject { wanted, known })
+            if !sent.contains_key("project") =>
+        {
+            let prefix = format!("{wanted}:");
+            let mut err = ToolError::new(
+                Code::NotFound,
+                format!(
+                    "{tool}: no project \"{wanted}\"; refs start with one of: {}.",
+                    known.join(", ")
+                ),
+            )
+            .see(format!("run {list}"));
+            if let Some(param) = ["ref", "a", "b"].into_iter().find(|k| {
+                sent.get(*k)
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v.starts_with(&prefix))
+            }) {
+                err = err.param(param).got(sent[param].clone());
+            }
+            err
+        }
+        Some(history::Problem::UnknownProject { wanted, known }) => {
+            let mut err = ToolError::new(
+                Code::InvalidEnum,
+                if known.is_empty() {
+                    format!("{tool}: no project \"{wanted}\"; history_list shows the projects.")
+                } else {
+                    format!(
+                        "{tool}: no project \"{wanted}\"; this target has {}.",
+                        known.join(", ")
+                    )
+                },
+            )
+            .param("project")
+            .got(json!(wanted))
+            .allowed(known.iter().map(|k| json!(k)).collect());
+            if let [only] = known.as_slice()
+                && sent.contains_key("project")
+            {
+                let mut call = Map::new();
+                call.insert("do".to_owned(), json!(tool));
+                call.extend(sent.clone());
+                call.insert("project".to_owned(), json!(only));
+                err = err.retry(Value::Object(call));
+            }
+            err
+        }
+        None => ToolError::new(Code::ToolFailed, format!("{e:#}")),
+    }
+}
+
+/// The error for `run {"do":"guide"}` or `{"do":"run"}`: the gateway's own tools are not run
+/// through `run`. For `guide`, `see` is the guide call to make instead, with the topic given.
+fn gateway_tool_as_do(tool: &str, arguments: Option<&JsonObject>) -> Option<CallToolResult> {
+    match error::norm(tool).as_str() {
+        "guide" => {
+            let topic = arguments
+                .and_then(|a| ["topic", "name", "tool"].iter().find_map(|k| a.get(*k)))
+                .and_then(Value::as_str);
+            let call = topic.map_or_else(|| json!({}), |t| json!({ "topic": t }));
+            Some(
+                ToolError::new(
+                    Code::UnknownTool,
+                    format!("guide is its own tool, not a run target: call guide {call}."),
+                )
+                .see(format!("guide {call}"))
+                .into_result(),
+            )
+        }
+        "run" => Some(
+            ToolError::new(
+                Code::InvalidArguments,
+                "run is the tool you are calling: put the tool to run in \"do\", e.g. {\"do\":\"proxy_history\",\"count\":20}.",
+            )
+            .param("do")
+            .example(run_example())
+            .see("guide {}")
+            .into_result(),
+        ),
+        _ => None,
+    }
+}
+
 /// One tool call as `run` resolved it.
 #[derive(Debug, PartialEq)]
 struct Call {
@@ -323,10 +454,14 @@ struct Call {
 /// Keys a model wraps a tool's parameters in, in the order they are tried.
 const ARGUMENT_KEYS: [&str; 5] = ["arguments", "args", "params", "parameters", "input"];
 
+/// The wrapper key that is never a parameter name: a value that is not an object is an error.
+const WRAPPER_KEY: &str = "arguments";
+
 /// Reads a `run` call: `do` (else `tool`, else `name`) names the tool, `project` picks the Burp
 /// unless the tool takes a `project` itself, a wrapper object (`arguments`, `args`, ..., also as a
 /// JSON string) is unwrapped unless the tool declares that key (`declares(tool, key)`), and every
-/// other key is a parameter of the tool. Keys already flat win over wrapped ones.
+/// other key is a parameter of the tool. Keys already flat win over wrapped ones. A wrapper key
+/// other than `arguments` holding a non-object (`"input":"x"`) stays a parameter.
 fn normalize_run(
     mut raw: JsonObject,
     declares: impl Fn(&str, &str) -> bool,
@@ -340,11 +475,24 @@ fn normalize_run(
     };
     let tool = match named {
         Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_owned(),
-        _ => {
+        None | Some(Value::Null | Value::String(_)) => {
             return Err(ToolError::new(Code::MissingParameter, MISSING_DO)
                 .param("do")
                 .example(run_example())
                 .see("guide {}"));
+        }
+        Some(other) => {
+            return Err(ToolError::new(
+                Code::InvalidType,
+                format!(
+                    "run: 'do' must be a tool name string such as \"proxy_history\", got {other}."
+                ),
+            )
+            .param("do")
+            .got(other)
+            .expected("string")
+            .example(run_example())
+            .see("guide {}"));
         }
     };
     let project = if declares(&tool, "project") {
@@ -359,24 +507,32 @@ fn normalize_run(
         .into_iter()
         .find(|k| raw.contains_key(*k) && !declares(&tool, k))
     {
-        let value = raw.remove(key).unwrap_or_default();
-        let wrapped = match &value {
+        let wrapped = match &raw[key] {
             Value::Object(o) => Some(o.clone()),
             Value::String(s) => serde_json::from_str::<JsonObject>(s).ok(),
             _ => None,
         };
-        let Some(wrapped) = wrapped else {
-            return Err(ToolError::new(
-                Code::InvalidType,
-                format!(
-                    "run: '{key}' must be a JSON object of the tool's parameters, or leave it out and put the parameters next to \"do\"."
-                ),
-            )
-            .param(key)
-            .got(value));
-        };
-        for (k, v) in wrapped {
-            raw.entry(k).or_insert(v);
+        match wrapped {
+            Some(wrapped) => {
+                raw.remove(key);
+                for (k, v) in wrapped {
+                    raw.entry(k).or_insert(v);
+                }
+            }
+            // `input`, `params`, ... holding a value is a parameter under another tool's name
+            // (`input` for `data`): the tool's parameter check names the one it means.
+            None if key != WRAPPER_KEY => {}
+            None => {
+                let value = raw.remove(key).unwrap_or_default();
+                return Err(ToolError::new(
+                    Code::InvalidType,
+                    format!(
+                        "run: '{key}' must be a JSON object of the tool's parameters, or leave it out and put the parameters next to \"do\"."
+                    ),
+                )
+                .param(key)
+                .got(value));
+            }
         }
     }
     Ok(Call {
@@ -674,6 +830,23 @@ impl Gateway {
     /// `run`: one call, or a batch of them.
     async fn run(&self, raw: Option<JsonObject>) -> CallToolResult {
         let mut raw = raw.unwrap_or_default();
+        let mut notes = Vec::new();
+        // `steps` is what other tools call a batch.
+        if !["batch", "do", "tool", "name"]
+            .iter()
+            .any(|k| raw.get(*k).is_some_and(|v| !v.is_null()))
+            && let Some(steps) = raw.remove("steps")
+        {
+            notes.push("read 'steps' as 'batch'".to_owned());
+            raw.insert("batch".to_owned(), steps);
+        }
+        let bail = match read_bail(raw.remove("bail")) {
+            Ok((bail, note)) => {
+                notes.extend(note);
+                bail
+            }
+            Err(e) => return e.into_result(),
+        };
         // A client may fill every declared property; a null `batch` means no batch.
         if let Some(batch) = raw.remove("batch").filter(|b| !b.is_null()) {
             if ["do", "tool", "name"].iter().any(|k| raw.contains_key(*k)) {
@@ -683,10 +856,7 @@ impl Gateway {
                 )
                 .into_result();
             }
-            if let Some(extra) = raw
-                .keys()
-                .find(|k| !matches!(k.as_str(), "bail" | "project"))
-            {
+            if let Some(extra) = raw.keys().find(|k| k.as_str() != "project") {
                 return ToolError::new(
                     Code::UnknownParameter,
                     "run with batch takes only batch, bail and project; put each tool's parameters inside its step.",
@@ -694,7 +864,6 @@ impl Gateway {
                 .param(extra.as_str())
                 .into_result();
             }
-            let mut notes = Vec::new();
             let steps = match batch {
                 Value::Array(steps) => steps,
                 Value::String(s) => match serde_json::from_str::<Vec<Value>>(&s) {
@@ -723,26 +892,19 @@ impl Gateway {
                 .example(json!({"batch": [run_example()]}))
                 .into_result();
             }
-            let bail = raw.get("bail").and_then(Value::as_bool).unwrap_or(false);
             let project = raw
                 .get("project")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             return self.batch(steps, bail, project, &notes).await;
         }
-        // `bail` is run's own (batch) key, not a tool parameter.
-        if raw
-            .get("bail")
-            .is_some_and(|b| b.is_boolean() || b.is_null())
-        {
-            raw.remove("bail");
-        }
         let assets = self.assets().await.ok();
         let catalog = assets.as_deref().map(|a| &a.catalog);
-        match normalize_run(raw, |tool, key| tool_declares(catalog, tool, key)) {
+        let result = match normalize_run(raw, |tool, key| tool_declares(catalog, tool, key)) {
             Ok(call) => self.run_one(call).await,
             Err(e) => e.into_result(),
-        }
+        };
+        error::with_notes(result, &notes)
     }
 
     /// Steps in order; each result inline (no per-step spill), the whole batch spilled once.
@@ -759,6 +921,11 @@ impl Gateway {
         let mut out = Vec::with_capacity(total);
         let mut stopped_after = None;
         for (i, step) in steps.into_iter().enumerate() {
+            // A bare name is a step without parameters: "burp_status" is {"do":"burp_status"}.
+            let step = match step {
+                Value::String(name) => json!({ "do": name }),
+                other => other,
+            };
             let named = ["do", "tool", "name"]
                 .iter()
                 .find_map(|k| step.get(*k).cloned())
@@ -778,12 +945,24 @@ impl Gateway {
                         Err(e) => (false, e.to_value()),
                     }
                 }
-                _ => (
+                Value::Object(_) => (
                     false,
                     ToolError::new(
                         Code::InvalidArguments,
-                        "each step is one {\"do\":\"<tool>\", ...}; batch cannot nest.",
+                        "a batch step cannot hold another batch; list every call as its own {\"do\":\"<tool>\", ...} step.",
                     )
+                    .example(run_example())
+                    .to_value(),
+                ),
+                other => (
+                    false,
+                    ToolError::new(
+                        Code::InvalidType,
+                        format!(
+                            "each batch step is a {{\"do\":\"<tool>\", ...}} object or a tool name, got {other}."
+                        ),
+                    )
+                    .got(other)
                     .example(run_example())
                     .to_value(),
                 ),
@@ -850,6 +1029,9 @@ impl Gateway {
             mut arguments,
             project,
         } = call;
+        if let Some(result) = gateway_tool_as_do(&tool, arguments.as_ref()) {
+            return (tool, result);
+        }
         let (local, note) = match local_tool(&tool) {
             Some(local) => (Some(local), None),
             None => match LOCAL_TOOLS.iter().find(|t| t.name == error::norm(&tool)) {
@@ -915,7 +1097,7 @@ impl Gateway {
     ) -> CallToolResult {
         let endpoint = match self.endpoint(project).await {
             Ok(e) => e,
-            Err(e) => return e.into_result(),
+            Err(e) => return self.unreached(e, tool, arguments, project).await,
         };
         match self.api.call(&endpoint, tool, arguments).await {
             Ok(result) => match project {
@@ -928,6 +1110,65 @@ impl Gateway {
             )
             .into_result(),
             Err(ApiError::Other(msg)) => ToolError::new(Code::Internal, msg).into_result(),
+        }
+    }
+
+    /// The answer to a call no Burp can take (`burp_not_running`, `project_not_running`): a name
+    /// the catalog does not know is `unknown_tool` right away, so no Burp is started for it; a known
+    /// one gets `retry`, a batch that starts Burp and then makes the call (left out for a
+    /// destructive call, which is only made as sent).
+    async fn unreached(
+        &self,
+        error: ToolError,
+        tool: &str,
+        arguments: Option<JsonObject>,
+        project: Option<&str>,
+    ) -> CallToolResult {
+        if !matches!(error.code, Code::BurpNotRunning | Code::ProjectNotRunning) {
+            return error.into_result();
+        }
+        let Ok(assets) = self.assets().await else {
+            return error.into_result();
+        };
+        let catalog = &assets.catalog;
+        let arguments = arguments.unwrap_or_default();
+        match catalog.resolve_call(tool) {
+            catalog::Resolved::NotFound { did_you_mean } => {
+                let mut unknown = ToolError::new(
+                    Code::UnknownTool,
+                    format!("unknown tool \"{tool}\"; guide {{}} lists every tool."),
+                )
+                .see("guide {}");
+                if let [only] = did_you_mean.as_slice()
+                    && let Some((name, action)) = catalog.resolve(only)
+                    && !catalog.destructive(&name, action.as_deref())
+                {
+                    let mut call = Map::new();
+                    call.insert("do".to_owned(), json!(only));
+                    call.extend(arguments);
+                    unknown = unknown.retry(Value::Object(call));
+                }
+                unknown.did_you_mean(did_you_mean).into_result()
+            }
+            catalog::Resolved::Found {
+                tool: name, action, ..
+            } => {
+                if catalog.destructive(&name, action.as_deref()) {
+                    return error.into_result();
+                }
+                let mut up = Map::new();
+                up.insert("do".to_owned(), json!("burp_up"));
+                let mut call = Map::new();
+                call.insert("do".to_owned(), json!(tool));
+                call.extend(arguments);
+                if let Some(project) = project {
+                    up.insert("project".to_owned(), json!(project));
+                    call.entry("project").or_insert_with(|| json!(project));
+                }
+                error
+                    .retry(json!({"batch": [up, call], "bail": true}))
+                    .into_result()
+            }
         }
     }
 
@@ -946,16 +1187,16 @@ impl Gateway {
             (Some(live), None) => live.iter().map(|t| t.name.to_string()).collect(),
             _ => Vec::new(),
         };
-        let topic = args
-            .topic
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty());
+        let cleaned = args.topic.as_deref().map(clean_topic);
+        let topic = cleaned.as_deref().filter(|t| !t.is_empty());
         let result = match topic {
             None => plain(
                 self.overview(catalog, live.as_deref(), &other, catalog_error)
                     .await,
             ),
+            Some(topic) if matches!(error::norm(topic).as_str(), "run" | "guide") => {
+                plain(format!("{GUIDE_HEAD}\n\nrun: {RUN_DESCRIPTION}"))
+            }
             Some(topic) => {
                 let names = topic_names(catalog, live.as_deref(), &other);
                 self.topic(topic, catalog, live.as_deref(), &other)
@@ -1273,8 +1514,9 @@ impl Gateway {
             Ok(t) => t.clone(),
             Err(e) => return e.into_result(),
         };
+        let sent = arguments.clone().unwrap_or_default();
         let run = move || -> Result<(Value, Vec<String>), ToolError> {
-            let failed = |e: anyhow::Error| ToolError::new(Code::ToolFailed, format!("{e:#}"));
+            let failed = |e: anyhow::Error| history_error(local.name, &e, &sent);
             let to_value = |v: Result<Value, serde_json::Error>| {
                 v.map_err(|e| ToolError::new(Code::Internal, e.to_string()))
             };
@@ -1383,7 +1625,9 @@ fn tool_topic(topic: &str, catalog: Option<&Catalog>, live: Option<&[Tool]>) -> 
             local_playbook(local.domain).to_owned(),
             ToolView::local(local),
         )
-    } else if let Some((name, action)) = catalog.and_then(|c| c.resolve(topic))
+    } else if let Some(catalog::Resolved::Found {
+        tool: name, action, ..
+    }) = catalog.map(|c| c.resolve_call(topic))
         && let Some(view) = tool_view(&name, catalog, live)
         && action.as_ref().is_none_or(|a| {
             let actions = actions_of(&view.schema);
@@ -1406,16 +1650,108 @@ fn tool_topic(topic: &str, catalog: Option<&Catalog>, live: Option<&[Tool]>) -> 
             ToolView::live(tool),
         )
     };
+    let spec = catalog.and_then(|c| c.tool(&name));
+    let action_spec = action
+        .as_deref()
+        .and_then(|a| spec.and_then(|s| s.actions.get(a)));
     let mut out = json!({"do": name});
-    if let Some(action) = action {
+    if let Some(action) = &action {
         out["action"] = json!(action);
     }
     out["domain"] = json!(domain);
     out["playbook"] = json!(playbook);
     out["description"] = json!(view.description);
     out["annotations"] = view.annotations.unwrap_or(Value::Null);
-    out["inputSchema"] = view.schema;
+    match (&action, action_spec) {
+        // One action of a grouped tool: its own parameters only, with a call that works.
+        (Some(action), Some(a)) => {
+            let schema = narrowed(&view.schema, &a.params, &a.required);
+            out["usage"] = json!(super::args::usage(&format!("{name}.{action}"), &schema));
+            out["example"] = a.example.clone();
+            out["inputSchema"] = Value::Object(schema);
+        }
+        // A grouped tool: one call line per action; `guide tool.action` narrows to one.
+        _ if spec.is_some_and(|s| !s.actions.is_empty()) => {
+            let actions: Map<String, Value> = spec
+                .map(|s| &s.actions)
+                .into_iter()
+                .flatten()
+                .map(|(a, aspec)| {
+                    let schema = narrowed(&view.schema, &aspec.params, &aspec.required);
+                    let signature = super::args::usage(&format!("{name}.{a}"), &schema);
+                    (a.clone(), json!(signature))
+                })
+                .collect();
+            out["usage"] = json!(format!(
+                "guide {{\"topic\":\"{name}.<action>\"}} shows one action"
+            ));
+            out["actions"] = Value::Object(actions);
+            out["inputSchema"] = view.schema;
+        }
+        _ => {
+            if let Some(schema) = view.schema.as_object() {
+                out["usage"] = json!(super::args::usage(&name, schema));
+            }
+            let example = local_tool(&name)
+                .map(LocalTool::example)
+                .or_else(|| spec.and_then(|s| s.example.clone()));
+            if let Some(example) = example {
+                out["example"] = example;
+            }
+            out["inputSchema"] = view.schema;
+        }
+    }
     Some(out)
+}
+
+/// `schema` with only the `params` properties (in their order) and `required` as given.
+fn narrowed(schema: &Value, params: &[String], required: &[String]) -> JsonObject {
+    let props = schema.get("properties").and_then(Value::as_object);
+    let kept: Map<String, Value> = params
+        .iter()
+        .filter_map(|p| {
+            props
+                .and_then(|all| all.get(p))
+                .map(|d| (p.clone(), d.clone()))
+        })
+        .collect();
+    let mut out = Map::new();
+    out.insert("type".to_owned(), json!("object"));
+    out.insert("properties".to_owned(), Value::Object(kept));
+    out.insert("required".to_owned(), json!(required));
+    out
+}
+
+/// `guide` arguments with `name` or `tool` read as `topic` (when no topic is given), and the note
+/// saying so.
+fn topic_alias(arguments: Option<JsonObject>) -> (Option<JsonObject>, Option<String>) {
+    let Some(mut arguments) = arguments else {
+        return (None, None);
+    };
+    if arguments.get("topic").is_some_and(|t| !t.is_null()) {
+        return (Some(arguments), None);
+    }
+    let Some(key) = ["name", "tool"]
+        .into_iter()
+        .find(|k| arguments.contains_key(*k))
+    else {
+        return (Some(arguments), None);
+    };
+    let value = arguments.remove(key).unwrap_or_default();
+    arguments.insert("topic".to_owned(), value);
+    (Some(arguments), Some(format!("read '{key}' as 'topic'")))
+}
+
+/// A `guide` topic as written in a resource or prompt reference: without `skill://`, a leading `/`
+/// (the prompt `/overview`) and a trailing `/SKILL.md`.
+fn clean_topic(topic: &str) -> String {
+    let t = topic.trim();
+    let t = t.strip_prefix("skill://").unwrap_or(t);
+    let t = t.trim_start_matches('/');
+    let t = t
+        .strip_suffix(SKILL_FILE)
+        .map_or(t, |rest| rest.trim_end_matches('/'));
+    t.to_owned()
 }
 
 /// A playbook's `SKILL.md`, or one of its files (`<playbook>/<path>`).
@@ -1565,13 +1901,17 @@ impl ServerHandler for Gateway {
         let arguments = request.arguments;
         let result = match name.as_str() {
             "guide" => {
+                let (arguments, renamed) = topic_alias(arguments);
                 match parse_args::<GuideArgs>(
                     &name,
                     arguments,
                     &json!({"topic": "overview"}),
                     false,
                 ) {
-                    Ok((args, notes)) => error::with_notes(self.guide(args).await, &notes),
+                    Ok((args, mut notes)) => {
+                        notes.extend(renamed);
+                        error::with_notes(self.guide(args).await, &notes)
+                    }
                     Err(e) => e.into_result(),
                 }
             }
@@ -1648,18 +1988,18 @@ impl ServerHandler for Gateway {
                     ]))
                 })
                 .ok_or_else(|| {
-                    ErrorData::invalid_params(format!("unknown resource: {uri}"), None)
+                    ErrorData::resource_not_found(format!("unknown resource: {uri}"), None)
                 });
         }
         let endpoint = self
             .endpoint(None)
             .await
             .map_err(|e| ErrorData::invalid_params(e.error.clone(), None))?;
-        self.api
-            .read_resource(&endpoint, uri)
-            .await
-            .map(ReadResourceResponse::Complete)
-            .map_err(|msg| ErrorData::internal_error(msg, None))
+        match self.api.read_resource(&endpoint, uri).await {
+            Ok(Ok(result)) => Ok(ReadResourceResponse::Complete(result)),
+            Ok(Err(missing)) => Err(ErrorData::resource_not_found(missing, None)),
+            Err(msg) => Err(ErrorData::internal_error(msg, None)),
+        }
     }
 
     fn list_skills(

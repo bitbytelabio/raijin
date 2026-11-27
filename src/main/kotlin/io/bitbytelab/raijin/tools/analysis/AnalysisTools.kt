@@ -40,7 +40,10 @@ object AnalysisTools {
                     ?: return@addTool toolError("Missing required parameter: request")
                 toolJsonResult(analysis.analyzeRequest(rawRequest))
             } catch (e: Exception) {
-                toolError(e.message ?: "Unknown error")
+                toolError(
+                    "'request' could not be read as a raw HTTP request (${e.message ?: e.javaClass.simpleName}); " +
+                        "send the request line, headers and a blank line, e.g. \"GET / HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n\""
+                )
             }
         }
 

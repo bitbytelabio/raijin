@@ -322,6 +322,29 @@ pub fn usage(tool: &str, schema: &JsonObject) -> String {
     format!("{tool}({})", parts.join(", "))
 }
 
+/// Parameter names that mean the same thing across tools and the APIs agents know: an undeclared
+/// name maps to the one member of its group a tool declares. The extension's table
+/// (`ToolArgs.PARAM_SYNONYMS`, `param_synonyms` in the catalog); a test keeps the two equal.
+pub const PARAM_SYNONYMS: &[&[&str]] = &[
+    &["count", "limit", "max", "max_results", "max_items", "size"],
+    &["start_index", "offset", "skip"],
+    &["pattern", "query", "q", "regex", "search", "search_pattern"],
+    &["data", "input", "text", "value", "string"],
+    &["url", "uri"],
+    &["request", "raw_request"],
+    &["response", "raw_response"],
+];
+
+/// The parameter of `props` that `key` means by [`PARAM_SYNONYMS`], when exactly one fits.
+fn synonym<'a>(key: &str, props: &'a JsonObject) -> Option<&'a str> {
+    let group = PARAM_SYNONYMS.iter().find(|g| g.contains(&key))?;
+    let mut fits = props
+        .keys()
+        .filter(|p| p.as_str() != key && group.contains(&p.as_str()));
+    let one = fits.next()?;
+    fits.next().is_none().then_some(one.as_str())
+}
+
 /// What `retry` an `unknown_parameter` error may carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Retry {
@@ -345,9 +368,11 @@ fn unknown_parameter(
     let targets: Vec<Option<&str>> = unknown
         .iter()
         .map(|k| {
-            suggest(k, props.keys().map(String::as_str), 1)
-                .first()
-                .copied()
+            synonym(k, props).or_else(|| {
+                suggest(k, props.keys().map(String::as_str), 1)
+                    .first()
+                    .copied()
+            })
         })
         .collect();
     let chosen: Vec<&str> = targets.iter().flatten().copied().collect();

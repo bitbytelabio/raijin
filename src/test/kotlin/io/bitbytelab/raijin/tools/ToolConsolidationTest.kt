@@ -118,7 +118,8 @@ class ToolConsolidationTest {
         assertEquals("unknown_action", badJson.str("code"))
         assertTrue("Did you mean 'check'?" in badJson.str("error")!!, text(bad))
         assertEquals("check", badJson.getValue("did_you_mean").jsonArray.first().jsonPrimitive.content)
-        assertTrue("include" in badJson.getValue("available").jsonArray.map { it.jsonPrimitive.content })
+        assertTrue("include" in badJson.getValue("allowed").jsonArray.map { it.jsonPrimitive.content })
+        assertNull(badJson["available"])
         assertEquals(buildJsonObject { put("action", "check") }, badJson.getValue("retry"))
         assertEquals(true, badJson.getValue("retryable").jsonPrimitive.boolean)
 
@@ -133,8 +134,8 @@ class ToolConsolidationTest {
         assertEquals("missing_parameter", missingJson.str("code"))
         assertTrue("missing required parameter(s): 'url'" in missingJson.str("error")!!, text(missing))
         assertEquals("url", missingJson.str("param"))
-        assertEquals("""scope(action="check", url*: string)""", missingJson.str("usage"))
-        assertEquals(buildJsonObject { put("action", "check"); put("url", "<url>") }, missingJson.getValue("example"))
+        assertEquals("""scope.check(url*: string)""", missingJson.str("usage"))
+        assertEquals(buildJsonObject { put("action", "check"); put("url", "https://example.com/") }, missingJson.getValue("example"))
         assertFalse(target.tools.keys.any { it == "scope_check" })
 
         val unknown = call(target, "scope", buildJsonObject { put("action", "check"); put("uri", "x") })
@@ -142,9 +143,10 @@ class ToolConsolidationTest {
         val unknownJson = json(unknown)
         assertEquals("unknown_parameter", unknownJson.str("code"))
         assertTrue("did you mean 'url'" in unknownJson.str("error")!!, text(unknown))
-        assertEquals(listOf("uri"), unknownJson.getValue("unknown_parameters").jsonArray.map { it.jsonPrimitive.content })
-        assertTrue(unknownJson.str("usage")!!.startsWith("scope(action=\"check\", url*"), text(unknown))
-        assertEquals(buildJsonObject { put("action", "check"); put("url", "<url>") }, unknownJson.getValue("example"))
+        assertEquals("uri", unknownJson.str("param"))
+        assertNull(unknownJson["unknown_parameters"])
+        assertTrue(unknownJson.str("usage")!!.startsWith("scope.check(url*"), text(unknown))
+        assertEquals(buildJsonObject { put("action", "check"); put("url", "https://example.com/") }, unknownJson.getValue("example"))
         assertEquals(buildJsonObject { put("action", "check"); put("url", "x") }, unknownJson.getValue("retry"))
     }
 
@@ -190,6 +192,56 @@ class ToolConsolidationTest {
         assertEquals("limit", r.str("param"))
         assertEquals(listOf("count"), r.getValue("did_you_mean").jsonArray.map { it.jsonPrimitive.content })
         assertEquals(buildJsonObject { put("count", 5) }, r.getValue("retry"))
+    }
+
+    @Test
+    fun `a synonym from another tool or API maps to the declared parameter`() {
+        val target = withKept("proxy_history_search", buildJsonObject {
+            putJsonObject("pattern") { put("type", "string") }
+            putJsonObject("max_results") { put("type", "integer") }
+        }) { toolJsonResult(buildJsonObject { put("ok", true) }) }
+        val r = json(call(target, "proxy_history_search", buildJsonObject { put("query", "x"); put("count", 1) }))
+        assertEquals("unknown_parameter", r.str("code"))
+        assertEquals(buildJsonObject { put("pattern", "x"); put("max_results", 1) }, r.getValue("retry"))
+    }
+
+    @Test
+    fun `every handler error becomes an envelope with a code`() {
+        var answer: CallToolResult = toolError("x")
+        val target = withKept("http_fuzz", buildJsonObject {
+            putJsonObject("run_id") { put("type", "string") }
+            putJsonObject("count") { put("type", "integer") }
+        }) { answer }
+        fun err(result: CallToolResult, args: JsonObject = buildJsonObject {}): JsonObject {
+            answer = result
+            val r = call(target, "http_fuzz", args)
+            assertEquals(true, r.isError, text(r))
+            val j = json(r)
+            assertTrue(j.str("error")!!.last() in ".!?)", j.toString())
+            assertNotNull(j["retryable"], j.toString())
+            return j
+        }
+
+        val notFound = err(toolJsonResult(buildJsonObject { put("error", "not_found") }), buildJsonObject { put("run_id", "nope") })
+        assertEquals("not_found", notFound.str("code"))
+        assertEquals("run_id", notFound.str("param"))
+        assertEquals("nope", notFound.str("got"))
+        assertTrue("\"nope\"" in notFound.str("error")!!, notFound.toString())
+        assertEquals(true, notFound.getValue("retryable").jsonPrimitive.boolean)
+
+        val typed = err(toolError("Parameter 'count' must be an integer (got 2.5)"), buildJsonObject { put("count", 3) })
+        assertEquals("invalid_type", typed.str("code"))
+        assertEquals("count", typed.str("param"))
+        assertEquals("integer", typed.str("expected"))
+        assertNotNull(typed["usage"])
+
+        val plain = err(CallToolResult(content = listOf(TextContent("boom")), isError = true))
+        assertEquals("tool_failed", plain.str("code"))
+        assertEquals("http_fuzz: boom.", plain.str("error"))
+        assertEquals(false, plain.getValue("retryable").jsonPrimitive.boolean)
+
+        val coded = err(ToolArgs.error("missing_parameter", "y"))
+        assertEquals("missing_parameter", coded.str("code"))
     }
 
     @Test
@@ -272,13 +324,20 @@ class ToolConsolidationTest {
                 putJsonObject("o") { put("a", 1) }
                 putJsonArray("a") { add("x") }
                 put("n", 7)
-                putJsonArray("notes") { add("coerced 'n' from string \"7\" to integer") }
+                putJsonArray("notes") {
+                    add("parsed 'o' from a JSON string")
+                    add("coerced 'n' from string \"7\" to integer")
+                }
             },
             Json.parseToJsonElement(text(coerced)),
         )
         val parsedArray = call(target, "http_fuzz", buildJsonObject { put("a", "[\"x\",\"y\"]"); put("o", "not json") })
         assertEquals(
-            buildJsonObject { putJsonArray("a") { add("x"); add("y") }; put("o", "not json") },
+            buildJsonObject {
+                putJsonArray("a") { add("x"); add("y") }
+                put("o", "not json")
+                putJsonArray("notes") { add("parsed 'a' from a JSON string") }
+            },
             Json.parseToJsonElement(text(parsedArray)),
         )
         // kotlinx would read unquoted words as literals: these stay the values sent.
@@ -307,10 +366,13 @@ class ToolConsolidationTest {
 
         val argError = json(call(target, "proxy_history", buildJsonObject { put("count", 0) }))
         assertEquals("proxy_history(count*: integer)", argError.str("usage"))
-        assertEquals(buildJsonObject { put("count", 1) }, argError.getValue("example"))
+        assertEquals(buildJsonObject { put("count", 20) }, argError.getValue("example"))
 
         val other = json(call(target, "proxy_history", buildJsonObject { put("count", 2) }))
-        assertEquals(buildJsonObject { put("error", "Burp is busy") }, other)
+        assertEquals(
+            buildJsonObject { put("error", "Burp is busy."); put("code", "tool_failed"); put("retryable", false) },
+            other,
+        )
     }
 
     @Test

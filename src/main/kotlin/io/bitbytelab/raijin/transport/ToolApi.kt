@@ -96,15 +96,15 @@ internal fun Application.installToolApi(server: Server) {
             }
             get("resources/read") {
                 val uri = call.request.queryParameters["uri"]
-                    ?: return@get call.respondError(HttpStatusCode.BadRequest, "uri query parameter is required")
+                    ?: return@get call.respondError(HttpStatusCode.BadRequest, "uri query parameter is required.", "missing_parameter")
                 val registered = server.resources[uri]
-                    ?: return@get call.respondError(HttpStatusCode.NotFound, "unknown resource $uri")
+                    ?: return@get call.respondError(HttpStatusCode.NotFound, "unknown resource $uri.", "not_found")
                 val result = try {
                     registered.readHandler(ApiConnection, ReadResourceRequest(ReadResourceRequestParams(uri = uri)))
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    return@get call.respondError(HttpStatusCode.InternalServerError, "reading $uri failed: ${e.message}")
+                    return@get call.respondError(HttpStatusCode.InternalServerError, "reading $uri failed: ${e.message}", "internal")
                 }
                 call.respondJson(HttpStatusCode.OK, McpJson.encodeToJsonElement(ReadResourceResult.serializer(), result))
             }
@@ -113,19 +113,22 @@ internal fun Application.installToolApi(server: Server) {
                 val body = call.readBounded()
                     ?: return@post call.respondError(
                         HttpStatusCode.PayloadTooLarge,
-                        "request body over ${McpServerManager.MAX_REQUEST_BODY_BYTES} bytes"
+                        "request body over ${McpServerManager.MAX_REQUEST_BODY_BYTES} bytes.",
+                        "invalid_arguments",
                     )
                 // A non-JSON content type is what a cross-site <form> can send without a CORS preflight.
                 if (body.isNotEmpty() && !call.request.contentType().match(ContentType.Application.Json)) {
                     return@post call.respondError(
                         HttpStatusCode.UnsupportedMediaType,
-                        "Content-Type must be application/json"
+                        "Content-Type must be application/json.",
+                        "invalid_arguments",
                     )
                 }
                 val arguments = parseArguments(body)
                     ?: return@post call.respondError(
                         HttpStatusCode.BadRequest,
-                        "body must be a JSON object of the tool's arguments"
+                        "body must be a JSON object of the tool's arguments.",
+                        "invalid_type",
                     )
                 val found = when (val r = ToolNames.resolve(name, server.tools.mapValues { it.value.tool })) {
                     is ToolNames.Found -> r
@@ -143,7 +146,7 @@ internal fun Application.installToolApi(server: Server) {
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    CallToolResult(content = listOf(TextContent("Error executing tool ${found.tool}: ${e.message}")), isError = true)
+                    ToolArgs.error("internal", "${ToolArgs.callName(found.tool, actionOf(args))} failed: ${e.message ?: e.javaClass.simpleName}")
                 }
                 val shaped = ToolArgs.withNotes(runForm(result, found.tool, actionOf(args)), listOfNotNull(found.note))
                 call.respondJson(HttpStatusCode.OK, McpJson.encodeToJsonElement(CallToolResult.serializer(), shaped))
@@ -208,8 +211,18 @@ private fun parseArguments(body: ByteArray): JsonObject? {
 private suspend fun ApplicationCall.respondJson(status: HttpStatusCode, body: JsonElement) =
     respondText(McpJson.encodeToString(JsonElement.serializer(), body), ContentType.Application.Json, status)
 
-private suspend fun ApplicationCall.respondError(status: HttpStatusCode, message: String) =
-    respondJson(status, JsonObject(mapOf("error" to JsonPrimitive(message))))
+/** An HTTP error in the envelope's shape: `{"error", "code", "retryable"}`. */
+private suspend fun ApplicationCall.respondError(status: HttpStatusCode, message: String, code: String) =
+    respondJson(
+        status,
+        JsonObject(
+            mapOf(
+                "error" to JsonPrimitive(message),
+                "code" to JsonPrimitive(code),
+                "retryable" to JsonPrimitive(code in ToolArgs.RETRYABLE),
+            )
+        ),
+    )
 
 /**
  * The [ClientConnection] tool handlers get over the API. No Raijin tool talks back to the client

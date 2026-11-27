@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Tool calls
+- Every error result now carries `code` and `retryable`, handler errors included: "not found" is `not_found` (retryable) with `see` pointing at the action that lists the ids (`turbo_run.list`, `collaborator.list_clients`, `findings.list`, ...), "must be an integer" is `invalid_type` with `expected`, an error that names one parameter gets `param`/`got`, anything else is `tool_failed`. `error` always ends as a sentence.
+- Parameter synonyms work both ways and across tools: `count`/`limit`/`max_results`, `offset`/`start_index`, `query`/`pattern`/`search_pattern`, `input`/`text`/`value`/`data`, `uri`/`url`, `raw_request`/`request`. The table ships in `catalog/tools.json` (`param_synonyms`) for the CLI.
+- `usage` reads `util.hash(data*: string, algorithm*: "MD5"|...)` and `example` is hand-picked and tested (`{"do":"http_send_request","url":"https://example.com/"}`); a grouped tool called without an action shows a read-only one (`burp.version`, not `burp.import_project_config`). Errors use `allowed`, never `available`/`available_topics`, and leave out empty `did_you_mean`.
+- JSON text read as an object or array is reported in `notes`.
+
+### Extension
+- `http_send_request`: `headers` takes `["X-A: 1"]`; a header entry it cannot read refuses the call and sends nothing (also per item in `http_send_requests_parallel` and `http_send_request_chain`). A raw request without a Host header and without `host` says so. A request with no response carries `no_response` with the target, and `time_request_sent` is null instead of the epoch.
+- `proxy_history` returns 20 items by default and leaves out `request_headers` unless `include_headers` is set.
+- `util.random_string`/`random_bytes` clamp `length` and report `length_clamped_to`; `util.base64_decode` names the bad character; `analyze.request` says when `request` is not a raw HTTP request.
+- Tool API: HTTP 400/415 answers and a throwing tool carry `code` and `retryable`.
+
+### raijin CLI
+- With Burp down, a name the catalog does not know is `unknown_tool` with suggestions right away; a known one gets `retry`: `{"batch":[{"do":"burp_up"},<the call>],"bail":true}` (none for a destructive call).
+- `bail` as `"true"`/`"false"` is read as a boolean (noted); any other non-boolean is refused. `steps` is read as `batch`, a step given as a name runs as `{"do":name}`, a non-string `do` is `invalid_type`, and `input` holding a value is a parameter, not a wrapper. `run {"do":"guide"}` and `{"do":"run"}` explain themselves.
+- History errors: a bad ref is `invalid_arguments`, a missing entry `not_found`, an unknown project `invalid_enum` with `allowed` (and `retry` when the target has one project).
+- `guide tool.action` gives that action's parameters only, with `usage` and `example`; a grouped tool lists one call line per action; every tool topic has `usage` and, when known, `example`. `guide` takes `name`/`tool` for `topic`, hash names (`sha256`), `run`, `skill://overview/SKILL.md` and `/overview`.
+- An unknown `skill://` or `burp://` resource is MCP error `-32002` (resource not found).
+
 ## 2.4.1
 
 ### Tool calls

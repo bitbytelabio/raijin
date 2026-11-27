@@ -28,6 +28,11 @@ internal object HttpExchangeJson {
      */
     fun serialize(result: HttpRequestResponse, elapsedMs: Long?, maxBodyLength: Int? = null): JsonObject = buildJsonObject {
         put("has_response", result.hasResponse())
+        if (!result.hasResponse()) {
+            val service = runCatching { result.request().httpService() }.getOrNull()
+            val target = service?.let { "${it.host()}:${it.port()}" } ?: "the target"
+            put("no_response", "no response from $target (connection refused, reset or timed out)")
+        }
         // Montoya throws for a request it cannot turn into a URL (a malformed target sent on purpose).
         put("url", runCatching { result.url() }.getOrNull().orEmpty())
 
@@ -107,7 +112,9 @@ internal object HttpExchangeJson {
                 put("timing", buildJsonObject {
                     put("time_to_first_byte_ms", td.timeBetweenRequestSentAndStartOfResponse().toMillis())
                     put("time_to_complete_ms", td.timeBetweenRequestSentAndEndOfResponse().toMillis())
-                    put("time_request_sent", td.timeRequestSent().toString())
+                    // Burp reports the epoch for a request it never sent.
+                    val sent = td.timeRequestSent()
+                    put("time_request_sent", sent?.takeIf { it.toInstant().toEpochMilli() > 0 }?.toString())
                 })
             }
         } catch (_: Exception) {

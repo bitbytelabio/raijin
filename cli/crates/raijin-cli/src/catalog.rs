@@ -1,10 +1,12 @@
 //! Raijin's tool catalog (`catalog/tools.json` in the jar, written by `ToolDomains.catalogJson`) and the
 //! playbooks (skills) bundled in this binary: `src/skills/<name>/SKILL.md` plus `references/*.md`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::mcp::error::norm;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Domain {
@@ -25,6 +27,55 @@ pub struct ToolSpec {
     /// MCP tool annotations (`readOnlyHint`, `destructiveHint`, ...), when the catalog has them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Value>,
+    /// A `run` call that works, for an ungrouped tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub example: Option<Value>,
+    /// A grouped tool's actions, each with its own parameters and example.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub actions: BTreeMap<String, ActionSpec>,
+}
+
+/// What one action of a grouped tool takes.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ActionSpec {
+    pub params: Vec<String>,
+    pub required: Vec<String>,
+    /// A `run` call that works: `{"do":"<tool>.<action>", ...}`.
+    pub example: Value,
+}
+
+/// What a call name means in the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolved {
+    /// The published tool, the action to add for a grouped call, and a note when the name was not
+    /// written exactly.
+    Found {
+        tool: String,
+        action: Option<String>,
+        note: Option<String>,
+    },
+    /// Nothing matches; up to three close call names.
+    NotFound { did_you_mean: Vec<String> },
+}
+
+/// Hash names that mean `util.hash` with an algorithm (`sha256`), as the extension reads them.
+const HASHES: [(&str, &str); 5] = [
+    ("md5", "MD5"),
+    ("sha1", "SHA_1"),
+    ("sha256", "SHA_256"),
+    ("sha384", "SHA_384"),
+    ("sha512", "SHA_512"),
+];
+
+/// The `util.hash` algorithm a hash name (`sha256`, `util.SHA-256`) means.
+pub fn hash_algorithm(name: &str) -> Option<&'static str> {
+    let key: String = name
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_' | '.' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect();
+    let key = key.strip_prefix("util").unwrap_or(&key);
+    HASHES.iter().find(|(k, _)| *k == key).map(|(_, a)| *a)
 }
 
 /// A grouped member's old tool name: the published `tool` and the `action` that replaces it.
@@ -72,6 +123,118 @@ impl Catalog {
         let (group, action) = name.split_once('.')?;
         self.tool(group)?;
         Some((group.to_owned(), Some(action.to_owned())))
+    }
+
+    /// Every call name: tools, `tool.action` and old member names.
+    pub fn call_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tools.iter().map(|t| t.name.clone()).collect();
+        for tool in &self.tools {
+            names.extend(tool.actions.keys().map(|a| format!("{}.{a}", tool.name)));
+        }
+        names.extend(self.aliases.keys().cloned());
+        names
+    }
+
+    /// What `name` means as the extension resolves it (`ToolNames.resolve`): an exact tool, alias or
+    /// `tool.action`, the same with other case and separators, or a hash name (`sha256`). Used to
+    /// answer an unknown name while Burp is down.
+    pub fn resolve_call(&self, name: &str) -> Resolved {
+        let trimmed = name.trim();
+        let found = |tool: String, action: Option<String>, note: Option<String>| Resolved::Found {
+            tool,
+            action,
+            note,
+        };
+        if let Some((tool, action)) = self.resolve(trimmed) {
+            match &action {
+                Some(a) if self.has_action(&tool, a) => return found(tool, action, None),
+                None => return found(tool, None, None),
+                Some(a) => {
+                    if let Some(real) = self.action_named(&tool, a) {
+                        let note = format!("ran '{trimmed}' as {tool}.{real}");
+                        return found(tool, Some(real), Some(note));
+                    }
+                }
+            }
+        }
+        let wanted = norm(trimmed);
+        let hits: BTreeSet<(String, Option<String>)> = self
+            .call_names()
+            .iter()
+            .filter(|n| norm(n) == wanted)
+            .filter_map(|n| self.resolve(n))
+            .collect();
+        if hits.len() == 1
+            && let Some((tool, action)) = hits.into_iter().next()
+        {
+            let call = action
+                .as_ref()
+                .map_or_else(|| tool.clone(), |a| format!("{tool}.{a}"));
+            return found(tool, action, Some(format!("ran '{trimmed}' as {call}")));
+        }
+        if self.tool("util").is_some()
+            && let Some(algorithm) = hash_algorithm(trimmed)
+        {
+            let note = format!("ran '{trimmed}' as util.hash with algorithm {algorithm}");
+            return found("util".to_owned(), Some("hash".to_owned()), Some(note));
+        }
+        let names: Vec<String> = self
+            .tools
+            .iter()
+            .map(|t| t.name.clone())
+            .chain(
+                self.tools
+                    .iter()
+                    .flat_map(|t| t.actions.keys().map(move |a| format!("{}.{a}", t.name))),
+            )
+            .collect();
+        let did_you_mean = crate::util::suggest(trimmed, names.iter().map(String::as_str), 3)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        Resolved::NotFound { did_you_mean }
+    }
+
+    /// Whether calling `tool` with `action` may remove or stop something, as the extension judges
+    /// it (`ToolNames.destructive`): an action word such as `delete` or `shutdown` for a grouped
+    /// call, else the tool's `destructiveHint`.
+    pub fn destructive(&self, tool: &str, action: Option<&str>) -> bool {
+        const WORDS: [&str; 10] = [
+            "delete", "remove", "clear", "shutdown", "stop", "kill", "reset", "drop", "purge",
+            "import",
+        ];
+        match action {
+            Some(action) if self.tool(tool).is_some_and(|t| !t.actions.is_empty()) => {
+                action.split('_').any(|w| WORDS.contains(&w))
+            }
+            _ => self.tool(tool).is_some_and(|t| {
+                t.annotations
+                    .as_ref()
+                    .and_then(|a| a.get("destructiveHint"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            }),
+        }
+    }
+
+    fn has_action(&self, tool: &str, action: &str) -> bool {
+        self.tool(tool)
+            .is_some_and(|t| t.actions.is_empty() || t.actions.contains_key(action))
+    }
+
+    /// The action of grouped `tool` that `raw` means: another case or separator, the tool prefix
+    /// (`scope_list`), the member name, or a hash name for `util`.
+    fn action_named(&self, tool: &str, raw: &str) -> Option<String> {
+        let spec = self.tool(tool)?;
+        let a = norm(raw);
+        let bare = a.strip_prefix(&format!("{tool}_")).unwrap_or(&a).to_owned();
+        if let Some(hit) = spec.actions.keys().find(|k| **k == a || **k == bare) {
+            return Some(hit.clone());
+        }
+        if let Some(alias) = self.aliases.get(&a).filter(|alias| alias.tool == tool) {
+            return Some(alias.action.clone());
+        }
+        (tool == "util" && hash_algorithm(raw).is_some()).then(|| "hash".to_owned())
     }
 
     pub fn domain(&self, name: &str) -> Option<&Domain> {
@@ -326,6 +489,50 @@ mod tests {
             on_disk, listed,
             "src/skills and BUNDLED/BUNDLED_FILES differ"
         );
+    }
+
+    #[test]
+    fn the_parameter_synonyms_match_the_extension() {
+        let text = include_str!("../../../../src/main/resources/catalog/tools.json");
+        let catalog: Value = serde_json::from_str(text).expect("catalog json");
+        let shipped: Vec<Vec<String>> =
+            serde_json::from_value(catalog["param_synonyms"].clone()).expect("param_synonyms");
+        let ours: Vec<Vec<String>> = crate::mcp::args::PARAM_SYNONYMS
+            .iter()
+            .map(|g| g.iter().map(|s| (*s).to_owned()).collect())
+            .collect();
+        assert_eq!(shipped, ours);
+    }
+
+    #[test]
+    fn calls_resolve_as_the_extension_resolves_them() {
+        let text = include_str!("../../../../src/main/resources/catalog/tools.json");
+        let catalog = Catalog::parse(text).expect("catalog parses");
+        let found = |name: &str| match catalog.resolve_call(name) {
+            Resolved::Found { tool, action, .. } => Some((tool, action)),
+            Resolved::NotFound { .. } => None,
+        };
+        let util = |a: &str| Some(("util".to_owned(), Some(a.to_owned())));
+        assert_eq!(found("util.hash"), util("hash"));
+        assert_eq!(found("util_hash"), util("hash"));
+        assert_eq!(found("Util.Hash"), util("hash"));
+        assert_eq!(found("sha256"), util("hash"));
+        assert_eq!(found("util.sha256"), util("hash"));
+        assert_eq!(
+            found("proxy_history"),
+            Some(("proxy_history".to_owned(), None))
+        );
+        assert_eq!(found("nope_tool"), None);
+        assert_eq!(found("scope.chek"), None);
+        let Resolved::NotFound { did_you_mean } = catalog.resolve_call("scope.chek") else {
+            panic!("scope.chek is not a call");
+        };
+        assert_eq!(
+            did_you_mean.first().map(String::as_str),
+            Some("scope.check")
+        );
+        assert!(catalog.destructive("burp", Some("shutdown")));
+        assert!(!catalog.destructive("scope", Some("check")));
     }
 
     #[test]

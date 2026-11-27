@@ -347,6 +347,32 @@ object ToolConsolidation {
         registered.filterKeys { it !in grouped }.values.forEach { rt -> publishKept(rt, target) }
     }
 
+    /**
+     * For `catalog/tools.json`: each group's actions as `{action: {params, required, example}}`, from
+     * the [members] (the fine-grained tools), with public parameter names and `example` as a `run` call.
+     */
+    fun actionCatalog(members: Map<String, Tool>): Map<String, JsonObject> = GROUPS.associate { g ->
+        g.tool to buildJsonObject {
+            g.actions.forEach { (action, member) ->
+                val tool = members[member] ?: error("Tool group '${g.tool}': no member '$member'")
+                val renames = g.renames[action].orEmpty()
+                val props = JsonObject(tool.inputSchema.properties.orEmpty().mapKeys { (k, _) -> renames[k] ?: k })
+                val required = tool.inputSchema.required.orEmpty().map { renames[it] ?: it }.toSet()
+                putJsonObject(action) {
+                    putJsonArray("params") { props.keys.forEach { add(it) } }
+                    putJsonArray("required") { required.forEach { add(it) } }
+                    put("example", runCall(g.tool, ToolArgs.example(g.tool, action, props, required)))
+                }
+            }
+        }
+    }
+
+    /** [args] (with `action` for a grouped tool) as a `run` call: `{"do":"tool.action", ...}`. */
+    fun runCall(tool: String, args: JsonObject): JsonObject {
+        val action = (args["action"] as? JsonPrimitive)?.contentOrNull
+        return JsonObject(mapOf("do" to JsonPrimitive(ToolArgs.callName(tool, action))) + (args - "action"))
+    }
+
     private fun spec(g: Group, action: String, rt: RegisteredTool): ActionSpec {
         val renames = g.renames[action].orEmpty()
         val props = JsonObject(rt.tool.inputSchema.properties.orEmpty().mapKeys { (k, _) -> renames[k] ?: k })
@@ -357,8 +383,20 @@ object ToolConsolidation {
             required = required,
             toMember = renames.entries.associate { (memberName, publicName) -> publicName to memberName },
             usage = ToolArgs.signature(g.tool, action, props, required),
-            example = ToolArgs.example(action, props, required),
+            example = ToolArgs.example(g.tool, action, props, required),
         )
+    }
+
+    /**
+     * The action a call of [g] without one is shown as an example of: the first with a hand-picked
+     * example that removes or stops nothing, else the first such action, else the first action.
+     */
+    private fun defaultSpec(g: Group, specs: Map<String, ActionSpec>): ActionSpec {
+        val safe = specs.filterKeys { !ToolNames.destructive(g.tool, it, null) }
+        return safe.entries.firstOrNull { ToolExamples.of(g.tool, it.key) != null }?.value
+            ?: safe.values.firstOrNull { it.required.isEmpty() }
+            ?: safe.values.firstOrNull()
+            ?: specs.values.first()
     }
 
     /** Publishes an ungrouped tool with modernized text, annotations and the shared argument checks. */
@@ -367,7 +405,7 @@ object ToolConsolidation {
         val props = rt.tool.inputSchema.properties ?: JsonObject(emptyMap())
         val required = rt.tool.inputSchema.required.orEmpty().toSet()
         val usage = ToolArgs.signature(name, null, props, required)
-        val example = ToolArgs.example(null, props, required)
+        val example = ToolArgs.example(name, null, props, required)
         val tool = rt.tool.copy(
             description = rt.tool.description?.let(::modernize),
             inputSchema = rt.tool.inputSchema.copy(properties = modernizeProps(rt.tool.inputSchema.properties)),
@@ -382,7 +420,7 @@ object ToolConsolidation {
             }
             val c = ToolArgs.coerce(props, args)
             val forwarded = if (c.args === args) request else CallToolRequest(request.params.copy(arguments = c.args))
-            ToolArgs.withNotes(ToolArgs.enrich(rt.handler(this, forwarded), usage, example, props, c.args), c.notes)
+            ToolArgs.withNotes(ToolArgs.enrich(rt.handler(this, forwarded), name, null, usage, example, props, c.args), c.notes)
         }
     }
 
@@ -497,7 +535,7 @@ object ToolConsolidation {
         members: Map<String, RegisteredTool>,
         specs: Map<String, ActionSpec>,
     ): String = buildString {
-        val shown = specs.values.firstOrNull { it.required.isNotEmpty() } ?: specs.values.first()
+        val shown = defaultSpec(g, specs)
         append(g.intro).append('\n')
         append("Call with {\"action\": \"<action>\", ...that action's parameters}; * marks a required parameter. Example: ")
             .append(shown.example.toString()).append('\n')
@@ -539,13 +577,13 @@ object ToolConsolidation {
         val raw = (args["action"] as? JsonPrimitive)?.contentOrNull
         val available = g.actions.keys.joinToString(", ")
         if (raw == null) {
-            val shown = specs.values.firstOrNull { it.required.isNotEmpty() } ?: specs.values.first()
             return ToolArgs.error(
                 "missing_action",
-                "Missing 'action' for tool '${g.tool}'. Set \"action\" to one of: $available.",
+                "${g.tool} needs an action: call ${g.tool}.<action> with one of: $available.",
             ) {
-                putJsonArray("available") { g.actions.keys.forEach { add(it) } }
-                put("example", shown.example)
+                put("param", "action")
+                putJsonArray("allowed") { g.actions.keys.forEach { add(it) } }
+                put("example", defaultSpec(g, specs).example)
             }
         }
         val notes = mutableListOf<String>()
@@ -563,19 +601,19 @@ object ToolConsolidation {
             val hint = hints.firstOrNull()?.let { " Did you mean '$it'?" }.orEmpty()
             return ToolArgs.error(
                 "unknown_action",
-                "Unknown action '$raw' for tool '${g.tool}'.$hint Valid actions: $available.",
+                "${g.tool} has no action '$raw'.$hint Valid actions: $available.",
             ) {
                 put("param", "action")
                 put("got", raw)
+                putJsonArray("allowed") { g.actions.keys.forEach { add(it) } }
                 putJsonArray("did_you_mean") { hints.forEach { add(it) } }
                 if (hints.size == 1 && !ToolNames.destructive(g.tool, hints[0], null)) {
                     put("retry", JsonObject(args + ("action" to JsonPrimitive(hints[0]))))
                 }
-                putJsonArray("available") { g.actions.keys.forEach { add(it) } }
             }
         }
         val spec = specs.getValue(resolved)
-        val call = "${g.tool}(action='$resolved')"
+        val call = ToolArgs.callName(g.tool, resolved)
 
         if (ToolArgs.unknownParams(spec.props, args, setOf("action")).isNotEmpty()) {
             return ToolArgs.unknownParameterError(
@@ -613,6 +651,9 @@ object ToolConsolidation {
                 )
             )
         )
-        return ToolArgs.withNotes(ToolArgs.enrich(result, spec.usage, spec.example, spec.props, c.args), notes)
+        return ToolArgs.withNotes(
+            ToolArgs.enrich(result, g.tool, resolved, spec.usage, spec.example, spec.props, c.args),
+            notes,
+        )
     }
 }

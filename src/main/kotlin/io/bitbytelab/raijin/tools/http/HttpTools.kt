@@ -7,7 +7,7 @@ import io.bitbytelab.raijin.bridge.HttpSendOptions
 import io.bitbytelab.raijin.core.asBodyString
 import io.bitbytelab.raijin.core.asStringList
 import io.bitbytelab.raijin.core.asStringMap
-import io.bitbytelab.raijin.core.asStringMapResult
+import io.bitbytelab.raijin.core.asHeaders
 import io.bitbytelab.raijin.safety.SafeRegex
 import io.bitbytelab.raijin.safety.ScopeGate
 import io.bitbytelab.raijin.state.StateManager
@@ -41,6 +41,9 @@ object HttpTools {
     internal val HTTP_MODES = listOf("AUTO", "HTTP_1", "HTTP_2", "HTTP_2_IGNORE_ALPN")
     private val DIRECTIONS = listOf("request", "response")
     private val RULE_ACTIONS = listOf("modify", "drop", "spoof_response")
+
+    /** A `Host` header line in a raw request's head. */
+    private val RAW_HOST_HEADER = Regex("(?im)^host[ \\t]*:")
 
     internal val PORTS = 1..65_535
     internal val LENGTHS = 0..Int.MAX_VALUE
@@ -133,12 +136,37 @@ Out-of-range numbers are clamped and reported in notes. Returns full response wi
                     verifyTls = args.bool("verify_tls") ?: false,
                 )
 
-                // Headers parsing — accepts object, array-of-pairs, array-of-{name,value}, raw header block.
-                // Surfaces a warning back to the caller when the input format is unusual or partly bad,
-                // instead of silently dropping headers.
+                // Headers parsing — accepts object, array-of-pairs, array-of-{name,value}, "Name: value"
+                // strings, raw header block. A request missing a header the caller gave is not the request
+                // they meant: any entry that cannot be read refuses the call, nothing is sent.
                 val headersInput = args["headers"]
-                val (headers, headersWarning) = headersInput.asStringMapResult()
-                val headersDropped = headersInput != null && headers == null
+                val parsedHeaders = headersInput.asHeaders()
+                if (parsedHeaders.unparsed > 0) {
+                    return@addTool io.bitbytelab.raijin.tools.ToolArgs.error(
+                        "invalid_type",
+                        "http_send_request: 'headers' could not be read (${parsedHeaders.warning}); nothing was sent. " +
+                            "Pass {\"X-Foo\":\"bar\"} or [\"X-Foo: bar\"].",
+                    ) {
+                        put("param", "headers")
+                        put("got", headersInput ?: JsonNull)
+                        put("expected", "object of name to value, or list of \"Name: value\" strings")
+                    }
+                }
+                val headers = parsedHeaders.map
+                val headersWarning = parsedHeaders.warning
+                if (rawRequest != null && url == null && host == null && !RAW_HOST_HEADER.containsMatchIn(rawRequest.substringBefore("\n\n").substringBefore("\r\n\r\n"))) {
+                    return@addTool io.bitbytelab.raijin.tools.ToolArgs.error(
+                        "missing_parameter",
+                        "http_send_request: raw_request has no Host header, so there is nowhere to send it; " +
+                            "add a Host header or pass 'host' (with 'port' and 'use_tls').",
+                    ) {
+                        put("param", "host")
+                        putJsonObject("example") {
+                            put("raw_request", "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                            put("host", "example.com"); put("port", 443); put("use_tls", true)
+                        }
+                    }
+                }
 
                 val result = bridge.sendRequest(
                     url, method, headers, body, rawRequest, host, port, useTls,
@@ -147,14 +175,10 @@ Out-of-range numbers are clamped and reported in notes. Returns full response wi
                     http2Fields, options,
                 )
 
-                val augmented = if (headersWarning != null || headersDropped) {
+                val augmented = if (headersWarning != null) {
                     buildJsonObject {
                         result.forEach { (k, v) -> put(k, v) }
-                        if (headersWarning != null) put("headers_warning", headersWarning)
-                        if (headersDropped) put(
-                            "headers_dropped",
-                            "Provided 'headers' could not be parsed and were NOT applied. Use {\"X-Foo\":\"bar\"} or [[\"X-Foo\",\"bar\"]]."
-                        )
+                        put("headers_warning", headersWarning)
                     }
                 } else result
 

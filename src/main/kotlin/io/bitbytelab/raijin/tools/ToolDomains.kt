@@ -3,6 +3,7 @@ package io.bitbytelab.raijin.tools
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
+import kotlinx.serialization.json.addJsonArray
 import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -102,9 +103,13 @@ object ToolDomains {
 
     /**
      * `catalog/tools.json`: the domains, every published tool's schema and annotations (tools sorted
-     * by name), and `aliases`: each grouped member name mapped to its `{tool, action}`.
+     * by name) with a `run` `example`, and for a grouped tool `actions`: each action's parameters,
+     * required ones and `example` ([ToolConsolidation.actionCatalog] over the fine-grained [members]);
+     * `aliases`: each grouped member name mapped to its `{tool, action}`; `param_synonyms`:
+     * [ToolArgs.PARAM_SYNONYMS].
      */
-    fun catalogJson(tools: Collection<Tool>): JsonObject = buildJsonObject {
+    fun catalogJson(tools: Collection<Tool>, members: Map<String, Tool>): JsonObject = buildJsonObject {
+        val actions = ToolConsolidation.actionCatalog(members)
         put("schema_version", 1)
         putJsonArray("domains") {
             DOMAINS.forEach { d ->
@@ -128,6 +133,14 @@ object ToolDomains {
                         putJsonArray("required") { tool.inputSchema.required.orEmpty().forEach { add(it) } }
                     }
                     put("domain", domainOf[tool.name])
+                    val grouped = actions[tool.name]
+                    if (grouped != null) {
+                        put("actions", grouped)
+                    } else {
+                        val props = tool.inputSchema.properties ?: JsonObject(emptyMap())
+                        val required = tool.inputSchema.required.orEmpty().toSet()
+                        put("example", ToolConsolidation.runCall(tool.name, ToolArgs.example(tool.name, null, props, required)))
+                    }
                     tool.annotations?.let { a ->
                         putJsonObject("annotations") {
                             a.readOnlyHint?.let { put("readOnlyHint", it) }
@@ -147,6 +160,9 @@ object ToolDomains {
                 .forEach { (member, tool, action) ->
                     putJsonObject(member) { put("tool", tool); put("action", action) }
                 }
+        }
+        putJsonArray("param_synonyms") {
+            ToolArgs.PARAM_SYNONYMS.forEach { group -> addJsonArray { group.forEach { add(it) } } }
         }
     }
 }

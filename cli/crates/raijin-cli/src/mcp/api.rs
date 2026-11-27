@@ -179,12 +179,13 @@ impl ToolApi {
         Ok(list.resources)
     }
 
-    /// One resource of the running Raijin, from `GET /api/v1/resources/read?uri=<uri>`.
+    /// One resource of the running Raijin, from `GET /api/v1/resources/read?uri=<uri>`. A resource
+    /// Raijin does not have is `Ok(Err(message))`; a failure to read it is `Err`.
     pub async fn read_resource(
         &self,
         endpoint: &Endpoint,
         uri: &str,
-    ) -> Result<ReadResourceResult, String> {
+    ) -> Result<Result<ReadResourceResult, String>, String> {
         let base = api_base(&endpoint.url)?;
         let mut url =
             url::Url::parse(&format!("{base}/resources/read")).map_err(|e| e.to_string())?;
@@ -197,9 +198,9 @@ impl ToolApi {
             && let Ok(Value::Object(answer)) = serde_json::from_slice::<Value>(&body)
             && let Some(Value::String(error)) = answer.get("error")
         {
-            return Err(error.clone());
+            return Ok(Err(error.clone()));
         }
-        decode(&base, uri, status, &body)
+        decode(&base, uri, status, &body).map(Ok)
     }
 
     /// The extension's version, from `GET /api/v1/info`.
@@ -369,7 +370,8 @@ mod tests {
         let read = api
             .read_resource(&endpoint, "burp://scope")
             .await
-            .expect("read");
+            .expect("read")
+            .expect("found");
         assert_eq!(read.contents.len(), 1, "{read:?}");
 
         let down = Endpoint {

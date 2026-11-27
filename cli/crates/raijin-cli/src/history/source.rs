@@ -14,7 +14,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::Deserialize;
 
-use super::{Filters, IssueRow, Row, RowSource, Selection, Warning, header_value};
+use super::{Filters, IssueRow, Problem, Row, RowSource, Selection, Warning, header_value};
 use crate::burp::instance::{Instance, is_ours};
 use crate::config::Target;
 
@@ -103,8 +103,10 @@ pub fn discover(target: &Target, selection: &Selection) -> Result<Vec<Source>> {
     if !selection.project.is_empty() {
         for wanted in &selection.project {
             if !by_name.contains_key(wanted) {
-                let names: Vec<&str> = by_name.keys().map(String::as_str).collect();
-                bail!("no project {wanted:?}; known: {}", names.join(", "));
+                bail!(Problem::UnknownProject {
+                    wanted: wanted.clone(),
+                    known: by_name.keys().cloned().collect(),
+                });
             }
         }
         by_name.retain(|name, _| selection.project.contains(name));
@@ -147,7 +149,11 @@ pub fn find(target: &Target, project: &str) -> Result<Source> {
     )?
     .into_iter()
     .next()
-    .with_context(|| format!("no project {project:?}"))
+    .ok_or_else(|| {
+        anyhow::Error::new(Problem::NotFound(format!(
+            "no project {project:?}; history_list shows the refs"
+        )))
+    })
 }
 
 /// Runs `f` on every source in its own thread. A failure becomes a warning; a live project gets
@@ -460,10 +466,12 @@ fn for_each_archive_line<T: for<'de> Deserialize<'de>>(
 
 /// The archive line with `seq`.
 pub fn archive_line(source: &Source, seq: u64) -> Result<ArchiveLine> {
-    let dir = source
-        .archive
-        .as_ref()
-        .with_context(|| format!("project {} has no archive", source.project))?;
+    let dir = source.archive.as_ref().ok_or_else(|| {
+        Problem::NotFound(format!(
+            "project {} has no archive, so no {}:a{seq}",
+            source.project, source.project
+        ))
+    })?;
     let mut found = None;
     for_each_archive_line(&dir.join(EXCHANGES_FILE), |line: ArchiveLine| {
         if line.seq == seq {
@@ -471,7 +479,12 @@ pub fn archive_line(source: &Source, seq: u64) -> Result<ArchiveLine> {
         }
         Ok(())
     })?;
-    found.with_context(|| format!("no archive entry a{seq} in project {}", source.project))
+    Ok(found.ok_or_else(|| {
+        Problem::NotFound(format!(
+            "no archive entry {}:a{seq}; history_list shows the refs",
+            source.project
+        ))
+    })?)
 }
 
 pub fn issue_line(source: &Source, seq: u64) -> Result<IssueLine> {
@@ -482,7 +495,12 @@ pub fn issue_line(source: &Source, seq: u64) -> Result<IssueLine> {
         }
         Ok(())
     })?;
-    found.with_context(|| format!("no issue i{seq} in project {}", source.project))
+    Ok(found.ok_or_else(|| {
+        Problem::NotFound(format!(
+            "no issue {}:i{seq}; history_list with source issues shows the refs",
+            source.project
+        ))
+    })?)
 }
 
 /// The Proxy entry `entry_id` with its raw messages.
@@ -502,12 +520,12 @@ pub fn proxy_entry(source: &Source, entry_id: u64) -> Result<(Row, Vec<u8>, Opti
         found = Some(entry);
         Ok(())
     })?;
-    let entry = found.with_context(|| {
-        format!(
+    let entry = found.ok_or_else(|| {
+        Problem::NotFound(format!(
             "no proxy entry {}:{entry_id} in {}; history_list shows the refs",
             source.project,
             burp.display()
-        )
+        ))
     })?;
     let request = message_bytes(&project, &entry.request)?;
     let response = entry

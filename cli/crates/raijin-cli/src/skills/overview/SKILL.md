@@ -62,8 +62,10 @@ description lists every action and its parameters (`*` = required). Copy paramet
   corrected call: resend `retry` as it is), `retryable` and `see`. `unknown_tool` / `unknown_action` /
   `unknown_topic`: use `retry` or a name from `did_you_mean`, else `guide {}`. `unknown_parameter`,
   `missing_parameter`, `invalid_type`, `invalid_enum`, `out_of_range`, `invalid_arguments`: fix the arguments
-  from `retry`, `usage` and `example`. `burp_not_running`: `run {"do":"burp_up"}`, then resend.
-  `project_not_running`: start that project as `example` shows. `project_required`: add `"project":"<name>"`
+  from `retry`, `usage` and `example`. `not_found` (an id, ref or run that does not exist): list them with
+  the call in `see`, then use an id from the list. `burp_not_running` / `project_not_running`: resend `retry`
+  as it is (a batch that starts Burp, then makes your call); without `retry` (a destructive call), run the
+  `example` (`burp_up`) first, then resend. `project_required`: add `"project":"<name>"`
   next to `do`. `retryable: false` (`raijin_unreachable`, `tool_failed`, `config_error`, `not_supported`,
   `internal`): never resend the same call; change it or tell the user. A result may carry `notes`: what the
   server changed in your call (a string read as a number, a name matched without case); use that form next time.

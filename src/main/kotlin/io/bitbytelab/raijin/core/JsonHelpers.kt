@@ -126,6 +126,7 @@ fun JsonElement?.asJsonObjectSafe(): JsonObject? {
  * - A JsonArray of [name, value] tuples:                [["X-Foo", "bar"], ["X-Bar", "baz"]]
  * - A JsonArray of {name, value} objects (Burp-native): [{"name":"X-Foo","value":"bar"}]
  * - A JsonArray of {key, value} objects:                [{"key":"X-Foo","value":"bar"}]
+ * - A JsonArray of "Name: value" strings:               ["X-Foo: bar"]
  * - A JsonPrimitive containing JSON of any of the above
  *
  * On unparseable input, [asStringMap] returns null (existing contract).
@@ -140,37 +141,60 @@ fun JsonElement?.asStringMap(): Map<String, String>? = this.asStringMapResult().
  * Callers should surface the warning in MCP tool responses so that agents learn the
  * correct format instead of having their headers silently dropped.
  */
-fun JsonElement?.asStringMapResult(): Pair<Map<String, String>?, String?> {
-    if (this == null) return null to null
+fun JsonElement?.asStringMapResult(): Pair<Map<String, String>?, String?> = asHeaders().let { it.map to it.warning }
+
+/**
+ * Headers read from a tool argument: [map] (null when nothing could be read), a [warning] on how the
+ * input was read or what was skipped, and [unparsed], the entries (or lines) that could not be read
+ * (at least 1 when something was given and nothing could be read; 0 for no input, null or blank).
+ * A caller that must send what it was given refuses when [unparsed] > 0.
+ */
+data class HeaderParse(val map: Map<String, String>?, val warning: String?, val unparsed: Int)
+
+/** [asStringMapResult] with the count of entries that could not be read. */
+fun JsonElement?.asHeaders(): HeaderParse {
+    if (this == null) return HeaderParse(null, null, 0)
     return when (this) {
-        is JsonNull -> null to null
-        is JsonObject -> objectToStringMap(this) to null
+        is JsonNull -> HeaderParse(null, null, 0)
+        is JsonObject -> HeaderParse(objectToStringMap(this), null, 0)
         is JsonArray -> arrayToStringMap(this)
         is JsonPrimitive -> {
-            val str = this.contentOrNull ?: return null to "headers primitive had no content"
+            val str = this.contentOrNull ?: return HeaderParse(null, "headers primitive had no content", 1)
+            if (str.isBlank()) return HeaderParse(null, null, 0)
             val trimmed = str.trimStart()
             try {
                 val parsed = json.parseToJsonElement(str)
                 when (parsed) {
-                    is JsonObject -> objectToStringMap(parsed) to null
+                    is JsonObject -> HeaderParse(objectToStringMap(parsed), null, 0)
                     is JsonArray -> arrayToStringMap(parsed)
-                    else -> null to "headers primitive parsed to ${parsed::class.simpleName}, expected object or array"
+                    else -> HeaderParse(null, "headers primitive parsed to ${parsed::class.simpleName}, expected object or array", 1)
                 }
             } catch (_: Exception) {
                 if (trimmed.contains(":")) {
                     // Best-effort raw HTTP header parsing: "X-Foo: bar\nX-Bar: baz"
-                    val (map, warnings) = parseRawHeaderBlock(str)
+                    val (map, warnings, noColon) = parseRawHeaderBlock(str)
                     if (map.isNotEmpty()) {
-                        map to (listOf("parsed as raw HTTP header block (one 'Name: value' per line)") + warnings).joinToString("; ")
+                        HeaderParse(
+                            map,
+                            (listOf("parsed as raw HTTP header block (one 'Name: value' per line)") + warnings).joinToString("; "),
+                            noColon,
+                        )
                     } else {
-                        null to "headers string is not JSON and not parseable as 'Name: value' lines"
+                        HeaderParse(null, "headers string is not JSON and not parseable as 'Name: value' lines", 1)
                     }
                 } else {
-                    null to "headers string is not valid JSON and contains no ':' for raw header parsing"
+                    HeaderParse(null, "headers string is not valid JSON and contains no ':' for raw header parsing", 1)
                 }
             }
         }
     }
+}
+
+/** `Name: value` split at the first `:`, the value losing at most one leading space; null without a `:`. */
+private fun headerLine(line: String): Pair<String, String>? {
+    val colon = line.indexOf(':')
+    if (colon < 0) return null
+    return line.substring(0, colon) to line.substring(colon + 1).removePrefix(" ")
 }
 
 private fun objectToStringMap(obj: JsonObject): Map<String, String> =
@@ -186,12 +210,13 @@ private fun objectToStringMap(obj: JsonObject): Map<String, String> =
  * - [["name","value"], ...]
  * - [{"name":"...","value":"..."}, ...]
  * - [{"key":"...","value":"..."}, ...]
+ * - ["Name: value", ...] (split at the first `:`, the value byte-exact but for one leading space)
  *
  * Multiple entries with the same name are coalesced (last value wins) — same as a real
  * HTTP server's lookup by header name in this MCP layer.
  */
-private fun arrayToStringMap(arr: JsonArray): Pair<Map<String, String>?, String?> {
-    if (arr.isEmpty()) return emptyMap<String, String>() to null
+private fun arrayToStringMap(arr: JsonArray): HeaderParse {
+    if (arr.isEmpty()) return HeaderParse(emptyMap(), null, 0)
     val result = object : LinkedHashMap<String, String>() {
         val duplicates = LinkedHashSet<String>()
         override fun put(key: String, value: String): String? {
@@ -229,16 +254,19 @@ private fun arrayToStringMap(arr: JsonArray): Pair<Map<String, String>?, String?
                     unrecognized++
                 }
             }
-            else -> unrecognized++
+            is JsonPrimitive -> {
+                val pair = element.takeIf { it.isString }?.let { headerLine(it.content) }
+                if (pair != null) result[pair.first] = pair.second else unrecognized++
+            }
         }
     }
     val warnings = buildList {
         if (unrecognized > 0) {
-            add("$unrecognized of ${arr.size} header entries could not be parsed; expected [name,value] pair, {name,value}, {key,value}, or single-entry object")
+            add("$unrecognized of ${arr.size} header entries could not be parsed; expected \"Name: value\", [name,value] pair, {name,value}, {key,value}, or single-entry object")
         }
         result.duplicates.forEach { add(duplicateHeaderWarning(it)) }
     }
-    return LinkedHashMap(result) to warnings.takeIf { it.isNotEmpty() }?.joinToString("; ")
+    return HeaderParse(LinkedHashMap(result), warnings.takeIf { it.isNotEmpty() }?.joinToString("; "), unrecognized)
 }
 
 private fun duplicateHeaderWarning(name: String) =
@@ -247,26 +275,24 @@ private fun duplicateHeaderWarning(name: String) =
 /**
  * `Name: value` lines split at the first `:`. The name is kept exactly as written (no token check,
  * so `Transfer-Encoding : chunked` keeps its space) and the value loses at most one leading space.
- * Returns the map and warnings for lines without a `:` and for repeated names.
+ * Returns the map, warnings for lines without a `:` and for repeated names, and the count of lines without a `:`.
  */
-private fun parseRawHeaderBlock(block: String): Pair<Map<String, String>, List<String>> {
+private fun parseRawHeaderBlock(block: String): Triple<Map<String, String>, List<String>, Int> {
     val result = linkedMapOf<String, String>()
     val warnings = mutableListOf<String>()
     val noColon = mutableListOf<String>()
     block.lineSequence().forEach { raw ->
         val line = raw.removeSuffix("\r")
         if (line.isBlank()) return@forEach
-        val colon = line.indexOf(':')
-        if (colon < 0) {
+        val (name, value) = headerLine(line) ?: run {
             noColon += line
             return@forEach
         }
-        val name = line.substring(0, colon)
         if (name in result) warnings += duplicateHeaderWarning(name)
-        result[name] = line.substring(colon + 1).removePrefix(" ")
+        result[name] = value
     }
     if (noColon.isNotEmpty()) warnings.add(0, "lines without ':' skipped: ${noColon.take(5).joinToString(" | ")}")
-    return result to warnings
+    return Triple(result, warnings, noColon.size)
 }
 
 /**

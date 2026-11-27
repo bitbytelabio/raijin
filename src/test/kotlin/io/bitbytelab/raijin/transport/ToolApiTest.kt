@@ -145,10 +145,10 @@ class ToolApiTest {
         mount()
         val response = call("boom_tool", "{}")
         assertEquals(HttpStatusCode.OK, response.status)
-        val result = json(response, response.bodyAsText())
-        assertTrue(result.getValue("isError").jsonPrimitive.boolean)
-        val text = result.getValue("content").jsonArray[0].jsonObject.getValue("text").jsonPrimitive.content
-        assertTrue(text.startsWith("Error executing tool boom_tool"), text)
+        val err = error(response, response.bodyAsText())
+        assertEquals("internal", err.getValue("code").jsonPrimitive.content)
+        assertEquals("boom_tool failed: boom.", err.getValue("error").jsonPrimitive.content)
+        assertEquals(false, err.getValue("retryable").jsonPrimitive.boolean)
     }
 
     @Test
@@ -156,7 +156,7 @@ class ToolApiTest {
         mount()
         val nope = call("nope", "{}").let { error(it, it.bodyAsText()) }
         assertEquals("unknown_tool", nope.getValue("code").jsonPrimitive.content)
-        assertEquals(JsonArray(emptyList()), nope.getValue("did_you_mean"))
+        assertTrue("did_you_mean" !in nope, nope.toString())
         assertTrue("retry" !in nope, nope.toString())
 
         val typo = call("ok_tol", "{}").let { error(it, it.bodyAsText()) }
@@ -221,7 +221,9 @@ class ToolApiTest {
         mount()
         val response = call("ok_tool", "[1]")
         assertEquals(HttpStatusCode.BadRequest, response.status)
-        assertTrue(response.bodyAsText().contains("JSON object"))
+        val body = Json.parseToJsonElement(response.bodyAsText()).jsonObject
+        assertTrue(body.getValue("error").jsonPrimitive.content.contains("JSON object"))
+        assertEquals("invalid_type", body.getValue("code").jsonPrimitive.content)
     }
 
     @Test
@@ -229,6 +231,7 @@ class ToolApiTest {
         mount()
         val response = call("ok_tool", """{"a":1}""", contentType = ContentType.Text.Plain)
         assertEquals(HttpStatusCode.UnsupportedMediaType, response.status)
+        assertEquals("invalid_arguments", Json.parseToJsonElement(response.bodyAsText()).jsonObject.getValue("code").jsonPrimitive.content)
     }
 
     @Test

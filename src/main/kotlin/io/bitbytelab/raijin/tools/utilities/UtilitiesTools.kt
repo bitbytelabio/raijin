@@ -1,10 +1,10 @@
 package io.bitbytelab.raijin.tools.utilities
 
 import io.bitbytelab.raijin.bridge.UtilitiesBridge
-import io.bitbytelab.raijin.core.asBoundedInt
 import io.bitbytelab.raijin.core.asBooleanSafe
 import io.bitbytelab.raijin.core.asClampedInt
 import io.bitbytelab.raijin.core.withClampReport
+import io.bitbytelab.raijin.tools.ToolArgs
 import io.bitbytelab.raijin.tools.toolError
 import io.bitbytelab.raijin.tools.toolJsonResult
 import io.modelcontextprotocol.kotlin.sdk.server.Server
@@ -122,7 +122,18 @@ object UtilitiesTools {
                 val data = args["data"]?.jsonPrimitive?.contentOrNull
                     ?: return@addTool toolError("Missing required parameter: data")
 
-                jsonKey("decoded", bridge.base64Decode(data))
+                val decoded = runCatching { bridge.base64Decode(data) }.getOrElse {
+                    val bad = data.indexOfFirst { c -> !c.isLetterOrDigit() && c !in "+/=-_" && !c.isWhitespace() }
+                    val why = if (bad >= 0) "bad character '${data[bad]}' at $bad" else "wrong length or padding"
+                    return@addTool ToolArgs.error(
+                        "invalid_arguments",
+                        "util.base64_decode: 'data' is not base64 ($why).",
+                    ) {
+                        put("param", "data")
+                        put("got", data.take(80))
+                    }
+                }
+                jsonKey("decoded", decoded)
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -252,12 +263,12 @@ object UtilitiesTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val length = args["length"].asBoundedInt("length", 1, MAX_RANDOM_LENGTH)
+                val length = args["length"].asClampedInt("length", 1, MAX_RANDOM_LENGTH)
                     .getOrElse { return@addTool toolError(it.message ?: "Invalid length") }
                     ?: return@addTool toolError("Missing required parameter: length")
                 val charset = args["charset"]?.jsonPrimitive?.contentOrNull ?: "alphanumeric"
 
-                toolJsonResult(bridge.randomString(length, charset))
+                toolJsonResult(bridge.randomString(length.value, charset).withClampReport("length", length))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }
@@ -278,11 +289,11 @@ object UtilitiesTools {
         ) { request ->
             try {
                 val args = request.params.arguments ?: emptyMap()
-                val length = args["length"].asBoundedInt("length", 1, MAX_RANDOM_LENGTH)
+                val length = args["length"].asClampedInt("length", 1, MAX_RANDOM_LENGTH)
                     .getOrElse { return@addTool toolError(it.message ?: "Invalid length") }
                     ?: return@addTool toolError("Missing required parameter: length")
 
-                toolJsonResult(bridge.randomBytes(length))
+                toolJsonResult(bridge.randomBytes(length.value).withClampReport("length", length))
             } catch (e: Exception) {
                 toolError(e.message ?: "Unknown error")
             }

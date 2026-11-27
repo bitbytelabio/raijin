@@ -8,7 +8,10 @@ import kotlin.test.assertTrue
 import kotlin.test.fail
 
 class ToolCatalogTest {
-    private val published by lazy { RegisteredTools().use { r -> r.published.tools.values.map { it.tool } } }
+    private val registered by lazy {
+        RegisteredTools().use { r -> r.published.tools.values.map { it.tool } to r.members.tools.mapValues { it.value.tool } }
+    }
+    private val published by lazy { registered.first }
     private val catalogFile = File("src/main/resources/catalog/tools.json")
     private val prettyJson = Json { prettyPrint = true; prettyPrintIndent = "  " }
 
@@ -43,7 +46,7 @@ class ToolCatalogTest {
     }
 
     @Test fun `the committed catalog matches the published tools`() {
-        val expected = ToolDomains.catalogJson(published)
+        val expected = ToolDomains.catalogJson(published, registered.second)
         if (System.getenv("RAIJIN_UPDATE_CATALOG") == "1") {
             catalogFile.parentFile.mkdirs()
             catalogFile.writeText(prettyJson.encodeToString(expected) + "\n")

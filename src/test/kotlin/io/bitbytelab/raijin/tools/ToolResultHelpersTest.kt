@@ -183,7 +183,7 @@ class ToolResultHelpersTest {
     fun `utilities errors are flagged isError with valid JSON`() {
         val server = utilitiesServer()
         val cases = listOf(
-            "util_random_string" to buildJsonObject { put("length", 0) },
+            "util_random_string" to buildJsonObject { put("length", "many") },
             "util_random_bytes" to buildJsonObject { put("length", "many") },
             "util_random_bytes" to buildJsonObject { },
             "util_decode_smart" to buildJsonObject { put("data", "x"); put("max_depth", 1.5) },

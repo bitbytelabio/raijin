@@ -5,7 +5,7 @@ import burp.api.montoya.http.message.HttpHeader
 import burp.api.montoya.http.message.requests.HttpRequest
 import io.bitbytelab.raijin.core.asBodyString
 import io.bitbytelab.raijin.core.asBooleanSafe
-import io.bitbytelab.raijin.core.asStringMapResult
+import io.bitbytelab.raijin.core.asHeaders
 import io.bitbytelab.raijin.safety.RequestHygiene
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -99,7 +99,12 @@ internal object HttpRequestBuilder {
         }
         val url = obj["url"]?.jsonPrimitive?.contentOrNull
         val method = obj["method"]?.jsonPrimitive?.contentOrNull
-        val (headers, headersWarning) = obj["headers"].asStringMapResult()
+        val parsed = obj["headers"].asHeaders()
+        require(parsed.unparsed == 0) {
+            "'headers' could not be read (${parsed.warning}); pass {\"X-Foo\":\"bar\"} or [\"X-Foo: bar\"]"
+        }
+        val headers = parsed.map
+        val headersWarning = parsed.warning
         if (fixReport != null) {
             headersWarning?.let { fixReport["headers_warning"] = JsonPrimitive(it) }
             val hygiene = RequestHygiene.scan(method, url, headers)

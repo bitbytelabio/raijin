@@ -80,10 +80,11 @@ class ProxyBridge(
         includeRequest: Boolean = false,
         includeResponse: Boolean = false,
         statusCodeRange: String? = null,
-        maxResponseLength: Int? = null
+        maxResponseLength: Int? = null,
+        includeHeaders: Boolean = true,
     ): JsonObject = history.getHistory(
         startIndex, count, host, method, statusCode, mimeType, inScopeOnly,
-        includeRequest, includeResponse, statusCodeRange, maxResponseLength
+        includeRequest, includeResponse, statusCodeRange, maxResponseLength, includeHeaders,
     )
 
     /** The HTTP proxy history items a regex matches; see [ProxyHistory.searchHistory]. */

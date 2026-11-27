@@ -54,7 +54,8 @@ internal class ProxyHistory(private val api: MontoyaApi) {
         includeRequest: Boolean,
         includeResponse: Boolean,
         statusCodeRange: String?,
-        maxResponseLength: Int?
+        maxResponseLength: Int?,
+        includeHeaders: Boolean = true,
     ): JsonObject {
         // Resolve the optional MIME type filter up front so an unrecognized value
         // produces a clear error instead of silently dropping the filter (which
@@ -109,7 +110,7 @@ internal class ProxyHistory(private val api: MontoyaApi) {
             nextStart(safeStart, slice.size, allItems.size)?.let { put("next_start_index", it) }
             put("items", buildJsonArray {
                 slice.forEachIndexed { i, item ->
-                    add(serializeHistoryItem(item, safeStart + i, includeRequest, includeResponse, maxResponseLength ?: 200_000))
+                    add(serializeHistoryItem(item, safeStart + i, includeRequest, includeResponse, maxResponseLength ?: 200_000, includeHeaders))
                 }
             })
             putNotes(notes)
@@ -335,7 +336,8 @@ internal class ProxyHistory(private val api: MontoyaApi) {
         position: Int,
         includeRequest: Boolean,
         includeResponse: Boolean,
-        maxResponseLength: Int? = null
+        maxResponseLength: Int? = null,
+        includeHeaders: Boolean = true,
     ): JsonObject {
         return buildJsonObject {
             // id: Burp's own message id (stable); index: the item's place in this filtered list (pages with start_index).
@@ -395,7 +397,7 @@ internal class ProxyHistory(private val api: MontoyaApi) {
             // Request headers — names/shape always preserved for recon; the VALUES of
             // credential-bearing headers (Cookie, Authorization, …) are redacted unless the
             // caller explicitly requested full request material (issue #20).
-            try {
+            if (includeHeaders) try {
                 put("request_headers", buildJsonArray {
                     item.request().headers().forEach { h ->
                         add(buildJsonObject {

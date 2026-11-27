@@ -23,6 +23,7 @@ pub enum Code {
     InvalidEnum,
     OutOfRange,
     InvalidArguments,
+    NotFound,
     BurpNotRunning,
     ProjectNotRunning,
     ProjectRequired,
@@ -87,9 +88,13 @@ pub struct Envelope {
 }
 
 impl ToolError {
-    /// An error with `code`; a non-retryable one says so at the end of `error`.
+    /// An error with `code`; `error` ends as a sentence (a `.` is added when it ends in none), and
+    /// a non-retryable one says so at the end.
     pub fn new(code: Code, error: impl Into<String>) -> Self {
-        let mut error = error.into();
+        let mut error = error.into().trim_end().to_owned();
+        if !error.ends_with(['.', '!', '?', ')']) {
+            error.push('.');
+        }
         if !code.retryable() {
             error.push_str(FINAL_SENTENCE);
         }
@@ -214,6 +219,11 @@ mod tests {
         let final_ = ToolError::new(Code::ToolFailed, "boom.");
         assert_eq!(final_.error, "boom. Do not resend this call unchanged.");
         assert!(!final_.retryable);
+        let unpunctuated = ToolError::new(Code::ToolFailed, "known: main");
+        assert_eq!(
+            unpunctuated.error,
+            "known: main. Do not resend this call unchanged."
+        );
     }
 
     #[test]
