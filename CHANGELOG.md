@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### raijin CLI
-- `raijin mcp` has a third tool, `browser`, for ShardBrowser profiles and their browser (`SHARDX_API`, `SHARDX_TOKEN`). `{"do":"browser.actions"}` or `guide {"topic":"browser"}` lists its actions, and `run` takes them as `{"do":"browser.<action>"}`.
+- `raijin mcp` has a third tool, `browser`, for ShardBrowser profiles and their browser. A launcher on this machine needs no setup: the API defaults to its own port and the token is signed with its own secret. `SHARDX_API` / `SHARDX_TOKEN` or `[browser] api` / `token_env` in raijin.toml override them. `{"do":"browser.actions"}` or `guide {"topic":"browser"}` lists its actions, and `run` takes them as `{"do":"browser.<action>"}`.
   - Every launcher action: profiles, fingerprints, proxies, folders, tags, templates, trash, cookies, extensions, bookmarks, automation projects and modules. `via_burp:true` on `create_profile`, `create_temporary_profile` and `edit_profile` points the profile at this target's running Burp proxy.
   - `page` runs agent-browser commands (`snapshot -i`, `click @e3`, `network requests`, ...) in-process on the profile's browser. agent-browser 0.45.0 is vendored as `crates/agent-browser` (Apache-2.0, see its NOTICE). `guide {"topic":"browser.page"}` maps each old `browser_*` tool to its replacement.
   - `human_*`, `touch_*` and `rotate_screen` give humanlike pointer, keyboard and finger input through the `Motion` CDP domain.

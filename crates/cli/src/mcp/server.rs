@@ -1943,6 +1943,8 @@ pub async fn serve(surface: Surface, remote_flag: Option<String>) -> Result<()> 
         }),
         None => configured,
     };
+    let browser =
+        crate::browser::Hub::new(&target.as_ref().map_or_default(|t| t.config.browser.clone()));
     let inline_kb = target
         .as_ref()
         .map_or(crate::config::Mcp::default().inline_limit_kb, |t| {
@@ -1961,7 +1963,7 @@ pub async fn serve(surface: Surface, remote_flag: Option<String>) -> Result<()> 
         data_auto_update: store::auto_update(),
         data_checked: tokio::sync::Mutex::new(false),
         data_cache: std::sync::Mutex::default(),
-        browser: crate::browser::Hub::from_env(),
+        browser,
     };
     let service = Box::pin(gateway.serve((stdin::repaired_stdin(), tokio::io::stdout()))).await?;
     service.waiting().await?;
@@ -4534,7 +4536,7 @@ mod weak_model {
             data_auto_update: false,
             data_checked: tokio::sync::Mutex::new(false),
             data_cache: std::sync::Mutex::default(),
-            browser: crate::browser::Hub::from_env(),
+            browser: crate::browser::Hub::new(&crate::config::Browser::default()),
         }
     }
 
@@ -5194,7 +5196,7 @@ mod see_notes {
             data_auto_update: false,
             data_checked: tokio::sync::Mutex::new(false),
             data_cache: std::sync::Mutex::default(),
-            browser: crate::browser::Hub::from_env(),
+            browser: crate::browser::Hub::new(&crate::config::Browser::default()),
         };
         for raw in [
             json!({"see": "history_list"}),

@@ -131,6 +131,19 @@ pub struct Remote {
     pub token_env: Option<String>,
 }
 
+/// `[browser]`: the `ShardBrowser` launcher the `browser` tool of `raijin mcp` talks to. Both keys
+/// are optional: `SHARDX_API` wins over `api`, and without either the local launcher's own port
+/// is read from its settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Browser {
+    /// The launcher API's base URL, such as `http://127.0.0.1:40325`.
+    pub api: Option<String>,
+    /// The environment variable holding the API token (default `SHARDX_TOKEN`). Without a
+    /// token a local launcher's token is made from its own settings.
+    pub token_env: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Burp {
@@ -166,6 +179,8 @@ pub struct Config {
     pub remote: Option<Remote>,
     #[serde(default)]
     pub burp: Burp,
+    #[serde(default)]
+    pub browser: Browser,
 }
 
 fn default_project() -> String {

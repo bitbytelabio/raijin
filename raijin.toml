@@ -20,7 +20,7 @@ projects_dir = "burp"
 # Raijin jar. Default: raijin.jar beside the raijin binary when it is this release's jar
 # (install.sh puts it there), else this release's jar downloaded to ~/.raijin/jars/.
 # RAIJIN_JAR overrides both this setting and the default.
-jar = "build/libs/raijin.jar"
+# jar = "/path/to/raijin.jar"
 
 # BApps installed in your global Burp (~/.BurpSuite) to load too, by name.
 bapps = []
@@ -38,9 +38,16 @@ include = []
 # Tool results larger than this many KiB are saved to .raijin/tool-results/ instead of returned inline.
 inline_limit_kb = 24
 
-# Drive an already-running Raijin instead of a CLI-managed Burp.
+[data]
+# This target's own payloads, BChecks and Bambdas (tracked by git, unlike .raijin/):
+# <dir>/payloads/<category>.json, <dir>/bchecks/**/*.bcheck, <dir>/bambdas/**/*.bambda.
+# PortSwigger's cheat sheets, BChecks and Bambdas are cached once per machine in ~/.raijin/data/.
+dir = "data"
+
+# Drive an already-running Raijin instead of a CLI-managed Burp. The CLI calls its JSON tool API
+# (<url>/api/v1); a URL ending in /mcp or /api/v1 works too, and a path is kept as a proxy prefix.
 # [remote]
-# url = "http://127.0.0.1:9876/mcp"
+# url = "http://127.0.0.1:9876"
 # token_env = "RAIJIN_TOKEN"   # only when that Raijin requires a bearer token
 
 # Burp install; found automatically in the usual places.
@@ -48,3 +55,10 @@ inline_limit_kb = 24
 # install_dir = "/Applications/Burp Suite Professional.app"
 # java = "/path/to/java"
 # jar = "/path/to/burpsuite.jar"
+
+# The ShardBrowser launcher behind `raijin mcp`'s browser tool. Defaults: SHARDX_API, else the
+# local launcher's own port from its settings (else 40325); SHARDX_TOKEN, else a short-lived
+# token signed with the local launcher's secret.
+# [browser]
+# api = "http://127.0.0.1:40325"
+# token_env = "SHARDX_TOKEN"

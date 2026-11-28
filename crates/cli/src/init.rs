@@ -70,6 +70,13 @@ dir = "data"
 # install_dir = "/Applications/Burp Suite Professional.app"
 # java = "/path/to/java"
 # jar = "/path/to/burpsuite.jar"
+
+# The ShardBrowser launcher behind `raijin mcp`'s browser tool. Defaults: SHARDX_API, else the
+# local launcher's own port from its settings (else 40325); SHARDX_TOKEN, else a short-lived
+# token signed with the local launcher's secret.
+# [browser]
+# api = "http://127.0.0.1:40325"
+# token_env = "SHARDX_TOKEN"
 "#
     )
 }

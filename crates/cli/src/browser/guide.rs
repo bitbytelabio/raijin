@@ -18,7 +18,7 @@ Rules:
 - Routes, dialog handlers and other listeners set in a script last only while that script runs: put the actions that need them in the same script.
 - Page actions and scripts start the profile when it is not running (headless: true for no window).
 
-Config: SHARDX_API (default http://127.0.0.1:40325), SHARDX_TOKEN (ShardBrowser Settings → Automation API). Playwright scripts need the driver: cargo install playwright-rs --features cli && playwright-rs install (or PLAYWRIGHT_DRIVER_PATH). Topics: browser.page (page commands), browser.blocks (automation blocks)."#;
+Config: SHARDX_API, else [browser] api in raijin.toml, else the local launcher's port (default http://127.0.0.1:40325); SHARDX_TOKEN (or the variable [browser] token_env names), else a token made from the local launcher's own settings, so a launcher on this machine needs no setup. health_check shows which token is used. Playwright scripts need the driver: cargo install playwright-rs --features cli && playwright-rs install (or PLAYWRIGHT_DRIVER_PATH). Topics: browser.page (page commands), browser.blocks (automation blocks)."#;
 
 pub const PAGE_GUIDE: &str = r#"page: agent-browser commands on a profile's browser. {"do":"page","profile_id":"<id>","cmd":"<line>"} runs one line; "cmds":["<line>",...] runs several, stopping at the first failure unless "continue_on_error":true. Quote text with spaces: fill @e2 "hello world".
 

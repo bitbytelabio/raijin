@@ -851,9 +851,10 @@ impl Call<'_> {
 }
 
 impl Hub {
-    pub fn from_env() -> Self {
+    /// The launcher `settings` (`[browser]` of raijin.toml) and the environment point at.
+    pub fn new(settings: &crate::config::Browser) -> Self {
         Self {
-            launcher: launcher::Launcher::from_env(),
+            launcher: launcher::Launcher::new(settings),
             sessions: Mutex::default(),
             flags: OnceLock::new(),
         }
