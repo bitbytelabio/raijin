@@ -1114,4 +1114,39 @@ mod tests {
         let variable = [json!({"kind": "wait", "params": {"seconds": "{{x}}"}})];
         assert!(script::check_block_waits(&variable, call, "blocks").is_ok());
     }
+
+    #[test]
+    fn screenshots_without_a_path_stay_with_the_target() {
+        let mut flags = agent_browser::flags::try_parse_flags(&[]).expect("flags");
+        flags.screenshot_dir = None;
+        let parse = |line: &str| {
+            let argv = agent_browser::commands::shell_words_split(line);
+            agent_browser::commands::parse_command(&argv, &flags).expect(line)
+        };
+        let dir = std::path::Path::new("/t/.raijin/screenshots");
+        for line in ["screenshot", "screenshot --full", "screenshot #hero"] {
+            let mut cmd = parse(line);
+            assert_eq!(
+                page::place_screenshot(&mut cmd, Some(dir)).as_deref(),
+                Some(dir),
+                "{line}"
+            );
+            assert_eq!(cmd["screenshotDir"], "/t/.raijin/screenshots", "{line}");
+        }
+        for line in [
+            "screenshot /tmp/x.png",
+            "screenshot #hero /tmp/x.png",
+            "get url",
+        ] {
+            let mut cmd = parse(line);
+            let before = cmd.clone();
+            assert_eq!(page::place_screenshot(&mut cmd, Some(dir)), None, "{line}");
+            assert_eq!(cmd, before, "{line}");
+        }
+        let mut own = json!({"action": "screenshot", "path": null, "screenshotDir": "/mine"});
+        assert_eq!(page::place_screenshot(&mut own, Some(dir)), None);
+        assert_eq!(own["screenshotDir"], "/mine");
+        let mut cmd = parse("screenshot");
+        assert_eq!(page::place_screenshot(&mut cmd, None), None);
+    }
 }

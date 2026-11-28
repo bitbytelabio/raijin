@@ -3,6 +3,7 @@
 
 use std::fmt::Write as _;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -17,6 +18,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::{Call, Hub, error_with, text_result};
+use crate::config::{Target, user_state_dir};
 use crate::mcp::error::{Code, ToolError};
 
 /// One profile's attached engine and what the Motion actions keep for it.
@@ -63,6 +65,32 @@ struct Prepared {
     cmd: Value,
     /// `network requests --full`: keep every field.
     full: bool,
+    /// The directory a `screenshot` without a path is saved to, made owner-only before it runs.
+    shots: Option<PathBuf>,
+}
+
+/// Where a `screenshot` without a path goes: `<target>/.raijin/screenshots`, else
+/// `~/.raijin/screenshots`; `None` without a home, leaving the engine's own default.
+fn screenshot_dir(target: Option<&Target>) -> Option<PathBuf> {
+    match target {
+        Some(t) => Some(t.state_dir().join("screenshots")),
+        None => user_state_dir().ok().map(|d| d.join("screenshots")),
+    }
+}
+
+/// Points a parsed `screenshot` without a path at `dir` (the engine would save it under
+/// `~/.agent-browser`); the directory to create, or `None` when the command is left as it is
+/// (another action, a path given, or `AGENT_BROWSER_SCREENSHOT_DIR` already set).
+pub fn place_screenshot(cmd: &mut Value, dir: Option<&Path>) -> Option<PathBuf> {
+    let dir = dir?;
+    let bare = cmd.get("action").and_then(Value::as_str) == Some("screenshot")
+        && cmd.get("path").is_none_or(Value::is_null)
+        && cmd.get("screenshotDir").is_none_or(Value::is_null);
+    if !bare {
+        return None;
+    }
+    cmd["screenshotDir"] = json!(dir.to_string_lossy());
+    Some(dir.to_path_buf())
 }
 
 /// First words agent-browser has that manage something raijin owns, with why they are refused.
@@ -323,9 +351,10 @@ impl Hub {
             }
         };
         // Every line is checked before the browser starts: a typo never starts a profile.
+        let shots = screenshot_dir(call.ctx.target);
         let prepared: Vec<Result<Prepared, ToolError>> = lines
             .iter()
-            .map(|l| self.prepare_line(l, &mut call.notes))
+            .map(|l| self.prepare_line(l, shots.as_deref(), &mut call.notes))
             .collect();
         let headless = args.headless.unwrap_or(false);
         if !many {
@@ -377,7 +406,12 @@ impl Hub {
 
     /// One command line, split, checked against what raijin manages itself and parsed; nothing
     /// runs yet.
-    fn prepare_line(&self, line: &str, notes: &mut Vec<String>) -> Result<Prepared, ToolError> {
+    fn prepare_line(
+        &self,
+        line: &str,
+        shots: Option<&Path>,
+        notes: &mut Vec<String>,
+    ) -> Result<Prepared, ToolError> {
         let mut argv = shell_words_split(line);
         if argv.first().is_some_and(|w| w == "agent-browser") {
             argv.remove(0);
@@ -425,7 +459,7 @@ impl Hub {
             argv.retain(|w| w != "--full");
             full = argv.len() != before;
         }
-        let cmd = parse_command(&argv, self.flags()?)
+        let mut cmd = parse_command(&argv, self.flags()?)
             .map_err(|e| ToolError::new(Code::InvalidArguments, e.format()).param("cmd"))?;
         if let Some(action) = cmd
             .get("action")
@@ -440,12 +474,18 @@ impl Hub {
             )
             .param("cmd"));
         }
-        Ok(Prepared { cmd, full })
+        let shots = place_screenshot(&mut cmd, shots);
+        Ok(Prepared { cmd, full, shots })
     }
 }
 
 /// Runs a prepared line; `network requests` comes back one line per request unless `--full`.
 async fn run_line(state: &mut DaemonState, p: &Prepared) -> Result<Value, ToolError> {
+    // Screenshots hold what the page showed: owner-only, like the rest of `.raijin/`.
+    if let Some(dir) = &p.shots {
+        crate::util::private_dir(dir)
+            .map_err(|e| ToolError::new(Code::ToolFailed, format!("{e:#}")))?;
+    }
     let data = run_parsed(state, &p.cmd).await?;
     if p.cmd.get("action").and_then(Value::as_str) == Some("requests") && !p.full {
         return Ok(summarize_requests(data));

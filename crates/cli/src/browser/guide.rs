@@ -30,7 +30,7 @@ Commands:
 - get text|html|value|attr|count|box|url|title ...; is visible|enabled|checked <sel>
 - wait <sel> [--state visible|hidden] [--timeout <ms>] | wait <ms> | wait --url <glob> | wait --load <state> | wait --fn <js> | wait --download <abs path>
 - scroll down <px> | scrollintoview <sel>
-- screenshot [--full] [<sel>] <abs.png> (returns the path) | pdf <abs.pdf> | eval <js> (everything after "eval " is the JavaScript, quotes included; one wholly quoted token is unquoted)
+- screenshot [--full] [<sel>] [<abs.png>] (returns the path; without one the file goes to <target>/.raijin/screenshots/) | pdf <abs.pdf> | eval <js> (everything after "eval " is the JavaScript, quotes included; one wholly quoted token is unquoted)
 - cookies [set <name> <value> --url <u>|clear] | storage local [get <k>|set <k> <v>|clear]
 - tab list|new [url]|<tN>|close [tN] | frame <css selector of the iframe element>|main (e.g. frame iframe[name=x]) | dialog accept [text]|dismiss (confirm and prompt; alert and beforeunload are accepted automatically)
 - set viewport <w> <h> | set headers <json> | set offline on|off
@@ -72,11 +72,11 @@ pub const LEGACY: &[(&str, &str)] = &[
     ("browser_content", "script js: return await page.content()"),
     (
         "browser_screenshot",
-        r#"page "screenshot [--full] <abs.png>""#,
+        r#"page "screenshot [--full] [<abs.png>]" (no path: .raijin/screenshots/)"#,
     ),
     (
         "browser_element_screenshot",
-        r#"page "screenshot <sel> <abs.png>""#,
+        r#"page "screenshot <sel> [<abs.png>]""#,
     ),
     ("browser_click", r#"page "click <sel>""#),
     ("browser_double_click", r#"page "dblclick <sel>""#),
