@@ -6,7 +6,7 @@ plugins {
 
 group = "io.bitbytelab"
 
-version = "3.0.0"
+version = "3.1.0"
 
 // Build JDK: gradle/gradle-daemon-jvm.properties pins the Gradle daemon to JDK 25. The
 // toolchain compiles and tests on JDK 25 and emits Java 25 bytecode, so the jar needs a Burp

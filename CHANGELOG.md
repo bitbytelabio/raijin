@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.1.0
 
 ### raijin CLI
 - `raijin mcp` has a third tool, `browser`, for ShardBrowser profiles and their browser. A launcher on this machine needs no setup: the API defaults to its own port and the token is signed with its own secret. `SHARDX_API` / `SHARDX_TOKEN` or `[browser] api` / `token_env` in raijin.toml override them. `{"do":"browser.actions"}` or `guide {"topic":"browser"}` lists its actions, and `run` takes them as `{"do":"browser.<action>"}`.
