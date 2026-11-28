@@ -1,6 +1,1 @@
-{
-  "mcpServers": {
-    "burpsuite": { "type": "http", "url": "http://127.0.0.1:9876/mcp", "enable": false },
-    "raijin": { "command": "raijin", "args": ["mcp"] }
-  }
-}
+{ "mcpServers": { "raijin": { "command": "./target/release/raijin", "args": ["mcp"] } } }
