@@ -1,4 +1,4 @@
-//! `raijin mcp`: a stdio MCP server (rmcp; MCP 2026-07-28 and the legacy initialize era) with two tools, `guide` and `run`, in front of Raijin's tool API, the Burp lifecycle and the offline history engine; playbooks as prompts, skills and `skill://` resources.
+//! `raijin mcp`: a stdio MCP server (rmcp; MCP 2026-07-28 and the legacy initialize era) with three tools, `guide`, `run` and `browser`, in front of Raijin's tool API, the Burp lifecycle and the offline history engine; playbooks as prompts, skills and `skill://` resources.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -41,13 +41,14 @@ use crate::util::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Surface {
-    /// guide and run only. lean (default) suits weak or small models.
+    /// guide, run and browser only. lean (default) suits weak or small models.
     Lean,
     /// Also every Raijin tool, callable directly: full lists every tool (~176 KB tools/list), which some clients truncate.
     Full,
 }
 
-const INSTRUCTIONS_HEAD: &str = "Raijin drives Burp Suite through two tools. guide() shows the running Burp \
+const INSTRUCTIONS_HEAD: &str = "Raijin drives Burp Suite through guide and run, and ShardBrowser profiles and their \
+browser through browser. guide() shows the running Burp \
 instances, every tool by domain (grouped tools list their actions) and the playbooks; \
 guide({\"topic\":\"<tool, tool.action, domain or playbook>\"}) gives one tool's inputSchema, a domain's tools, or a \
 playbook: copy parameter names from it, never guess. run({\"do\":\"<tool>\", ...that tool's parameters}) runs one \
@@ -63,7 +64,8 @@ the call from 'usage' and 'example'; never resend a call unchanged when 'retryab
 inline limit come back as {saved_to, preview}: parse the file with jq/python, never read it whole. Call guide() \
 first: it lists every tool by domain; then read the overview playbook: guide({\"topic\":\"overview\"}), also the \
 prompt /overview and skill://overview/SKILL.md. 'see' is a call to make first: an object with \"do\" goes to run, \
-one with \"guide\" holds guide's arguments.";
+one with \"guide\" holds guide's arguments. browser({\"do\":\"browser.actions\"}) lists the browser actions (the \
+browser. prefix is optional there); run also takes them as {\"do\":\"browser.<action>\"}.";
 
 /// Why a destructive tool named in another form is not run.
 const DESTRUCTIVE_EXACT: &str = "It is destructive, so it runs only under its exact name.";
@@ -98,7 +100,7 @@ const MISSING_DO: &str = "run needs \"do\": the tool to run, e.g. {\"do\":\"prox
 guide() lists every tool.";
 
 /// After `unknown tool "<name>": ` on the lean surface.
-const UNKNOWN_SURFACE_TOOL: &str = "this server has two tools, guide and run. Run Raijin tools through \
+const UNKNOWN_SURFACE_TOOL: &str = "this server has three tools, guide, run and browser. Run Raijin tools through \
 run, e.g. run {\"do\":\"proxy_history\",\"count\":20}.";
 
 const LIFECYCLE: &str = "lifecycle";
@@ -1438,7 +1440,8 @@ fn normalize_run(
 /// Whether `name` is a tool `run` can run: a local tool (in any case or separators) or a name the
 /// catalog resolves.
 fn names_a_tool(catalog: Option<&Catalog>, name: &str) -> bool {
-    local_tool(name).is_some()
+    crate::browser::names_action(name)
+        || local_tool(name).is_some()
         || local_tool(&error::norm(name)).is_some()
         || catalog
             .is_some_and(|c| !matches!(c.resolve_call(name), catalog::Resolved::NotFound { .. }))
@@ -1446,6 +1449,9 @@ fn names_a_tool(catalog: Option<&Catalog>, name: &str) -> bool {
 
 /// Whether `tool` (a local tool, or a catalog tool or alias) declares parameter `key`.
 fn tool_declares(catalog: Option<&Catalog>, tool: &str, key: &str) -> bool {
+    if crate::browser::names_action(tool) {
+        return crate::browser::declares(tool, key);
+    }
     let has = |schema: &Value| {
         schema
             .get("properties")
@@ -1897,6 +1903,8 @@ pub struct Gateway {
     data_checked: tokio::sync::Mutex<bool>,
     /// The parsed upstream data, with the manifest stamps it was read at.
     data_cache: std::sync::Mutex<Option<DataCache>>,
+    /// The `browser` tool: `ShardBrowser` profiles and their page sessions.
+    browser: crate::browser::Hub,
 }
 
 /// Parsed upstream data and the [`store::stamp`] it was read at.
@@ -1953,10 +1961,9 @@ pub async fn serve(surface: Surface, remote_flag: Option<String>) -> Result<()> 
         data_auto_update: store::auto_update(),
         data_checked: tokio::sync::Mutex::new(false),
         data_cache: std::sync::Mutex::default(),
+        browser: crate::browser::Hub::from_env(),
     };
-    let service = gateway
-        .serve((stdin::repaired_stdin(), tokio::io::stdout()))
-        .await?;
+    let service = Box::pin(gateway.serve((stdin::repaired_stdin(), tokio::io::stdout()))).await?;
     service.waiting().await?;
     Ok(())
 }
@@ -2114,6 +2121,57 @@ impl Gateway {
     async fn live_tools(&self) -> Option<Vec<Tool>> {
         let endpoint = self.endpoint(None).await.ok()?;
         self.api.tools(&endpoint).await.ok()
+    }
+
+    /// `browser`: `run` with every `do` (also of each batch step) read as `browser.<do>`.
+    async fn browser_tool(&self, raw: Option<JsonObject>) -> CallToolResult {
+        fn prefix(name: &mut String) {
+            if !name
+                .trim()
+                .get(..8)
+                .is_some_and(|head| head.eq_ignore_ascii_case("browser."))
+            {
+                *name = format!("browser.{}", name.trim());
+            }
+        }
+        let mut raw = raw.unwrap_or_default();
+        if let Some(Value::String(name)) = raw.get_mut("do") {
+            prefix(name);
+        }
+        // Every batch form `run` reads (`steps`, a JSON string, one object, bare names) as an
+        // array, so each step can be prefixed.
+        if !raw.contains_key("batch")
+            && !raw.contains_key("do")
+            && let Some(steps) = raw.remove("steps")
+        {
+            raw.insert("batch".to_owned(), steps);
+        }
+        match raw.get("batch") {
+            Some(Value::String(s)) => {
+                if let Ok(steps) = serde_json::from_str::<Vec<Value>>(s) {
+                    raw.insert("batch".to_owned(), Value::Array(steps));
+                }
+            }
+            Some(Value::Object(step)) => {
+                let steps = vec![Value::Object(step.clone())];
+                raw.insert("batch".to_owned(), Value::Array(steps));
+            }
+            _ => {}
+        }
+        if let Some(Value::Array(steps)) = raw.get_mut("batch") {
+            for step in steps.iter_mut() {
+                match step {
+                    Value::String(name) => prefix(name),
+                    Value::Object(call) => {
+                        if let Some(Value::String(name)) = call.get_mut("do") {
+                            prefix(name);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.run(Some(raw)).await
     }
 
     /// `run`: one call, or a batch of them.
@@ -2437,6 +2495,26 @@ impl Gateway {
             .into_result();
             return (tool, result);
         }
+        if let Some(head) = tool.get(..8)
+            && head.eq_ignore_ascii_case("browser.")
+        {
+            let ctx = crate::browser::Ctx {
+                target: self.target.as_deref(),
+                target_error: self.target_error.as_deref(),
+                remote: self.remote.is_some(),
+            };
+            let mut result = self.browser.call(&tool[8..], arguments, ctx).await;
+            if project.is_some() {
+                result = error::with_notes(
+                    result,
+                    &[
+                        "ignored 'project' (it picks a Burp; browser actions do not use one)"
+                            .to_owned(),
+                    ],
+                );
+            }
+            return (tool, result);
+        }
         let (local, note) = match local_tool(&tool) {
             Some(local) => (Some(local), None),
             None => match LOCAL_TOOLS.iter().find(|t| t.name == error::norm(&tool)) {
@@ -2508,7 +2586,8 @@ impl Gateway {
 
     /// Whether `run` can run `name`: a local tool, a catalog tool or a resolvable alias.
     async fn runnable(&self, name: &str) -> bool {
-        local_tool(name.trim()).is_some()
+        crate::browser::names_action(name)
+            || local_tool(name.trim()).is_some()
             || self
                 .assets()
                 .await
@@ -2738,6 +2817,7 @@ impl Gateway {
             Some(topic) if matches!(error::norm(topic).as_str(), "run" | "guide") => {
                 plain(format!("{GUIDE_HEAD}\n\nrun: {RUN_DESCRIPTION}"))
             }
+            Some(topic) if crate::browser::is_topic(topic) => crate::browser::topic(topic),
             Some(topic) => {
                 let names = topic_names(catalog, live.as_deref(), &other);
                 let domains = catalog.map_or_else(
@@ -2911,6 +2991,7 @@ impl Gateway {
             .map(|t| t.name)
             .collect();
         lines.push(domain_line(DATA, DATA_DESCRIPTION, &data_tools.join(", ")));
+        lines.push(crate::browser::overview_line());
 
         lines.push(String::new());
         lines.push("Playbooks (guide {\"topic\":\"<name>\"}):".to_owned());
@@ -3471,6 +3552,15 @@ impl Gateway {
             },
             "additionalProperties": true
         });
+        let browser_schema = json!({
+            "type": "object",
+            "properties": {
+                "do": {"type": "string", "description": "Browser action, e.g. page or create_temporary_profile (browser. prefix optional)"},
+                "batch": {"type": "array", "items": {"type": "object"}},
+                "bail": {"type": "boolean", "description": "batch: stop at the first failed step"}
+            },
+            "additionalProperties": true
+        });
         vec![
             annotated(
                 Tool::new(
@@ -3488,6 +3578,15 @@ impl Gateway {
                     run_schema.as_object().cloned().unwrap_or_default(),
                 ),
                 "Run a Raijin tool",
+                json!({"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true}),
+            ),
+            annotated(
+                Tool::new_with_raw(
+                    "browser",
+                    Some(Cow::Borrowed(crate::browser::BROWSER_DESCRIPTION)),
+                    browser_schema.as_object().cloned().unwrap_or_default(),
+                ),
+                "ShardBrowser profiles and browser",
                 json!({"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true}),
             ),
         ]
@@ -3932,16 +4031,18 @@ impl ServerHandler for Gateway {
             .collect();
         let raw_name = request.name.to_string();
         let canonical = error::norm(error::strip_server_prefix(&raw_name).unwrap_or(&raw_name));
-        let name = if matches!(canonical.as_str(), "run" | "guide") && canonical != raw_name {
-            notes.push(format!("read tool '{raw_name}' as {canonical}"));
-            canonical
-        } else {
-            raw_name
-        };
+        let name =
+            if matches!(canonical.as_str(), "run" | "guide" | "browser") && canonical != raw_name {
+                notes.push(format!("read tool '{raw_name}' as {canonical}"));
+                canonical
+            } else {
+                raw_name
+            };
         let arguments = request.arguments;
         let result = match name.as_str() {
             "guide" => self.guide_tool(arguments).await,
             "run" => self.run(arguments).await,
+            "browser" => self.browser_tool(arguments).await,
             // A Raijin tool called directly: run it as run would.
             _ if self.runnable(&name).await => {
                 let notes = if self.surface == Surface::Full {
@@ -4279,6 +4380,7 @@ mod tests {
             RUN_EXAMPLE,
             MISSING_DO,
             UNKNOWN_SURFACE_TOOL,
+            crate::browser::BROWSER_DESCRIPTION,
         ]
         .map(str::to_owned)
         .to_vec();
@@ -4297,6 +4399,12 @@ mod tests {
                 let tool = call["do"].as_str().expect("string do");
                 if local_tool(tool).is_some() {
                     local_call_fits(&call).unwrap_or_else(|e| panic!("{tool}: {}", e.error));
+                } else if let Some(action) = tool.strip_prefix("browser.") {
+                    if action.starts_with('<') {
+                        continue;
+                    }
+                    crate::browser::call_fits(action, &call)
+                        .unwrap_or_else(|e| panic!("{tool}: {}", e.error));
                 } else {
                     let (name, action) = catalog
                         .resolve(tool)
@@ -4426,6 +4534,7 @@ mod weak_model {
             data_auto_update: false,
             data_checked: tokio::sync::Mutex::new(false),
             data_cache: std::sync::Mutex::default(),
+            browser: crate::browser::Hub::from_env(),
         }
     }
 
@@ -5085,6 +5194,7 @@ mod see_notes {
             data_auto_update: false,
             data_checked: tokio::sync::Mutex::new(false),
             data_cache: std::sync::Mutex::default(),
+            browser: crate::browser::Hub::from_env(),
         };
         for raw in [
             json!({"see": "history_list"}),

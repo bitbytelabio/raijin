@@ -1,0 +1,24 @@
+This crate is agent-browser by Vercel Labs, https://github.com/vercel-labs/agent-browser,
+vendored from its cli/ directory at tag v0.45.0 (commit f0a98351ec920bd826b22c98dacf8414f04b9832).
+It is licensed under the Apache License 2.0; see LICENSE.
+
+Raijin builds it as a library for the `browser` tool of `raijin mcp` and runs it in-process.
+Changes from upstream:
+
+1. Removed the modules a library does not need: src/main.rs, src/chat.rs, src/doctor/,
+   src/mcp.rs, src/skills.rs, src/upgrade.rs, src/test_utils.rs, src/native/e2e_tests.rs,
+   src/native/parity_tests.rs, src/native/test_fixtures/, and their `mod` lines in
+   src/native/mod.rs.
+2. Added src/lib.rs, which declares the remaining modules and exposes `commands`, `flags`
+   and `native`.
+3. The dashboard is not built here: src/native/stream/http.rs embeds `dashboard/`, which holds
+   upstream's placeholder index.html, and build.rs no longer creates
+   ../packages/dashboard/out. The CDP protocol code generation in build.rs is unchanged.
+4. src/native/cdp/client.rs: `send_command` delegates to the new `send_command_with_timeout`,
+   which takes the response timeout instead of a fixed 30 seconds.
+5. `DaemonState::new` (src/native/actions.rs) and `MemStore` (src/session_settings/store.rs,
+   re-exported from src/session_settings/mod.rs) are no longer test-only, so a session can be
+   created in-process with its security settings kept in memory.
+6. Cargo.toml: added `publish = false`, `autobins = false` and a `[lib]` section; removed
+   `[dev-dependencies]`, every `[profile.*]` section and the crates.io metadata fields that
+   point outside this directory.

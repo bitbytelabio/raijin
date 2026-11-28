@@ -1,6 +1,7 @@
 //! `raijin`: runs Burp Suite with Raijin per target, serves the `raijin mcp` gateway, and reads
 //! `.burp` projects offline.
 
+mod browser;
 mod burp;
 mod catalog;
 mod config;
@@ -71,7 +72,7 @@ enum Command {
     History(HistoryCommand),
     /// stdio MCP server for coding agents (guide / run).
     Mcp {
-        /// lean: guide and run; full: also every Raijin tool directly. lean (default) suits weak or small models; full lists every tool (~176 KB tools/list), which some clients truncate.
+        /// lean: guide, run and browser; full: also every Raijin tool directly. lean (default) suits weak or small models; full lists every tool (~176 KB tools/list), which some clients truncate.
         #[arg(long, value_enum, default_value_t = mcp::server::Surface::Lean)]
         surface: mcp::server::Surface,
         /// Use an already-running Raijin at this URL, e.g. `http://127.0.0.1:9876`; the CLI calls its tool API at /api/v1 (overrides [remote] url).
@@ -170,9 +171,15 @@ enum HistoryCommand {
 }
 
 fn main() -> ExitCode {
+    // agent-browser's reqwest 0.12 enables rustls/ring next to our aws-lc-rs; with two providers
+    // compiled in, `ClientConfig::builder()` panics unless one is installed process-wide.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
+    // agent-browser's command futures nest deeply; polling them overflows tokio's default 2 MiB
+    // worker stack (in debug builds at least).
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
         .build()
     {
         Ok(rt) => rt,
@@ -280,7 +287,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::History(command) => history_command(command).await,
-        Command::Mcp { surface, remote } => mcp::server::serve(surface, remote).await,
+        Command::Mcp { surface, remote } => Box::pin(mcp::server::serve(surface, remote)).await,
         Command::Update(options) => update::run(options).await,
         Command::Data(command) => data_command(command).await,
     }

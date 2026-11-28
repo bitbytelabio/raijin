@@ -1,0 +1,2465 @@
+use std::collections::{HashMap, HashSet};
+
+use serde_json::Value;
+
+use super::cdp::client::CdpClient;
+use super::cdp::types::{AXNode, AXProperty, AXValue, GetFullAXTreeResult};
+use super::element::{normalize_ax_role, resolve_ax_session, RefMap};
+
+#[cfg(test)]
+mod document_identity_regressions {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    async fn observe_documents(documents: &[Option<&str>], sessions: &[&str]) -> Vec<String> {
+        let document = Arc::new(Mutex::new(None::<String>));
+        let server_document = document.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                let Ok(text) = message.to_text() else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(text).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "Page.getFrameTree" => json!({"frameTree": {"frame": {
+                        "id": "child", "loaderId": server_document.lock().unwrap().clone()
+                    }}}),
+                    "Accessibility.getFullAXTree" => json!({"nodes": [{
+                        "nodeId": "1", "role": {"type": "role", "value": "button"},
+                        "name": {"type": "string", "value": "Buy"}, "backendDOMNodeId": 42
+                    }]}),
+                    "Runtime.evaluate" => json!({"result": {"type": "object", "value": []}}),
+                    _ => json!({}),
+                };
+                ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"id": request["id"], "result": result}).to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mut refs = RefMap::new();
+        let mut observations = Vec::new();
+        for (loader, session) in documents.iter().zip(sessions) {
+            *document.lock().unwrap() = loader.map(str::to_string);
+            refs.begin_snapshot();
+            take_snapshot(
+                &client,
+                "parent-session",
+                &SnapshotOptions::default(),
+                &mut refs,
+                Some("child"),
+                &HashMap::from([("child".into(), session.to_string())]),
+            )
+            .await
+            .unwrap();
+            observations.push(refs.entries_sorted()[0].0.clone());
+        }
+        server.abort();
+        observations
+    }
+
+    #[tokio::test]
+    async fn durable_refs_invalidate_replaced_iframe_document() {
+        let refs =
+            observe_documents(&[Some("a"), Some("a"), Some("b")], &["child-session"; 3]).await;
+        assert_eq!(refs[0], refs[1], "same document should preserve refs");
+        assert_ne!(
+            refs[1], refs[2],
+            "replacement document must not reuse a ref for backend ID 42"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_refs_invalidate_replaced_iframe_session() {
+        let refs = observe_documents(&[Some("a"); 2], &["session-a", "session-b"]).await;
+        assert_ne!(
+            refs[0], refs[1],
+            "backend IDs belong to their effective CDP session"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_refs_do_not_share_unknown_document() {
+        let refs = observe_documents(
+            &[None, None, Some("a"), None, Some("a")],
+            &["child-session"; 5],
+        )
+        .await;
+        let unique: std::collections::HashSet<_> = refs.iter().collect();
+        assert_eq!(
+            unique.len(),
+            refs.len(),
+            "unknown identity must break continuity: {refs:?}"
+        );
+    }
+}
+
+const INTERACTIVE_ROLES: &[&str] = &[
+    "button",
+    "link",
+    "textbox",
+    "checkbox",
+    "radio",
+    "combobox",
+    "listbox",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "option",
+    "searchbox",
+    "slider",
+    "spinbutton",
+    "switch",
+    "tab",
+    "treeitem",
+    "DisclosureTriangle",
+    "ColorWell",
+    "Iframe",
+];
+
+const TABLE_CELL_ROLES: &[&str] = &["cell", "gridcell", "columnheader", "rowheader"];
+
+const CONTENT_ROLES: &[&str] = &[
+    "heading",
+    "listitem",
+    "article",
+    "region",
+    "main",
+    "navigation",
+];
+
+const STRUCTURAL_ROLES: &[&str] = &[
+    "generic",
+    "group",
+    "list",
+    "table",
+    "row",
+    "rowgroup",
+    "grid",
+    "treegrid",
+    "menu",
+    "menubar",
+    "toolbar",
+    "tablist",
+    "tree",
+    "directory",
+    "document",
+    "application",
+    "presentation",
+    "none",
+    "WebArea",
+    "RootWebArea",
+];
+
+const ZERO_WIDTH_CHARS: &[char] = &[
+    '\u{FEFF}', // BOM / Zero Width No-Break Space
+    '\u{200B}', // Zero Width Space
+    '\u{200C}', // Zero Width Non-Joiner
+    '\u{200D}', // Zero Width Joiner
+    '\u{2060}', // Word Joiner
+];
+
+fn normalize_snapshot_name(name: &str) -> String {
+    name.chars()
+        .filter_map(|ch| match ch {
+            '\u{00A0}' => Some(' '),
+            ch if ZERO_WIDTH_CHARS.contains(&ch) => None,
+            ch => Some(ch),
+        })
+        .collect()
+}
+
+#[derive(Default)]
+pub struct SnapshotOptions {
+    pub selector: Option<String>,
+    pub interactive: bool,
+    pub compact: bool,
+    pub depth: Option<usize>,
+    pub urls: bool,
+}
+
+pub struct SnapshotRefContext<'a> {
+    pub node_contexts: &'a HashMap<i64, String>,
+    pub session_id: &'a str,
+    pub frame_id: Option<&'a str>,
+    pub document_is_known: bool,
+}
+
+struct TreeNode {
+    role: String,
+    name: String,
+    display_name: Option<String>,
+    level: Option<i64>,
+    checked: Option<String>,
+    expanded: Option<bool>,
+    selected: Option<bool>,
+    disabled: Option<bool>,
+    required: Option<bool>,
+    value_text: Option<String>,
+    backend_node_id: Option<i64>,
+    children: Vec<usize>,
+    parent_idx: Option<usize>,
+    has_ref: bool,
+    ref_id: Option<String>,
+    depth: usize,
+    cursor_info: Option<CursorElementInfo>,
+    url: Option<String>,
+    hint: Option<String>,
+}
+
+impl TreeNode {
+    // Create an empty node
+    fn empty() -> Self {
+        Self {
+            role: String::new(),
+            name: String::new(),
+            display_name: None,
+            level: None,
+            checked: None,
+            expanded: None,
+            selected: None,
+            disabled: None,
+            required: None,
+            value_text: None,
+            backend_node_id: None,
+            children: Vec::new(),
+            parent_idx: None,
+            has_ref: false,
+            ref_id: None,
+            depth: 0,
+            cursor_info: None,
+            url: None,
+            hint: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.role = String::new();
+        self.name = String::new();
+        self.display_name = None;
+        self.level = None;
+        self.checked = None;
+        self.expanded = None;
+        self.selected = None;
+        self.disabled = None;
+        self.required = None;
+        self.value_text = None;
+        self.backend_node_id = None;
+        self.children.clear();
+        self.parent_idx = None;
+        self.has_ref = false;
+        self.url = None;
+        self.ref_id = None;
+        self.depth = 0;
+        self.cursor_info = None;
+    }
+
+    /// The name an interactive snapshot prints: the accessible name, or the cursor-interactive text when that is empty.
+    fn label(&self) -> &str {
+        match &self.cursor_info {
+            Some(cursor_info) if self.name.is_empty() => &cursor_info.text,
+            _ => &self.name,
+        }
+    }
+}
+
+/// How a ref's printed role and label identify it among the refs of one snapshot.
+enum LabelState {
+    Unique,
+    Shared,
+    Empty,
+}
+
+/// The type of a hidden form input found inside a cursor-interactive element.
+#[derive(Clone, Copy)]
+enum HiddenInputKind {
+    Radio,
+    Checkbox,
+}
+
+impl HiddenInputKind {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "radio" => Some(Self::Radio),
+            "checkbox" => Some(Self::Checkbox),
+            _ => None,
+        }
+    }
+
+    fn as_role(&self) -> &str {
+        match self {
+            Self::Radio => "radio",
+            Self::Checkbox => "checkbox",
+        }
+    }
+}
+
+/// Information about a cursor-interactive element (elements with cursor:pointer, onclick, tabindex, etc.)
+#[derive(Clone)]
+pub(crate) struct CursorElementInfo {
+    kind: String, // "clickable", "focusable", "editable"
+    hints: Vec<String>,
+    text: String, // textContent from the DOM element (fallback when ARIA name is empty)
+    hidden_input_kind: Option<HiddenInputKind>,
+    hidden_input_checked: Option<String>, // "true", "false", or "mixed" (tristate)
+    native: bool, // native tag (a, summary, ...): dropped when the AX pass already gives it an interactive role
+}
+
+struct RoleNameTracker {
+    counts: HashMap<String, usize>,
+    entries: Vec<(usize, String)>,
+}
+
+impl RoleNameTracker {
+    fn new() -> Self {
+        Self {
+            counts: HashMap::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    fn track(&mut self, role: &str, name: &str, node_idx: usize) -> usize {
+        let key = format!("{}:{}", role, name);
+        let count = self.counts.entry(key.clone()).or_insert(0);
+        let nth = *count;
+        *count += 1;
+        self.entries.push((node_idx, key));
+        nth
+    }
+
+    fn get_duplicates(&self) -> HashMap<String, usize> {
+        self.counts
+            .iter()
+            .filter(|(_, &count)| count > 1)
+            .map(|(key, &count)| (key.clone(), count))
+            .collect()
+    }
+}
+
+/// Builds a replacement snapshot and ref map without changing the live map.
+pub async fn stage_snapshot(
+    client: &CdpClient,
+    session_id: &str,
+    options: &SnapshotOptions,
+    ref_map: &RefMap,
+    frame_id: Option<&str>,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<(String, RefMap), String> {
+    let mut staged = ref_map.for_snapshot();
+    let tree = take_snapshot(
+        client,
+        session_id,
+        options,
+        &mut staged,
+        frame_id,
+        iframe_sessions,
+    )
+    .await?;
+    Ok((tree, staged))
+}
+
+const MAX_IFRAME_SNAPSHOT_DEPTH: usize = 4;
+
+pub async fn take_snapshot(
+    client: &CdpClient,
+    session_id: &str,
+    options: &SnapshotOptions,
+    ref_map: &mut RefMap,
+    frame_id: Option<&str>,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<String, String> {
+    client
+        .send_command_no_params("DOM.enable", Some(session_id))
+        .await?;
+    client
+        .send_command_no_params("Accessibility.enable", Some(session_id))
+        .await?;
+
+    let selector_backend_ids: Option<HashMap<i64, usize>> =
+        if let Some(ref selector) = options.selector {
+            let resolved = resolve_selector_backend_ids(client, session_id, selector).await;
+            let _ = client
+                .send_command(
+                    "Runtime.releaseObjectGroup",
+                    Some(serde_json::json!({ "objectGroup": SELECTOR_SCOPE_GROUP })),
+                    Some(session_id),
+                )
+                .await;
+            Some(resolved?)
+        } else {
+            None
+        };
+
+    let mut visited = HashSet::new();
+    let parent_session = match frame_id {
+        Some(fid) => {
+            visited.insert(fid.to_string());
+            super::element::find_frame_host_session(client, session_id, fid, iframe_sessions)
+                .await
+                .unwrap_or_else(|_| session_id.to_string())
+        }
+        None => session_id.to_string(),
+    };
+    take_snapshot_inner(
+        client,
+        session_id,
+        &parent_session,
+        options,
+        selector_backend_ids.as_ref(),
+        ref_map,
+        frame_id,
+        iframe_sessions,
+        0,
+        &mut visited,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn take_snapshot_inner(
+    client: &CdpClient,
+    session_id: &str,
+    parent_session_id: &str,
+    options: &SnapshotOptions,
+    selector_backend_ids: Option<&HashMap<i64, usize>>,
+    ref_map: &mut RefMap,
+    frame_id: Option<&str>,
+    iframe_sessions: &HashMap<String, String>,
+    depth: usize,
+    visited: &mut HashSet<String>,
+) -> Result<String, String> {
+    let (ax_params, effective_session_id) =
+        resolve_ax_session(frame_id, parent_session_id, iframe_sessions);
+    // Same-origin children share a CDP session but have separate loaders;
+    // out-of-process children also have their own effective session identity.
+    let frame_tree = client
+        .send_command_no_params("Page.getFrameTree", Some(effective_session_id))
+        .await
+        .ok();
+    let loader = frame_tree
+        .as_ref()
+        .and_then(|tree| frame_loader(&tree["frameTree"], frame_id));
+    let document_is_known =
+        ref_map.observe_document(session_id, frame_id, effective_session_id, loader);
+    // Ensure domains are enabled on the iframe session (defensive fallback
+    // in case the attach-time enable in execute_command was missed).
+    if effective_session_id != session_id {
+        let _ = client
+            .send_command_no_params("DOM.enable", Some(effective_session_id))
+            .await;
+        let _ = client
+            .send_command_no_params("Accessibility.enable", Some(effective_session_id))
+            .await;
+    }
+    // The full tree of a large page runs to megabytes, so the response is
+    // parsed once, straight from its text, instead of through a Value.
+    let ax_tree: GetFullAXTreeResult = client
+        .send_command_typed_raw(
+            "Accessibility.getFullAXTree",
+            &ax_params,
+            Some(effective_session_id),
+        )
+        .await?;
+
+    // A navigation that committed while the tree was fetched leaves a tree
+    // whose document is unknown, so none of its refs may be handed out.
+    if let Some(recorded) = loader.filter(|_| document_is_known) {
+        let after = client
+            .send_command_no_params("Page.getFrameTree", Some(effective_session_id))
+            .await
+            .ok();
+        if after
+            .as_ref()
+            .is_some_and(|tree| loader_replaced(recorded, &tree["frameTree"], frame_id))
+        {
+            return Err(
+                "The document changed while the snapshot was being captured (the page navigated or the frame was removed). Take the snapshot again."
+                    .to_string(),
+            );
+        }
+    }
+
+    let (mut tree_nodes, root_indices) = build_tree(&ax_tree.nodes);
+
+    // When a selector is given, find AX nodes whose backendDOMNodeId falls
+    // within the target DOM subtree and pick the top-level ones as roots.
+    let effective_roots = if let Some(id_set) = selector_backend_ids {
+        // Mark which tree_nodes belong to the target DOM subtree.
+        let in_subtree: Vec<bool> = tree_nodes
+            .iter()
+            .map(|n| {
+                n.backend_node_id
+                    .is_some_and(|bid| id_set.contains_key(&bid))
+            })
+            .collect();
+
+        // An AX node is a "top-level" match if it is in the subtree but none
+        // of its ancestors (in the AX tree) are. Checking only the parent is
+        // not enough: ignored nodes lose their backendDOMNodeId in
+        // build_tree, so a wrapper <div> between two matched nodes would
+        // turn everything below it into an extra root and render it twice.
+        let has_ancestor_in_subtree = |mut idx: usize| {
+            while let Some(pidx) = tree_nodes[idx].parent_idx {
+                if in_subtree[pidx] {
+                    return true;
+                }
+                idx = pidx;
+            }
+            false
+        };
+        let mut roots: Vec<usize> = (0..tree_nodes.len())
+            .filter(|&idx| in_subtree[idx] && !has_ancestor_in_subtree(idx))
+            .collect();
+        // Page order of the selector matches, not AX-tree index order.
+        roots.sort_by_key(|&idx| {
+            tree_nodes[idx]
+                .backend_node_id
+                .and_then(|bid| id_set.get(&bid).copied())
+        });
+
+        if roots.is_empty() {
+            return Err(format!(
+                "No accessibility node found for selector '{}'",
+                options.selector.as_deref().unwrap_or("")
+            ));
+        }
+        roots
+    } else {
+        root_indices
+    };
+
+    // Pre-collect cursor-interactive elements for the top document only;
+    // child frames don't share the top document's DOM or backendNodeIds.
+    let mut cursor_elements: HashMap<i64, CursorElementInfo> = if frame_id.is_none() {
+        find_cursor_interactive_elements(client, session_id)
+            .await
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    drop_natively_interactive(&mut cursor_elements, &tree_nodes);
+
+    promote_hidden_inputs(&mut tree_nodes, &cursor_elements);
+
+    assign_refs(
+        &mut tree_nodes,
+        &cursor_elements,
+        &HashMap::new(),
+        ref_map,
+        session_id,
+        frame_id,
+        document_is_known,
+    );
+
+    let hint_nodes = hint_targets(&tree_nodes);
+    for (idx, hint) in call_on_nodes(client, effective_session_id, &hint_nodes, HINT_FUNCTION).await
+    {
+        tree_nodes[idx].hint = Some(hint);
+    }
+
+    if options.urls {
+        let link_nodes: Vec<(usize, i64)> = tree_nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.role == "link" && n.has_ref)
+            .filter_map(|(i, n)| n.backend_node_id.map(|bid| (i, bid)))
+            .collect();
+        let href = "function() { return this.href || ''; }";
+        for (idx, url) in call_on_nodes(client, effective_session_id, &link_nodes, href).await {
+            tree_nodes[idx].url = Some(url);
+        }
+    }
+
+    let iframe_nodes: Vec<(usize, i64, bool)> = tree_nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(node_idx, node)| {
+            (node.role == "Iframe" && node.has_ref).then_some((
+                node_idx,
+                node.backend_node_id?,
+                node.name.is_empty(),
+            ))
+        })
+        .collect();
+    let iframe_results = futures_util::future::join_all(
+        iframe_nodes
+            .iter()
+            .map(|&(_, bid, _)| resolve_iframe_frame(client, effective_session_id, bid)),
+    )
+    .await;
+    let mut iframe_metadata: Vec<(usize, IframeMetadata)> = Vec::new();
+    for ((node_idx, _, name_is_empty), result) in iframe_nodes.into_iter().zip(iframe_results) {
+        if let Ok(metadata) = result {
+            if name_is_empty {
+                tree_nodes[node_idx].display_name = metadata.name.clone();
+            }
+            iframe_metadata.push((node_idx, metadata));
+        }
+    }
+
+    let mut output = String::new();
+    for &root_idx in &effective_roots {
+        render_tree(&tree_nodes, root_idx, 0, &mut output, options);
+    }
+
+    // Recurse into child iframes up to MAX_IFRAME_SNAPSHOT_DEPTH, guarding
+    // against cycles with `visited`.
+    if depth < MAX_IFRAME_SNAPSHOT_DEPTH {
+        let mut iframe_snapshots: Vec<(String, String)> = Vec::new(); // (ref_id, child_snapshot)
+        for (node_idx, metadata) in iframe_metadata {
+            let Some(child_fid) = metadata.frame_id else {
+                continue;
+            };
+            if !visited.insert(child_fid.clone()) {
+                continue;
+            }
+            let ref_id = tree_nodes[node_idx].ref_id.as_deref().unwrap_or("");
+            // Snapshot the child frame; errors are silently ignored
+            // (e.g. cross-origin iframes)
+            if let Ok(child_text) = Box::pin(take_snapshot_inner(
+                client,
+                session_id,
+                effective_session_id,
+                options,
+                None,
+                ref_map,
+                Some(&child_fid),
+                iframe_sessions,
+                depth + 1,
+                visited,
+            ))
+            .await
+            {
+                if !child_text.is_empty()
+                    && child_text != "(empty page)"
+                    && child_text != "(no interactive elements)"
+                {
+                    iframe_snapshots.push((ref_id.to_string(), child_text));
+                }
+            }
+        }
+
+        // Insert each child snapshot after its Iframe line in the output
+        for (ref_id, child_text) in iframe_snapshots {
+            let marker = format!("[ref={}]", ref_id);
+            if let Some(pos) = output.find(&marker) {
+                // Find the end of the Iframe line
+                let line_end = output[pos..]
+                    .find('\n')
+                    .map(|i| pos + i)
+                    .unwrap_or(output.len());
+                // Determine the indent of the Iframe line
+                let line_start = output[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let iframe_line = &output[line_start..line_end];
+                let iframe_indent = iframe_line.len() - iframe_line.trim_start().len();
+                let child_indent = iframe_indent + 2; // one level deeper
+                let prefix = " ".repeat(child_indent);
+
+                let indented_child: String = child_text
+                    .lines()
+                    .map(|line| format!("{}{}\n", prefix, line))
+                    .collect();
+
+                // Ensure there's a newline to insert after
+                if line_end == output.len() {
+                    output.push('\n');
+                    output.push_str(&indented_child);
+                } else {
+                    output.insert_str(line_end + 1, &indented_child);
+                }
+            }
+        }
+    }
+
+    Ok(finish_output(output, options))
+}
+
+/// Picks ref'd controls whose printed label is empty or shared with another ref, as (tree index, backend id).
+fn hint_targets(tree_nodes: &[TreeNode]) -> Vec<(usize, i64)> {
+    let mut label_counts: HashMap<(&str, &str), usize> = HashMap::new();
+    for node in tree_nodes.iter().filter(|node| node.has_ref) {
+        *label_counts
+            .entry((node.role.as_str(), node.label()))
+            .or_default() += 1;
+    }
+    tree_nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.has_ref)
+        .filter_map(|(idx, node)| {
+            let is_control = node.cursor_info.is_some()
+                || (INTERACTIVE_ROLES.contains(&node.role.as_str()) && node.role != "Iframe");
+            let state = match (
+                node.label(),
+                label_counts[&(node.role.as_str(), node.label())],
+            ) {
+                ("", _) => LabelState::Empty,
+                (_, 1) => LabelState::Unique,
+                _ => LabelState::Shared,
+            };
+            let needs_hint = match state {
+                LabelState::Unique => false,
+                LabelState::Shared | LabelState::Empty => true,
+            };
+            node.backend_node_id
+                .filter(|_| is_control && needs_hint)
+                .map(|bid| (idx, bid))
+        })
+        .collect()
+}
+
+/// Allocates or reuses refs for interactive and named content nodes and records them in `ref_map`.
+fn assign_refs(
+    tree_nodes: &mut [TreeNode],
+    cursor_elements: &HashMap<i64, CursorElementInfo>,
+    node_contexts: &HashMap<i64, String>,
+    ref_map: &mut RefMap,
+    session_id: &str,
+    frame_id: Option<&str>,
+    document_is_known: bool,
+) {
+    let mut trackers = HashMap::<String, RoleNameTracker>::new();
+    let mut next_ref: usize = ref_map.next_ref_num();
+
+    let mut nodes_with_refs: Vec<(usize, usize)> = Vec::new();
+
+    for (idx, node) in tree_nodes.iter().enumerate() {
+        let role = node.role.as_str();
+        let mut should_ref =
+            if INTERACTIVE_ROLES.contains(&role) || TABLE_CELL_ROLES.contains(&role) {
+                true
+            } else if CONTENT_ROLES.contains(&role) {
+                !node.name.is_empty()
+            } else {
+                false
+            };
+
+        if node
+            .backend_node_id
+            .is_some_and(|bid| cursor_elements.contains_key(&bid))
+        {
+            // ref elements that are cursor-interactive
+            should_ref = true;
+        }
+
+        if should_ref {
+            let context = node
+                .backend_node_id
+                .and_then(|id| node_contexts.get(&id))
+                .cloned()
+                .unwrap_or_default();
+            let nth = trackers
+                .entry(context)
+                .or_insert_with(RoleNameTracker::new)
+                .track(role, &node.name, idx);
+            nodes_with_refs.push((idx, nth));
+        }
+    }
+
+    let duplicates: HashMap<String, HashMap<String, usize>> = trackers
+        .into_iter()
+        .map(|(context, tracker)| (context, tracker.get_duplicates()))
+        .collect();
+
+    for (idx, nth) in &nodes_with_refs {
+        let node = &tree_nodes[*idx];
+        let key = format!("{}:{}", node.role, node.name);
+        let context = node
+            .backend_node_id
+            .and_then(|id| node_contexts.get(&id))
+            .map(String::as_str)
+            .unwrap_or_default();
+        let actual_nth = if duplicates
+            .get(context)
+            .is_some_and(|context_duplicates| context_duplicates.contains_key(&key))
+        {
+            Some(*nth)
+        } else {
+            None
+        };
+
+        let ref_id = if let Some(backend_node_id) = tree_nodes[*idx]
+            .backend_node_id
+            .filter(|_| document_is_known)
+        {
+            if let Some(existing) = ref_map.durable_ref(session_id, frame_id, backend_node_id) {
+                existing.to_string()
+            } else {
+                let allocated = format!("e{}", next_ref);
+                next_ref += 1;
+                ref_map.remember_durable_ref(session_id, frame_id, backend_node_id, &allocated);
+                allocated
+            }
+        } else {
+            let allocated = format!("e{}", next_ref);
+            next_ref += 1;
+            allocated
+        };
+
+        let node_frame = tree_nodes[*idx]
+            .backend_node_id
+            .and_then(|id| node_contexts.get(&id))
+            .map(String::as_str)
+            .or(frame_id);
+        ref_map.add_with_frame(
+            ref_id.clone(),
+            tree_nodes[*idx].backend_node_id,
+            &tree_nodes[*idx].role,
+            &tree_nodes[*idx].name,
+            actual_nth,
+            node_frame,
+        );
+
+        if document_is_known {
+            ref_map.bind_recorded_document(&ref_id, session_id, frame_id);
+        }
+
+        tree_nodes[*idx].has_ref = true;
+        tree_nodes[*idx].ref_id = Some(ref_id);
+    }
+
+    // Populate cursor_info for ref-bearing nodes
+    for (idx, _) in &nodes_with_refs {
+        if let Some(bid) = tree_nodes[*idx].backend_node_id {
+            if let Some(cursor_info) = cursor_elements.get(&bid) {
+                tree_nodes[*idx].cursor_info = Some((*cursor_info).clone());
+            }
+        }
+    }
+
+    ref_map.set_next_ref_num(next_ref);
+}
+
+/// Compacts the rendered tree when asked and substitutes the empty-page messages.
+fn finish_output(mut output: String, options: &SnapshotOptions) -> String {
+    if options.compact {
+        output = compact_tree(&output, options.interactive);
+    }
+
+    let trimmed = output.trim().to_string();
+
+    if trimmed.is_empty() {
+        if options.interactive {
+            return "(no interactive elements)".to_string();
+        }
+        return "(empty page)".to_string();
+    }
+
+    trimmed
+}
+
+/// Runs the shared tree, ref and render pipeline on prebuilt accessibility nodes.
+/// `urls` maps a node's `backend_d_o_m_node_id` to its link target and is used when `options.urls` is set.
+/// `cursor_elements` maps that same id to the element's cursor-interactive info.
+/// `hints` runs `HINT_FUNCTION` on the controls that need a hint and returns the non-empty results by tree index.
+pub async fn snapshot_from_ax_nodes<F: std::future::Future<Output = Vec<(usize, String)>>>(
+    nodes: &[AXNode],
+    urls: &HashMap<i64, String>,
+    cursor_elements: &HashMap<i64, CursorElementInfo>,
+    options: &SnapshotOptions,
+    ref_map: &mut RefMap,
+    refs: SnapshotRefContext<'_>,
+    hints: impl FnOnce(Vec<(usize, i64)>) -> F,
+) -> String {
+    let (mut tree_nodes, roots) = build_tree(nodes);
+    promote_hidden_inputs(&mut tree_nodes, cursor_elements);
+    assign_refs(
+        &mut tree_nodes,
+        cursor_elements,
+        refs.node_contexts,
+        ref_map,
+        refs.session_id,
+        refs.frame_id,
+        refs.document_is_known,
+    );
+    for (idx, hint) in hints(hint_targets(&tree_nodes)).await {
+        tree_nodes[idx].hint = Some(hint);
+    }
+    if options.urls {
+        for node in tree_nodes
+            .iter_mut()
+            .filter(|n| n.role == "link" && n.has_ref)
+        {
+            node.url = node.backend_node_id.and_then(|id| urls.get(&id).cloned());
+        }
+    }
+    let mut output = String::new();
+    for &root in &roots {
+        render_tree(&tree_nodes, root, 0, &mut output, options);
+    }
+    finish_output(output, options)
+}
+
+/// Describes a control from its icon, image file, stable attribute, and nearest row.
+pub(crate) const HINT_FUNCTION: &str = r#"function() {
+    const tail = (s, sep) => (s || '').split(sep).pop();
+    const use = this.querySelector('svg use');
+    const svg = this.querySelector('svg[id], svg[data-icon]');
+    const mark = this.querySelector('svg[class], i[class]');
+    const img = this.querySelector('img[src]:not([src^="data:"])');
+    const icon = use ? tail(use.getAttribute('href') || use.getAttribute('xlink:href'), '#')
+        : svg ? svg.id || svg.dataset.icon
+        : mark ? mark.getAttribute('class').split(/\s+/).filter((c) => /^(lucide|fa|bi|mdi|ri|ti|icon)-/.test(c)).join(' ')
+        : '';
+    const file = img ? tail(img.getAttribute('src').split(/[?#]/)[0], '/').replace(/\.\w+$/, '') : '';
+    const key = ['data-testid', 'name', 'id'].find((k) => /^(?!.*\d{3})[a-z][\w-]*$/i.test(this.getAttribute(k) || ''));
+    const row = this.closest('tr, li, article, [role=row], [role=listitem]');
+    const near = row ? row.innerText.replace(this.innerText, '').replace(/\s+/g, ' ').trim() : '';
+    return [icon && 'icon:' + icon, file && 'img:' + file, key && key + ':' + this.getAttribute(key), near && 'in:' + near]
+        .filter(Boolean).map((s) => s.slice(0, 48)).join('; ');
+}"#;
+
+/// Calls `function` on each DOM node in parallel and returns the non-empty strings it produced.
+async fn call_on_nodes(
+    client: &CdpClient,
+    session_id: &str,
+    nodes: &[(usize, i64)],
+    function: &str,
+) -> Vec<(usize, String)> {
+    let calls = nodes.iter().map(|&(idx, bid)| async move {
+        let node = client
+            .send_command(
+                "DOM.resolveNode",
+                Some(serde_json::json!({ "backendNodeId": bid })),
+                Some(session_id),
+            )
+            .await
+            .ok()?;
+        let result = client
+            .send_command(
+                "Runtime.callFunctionOn",
+                Some(serde_json::json!({
+                    "objectId": node["object"]["objectId"],
+                    "functionDeclaration": function,
+                    "returnByValue": true,
+                })),
+                Some(session_id),
+            )
+            .await
+            .ok()?;
+        let value = result["result"]["value"].as_str()?;
+        (!value.is_empty()).then(|| (idx, value.to_string()))
+    });
+    futures_util::future::join_all(calls)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Loader of the document currently shown in a frame of a `Page.getFrameTree` result.
+pub(super) fn frame_loader<'a>(tree: &'a Value, frame_id: Option<&str>) -> Option<&'a str> {
+    let frame = &tree["frame"];
+    if frame_id.is_none() || frame["id"].as_str() == frame_id {
+        return frame["loaderId"].as_str().filter(|id| !id.is_empty());
+    }
+    tree["childFrames"]
+        .as_array()?
+        .iter()
+        .find_map(|child| frame_loader(child, frame_id))
+}
+
+/// Whether the frame now shows a different document than `recorded`.
+fn loader_replaced(recorded: &str, tree: &Value, frame_id: Option<&str>) -> bool {
+    frame_loader(tree, frame_id) != Some(recorded)
+}
+
+struct IframeMetadata {
+    frame_id: Option<String>,
+    name: Option<String>,
+}
+
+/// Resolve the child frame ID and presentation-only label fallback for an
+/// iframe element. URLs are intentionally ignored.
+async fn resolve_iframe_frame(
+    client: &CdpClient,
+    session_id: &str,
+    backend_node_id: i64,
+) -> Result<IframeMetadata, String> {
+    // depth: 1 ensures contentDocument is included in the response
+    let describe: Value = client
+        .send_command(
+            "DOM.describeNode",
+            Some(serde_json::json!({ "backendNodeId": backend_node_id, "depth": 1 })),
+            Some(session_id),
+        )
+        .await?;
+
+    let node = describe
+        .get("node")
+        .ok_or_else(|| "Could not resolve iframe node".to_string())?;
+
+    let frame_id = node
+        .get("contentDocument")
+        .and_then(|cd| cd.get("frameId"))
+        .and_then(|v| v.as_str())
+        .or_else(|| node.get("frameId").and_then(|v| v.as_str()))
+        .map(str::to_string);
+
+    let name = dom_attribute(node, "title")
+        .or_else(|| dom_attribute(node, "name"))
+        .map(str::to_string);
+
+    Ok(IframeMetadata { frame_id, name })
+}
+
+fn dom_attribute<'a>(node: &'a Value, attribute_name: &str) -> Option<&'a str> {
+    node.get("attributes")
+        .and_then(Value::as_array)
+        .and_then(|attrs| {
+            attrs.as_chunks::<2>().0.iter().find_map(|pair| {
+                pair[0]
+                    .as_str()
+                    .filter(|name| name.eq_ignore_ascii_case(attribute_name))
+                    .and_then(|_| pair[1].as_str())
+                    .map(str::trim)
+                    .filter(|val| !val.is_empty())
+            })
+        })
+}
+
+/// Runs inside a scope root and reports the elements that behave as controls without an interactive role.
+/// `tag` names an attribute that receives each match's index for a caller that only gets values back;
+/// `withElement` adds the matched `element`, for a caller that receives node handles instead.
+pub(crate) const CURSOR_DETECTION_JS: &str = r#"
+(root, tag, withElement) => {
+    var results = [];
+    if (!root) return results;
+
+    var interactiveRoles = {
+        'button':1, 'link':1, 'textbox':1, 'checkbox':1, 'radio':1, 'combobox':1, 'listbox':1,
+        'menuitem':1, 'menuitemcheckbox':1, 'menuitemradio':1, 'option':1, 'searchbox':1,
+        'slider':1, 'spinbutton':1, 'switch':1, 'tab':1, 'treeitem':1
+    };
+    var interactiveTags = {
+        'a':1, 'button':1, 'input':1, 'select':1, 'textarea':1, 'details':1, 'summary':1
+    };
+
+    var allElements = root.querySelectorAll('*');
+    for (var i = 0; i < allElements.length; i++) {
+        var el = allElements[i];
+
+        if (el.closest && el.closest('[hidden], [aria-hidden="true"]')) continue;
+
+        var tagName = el.tagName.toLowerCase();
+        if (interactiveTags[tagName]) continue;
+
+        var role = el.getAttribute('role');
+        if (role && interactiveRoles[role.toLowerCase()]) continue;
+
+        var computedStyle = getComputedStyle(el);
+        var hasCursorPointer = computedStyle.cursor === 'pointer';
+        var hasOnClick = el.hasAttribute('onclick') || el.onclick !== null;
+        var tabIndex = el.getAttribute('tabindex');
+        var hasTabIndex = tabIndex !== null && tabIndex !== '-1';
+        var ce = el.getAttribute('contenteditable');
+        var isEditable = ce === '' || ce === 'true';
+
+        if (!hasCursorPointer && !hasOnClick && !hasTabIndex && !isEditable) continue;
+
+        // Skip elements that only inherit cursor:pointer from an ancestor
+        if (hasCursorPointer && !hasOnClick && !hasTabIndex && !isEditable) {
+            var parent = el.parentElement;
+            if (parent && getComputedStyle(parent).cursor === 'pointer') continue;
+        }
+
+        var text = (el.textContent || '').trim().slice(0, 100);
+
+        var rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+
+        // Detect hidden radio/checkbox inputs inside this element (common pattern:
+        // <label> wrapping a display:none <input type="radio"> styled as a card).
+        // Note: we only check display/visibility/hidden, NOT opacity:0 or sr-only,
+        // because those inputs remain in Chrome's AX tree and already appear as
+        // role="radio" without promotion.
+        var hiddenInputType = null;
+        var hiddenInputChecked = null;
+        var hiddenInput = el.querySelector('input[type="radio"], input[type="checkbox"]');
+        if (hiddenInput) {
+            var hiddenInputStyle = getComputedStyle(hiddenInput);
+            var isInputHidden = hiddenInputStyle.display === 'none' || hiddenInputStyle.visibility === 'hidden' || hiddenInput.hidden;
+            if (isInputHidden) {
+                hiddenInputType = hiddenInput.type;
+                hiddenInputChecked = hiddenInput.indeterminate ? 'mixed' : String(hiddenInput.checked);
+            }
+        }
+
+        if (tag) el.setAttribute(tag, String(results.length));
+        var item = {
+            text: text,
+            tagName: tagName,
+            hasOnClick: hasOnClick,
+            hasCursorPointer: hasCursorPointer,
+            hasTabIndex: hasTabIndex,
+            isEditable: isEditable,
+            hiddenInputType: hiddenInputType,
+            hiddenInputChecked: hiddenInputChecked
+        };
+        if (withElement) item.element = el;
+        results.push(item);
+    }
+    return results;
+}
+"#;
+
+/// JS array of the elements matching `selector`, without matches nested in an earlier match.
+pub(super) fn outermost_matches_expression(selector: &str) -> String {
+    format!(
+        "(function(){{ var last = null; \
+         return Array.from(document.querySelectorAll({})).filter(function(el){{ \
+         if (last && last.contains(el)) return false; last = el; return true; }}); }})()",
+        serde_json::to_string(selector).unwrap_or_default()
+    )
+}
+
+const SELECTOR_SCOPE_GROUP: &str = "ab-snapshot-scope";
+
+/// backendNodeIds of the DOM subtrees under every element matching `selector`,
+/// each mapped to the page-order index of its match. A match nested inside an
+/// earlier match is skipped: its subtree is covered.
+async fn resolve_selector_backend_ids(
+    client: &CdpClient,
+    session_id: &str,
+    selector: &str,
+) -> Result<HashMap<i64, usize>, String> {
+    let js = outermost_matches_expression(selector);
+    let evaluated: Value = client
+        .send_command(
+            "Runtime.evaluate",
+            Some(serde_json::json!({
+                "expression": js,
+                "returnByValue": false,
+                "awaitPromise": false,
+                "objectGroup": SELECTOR_SCOPE_GROUP,
+            })),
+            Some(session_id),
+        )
+        .await?;
+
+    // A throwing evaluation (e.g. an invalid CSS selector like a snapshot ref
+    // "@e1") fails clearly instead of reaching DOM.describeNode with the
+    // exception object.
+    if let Some(exception) = evaluated.get("exceptionDetails") {
+        let detail = exception["exception"]["description"]
+            .as_str()
+            .or_else(|| exception["text"].as_str())
+            .unwrap_or("");
+        return Err(format!("Invalid selector '{}': {}", selector, detail));
+    }
+    let array_id = evaluated["result"]["objectId"]
+        .as_str()
+        .ok_or_else(|| format!("Selector '{}' did not match any element", selector))?;
+
+    let matches = array_element_object_ids(client, session_id, array_id).await?;
+    if matches.is_empty() {
+        return Err(format!("Selector '{}' did not match any element", selector));
+    }
+
+    // Request the full DOM subtree (depth: -1), including shadow roots
+    // (pierce), so we can collect all backendNodeIds that live under each match.
+    let describes = futures_util::future::join_all(matches.iter().map(|object_id| {
+        client.send_command(
+            "DOM.describeNode",
+            Some(serde_json::json!({ "objectId": object_id, "depth": -1, "pierce": true })),
+            Some(session_id),
+        )
+    }))
+    .await;
+
+    let mut ids: HashMap<i64, usize> = HashMap::new();
+    for (match_index, describe) in describes.into_iter().enumerate() {
+        if let Some(root_node) = describe?.get("node") {
+            let mut subtree = std::collections::HashSet::new();
+            collect_backend_node_ids(root_node, &mut subtree);
+            for id in subtree {
+                ids.entry(id).or_insert(match_index);
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Err(format!(
+            "Could not resolve backendNodeId for selector '{}'",
+            selector
+        ));
+    }
+    Ok(ids)
+}
+
+/// Object ids of the elements held by a remote JS array, in index order.
+async fn array_element_object_ids(
+    client: &CdpClient,
+    session_id: &str,
+    array_id: &str,
+) -> Result<Vec<String>, String> {
+    let props: Value = client
+        .send_command(
+            "Runtime.getProperties",
+            Some(serde_json::json!({ "objectId": array_id, "ownProperties": true })),
+            Some(session_id),
+        )
+        .await?;
+    let mut indexed: Vec<(usize, String)> = props["result"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let index = entry["name"].as_str()?.parse::<usize>().ok()?;
+                    let object_id = entry["value"]["objectId"].as_str()?;
+                    Some((index, object_id.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed.into_iter().map(|(_, id)| id).collect())
+}
+
+const CURSOR_SCAN_GROUP: &str = "ab-cursor-scan";
+
+async fn find_cursor_interactive_elements(
+    client: &CdpClient,
+    session_id: &str,
+) -> Result<HashMap<i64, CursorElementInfo>, String> {
+    let scanned = scan_cursor_interactive_elements(client, session_id).await;
+    let _ = client
+        .send_command(
+            "Runtime.releaseObjectGroup",
+            Some(serde_json::json!({ "objectGroup": CURSOR_SCAN_GROUP })),
+            Some(session_id),
+        )
+        .await;
+    let (elements, backend_ids) = scanned?;
+
+    let mut map: HashMap<i64, CursorElementInfo> = HashMap::new();
+    for (i, elem) in elements.iter().enumerate() {
+        if let Some(backend_node_id) = backend_ids.get(i).copied().flatten() {
+            map.insert(backend_node_id, cursor_info_from_value(elem));
+        }
+    }
+    Ok(map)
+}
+
+/// Parses one result item from `CURSOR_DETECTION_JS` into the info the snapshot pipeline renders.
+pub(crate) fn cursor_info_from_value(element: &Value) -> CursorElementInfo {
+    // Role differentiation: v0.19.0 uses 'clickable' for cursor:pointer or onclick,
+    // 'focusable' for tabindex-only elements.
+    let has_cursor_pointer = element
+        .get("hasCursorPointer")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let has_on_click = element
+        .get("hasOnClick")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let has_tab_index = element
+        .get("hasTabIndex")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let is_editable = element
+        .get("isEditable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let kind = if has_cursor_pointer || has_on_click {
+        "clickable"
+    } else if is_editable {
+        "editable"
+    } else {
+        "focusable"
+    };
+
+    let mut hints: Vec<String> = Vec::new();
+    if has_cursor_pointer {
+        hints.push("cursor:pointer".to_string());
+    }
+    if has_on_click {
+        hints.push("onclick".to_string());
+    }
+    if has_tab_index {
+        hints.push("tabindex".to_string());
+    }
+    if is_editable {
+        hints.push("contenteditable".to_string());
+    }
+
+    CursorElementInfo {
+        kind: kind.to_string(),
+        hints,
+        text: element
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        hidden_input_kind: element
+            .get("hiddenInputType")
+            .and_then(|v| v.as_str())
+            .and_then(HiddenInputKind::parse),
+        hidden_input_checked: element
+            .get("hiddenInputChecked")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        native: element
+            .get("isNative")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    }
+}
+
+/// Scan results: one info object per candidate element and its backendNodeId.
+type CursorScan = (Vec<Value>, Vec<Option<i64>>);
+
+async fn scan_cursor_interactive_elements(
+    client: &CdpClient,
+    session_id: &str,
+) -> Result<CursorScan, String> {
+    // Walks the document and every open shadow root. An element is a candidate
+    // when it has cursor:pointer, onclick, tabindex or contenteditable and no
+    // explicit interactive role. Native controls whose implicit role is always
+    // interactive are skipped here; the remaining native candidates are flagged
+    // so the caller can drop the ones the AX pass already covers.
+    let js = r#"
+(function() {
+    var infos = [];
+    var els = [];
+    var result = { infos: infos, els: els };
+    if (!document.body) return result;
+
+    var interactiveRoles = {
+        'button':1, 'link':1, 'textbox':1, 'checkbox':1, 'radio':1, 'combobox':1, 'listbox':1,
+        'menuitem':1, 'menuitemcheckbox':1, 'menuitemradio':1, 'option':1, 'searchbox':1,
+        'slider':1, 'spinbutton':1, 'switch':1, 'tab':1, 'treeitem':1
+    };
+    var interactiveTags = {
+        'a':1, 'button':1, 'input':1, 'select':1, 'textarea':1, 'details':1, 'summary':1
+    };
+
+    function hasInteractiveImplicitRole(el, tagName) {
+        if (tagName === 'a') return el.hasAttribute('href');
+        if (tagName === 'input') return el.type !== 'hidden';
+        return tagName === 'button' || tagName === 'select' || tagName === 'textarea';
+    }
+
+    var interactiveDescendant =
+        'a[href], button, input:not([type="hidden"]), select, textarea, summary, ' +
+        '[role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="tab"], ' +
+        '[role="menuitem"], [role="switch"], [role="textbox"], [role="combobox"]';
+
+    function isVisible(el) {
+        if (el.closest('[hidden], [aria-hidden="true"]')) return false;
+        var style = getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        var rect;
+        if (style.display === 'contents') {
+            // Generates no box of its own; its rendered children decide.
+            var range = document.createRange();
+            range.selectNodeContents(el);
+            rect = range.getBoundingClientRect();
+        } else {
+            rect = el.getBoundingClientRect();
+        }
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    function hasVisibleControl(el) {
+        var found = el.querySelectorAll(interactiveDescendant);
+        for (var i = 0; i < found.length; i++) {
+            if (isVisible(found[i])) return true;
+        }
+        return false;
+    }
+
+    function scan(root) {
+        var all = root.querySelectorAll('*');
+        for (var i = 0; i < all.length; i++) {
+            var el = all[i];
+            if (el.shadowRoot) scan(el.shadowRoot);
+
+            if (el.closest && el.closest('[hidden], [aria-hidden="true"]')) continue;
+
+            var tagName = el.tagName.toLowerCase();
+            var role = el.getAttribute('role');
+            var explicitRole = role ? role.trim().toLowerCase() : '';
+            if (explicitRole && interactiveRoles[explicitRole]) continue;
+
+            // <details> is a container; its <summary> carries the control.
+            if (tagName === 'details') continue;
+
+            var isNative = !!interactiveTags[tagName];
+            if (isNative && !explicitRole && hasInteractiveImplicitRole(el, tagName)) continue;
+
+            // A link without href that wraps a control is covered by that control.
+            if (tagName === 'a' && !explicitRole && hasVisibleControl(el)) continue;
+
+            var computedStyle = getComputedStyle(el);
+            var hasCursorPointer = computedStyle.cursor === 'pointer';
+            var hasOnClick = el.hasAttribute('onclick') || el.onclick !== null;
+            var tabIndex = el.getAttribute('tabindex');
+            var hasTabIndex = tabIndex !== null && tabIndex !== '-1';
+            var ce = el.getAttribute('contenteditable');
+            var isEditable = ce === '' || ce === 'true';
+
+            if (!hasCursorPointer && !hasOnClick && !hasTabIndex && !isEditable) continue;
+
+            // Skip elements that only inherit cursor:pointer from an ancestor
+            if (hasCursorPointer && !hasOnClick && !hasTabIndex && !isEditable) {
+                var parent = el.assignedSlot || el.parentElement ||
+                    (el.parentNode && el.parentNode.host);
+                if (parent && getComputedStyle(parent).cursor === 'pointer') continue;
+            }
+
+            var text = (el.textContent || '').trim().slice(0, 100);
+
+            var rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+
+            // Detect hidden radio/checkbox inputs inside this element (common pattern:
+            // <label> wrapping a display:none <input type="radio"> styled as a card).
+            // Note: we only check display/visibility/hidden, NOT opacity:0 or sr-only,
+            // because those inputs remain in Chrome's AX tree and already appear as
+            // role="radio" without promotion.
+            var hiddenInputType = null;
+            var hiddenInputChecked = null;
+            var hiddenInput = el.querySelector('input[type="radio"], input[type="checkbox"]');
+            if (hiddenInput) {
+                var hiddenInputStyle = getComputedStyle(hiddenInput);
+                var isInputHidden = hiddenInputStyle.display === 'none' || hiddenInputStyle.visibility === 'hidden' || hiddenInput.hidden;
+                if (isInputHidden) {
+                    hiddenInputType = hiddenInput.type;
+                    hiddenInputChecked = hiddenInput.indeterminate ? 'mixed' : String(hiddenInput.checked);
+                }
+            }
+
+            els.push(el);
+            infos.push({
+                text: text,
+                tagName: tagName,
+                isNative: isNative,
+                hasOnClick: hasOnClick,
+                hasCursorPointer: hasCursorPointer,
+                hasTabIndex: hasTabIndex,
+                isEditable: isEditable,
+                hiddenInputType: hiddenInputType,
+                hiddenInputChecked: hiddenInputChecked
+            });
+        }
+    }
+
+    scan(document.body);
+    return result;
+})()
+"#;
+
+    // Matched elements stay in the page as a JS array. Their backendNodeIds are
+    // resolved from remote object ids, so the DOM is left untouched.
+    let evaluated: Value = client
+        .send_command(
+            "Runtime.evaluate",
+            Some(serde_json::json!({
+                "expression": js,
+                "returnByValue": false,
+                "awaitPromise": false,
+                "objectGroup": CURSOR_SCAN_GROUP,
+            })),
+            Some(session_id),
+        )
+        .await?;
+    let Some(result_id) = evaluated["result"]["objectId"].as_str() else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+
+    let infos: Value = client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(serde_json::json!({
+                "objectId": result_id,
+                "functionDeclaration": "function() { return this.infos; }",
+                "returnByValue": true,
+            })),
+            Some(session_id),
+        )
+        .await?;
+    let elements: Vec<Value> = infos["result"]["value"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if elements.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let els: Value = client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(serde_json::json!({
+                "objectId": result_id,
+                "functionDeclaration": "function() { return this.els; }",
+                "returnByValue": false,
+            })),
+            Some(session_id),
+        )
+        .await?;
+    let els_id = els["result"]["objectId"]
+        .as_str()
+        .ok_or("cursor scan returned no element list")?;
+    let object_ids = array_element_object_ids(client, session_id, els_id).await?;
+
+    let describes = futures_util::future::join_all(object_ids.iter().map(|object_id| {
+        client.send_command(
+            "DOM.describeNode",
+            Some(serde_json::json!({ "objectId": object_id })),
+            Some(session_id),
+        )
+    }))
+    .await;
+    let backend_ids: Vec<Option<i64>> = describes
+        .into_iter()
+        .map(|desc| desc.ok().and_then(|d| d["node"]["backendNodeId"].as_i64()))
+        .collect();
+
+    Ok((elements, backend_ids))
+}
+
+/// Native elements whose AX role is already interactive are ref'd by the AX
+/// pass, so the cursor scan result for them is discarded. A native tag with any
+/// other role (for example `<button role="menu">`) keeps its cursor entry.
+fn drop_natively_interactive(
+    cursor_elements: &mut HashMap<i64, CursorElementInfo>,
+    tree_nodes: &[TreeNode],
+) {
+    let interactive: std::collections::HashSet<i64> = tree_nodes
+        .iter()
+        .filter(|n| INTERACTIVE_ROLES.contains(&n.role.as_str()) && n.role != "Iframe")
+        .filter_map(|n| n.backend_node_id)
+        .collect();
+    cursor_elements.retain(|bid, info| !(info.native && interactive.contains(bid)));
+}
+
+/// Promote LabelText/generic nodes that wrap a hidden radio/checkbox input.
+/// When a `<label>` contains a `display:none` `<input type="radio">`, the browser leaves the input
+/// out of its accessibility tree and exposes only the label with role="LabelText" and an empty name.
+/// We detect these via cursor-interactive scanning and promote the label to the correct input role
+/// so consumers see role="radio" in data.refs.
+fn promote_hidden_inputs(
+    tree_nodes: &mut [TreeNode],
+    cursor_elements: &HashMap<i64, CursorElementInfo>,
+) {
+    for node in tree_nodes.iter_mut() {
+        if !matches!(node.role.as_str(), "LabelText" | "generic") {
+            continue;
+        }
+        let cursor_info = match node
+            .backend_node_id
+            .and_then(|bid| cursor_elements.get(&bid))
+        {
+            Some(info) => info,
+            None => continue,
+        };
+        if let Some(input_kind) = cursor_info.hidden_input_kind {
+            node.role = input_kind.as_role().to_string();
+            if node.name.is_empty() && !cursor_info.text.is_empty() {
+                node.name = cursor_info.text.clone();
+            }
+            if let Some(ref checked) = cursor_info.hidden_input_checked {
+                node.checked = Some(checked.clone());
+            }
+        }
+    }
+}
+
+fn build_tree(nodes: &[AXNode]) -> (Vec<TreeNode>, Vec<usize>) {
+    let mut tree_nodes: Vec<TreeNode> = Vec::with_capacity(nodes.len());
+    let mut id_to_idx: HashMap<String, usize> = HashMap::new();
+
+    for (i, node) in nodes.iter().enumerate() {
+        let role = normalize_ax_role(extract_ax_string(&node.role));
+        let name = extract_ax_string(&node.name);
+        let value_text = extract_ax_string_opt(&node.value);
+
+        let (level, checked, expanded, selected, disabled, required) =
+            extract_properties(&node.properties);
+
+        if (node.ignored.unwrap_or(false) && role != "RootWebArea") || role == "InlineTextBox" {
+            tree_nodes.push(TreeNode::empty());
+            id_to_idx.insert(node.node_id.clone(), i);
+            continue;
+        }
+
+        tree_nodes.push(TreeNode {
+            role,
+            name,
+            display_name: None,
+            level,
+            checked,
+            expanded,
+            selected,
+            disabled,
+            required,
+            value_text,
+            backend_node_id: node.backend_d_o_m_node_id,
+            children: Vec::new(),
+            parent_idx: None,
+            has_ref: false,
+            ref_id: None,
+            depth: 0,
+            cursor_info: None,
+            url: None,
+            hint: None,
+        });
+        id_to_idx.insert(node.node_id.clone(), i);
+    }
+
+    // Build parent-child relationships
+    for (i, node) in nodes.iter().enumerate() {
+        if let Some(ref child_ids) = node.child_ids {
+            for cid in child_ids {
+                if let Some(&child_idx) = id_to_idx.get(cid) {
+                    tree_nodes[i].children.push(child_idx);
+                    tree_nodes[child_idx].parent_idx = Some(i);
+                }
+            }
+        }
+    }
+
+    // Process StaticText aggregation
+    for i in 0..tree_nodes.len() {
+        if tree_nodes[i].role.is_empty() || tree_nodes[i].children.is_empty() {
+            continue;
+        }
+
+        let children_indices: Vec<usize> = tree_nodes[i].children.clone();
+
+        // Continuous StaticText nodes at the same level are an artifact of HTML structure rather than semantic meaning.
+        // They typically represent a single continuous piece of text on the page that was split due to inline elements, formatting tags, or other structural reasons.
+        // Thus, continuous StaticText children are aggregated into the first one.
+        let mut start = 0;
+        while start < children_indices.len() {
+            // Skip non-StaticText nodes
+            if tree_nodes[children_indices[start]].role != "StaticText" {
+                start += 1;
+                continue;
+            }
+
+            // Find the end of the current StaticText sequence
+            let mut end = start + 1;
+            while end < children_indices.len()
+                && tree_nodes[children_indices[end]].role == "StaticText"
+            {
+                end += 1;
+            }
+
+            // If we have a sequence of at least two StaticText
+            if end > start + 1 {
+                // Collect and aggregate all names from the sequence
+                let aggregated_name: String = (start..end)
+                    .map(|idx| tree_nodes[children_indices[idx]].name.clone())
+                    .collect();
+                // Always aggregate into the first node of the sequence
+                tree_nodes[children_indices[start]].name = aggregated_name;
+                // Clear the rest of the nodes in the sequence (from start+1 to end-1)
+                for j in (start + 1)..end {
+                    tree_nodes[children_indices[j]].clear();
+                }
+            }
+            start = end;
+        }
+
+        // Deduplicate redundant StaticText
+        if children_indices.len() == 1
+            && tree_nodes[children_indices[0]].role == "StaticText"
+            && tree_nodes[i].name == tree_nodes[children_indices[0]].name
+        {
+            tree_nodes[children_indices[0]].clear();
+        }
+    }
+
+    // Set depths
+    let mut root_indices = Vec::new();
+    let children_exist: Vec<bool> = nodes.iter().map(|_| false).collect();
+    let mut is_child = children_exist;
+    for node in &tree_nodes {
+        for &child in &node.children {
+            is_child[child] = true;
+        }
+    }
+    for (i, &is_c) in is_child.iter().enumerate() {
+        if !is_c {
+            root_indices.push(i);
+        }
+    }
+
+    fn set_depth(nodes: &mut [TreeNode], idx: usize, depth: usize) {
+        nodes[idx].depth = depth;
+        let children: Vec<usize> = nodes[idx].children.clone();
+        for child_idx in children {
+            set_depth(nodes, child_idx, depth + 1);
+        }
+    }
+
+    for &root in &root_indices {
+        set_depth(&mut tree_nodes, root, 0);
+    }
+
+    (tree_nodes, root_indices)
+}
+
+fn render_tree(
+    nodes: &[TreeNode],
+    idx: usize,
+    indent: usize,
+    output: &mut String,
+    options: &SnapshotOptions,
+) {
+    let node = &nodes[idx];
+
+    // Reduce unnecessary indentation and rendering
+    if node.role.is_empty()
+        || (node.role == "generic" && !node.has_ref && node.children.len() <= 1)
+        || (node.role == "StaticText" && normalize_snapshot_name(&node.name).trim().is_empty())
+    {
+        // Ignored node -- still render children
+        for &child in &node.children {
+            render_tree(nodes, child, indent, output, options);
+        }
+        return;
+    }
+
+    if let Some(max_depth) = options.depth {
+        if indent > max_depth {
+            return;
+        }
+    }
+
+    let role = &node.role;
+
+    // Skip root WebArea wrapper
+    if role == "RootWebArea" || role == "WebArea" {
+        for &child in &node.children {
+            render_tree(nodes, child, indent, output, options);
+        }
+        return;
+    }
+
+    if options.interactive && !node.has_ref {
+        // In interactive mode, skip non-interactive but render children
+        for &child in &node.children {
+            render_tree(nodes, child, indent, output, options);
+        }
+        return;
+    }
+
+    let prefix = "  ".repeat(indent);
+    let mut line = format!("{}- {}", prefix, role);
+
+    let unescaped_display_name = if !node.name.is_empty() {
+        node.name.as_str()
+    } else if node.role == "Iframe" {
+        node.display_name.as_deref().unwrap_or("")
+    } else if options.interactive {
+        node.label()
+    } else {
+        ""
+    };
+    if !unescaped_display_name.is_empty() {
+        if let Ok(display_name) =
+            serde_json::to_string(&normalize_snapshot_name(unescaped_display_name))
+        {
+            line.push_str(&format!(" {}", display_name));
+        }
+    }
+
+    // Properties
+    let mut attrs = Vec::new();
+
+    if let Some(level) = node.level {
+        attrs.push(format!("level={}", level));
+    }
+    if let Some(ref checked) = node.checked {
+        attrs.push(format!("checked={}", checked));
+    }
+    if let Some(expanded) = node.expanded {
+        attrs.push(format!("expanded={}", expanded));
+    }
+    if let Some(selected) = node.selected {
+        if selected {
+            attrs.push("selected".to_string());
+        }
+    }
+    if let Some(disabled) = node.disabled {
+        if disabled {
+            attrs.push("disabled".to_string());
+        }
+    }
+    if let Some(required) = node.required {
+        if required {
+            attrs.push("required".to_string());
+        }
+    }
+
+    if let Some(ref ref_id) = node.ref_id {
+        attrs.push(format!("ref={}", ref_id));
+    }
+
+    if let Some(ref url) = node.url {
+        attrs.push(format!("url={}", url));
+    }
+
+    if !attrs.is_empty() {
+        line.push_str(&format!(" [{}]", attrs.join(", ")));
+    }
+
+    if let Some(ref hint) = node.hint {
+        line.push_str(&format!(" hint={:?}", hint));
+    }
+
+    // Add cursor-interactive kind & hints
+    if let Some(ref cursor_info) = node.cursor_info {
+        line.push_str(&format!(
+            " {} [{}]",
+            cursor_info.kind,
+            cursor_info.hints.join(", ")
+        ));
+    }
+
+    // Value
+    if let Some(ref val) = node.value_text {
+        if !val.is_empty() && val != &node.name {
+            line.push_str(&format!(": {}", val));
+        }
+    }
+
+    output.push_str(&line);
+    output.push('\n');
+
+    for &child in &node.children {
+        render_tree(nodes, child, indent + 1, output, options);
+    }
+}
+
+/// Retain matching content and its direct ancestor chain, including visible text in noninteractive snapshots.
+fn compact_tree(tree: &str, interactive: bool) -> String {
+    let lines: Vec<&str> = tree.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    let mut keep = vec![false; lines.len()];
+    // Index and indent of the open ancestors, outermost first. Keeping them in
+    // a stack lets a kept line mark its ancestors once instead of walking back
+    // over every earlier line, which made compact mode quadratic on big tables.
+    let mut ancestors: Vec<(usize, usize)> = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        let indent = count_indent(line);
+        while let Some(&(_, ancestor_indent)) = ancestors.last() {
+            if ancestor_indent < indent {
+                break;
+            }
+            ancestors.pop();
+        }
+
+        if line.contains("ref=") || line.contains(": ") || (!interactive && line.contains(" \"")) {
+            keep[i] = true;
+            for &(ancestor, _) in &ancestors {
+                keep[ancestor] = true;
+            }
+        }
+
+        ancestors.push((i, indent));
+    }
+
+    let result: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep[*i])
+        .map(|(_, line)| *line)
+        .collect();
+
+    let output = result.join("\n");
+    if output.trim().is_empty() && interactive {
+        return "(no interactive elements)".to_string();
+    }
+    output
+}
+
+fn count_indent(line: &str) -> usize {
+    let trimmed = line.trim_start();
+    (line.len() - trimmed.len()) / 2
+}
+
+fn extract_ax_string(value: &Option<AXValue>) -> String {
+    match value {
+        Some(v) => match &v.value {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::Bool(b)) => b.to_string(),
+            _ => String::new(),
+        },
+        None => String::new(),
+    }
+}
+
+fn extract_ax_string_opt(value: &Option<AXValue>) -> Option<String> {
+    match value {
+        Some(v) => match &v.value {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        },
+        None => None,
+    }
+}
+
+type NodeProperties = (
+    Option<i64>,    // level
+    Option<String>, // checked
+    Option<bool>,   // expanded
+    Option<bool>,   // selected
+    Option<bool>,   // disabled
+    Option<bool>,   // required
+);
+
+fn extract_properties(props: &Option<Vec<AXProperty>>) -> NodeProperties {
+    let mut level = None;
+    let mut checked = None;
+    let mut expanded = None;
+    let mut selected = None;
+    let mut disabled = None;
+    let mut required = None;
+
+    if let Some(properties) = props {
+        for prop in properties {
+            match prop.name.as_str() {
+                "level" => {
+                    level = prop.value.value.as_ref().and_then(|v| v.as_i64());
+                }
+                "checked" => {
+                    checked = prop.value.value.as_ref().map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        Value::Bool(b) => b.to_string(),
+                        _ => "false".to_string(),
+                    });
+                }
+                "expanded" => {
+                    expanded = prop.value.value.as_ref().and_then(|v| v.as_bool());
+                }
+                "selected" => {
+                    selected = prop.value.value.as_ref().and_then(|v| v.as_bool());
+                }
+                "disabled" => {
+                    disabled = prop.value.value.as_ref().and_then(|v| v.as_bool());
+                }
+                "required" => {
+                    required = prop.value.value.as_ref().and_then(|v| v.as_bool());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    (level, checked, expanded, selected, disabled, required)
+}
+
+/// Build the set of texts to de-duplicate cursor-interactive elements against.
+///
+/// All ref-bearing ARIA tree nodes have their names stored in `ref_map` during
+/// tree construction, so the ref-map entries are the single source of truth.
+/// This avoids fragile parsing of the rendered tree text.
+fn build_dedup_set(ref_map: &RefMap) -> std::collections::HashSet<String> {
+    ref_map
+        .entries_sorted()
+        .into_iter()
+        .filter(|(_, entry)| !entry.name.is_empty())
+        .map(|(_, entry)| entry.name.to_lowercase())
+        .collect()
+}
+
+/// Recursively collect all `backendNodeId` values from a CDP DOM node tree
+/// (as returned by `DOM.describeNode` with `depth: -1`).
+fn collect_backend_node_ids(node: &Value, ids: &mut std::collections::HashSet<i64>) {
+    if let Some(id) = node.get("backendNodeId").and_then(|v| v.as_i64()) {
+        ids.insert(id);
+    }
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        for child in children {
+            collect_backend_node_ids(child, ids);
+        }
+    }
+    // Shadow DOM and content documents
+    if let Some(shadow) = node.get("shadowRoots").and_then(|v| v.as_array()) {
+        for child in shadow {
+            collect_backend_node_ids(child, ids);
+        }
+    }
+    if let Some(doc) = node.get("contentDocument") {
+        collect_backend_node_ids(doc, ids);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loader_replaced_detects_a_document_swapped_during_capture() {
+        let tree = serde_json::json!({
+            "frame": { "id": "main", "loaderId": "L2" },
+            "childFrames": [{ "frame": { "id": "child", "loaderId": "C1" } }]
+        });
+        assert!(loader_replaced("L1", &tree, None));
+        assert!(!loader_replaced("L2", &tree, None));
+        assert!(!loader_replaced("C1", &tree, Some("child")));
+        assert!(loader_replaced("C0", &tree, Some("child")));
+        // A frame that is gone no longer shows the recorded document.
+        assert!(loader_replaced("C1", &tree, Some("removed")));
+    }
+
+    #[test]
+    fn test_normalize_snapshot_name_preserves_word_boundaries() {
+        assert_eq!(
+            normalize_snapshot_name("Capital\u{00A0}Federal"),
+            "Capital Federal"
+        );
+        assert_eq!(normalize_snapshot_name("zero\u{200B}width"), "zerowidth");
+    }
+
+    fn tree_node(role: &str, backend_node_id: i64) -> TreeNode {
+        let mut node = TreeNode::empty();
+        node.role = role.to_string();
+        node.backend_node_id = Some(backend_node_id);
+        node
+    }
+
+    fn cursor_entry(native: bool) -> CursorElementInfo {
+        CursorElementInfo {
+            kind: "clickable".to_string(),
+            hints: Vec::new(),
+            text: String::new(),
+            hidden_input_kind: None,
+            hidden_input_checked: None,
+            native,
+        }
+    }
+
+    #[test]
+    fn test_cursor_scan_keeps_native_tags_without_interactive_role() {
+        let nodes = [
+            tree_node("button", 1),
+            tree_node("menu", 2),
+            tree_node("DisclosureTriangle", 3),
+            tree_node("generic", 4),
+        ];
+        let mut entries: HashMap<i64, CursorElementInfo> =
+            (1..=5).map(|bid| (bid, cursor_entry(true))).collect();
+        entries.insert(6, cursor_entry(false));
+        entries.insert(1, cursor_entry(false));
+        drop_natively_interactive(&mut entries, &nodes);
+
+        // Native entry on an interactive AX role is dropped; everything else stays.
+        assert!(!entries.contains_key(&3));
+        assert!(entries.contains_key(&2));
+        assert!(entries.contains_key(&4));
+        assert!(entries.contains_key(&5));
+        assert!(entries.contains_key(&6));
+        // A non-native entry is kept even when its AX role is interactive.
+        assert!(entries.contains_key(&1));
+    }
+
+    #[test]
+    fn test_interactive_roles() {
+        assert!(INTERACTIVE_ROLES.contains(&"button"));
+        assert!(INTERACTIVE_ROLES.contains(&"textbox"));
+        assert!(INTERACTIVE_ROLES.contains(&"DisclosureTriangle"));
+        assert!(INTERACTIVE_ROLES.contains(&"ColorWell"));
+        assert!(!INTERACTIVE_ROLES.contains(&"heading"));
+    }
+
+    #[test]
+    fn test_content_roles() {
+        assert!(CONTENT_ROLES.contains(&"heading"));
+        assert!(!CONTENT_ROLES.contains(&"button"));
+    }
+
+    #[test]
+    fn test_compact_tree_basic() {
+        let tree = "- navigation\n  - link \"Home\" [ref=e1]\n  - link \"About\" [ref=e2]\n- main\n  - heading \"Title\"\n  - paragraph\n    - text: Hello\n- status\n  - StaticText \"Saved successfully\"\n- empty\n  - paragraph\n";
+        let result = compact_tree(tree, false);
+        assert!(result.contains("[ref=e1]"));
+        assert!(result.contains("[ref=e2]"));
+        assert!(result.contains("Hello"));
+        assert!(result.contains("- status\n  - StaticText \"Saved successfully\""));
+        assert!(!result.contains("- empty"));
+
+        let interactive = compact_tree(tree, true);
+        assert!(!interactive.contains("Saved successfully"));
+        assert!(interactive.contains("[ref=e1]"));
+        assert!(interactive.contains("Hello"));
+    }
+
+    #[test]
+    fn test_compact_tree_keeps_only_direct_ancestors() {
+        for (interactive, content) in [
+            (false, "StaticText \"Saved successfully\""),
+            (true, "button \"Save\" [ref=e1]"),
+        ] {
+            let tree = format!(
+                "- main\n  - empty-section\n    - empty-paragraph\n  - section\n    - empty-paragraph\n    - paragraph\n      - {content}\n  - trailing-section\n- empty-root\n"
+            );
+            assert_eq!(
+                compact_tree(&tree, interactive),
+                format!("- main\n  - section\n    - paragraph\n      - {content}")
+            );
+        }
+    }
+
+    #[test]
+    fn test_compact_tree_radio_checkbox() {
+        // Radio/checkbox lines have attributes before ref (e.g. [checked=false, ref=e1])
+        // so "ref=" appears without a leading "[" — compact_tree must still keep them.
+        let tree = "- form\n  - radio \"Single unit\" [checked=false, ref=e1]\n  - checkbox \"I agree\" [checked=false, ref=e2]\n  - button \"Submit\" [ref=e3]\n";
+        let result = compact_tree(tree, true);
+        assert!(
+            result.contains("radio \"Single unit\""),
+            "radio should be kept"
+        );
+        assert!(
+            result.contains("checkbox \"I agree\""),
+            "checkbox should be kept"
+        );
+        assert!(
+            result.contains("button \"Submit\""),
+            "button should be kept"
+        );
+    }
+
+    #[test]
+    fn test_compact_tree_empty_interactive() {
+        let result = compact_tree("- generic\n", true);
+        assert_eq!(result, "(no interactive elements)");
+    }
+
+    /// The original ancestor walk, kept as the reference the stack in
+    /// `compact_tree` has to reproduce exactly.
+    fn compact_tree_reference(tree: &str, interactive: bool) -> String {
+        let lines: Vec<&str> = tree.lines().collect();
+        let mut keep = vec![false; lines.len()];
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("ref=")
+                || line.contains(": ")
+                || (!interactive && line.contains(" \""))
+            {
+                keep[i] = true;
+                let mut my_indent = count_indent(line);
+                for j in (0..i).rev() {
+                    let ancestor_indent = count_indent(lines[j]);
+                    if ancestor_indent < my_indent {
+                        keep[j] = true;
+                        my_indent = ancestor_indent;
+                        if ancestor_indent == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let output = lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep[*i])
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if output.trim().is_empty() && interactive {
+            return "(no interactive elements)".to_string();
+        }
+        output
+    }
+
+    #[test]
+    fn test_compact_tree_matches_reference_on_generated_trees() {
+        // Successive rounds shuffle indents, empty branches and kept lines so
+        // the stack path is compared against the ancestor walk on many shapes.
+        let lines = [
+            "- root",
+            "  - empty-section",
+            "    - empty-paragraph",
+            "  - section",
+            "    - paragraph",
+            "      - StaticText \"Saved\"",
+            "      - text: Hello",
+            "        - deeper",
+            "  - button \"Save\" [ref=e1]",
+            "    - StaticText \"Save\"",
+            "- other-root",
+            "",
+            "      - jump",
+            "        - jump-deeper",
+            "          - checkbox [checked=false, ref=e2]",
+            "- trailing",
+        ];
+        for len in 0..=lines.len() {
+            for rotation in 0..4 {
+                let mut rotated: Vec<&str> = lines[..len].to_vec();
+                rotated.rotate_left(rotation % len.max(1));
+                let tree = format!("{}\n", rotated.join("\n"));
+                for interactive in [false, true] {
+                    assert_eq!(
+                        compact_tree(&tree, interactive),
+                        compact_tree_reference(&tree, interactive),
+                        "tree: {tree:?}, interactive: {interactive}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_count_indent() {
+        assert_eq!(count_indent("- heading"), 0);
+        assert_eq!(count_indent("  - link"), 1);
+        assert_eq!(count_indent("    - text"), 2);
+    }
+
+    #[test]
+    fn test_role_name_tracker() {
+        let mut tracker = RoleNameTracker::new();
+        assert_eq!(tracker.track("button", "Submit", 0), 0);
+        assert_eq!(tracker.track("button", "Submit", 1), 1);
+        assert_eq!(tracker.track("button", "Cancel", 2), 0);
+
+        let dups = tracker.get_duplicates();
+        assert!(dups.contains_key("button:Submit"));
+        assert!(!dups.contains_key("button:Cancel"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cursor-interactive text dedup (Issue #841 regression guard)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_set_from_ref_map_names() {
+        let mut ref_map = RefMap::new();
+        ref_map.add("e1".to_string(), Some(1), "link", "Example Link", None);
+        ref_map.add("e2".to_string(), Some(2), "button", "Submit", None);
+
+        let set = build_dedup_set(&ref_map);
+        assert!(set.contains("example link"));
+        assert!(set.contains("submit"));
+        assert!(!set.contains("other text"));
+    }
+
+    #[test]
+    fn test_dedup_set_case_insensitive() {
+        let mut ref_map = RefMap::new();
+        ref_map.add("e1".to_string(), Some(1), "button", "Submit Form", None);
+
+        let set = build_dedup_set(&ref_map);
+        assert!(set.contains("submit form"));
+        assert!(!set.contains("Submit Form"));
+    }
+
+    #[test]
+    fn test_dedup_set_empty_inputs() {
+        let ref_map = RefMap::new();
+        let set = build_dedup_set(&ref_map);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn test_dedup_set_skips_empty_names() {
+        let mut ref_map = RefMap::new();
+        ref_map.add("e1".to_string(), Some(1), "generic", "", None);
+        ref_map.add("e2".to_string(), Some(2), "button", "OK", None);
+
+        let set = build_dedup_set(&ref_map);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("ok"));
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_ax_session tests (Issue #925 regression guard)
+    // Cross-origin iframes must use a dedicated session without frameId.
+    // Same-origin iframes must use the parent session with frameId.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cross_origin_iframe_uses_dedicated_session() {
+        let parent_session = "parent-session";
+        let iframe_frame_id = "cross-origin-iframe-frame";
+        let iframe_session = "cross-origin-iframe-session";
+
+        let mut iframe_sessions = HashMap::new();
+        iframe_sessions.insert(iframe_frame_id.to_string(), iframe_session.to_string());
+
+        let (params, session) =
+            resolve_ax_session(Some(iframe_frame_id), parent_session, &iframe_sessions);
+
+        assert_eq!(session, iframe_session);
+        assert_eq!(params, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_same_origin_iframe_uses_parent_session_with_frame_id() {
+        let parent_session = "parent-session";
+        let iframe_frame_id = "same-origin-iframe-frame";
+        let iframe_sessions = HashMap::new();
+
+        let (params, session) =
+            resolve_ax_session(Some(iframe_frame_id), parent_session, &iframe_sessions);
+
+        assert_eq!(session, parent_session);
+        assert_eq!(params, serde_json::json!({ "frameId": iframe_frame_id }));
+    }
+
+    #[test]
+    fn test_main_frame_uses_parent_session() {
+        let parent_session = "parent-session";
+        let iframe_sessions = HashMap::new();
+
+        let (params, session) = resolve_ax_session(None, parent_session, &iframe_sessions);
+
+        assert_eq!(session, parent_session);
+        assert_eq!(params, serde_json::json!({}));
+    }
+
+    // -----------------------------------------------------------------------
+    // promote_hidden_inputs
+    // -----------------------------------------------------------------------
+
+    fn make_node(role: &str, name: &str, backend_node_id: Option<i64>) -> TreeNode {
+        let mut node = TreeNode::empty();
+        node.role = role.to_string();
+        node.name = name.to_string();
+        node.backend_node_id = backend_node_id;
+        node
+    }
+
+    fn make_cursor_info(
+        hidden_kind: Option<HiddenInputKind>,
+        hidden_checked: Option<&str>,
+        text: &str,
+    ) -> CursorElementInfo {
+        CursorElementInfo {
+            kind: "clickable".to_string(),
+            hints: vec!["cursor:pointer".to_string()],
+            text: text.to_string(),
+            hidden_input_kind: hidden_kind,
+            hidden_input_checked: hidden_checked.map(|s| s.to_string()),
+            native: false,
+        }
+    }
+
+    #[test]
+    fn test_promote_label_with_hidden_radio() {
+        let mut nodes = vec![
+            make_node("LabelText", "", Some(1)),
+            make_node("LabelText", "", Some(2)),
+            make_node("button", "Submit", Some(3)),
+        ];
+        let mut cursor_elements = HashMap::new();
+        cursor_elements.insert(
+            1,
+            make_cursor_info(Some(HiddenInputKind::Radio), Some("false"), "Option A"),
+        );
+        cursor_elements.insert(
+            2,
+            make_cursor_info(Some(HiddenInputKind::Radio), Some("true"), "Option B"),
+        );
+
+        promote_hidden_inputs(&mut nodes, &cursor_elements);
+
+        assert_eq!(nodes[0].role, "radio");
+        assert_eq!(nodes[0].name, "Option A");
+        assert_eq!(nodes[0].checked, Some("false".to_string()));
+        assert_eq!(nodes[1].role, "radio");
+        assert_eq!(nodes[1].name, "Option B");
+        assert_eq!(nodes[1].checked, Some("true".to_string()));
+        // button should be untouched
+        assert_eq!(nodes[2].role, "button");
+    }
+
+    #[test]
+    fn test_promote_preserves_existing_name() {
+        // If AX tree already has a name, don't overwrite with textContent
+        let mut nodes = vec![make_node("LabelText", "AX Name", Some(1))];
+        let mut cursor_elements = HashMap::new();
+        cursor_elements.insert(
+            1,
+            make_cursor_info(Some(HiddenInputKind::Radio), Some("false"), "Text Content"),
+        );
+
+        promote_hidden_inputs(&mut nodes, &cursor_elements);
+
+        assert_eq!(nodes[0].role, "radio");
+        assert_eq!(nodes[0].name, "AX Name"); // preserved, not overwritten
+    }
+
+    #[test]
+    fn test_promote_skips_without_hidden_input() {
+        // Cursor-interactive label WITHOUT a hidden input should not be promoted
+        let mut nodes = vec![make_node("LabelText", "", Some(1))];
+        let mut cursor_elements = HashMap::new();
+        cursor_elements.insert(1, make_cursor_info(None, None, "Click me"));
+
+        promote_hidden_inputs(&mut nodes, &cursor_elements);
+
+        assert_eq!(nodes[0].role, "LabelText"); // unchanged
+    }
+
+    #[test]
+    fn test_dom_attribute_reads_name_and_title_ignoring_blank_and_src() {
+        let node = serde_json::json!({
+            "attributes": ["NAME", " results ", "title", "   ", "src", "https://example.com/?token=abc"]
+        });
+
+        assert_eq!(dom_attribute(&node, "name"), Some("results"));
+        assert_eq!(dom_attribute(&node, "title"), None);
+        assert_eq!(dom_attribute(&node, "id"), None);
+    }
+
+    #[test]
+    fn test_iframe_display_name_is_presentation_only() {
+        let mut fallback = make_node("Iframe", "", Some(1));
+        fallback.display_name = Some("results".to_string());
+        fallback.has_ref = true;
+        fallback.ref_id = Some("e1".to_string());
+
+        let mut accessible = make_node("Iframe", "Accessible frame", Some(2));
+        accessible.display_name = Some("dom-name".to_string());
+        accessible.has_ref = true;
+        accessible.ref_id = Some("e2".to_string());
+
+        let mut unnamed = make_node("Iframe", "", Some(3));
+        unnamed.has_ref = true;
+        unnamed.ref_id = Some("e3".to_string());
+
+        let nodes = vec![fallback, accessible, unnamed];
+        for interactive in [false, true] {
+            let options = SnapshotOptions {
+                interactive,
+                ..SnapshotOptions::default()
+            };
+            let mut output = String::new();
+            for idx in 0..nodes.len() {
+                render_tree(&nodes, idx, 0, &mut output, &options);
+            }
+
+            assert!(output.contains("- Iframe \"results\" [ref=e1]"), "{output}");
+            assert!(
+                output.contains("- Iframe \"Accessible frame\" [ref=e2]"),
+                "{output}"
+            );
+            assert!(output.contains("- Iframe [ref=e3]"), "{output}");
+            assert!(!output.contains("dom-name"), "{output}");
+        }
+    }
+}

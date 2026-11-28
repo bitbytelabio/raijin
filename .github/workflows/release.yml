@@ -120,6 +120,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      PLAYWRIGHT_SKIP_DRIVER_DOWNLOAD: "1"
     steps:
       - uses: actions/checkout@v4
         with:

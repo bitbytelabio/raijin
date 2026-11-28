@@ -63,7 +63,7 @@ async fn lean_surface_lists_guide_and_run() {
         .into_iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert_eq!(tools, ["guide", "run"]);
+    assert_eq!(tools, ["guide", "run", "browser"]);
     let info = client.peer_info().expect("server info");
     assert!(
         info.instructions
@@ -231,7 +231,7 @@ async fn full_surface_lists_every_catalog_tool() {
         .await
         .expect("initialize");
     let tools = client.list_all_tools().await.expect("tools/list");
-    // guide + run, the 43 catalog tools, and the CLI's own (history_*, data_*, burp_*).
+    // guide + run + browser, the 43 catalog tools, and the CLI's own (history_*, data_*, burp_*).
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     let local = names
         .iter()
@@ -241,7 +241,7 @@ async fn full_surface_lists_every_catalog_tool() {
         local > 0 && names.contains(&"history_list") && names.contains(&"data_search"),
         "a full-surface client must see the CLI's own tools: {names:?}"
     );
-    assert_eq!(tools.len(), 2 + 43 + local, "{names:?}");
+    assert_eq!(tools.len(), 3 + 43 + local, "{names:?}");
     let direct = call(&client, "proxy_history", json!({})).await;
     assert!(
         text(&direct).contains("no Burp running for this target"),
@@ -916,7 +916,7 @@ async fn modern_client_uses_server_discover() {
         .into_iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert_eq!(tools, ["guide", "run"]);
+    assert_eq!(tools, ["guide", "run", "browser"]);
     assert_eq!(
         rows(&call(&client, "run", json!({"do": "history_list", "limit": 1})).await),
         1

@@ -1,0 +1,1701 @@
+use serde_json::{json, Value};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::stream::SplitStream;
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{broadcast, mpsc, watch, Mutex, Notify, RwLock};
+use tokio::time::Instant;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
+
+use crate::native::bidi::stream::{self as firefox_stream, FirefoxLive};
+use crate::native::cdp::client::CdpClient;
+use crate::native::interaction::named_key_info;
+
+use super::http::handle_http_request;
+use super::origin::is_allowed_ws_upgrade;
+use super::FirefoxTabs;
+use super::{timestamp_ms, IdleActivity, StreamFrame};
+
+/// Highest per-client frame rate a client may request via the `config` message.
+const MAX_CONFIGURABLE_FPS: u32 = 120;
+
+/// Maximum number of editing commands accepted in one `input_keyboard` message.
+const MAX_KEY_COMMANDS: usize = 4;
+
+/// Maximum byte length accepted for `input_insert_text`.
+const MAX_INSERT_TEXT_BYTES: usize = 1_048_576;
+
+/// Timeout for reading the remote page selection on `input_read_clipboard`.
+const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Editing and caret-navigation commands accepted in `input_keyboard.commands`.
+const ALLOWED_KEY_COMMANDS: &[&str] = &[
+    "selectAll",
+    "copy",
+    "cut",
+    "paste",
+    "undo",
+    "redo",
+    "moveToBeginningOfLine",
+    "moveToBeginningOfLineAndModifySelection",
+    "moveToEndOfLine",
+    "moveToEndOfLineAndModifySelection",
+    "moveToBeginningOfDocument",
+    "moveToBeginningOfDocumentAndModifySelection",
+    "moveToEndOfDocument",
+    "moveToEndOfDocumentAndModifySelection",
+    "moveWordBackward",
+    "moveWordBackwardAndModifySelection",
+    "moveWordForward",
+    "moveWordForwardAndModifySelection",
+    "deleteToBeginningOfLine",
+    "deleteToEndOfLine",
+    "deleteWordBackward",
+    "deleteWordForward",
+    "deleteBackward",
+    "deleteForward",
+];
+
+const ALLOWED_KEY_EVENT_TYPES: &[&str] = &["keyDown", "keyUp", "rawKeyDown", "char"];
+
+/// Reads the current text selection in the active document (including Shadow DOM
+/// and same-origin iframes) without granting browser clipboard permissions.
+/// Password inputs always return an empty string.
+const READ_SELECTION_SCRIPT: &str = r#"(() => {
+    let doc = document;
+    let el = doc.activeElement;
+    while (el) {
+        if (el.shadowRoot && el.shadowRoot.activeElement) {
+            el = el.shadowRoot.activeElement;
+            continue;
+        }
+        if (el.tagName === 'IFRAME') {
+            try {
+                if (el.contentDocument && el.contentDocument.activeElement) {
+                    doc = el.contentDocument;
+                    el = doc.activeElement;
+                    continue;
+                }
+            } catch {}
+        }
+        break;
+    }
+    if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
+        if (el.tagName === 'INPUT' && (el.type || '').toLowerCase() === 'password') {
+            return '';
+        }
+        const start = el.selectionStart;
+        const end = el.selectionEnd;
+        if (typeof start === 'number' && typeof end === 'number' && end > start) {
+            return el.value.slice(start, end);
+        }
+    }
+    const win = doc.defaultView || window;
+    return (win.getSelection && win.getSelection().toString()) || '';
+})()"#;
+
+/// Reads the current text selection and reports whether the selection is
+/// editable so the server can follow up with a native CDP delete operation
+/// that preserves the browser undo stack and works in contenteditable without
+/// prior user activation.
+const READ_SELECTION_FOR_CUT_SCRIPT: &str = r#"(() => {
+    let doc = document;
+    let el = doc.activeElement;
+    while (el) {
+        if (el.shadowRoot && el.shadowRoot.activeElement) {
+            el = el.shadowRoot.activeElement;
+            continue;
+        }
+        if (el.tagName === 'IFRAME') {
+            try {
+                if (el.contentDocument && el.contentDocument.activeElement) {
+                    doc = el.contentDocument;
+                    el = doc.activeElement;
+                    continue;
+                }
+            } catch {}
+        }
+        break;
+    }
+    if (el && (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
+        if (el.tagName === 'INPUT' && (el.type || '').toLowerCase() === 'password') {
+            return { text: '', editable: false };
+        }
+        const start = el.selectionStart;
+        const end = el.selectionEnd;
+        if (typeof start === 'number' && typeof end === 'number' && end > start) {
+            return {
+                text: el.value.slice(start, end),
+                editable: !el.readOnly && !el.disabled,
+            };
+        }
+        return { text: '', editable: false };
+    }
+    const win = doc.defaultView || window;
+    const sel = win.getSelection && win.getSelection();
+    const text = (sel && sel.toString()) || '';
+    if (!text) {
+        return { text: '', editable: false };
+    }
+    const anchorEl =
+        sel && sel.anchorNode
+            ? (sel.anchorNode.nodeType === 1 ? sel.anchorNode : sel.anchorNode.parentElement)
+            : null;
+    const editable = Boolean((el && el.isContentEditable) || (anchorEl && anchorEl.isContentEditable));
+    return { text, editable };
+})()"#;
+
+/// Per-connection delivery settings, set by the client's `config` message.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct ClientConfig {
+    /// Frames per second ceiling. 0 means uncapped.
+    max_fps: u32,
+    /// Keep at most one frame in flight, awaiting the client's ack.
+    ///
+    /// Invariant: latest-frame-wins holds only above the socket. Frames already
+    /// handed to the transport are delivered in order, so only an ack proves the
+    /// client kept up. Mirrors CDP's own `Page.screencastFrameAck`.
+    ack_pacing: bool,
+}
+
+/// Parse a client `config` message into the settings it changes, leaving the
+/// rest of `current` untouched. Returns `None` when the message carries no
+/// recognized setting, so an unknown or malformed config never disturbs a
+/// working connection.
+fn apply_config(current: ClientConfig, parsed: &Value) -> Option<ClientConfig> {
+    let mut next = current;
+    let mut changed = false;
+
+    // Clamped on u64 before narrowing so oversized values cap at the maximum
+    // instead of wrapping.
+    if let Some(fps) = parsed.get("maxFps").and_then(|v| v.as_u64()) {
+        next.max_fps = fps.min(MAX_CONFIGURABLE_FPS as u64) as u32;
+        changed = true;
+    }
+    if let Some(pacing) = parsed.get("pacing").and_then(|v| v.as_str()) {
+        match pacing {
+            "ack" => {
+                next.ack_pacing = true;
+                changed = true;
+            }
+            "push" => {
+                next.ack_pacing = false;
+                changed = true;
+            }
+            _ => {}
+        }
+    }
+
+    if changed {
+        Some(next)
+    } else {
+        None
+    }
+}
+
+/// Settings declared on the WebSocket URL, applied before the first frame.
+///
+/// Invariant: only the URL can govern the opening frame, since the cached frame
+/// is written before a `config` message can arrive. An unparsable value leaves
+/// the default; a later `config` still wins.
+fn config_from_upgrade(request: &str) -> ClientConfig {
+    let mut cfg = ClientConfig::default();
+    let Some(query) = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|target| target.split_once('?'))
+        .map(|(_, query)| query)
+    else {
+        return cfg;
+    };
+
+    for (key, value) in query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (k.trim(), v.trim()))
+    {
+        match key {
+            "maxFps" => {
+                if let Ok(fps) = value.parse::<u64>() {
+                    cfg.max_fps = fps.min(MAX_CONFIGURABLE_FPS as u64) as u32;
+                }
+            }
+            "pacing" => match value {
+                "ack" => cfg.ack_pacing = true,
+                "push" => cfg.ack_pacing = false,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    cfg
+}
+
+/// Read the acknowledged frame id from a client `ack` message. Acks are
+/// cumulative: a client that skipped intermediate ids still unblocks the
+/// writer by acknowledging the newest one it rendered.
+fn parse_ack_seq(parsed: &Value) -> Option<u64> {
+    parsed.get("seq").and_then(|v| v.as_u64())
+}
+
+/// Earliest instant the next frame may be sent. `None` (nothing delivered yet)
+/// and `fps == 0` (uncapped) both mean "now": a cap bounds the interval between
+/// deliveries and never delays the first one.
+fn deadline_from(last_sent: Option<Instant>, fps: u32) -> Instant {
+    match last_sent {
+        Some(sent) if fps > 0 => sent + Duration::from_micros(1_000_000 / fps as u64),
+        Some(sent) => sent,
+        None => Instant::now(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn accept_loop(
+    listener: TcpListener,
+    frame_tx: broadcast::Sender<String>,
+    frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
+    client_count: Arc<Mutex<usize>>,
+    client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
+    firefox_live: Arc<RwLock<Option<FirefoxLive>>>,
+    client_notify: Arc<Notify>,
+    idle_activity: Arc<IdleActivity>,
+    screencasting: Arc<Mutex<bool>>,
+    cdp_session_id: Arc<RwLock<Option<String>>>,
+    viewport_width: Arc<Mutex<u32>>,
+    viewport_height: Arc<Mutex<u32>>,
+    last_tabs: Arc<RwLock<Vec<Value>>>,
+    firefox_tabs: Arc<FirefoxTabs>,
+    last_engine: Arc<RwLock<String>>,
+    recording: Arc<Mutex<bool>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    session_name: String,
+) {
+    let session_name: Arc<str> = Arc::from(session_name);
+    // Invariant: every per-connection task is owned here, never detached, so
+    // awaiting this loop proves none survives. Teardown aborts rather than
+    // drains, because a writer parked in `ws_tx.send()` against a client that
+    // stopped reading would hold a graceful drain open forever.
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            // Reap finished connections so the set does not grow without bound.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            accept_result = listener.accept() => {
+                let Ok((stream, addr)) = accept_result else {
+                    break;
+                };
+                let frame_tx = frame_tx.clone();
+                let frame_watch = frame_watch.clone();
+                let client_count = client_count.clone();
+                let client_slot = client_slot.clone();
+                let firefox_live = firefox_live.clone();
+                let client_notify = client_notify.clone();
+                let idle_activity = idle_activity.clone();
+                let screencasting = screencasting.clone();
+                let cdp_session_id = cdp_session_id.clone();
+                let vw = viewport_width.clone();
+                let vh = viewport_height.clone();
+                let lt = last_tabs.clone();
+                let ft = firefox_tabs.clone();
+                let le = last_engine.clone();
+                let rec = recording.clone();
+                let shutdown_rx = shutdown_rx.clone();
+                let sn = session_name.clone();
+
+                connections.spawn(async move {
+                    handle_connection(
+                        stream,
+                        addr,
+                        frame_tx,
+                        frame_watch,
+                        client_count,
+                        client_slot,
+                        firefox_live,
+                        client_notify,
+                        idle_activity,
+                        screencasting,
+                        cdp_session_id,
+                        vw,
+                        vh,
+                        lt,
+                        ft,
+                        le,
+                        rec,
+                        shutdown_rx,
+                        sn,
+                    )
+                    .await;
+                });
+            }
+        }
+    }
+    connections.shutdown().await;
+}
+
+fn is_websocket_upgrade(request: &str) -> bool {
+    request.lines().any(|line| {
+        if let Some((name, value)) = line.split_once(':') {
+            name.trim().eq_ignore_ascii_case("upgrade")
+                && value.trim().eq_ignore_ascii_case("websocket")
+        } else {
+            false
+        }
+    })
+}
+
+/// Peek at the TCP stream to dispatch between WebSocket upgrade and plain HTTP.
+#[allow(clippy::too_many_arguments)]
+async fn handle_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    frame_tx: broadcast::Sender<String>,
+    frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
+    client_count: Arc<Mutex<usize>>,
+    client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
+    firefox_live: Arc<RwLock<Option<FirefoxLive>>>,
+    client_notify: Arc<Notify>,
+    idle_activity: Arc<IdleActivity>,
+    screencasting: Arc<Mutex<bool>>,
+    cdp_session_id: Arc<RwLock<Option<String>>>,
+    viewport_width: Arc<Mutex<u32>>,
+    viewport_height: Arc<Mutex<u32>>,
+    last_tabs: Arc<RwLock<Vec<Value>>>,
+    firefox_tabs: Arc<FirefoxTabs>,
+    last_engine: Arc<RwLock<String>>,
+    recording: Arc<Mutex<bool>>,
+    shutdown_rx: watch::Receiver<bool>,
+    session_name: Arc<str>,
+) {
+    let mut buf = [0u8; 4096];
+    let n = match stream.peek(&mut buf).await {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+    let request = String::from_utf8_lossy(&buf[..n]);
+
+    if is_websocket_upgrade(&request) {
+        let frame_rx = frame_tx.subscribe();
+        let initial_config = config_from_upgrade(&request);
+        handle_ws_client(
+            stream,
+            addr,
+            initial_config,
+            frame_rx,
+            frame_watch,
+            client_count,
+            client_slot,
+            firefox_live,
+            client_notify,
+            idle_activity,
+            screencasting,
+            cdp_session_id,
+            viewport_width,
+            viewport_height,
+            last_tabs,
+            last_engine,
+            recording,
+            shutdown_rx,
+        )
+        .await;
+    } else {
+        handle_http_request(
+            stream,
+            &buf[..n],
+            &last_tabs,
+            &last_engine,
+            &client_count,
+            &firefox_tabs,
+            &session_name,
+        )
+        .await;
+    }
+}
+
+/// One WebSocket client, split in two halves: a reader task dispatching input
+/// to CDP, and a writer loop delivering frames latest-first under an optional
+/// per-client cap. Invariant: the halves never wait on each other, which is
+/// what keeps input responsive while a frame is mid-write.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+async fn handle_ws_client(
+    stream: TcpStream,
+    _addr: SocketAddr,
+    initial_config: ClientConfig,
+    mut broadcast_rx: broadcast::Receiver<String>,
+    mut frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
+    client_count: Arc<Mutex<usize>>,
+    client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
+    firefox_live: Arc<RwLock<Option<FirefoxLive>>>,
+    client_notify: Arc<Notify>,
+    idle_activity: Arc<IdleActivity>,
+    screencasting: Arc<Mutex<bool>>,
+    cdp_session_id: Arc<RwLock<Option<String>>>,
+    viewport_width: Arc<Mutex<u32>>,
+    viewport_height: Arc<Mutex<u32>>,
+    last_tabs: Arc<RwLock<Vec<Value>>>,
+    last_engine: Arc<RwLock<String>>,
+    recording: Arc<Mutex<bool>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let callback =
+        |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+         resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            let origin = req
+                .headers()
+                .get("origin")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let host = req
+                .headers()
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            if !is_allowed_ws_upgrade(origin.as_deref(), host.as_deref()) {
+                let mut reject =
+                    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some(
+                        "Origin not allowed".to_string(),
+                    ));
+                *reject.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
+                return Err(reject);
+            }
+            Ok(resp)
+        };
+
+    let ws_stream = match tokio_tungstenite::accept_hdr_async(stream, callback).await {
+        Ok(ws) => ws,
+        Err(_) => return,
+    };
+
+    {
+        let mut count = client_count.lock().await;
+        *count += 1;
+    }
+
+    let (mut ws_tx, ws_rx) = ws_stream.split();
+
+    // Watch channels, not atomics, so a mid-stream change wakes the writer's
+    // select! below instead of leaving it asleep on a stale deadline.
+    let (config_tx, mut config_rx) = watch::channel::<ClientConfig>(initial_config);
+    let (ack_tx, mut ack_rx) = watch::channel::<u64>(0);
+    let (reply_tx, mut reply_rx) = mpsc::channel::<String>(16);
+    // Spawned before the status, tabs and seed writes below: those are
+    // unbounded sends, and a full receive queue would otherwise hold input
+    // behind the whole handshake.
+    let mut reader_task = AbortOnDrop(tokio::spawn(reader_loop(
+        ws_rx,
+        client_slot.clone(),
+        firefox_live.clone(),
+        cdp_session_id.clone(),
+        config_tx,
+        ack_tx,
+        reply_tx,
+        idle_activity.clone(),
+    )));
+
+    {
+        let guard = client_slot.read().await;
+        let connected = guard.is_some() || firefox_live.read().await.is_some();
+        let sc = *screencasting.lock().await;
+        let vw = *viewport_width.lock().await;
+        let vh = *viewport_height.lock().await;
+        let eng = last_engine.read().await.clone();
+        let rec = *recording.lock().await;
+        let status = json!({
+            "type": "status",
+            "connected": connected,
+            "screencasting": sc,
+            "viewportWidth": vw,
+            "viewportHeight": vh,
+            "engine": eng,
+            "recording": rec,
+        });
+        let _ = ws_tx.send(Message::Text(status.to_string())).await;
+
+        let tabs = last_tabs.read().await;
+        if !tabs.is_empty() {
+            let tabs_msg = json!({
+                "type": "tabs",
+                "tabs": *tabs,
+                "timestamp": timestamp_ms(),
+            });
+            let _ = ws_tx.send(Message::Text(tabs_msg.to_string())).await;
+        }
+    }
+
+    // Invariant: only a successful send writes `last_sent`. `None` means
+    // nothing was delivered, so the cap owes this connection no wait.
+    let mut last_sent: Option<Instant> = None;
+    // Id written but not yet acknowledged, ack pacing only. While set the
+    // writer holds, and newer frames replace each other in the watch channel.
+    let mut awaiting_ack: Option<u64> = None;
+
+    // Seed with the newest frame, marked seen so the writer does not re-send
+    // it. Charged against the cap, so a URL-declared cap governs the gap after.
+    let initial_frame = frame_watch.borrow_and_update().clone();
+    if let Some(frame) = initial_frame {
+        if ws_tx.send(Message::Text(frame.json.clone())).await.is_ok() {
+            last_sent = Some(Instant::now());
+            if initial_config.ack_pacing {
+                awaiting_ack = frame.seq;
+            }
+        }
+    }
+
+    client_notify.notify_one();
+
+    let mut next_allowed = deadline_from(last_sent, initial_config.max_fps);
+    let mut pending_frame = false;
+
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    let _ = ws_tx.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+            _ = &mut reader_task.0 => {
+                break;
+            }
+            Some(reply) = reply_rx.recv() => {
+                if ws_tx.send(Message::Text(reply)).await.is_err() {
+                    break;
+                }
+            }
+            msg = broadcast_rx.recv() => {
+                match msg {
+                    Ok(data) => {
+                        if ws_tx.send(Message::Text(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            changed = frame_watch.changed(), if !pending_frame => {
+                if changed.is_err() {
+                    break;
+                }
+                pending_frame = true;
+            }
+            changed = config_rx.changed() => {
+                // The sender lives as long as the reader, so an error here
+                // means the reader ended. Break and let cleanup run.
+                if changed.is_err() {
+                    break;
+                }
+                let cfg = *config_rx.borrow_and_update();
+                // Loosening the cap pulls the deadline into the past, so a
+                // pending frame goes out at once.
+                next_allowed = deadline_from(last_sent, cfg.max_fps);
+                // Leaving ack pacing releases a frame that is still waiting on
+                // an acknowledgement the client will now never send.
+                if !cfg.ack_pacing {
+                    awaiting_ack = None;
+                }
+            }
+            changed = ack_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let acked = *ack_rx.borrow_and_update();
+                // Cumulative: an ack for a newer frame covers the one in
+                // flight, so a client that renders out of order or skips ids
+                // still unblocks the writer.
+                if awaiting_ack.is_some_and(|seq| acked >= seq) {
+                    awaiting_ack = None;
+                }
+            }
+            _ = tokio::time::sleep_until(next_allowed), if pending_frame && awaiting_ack.is_none() => {
+                // Invariant: read at send time, not arrival time. That is what
+                // makes this latest-frame-wins; anything that arrived while the
+                // writer waited is skipped rather than queued.
+                let frame = frame_watch.borrow_and_update().clone();
+                pending_frame = false;
+                let cfg = *config_rx.borrow();
+                if let Some(frame) = frame {
+                    if cfg.ack_pacing {
+                        awaiting_ack = frame.seq;
+                        // Settle against the banked watermark: a client that
+                        // acked ahead of the stream would never move it again.
+                        if awaiting_ack.is_some_and(|seq| *ack_rx.borrow() >= seq) {
+                            awaiting_ack = None;
+                        }
+                    }
+                    if ws_tx.send(Message::Text(frame.json.clone())).await.is_err() {
+                        break;
+                    }
+                    last_sent = Some(Instant::now());
+                }
+                next_allowed = deadline_from(last_sent, cfg.max_fps);
+            }
+        }
+    }
+
+    drop(reader_task);
+
+    {
+        let mut count = client_count.lock().await;
+        *count = count.saturating_sub(1);
+    }
+
+    client_notify.notify_one();
+}
+
+/// Reads client messages and dispatches them without waiting on frame
+/// delivery. Input reaches CDP sequentially: mouse move, press and release
+/// must not be reordered.
+#[allow(clippy::too_many_arguments)]
+async fn reader_loop(
+    mut ws_rx: SplitStream<WebSocketStream<TcpStream>>,
+    client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
+    firefox_live: Arc<RwLock<Option<FirefoxLive>>>,
+    cdp_session_id: Arc<RwLock<Option<String>>>,
+    config: watch::Sender<ClientConfig>,
+    ack: watch::Sender<u64>,
+    reply_tx: mpsc::Sender<String>,
+    idle_activity: Arc<IdleActivity>,
+) {
+    while let Some(msg) = ws_rx.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                let parsed: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if msg_type == "config" {
+                    // Bound to a local first: a `watch` Ref taken in the
+                    // `if let` scrutinee lives for the whole body, and
+                    // `send_replace` would deadlock against it.
+                    let current = *config.borrow();
+                    if let Some(next) = apply_config(current, &parsed) {
+                        // send_replace, not send, so an unchanged value still
+                        // wakes the writer to re-derive its deadline.
+                        let _ = config.send_replace(next);
+                    }
+                    continue;
+                }
+                if msg_type == "ack" {
+                    if let Some(seq) = parse_ack_seq(&parsed) {
+                        // send_if_modified keeps the acknowledged id monotonic:
+                        // a late ack for an older frame must not walk it back
+                        // and re-block the writer.
+                        ack.send_if_modified(|current| {
+                            if seq > *current {
+                                *current = seq;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    }
+                    continue;
+                }
+                if is_user_input_message_type(msg_type) {
+                    let live = firefox_live.read().await.clone();
+                    if let Some(live) = live {
+                        idle_activity.mark();
+                        firefox_stream::dispatch_input(&live, msg_type, &parsed).await;
+                        continue;
+                    }
+                }
+                let guard = client_slot.read().await;
+                if let Some(ref client) = *guard {
+                    // Marked inside the guard: only input that reaches CDP
+                    // counts as activity.
+                    if is_user_input_message_type(msg_type) {
+                        idle_activity.mark();
+                    }
+                    let sid = cdp_session_id.read().await;
+                    dispatch_input(msg_type, &parsed, client, sid.as_deref(), &reply_tx).await;
+                }
+            }
+            Ok(Message::Close(_)) | Err(_) => break,
+            _ => {}
+        }
+    }
+}
+
+/// Aborts its task on drop.
+///
+/// Invariant: the reader is spawned inside the connection task, so aborting the
+/// connection does not reach it. Without this guard the reader outlives
+/// teardown and keeps dispatching input.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn validated_key_commands(parsed: &Value, event_type: &str) -> Option<Vec<&'static str>> {
+    if !matches!(event_type, "keyDown" | "rawKeyDown") {
+        return None;
+    }
+    let arr = parsed.get("commands")?.as_array()?;
+    let mut out = Vec::new();
+    for item in arr.iter().take(MAX_KEY_COMMANDS) {
+        let cmd = item.as_str()?;
+        if let Some(&allowed) = ALLOWED_KEY_COMMANDS.iter().find(|&&c| c == cmd) {
+            out.push(allowed);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn resolve_stream_vk_code(parsed: &Value) -> i64 {
+    if let Some(vk) = parsed
+        .get("windowsVirtualKeyCode")
+        .and_then(|v| v.as_i64())
+        .filter(|&v| v > 0)
+    {
+        return vk;
+    }
+    if let Some(code) = parsed.get("code").and_then(|v| v.as_str()) {
+        let (_, _, vk) = named_key_info(code);
+        if vk > 0 {
+            return i64::from(vk);
+        }
+    }
+    if let Some(key) = parsed.get("key").and_then(|v| v.as_str()) {
+        let (_, _, vk) = named_key_info(key);
+        if vk > 0 {
+            return i64::from(vk);
+        }
+    }
+    0
+}
+
+fn validated_insert_text(parsed: &Value) -> Option<&str> {
+    let text = parsed.get("text")?.as_str()?;
+    (!text.is_empty() && text.len() <= MAX_INSERT_TEXT_BYTES).then_some(text)
+}
+
+/// `Input.dispatchKeyEvent` params for a client `input_keyboard` message.
+///
+/// Invariant: an omitted optional string is left out, never sent as `null`.
+/// CDP rejects the whole command on a null string and the caller discards the
+/// error, so one null silently drops the keystroke. `""` is not a substitute:
+/// `text: ""` on a printable key inserts no character.
+fn keyboard_params(parsed: &Value) -> Value {
+    let event_type = parsed
+        .get("eventType")
+        .and_then(|v| v.as_str())
+        .filter(|t| ALLOWED_KEY_EVENT_TYPES.contains(t))
+        .unwrap_or("keyDown");
+    let mut params = serde_json::Map::new();
+    params.insert("type".into(), json!(event_type));
+    for field in ["key", "code", "text"] {
+        if let Some(value) = parsed.get(field).and_then(|v| v.as_str()) {
+            params.insert(field.into(), json!(value));
+        }
+    }
+    params.insert(
+        "windowsVirtualKeyCode".into(),
+        json!(resolve_stream_vk_code(parsed)),
+    );
+    let mut modifiers = parsed
+        .get("modifiers")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        & 0x0F;
+    // AltGr reports Ctrl+Alt (bits 1|2 = 3) alongside a printable `text` char,
+    // but Chromium ignores `text` on keyDown when the Ctrl bit is set. Strip
+    // Ctrl|Alt on text-carrying keyDown events so AltGr characters are typed.
+    let has_text = params
+        .get("text")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| !t.is_empty());
+    if event_type == "keyDown" && has_text && (modifiers & 3) == 3 {
+        modifiers &= !3;
+    }
+    params.insert("modifiers".into(), json!(modifiers));
+    if let Some(commands) = validated_key_commands(parsed, event_type) {
+        params.insert("commands".into(), json!(commands));
+    }
+    Value::Object(params)
+}
+
+/// Validate and build `Input.dispatchMouseEvent` params from a client
+/// `input_mouse` message. Returns `None` for unrecognized event types so
+/// malformed input cannot be forwarded to CDP.
+fn mouse_event_params(parsed: &Value) -> Option<Value> {
+    let event_type = parsed
+        .get("eventType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mouseMoved");
+    if !matches!(
+        event_type,
+        "mousePressed" | "mouseReleased" | "mouseMoved" | "mouseWheel"
+    ) {
+        return None;
+    }
+    let finite = |key: &str| {
+        parsed
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0)
+    };
+    let button = parsed
+        .get("button")
+        .and_then(|v| v.as_str())
+        .filter(|b| {
+            matches!(
+                *b,
+                "none" | "left" | "middle" | "right" | "back" | "forward"
+            )
+        })
+        .unwrap_or("none");
+    let buttons = mouse_buttons_param(parsed, event_type, button);
+    let click_count = parsed
+        .get("clickCount")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .clamp(0, 3);
+    let modifiers = parsed
+        .get("modifiers")
+        .and_then(|v| v.as_i64())
+        .filter(|m| *m >= 0)
+        .map(|m| m & 0x0f)
+        .unwrap_or(0);
+    Some(json!({
+        "type": event_type,
+        "x": finite("x"),
+        "y": finite("y"),
+        "button": button,
+        "buttons": buttons,
+        "clickCount": click_count,
+        "deltaX": finite("deltaX"),
+        "deltaY": finite("deltaY"),
+        "modifiers": modifiers,
+    }))
+}
+
+fn mouse_buttons_param(parsed: &Value, event_type: &str, button: &str) -> i64 {
+    if let Some(buttons) = parsed
+        .get("buttons")
+        .and_then(|v| v.as_i64())
+        .filter(|b| *b >= 0)
+    {
+        return buttons & 0x1f;
+    }
+    if !matches!(event_type, "mousePressed" | "mouseReleased") {
+        return 0;
+    }
+    match button {
+        "left" => 1,
+        "right" => 2,
+        "middle" => 4,
+        "back" => 8,
+        "forward" => 16,
+        _ => 0,
+    }
+}
+
+/// Dispatches one client input event to CDP.
+///
+/// Invariant: sends without awaiting Chrome's reply. The reply carries nothing
+/// this path uses, and awaiting it serializes the whole reader behind one round
+/// trip per event, so a mouse sweep delays the click behind it. Ordering still
+/// holds: every send takes the same socket mutex and this task calls them in
+/// order, so press never overtakes move.
+async fn dispatch_input(
+    msg_type: &str,
+    parsed: &Value,
+    client: &Arc<CdpClient>,
+    session_id: Option<&str>,
+    reply_tx: &mpsc::Sender<String>,
+) {
+    match msg_type {
+        "input_mouse" => {
+            if let Some(params) = mouse_event_params(parsed) {
+                let _ = client
+                    .send_command_no_wait("Input.dispatchMouseEvent", Some(params), session_id)
+                    .await;
+            }
+        }
+        "input_keyboard" => {
+            let _ = client
+                .send_command_no_wait(
+                    "Input.dispatchKeyEvent",
+                    Some(keyboard_params(parsed)),
+                    session_id,
+                )
+                .await;
+        }
+        "input_insert_text" => {
+            if let Some(text) = validated_insert_text(parsed) {
+                let _ = client
+                    .send_command_no_wait(
+                        "Input.insertText",
+                        Some(json!({ "text": text })),
+                        session_id,
+                    )
+                    .await;
+            }
+        }
+        "input_read_clipboard" => {
+            let cut = parsed.get("cut").and_then(|v| v.as_bool()).unwrap_or(false);
+            if cut {
+                // Run cut inline and atomically so subsequent focus/selection
+                // input events cannot overtake it; frame delivery runs on its
+                // own task and stays unblocked.
+                let reply = eval_clipboard_selection(client, session_id, true).await;
+                let _ = reply_tx.try_send(reply.to_string());
+            } else {
+                let client = Arc::clone(client);
+                let sid = session_id.map(str::to_string);
+                let reply_tx = reply_tx.clone();
+                tokio::spawn(async move {
+                    let reply = eval_clipboard_selection(&client, sid.as_deref(), false).await;
+                    let _ = reply_tx.try_send(reply.to_string());
+                });
+            }
+        }
+        "input_touch" => {
+            let _ = client
+                .send_command_no_wait(
+                    "Input.dispatchTouchEvent",
+                    Some(json!({
+                        "type": parsed.get("eventType").and_then(|v| v.as_str()).unwrap_or("touchStart"),
+                        "touchPoints": parsed.get("touchPoints").unwrap_or(&json!([])),
+                        "modifiers": parsed.get("modifiers").and_then(|v| v.as_i64()).unwrap_or(0),
+                    })),
+                    session_id,
+                )
+                .await;
+        }
+        "status" => {}
+        _ => {}
+    }
+}
+
+async fn eval_clipboard_selection(
+    client: &CdpClient,
+    session_id: Option<&str>,
+    cut: bool,
+) -> Value {
+    if !cut {
+        let eval = tokio::time::timeout(
+            CLIPBOARD_READ_TIMEOUT,
+            client.send_command(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": READ_SELECTION_SCRIPT,
+                    "returnByValue": true,
+                    "awaitPromise": false,
+                })),
+                session_id,
+            ),
+        )
+        .await;
+
+        return match eval {
+            Ok(Ok(val)) => {
+                let text = val
+                    .pointer("/result/value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                json!({ "type": "clipboard", "text": text })
+            }
+            Ok(Err(err)) => json!({ "type": "clipboard", "error": err }),
+            Err(_) => json!({ "type": "clipboard", "error": "Clipboard read timed out" }),
+        };
+    }
+
+    let eval = tokio::time::timeout(
+        CLIPBOARD_READ_TIMEOUT,
+        client.send_command(
+            "Runtime.evaluate",
+            Some(json!({
+                "expression": READ_SELECTION_FOR_CUT_SCRIPT,
+                "returnByValue": true,
+                "awaitPromise": false,
+            })),
+            session_id,
+        ),
+    )
+    .await;
+
+    let (text, editable) = match eval {
+        Ok(Ok(val)) => {
+            let value = val.pointer("/result/value");
+            let text = value
+                .and_then(|v| v.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let editable = value
+                .and_then(|v| v.get("editable"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (text, editable)
+        }
+        Ok(Err(err)) => return json!({ "type": "clipboard", "error": err }),
+        Err(_) => return json!({ "type": "clipboard", "error": "Clipboard read timed out" }),
+    };
+
+    if editable && !text.is_empty() {
+        let _ = tokio::time::timeout(
+            CLIPBOARD_READ_TIMEOUT,
+            client.send_command(
+                "Input.dispatchKeyEvent",
+                Some(json!({
+                    "type": "rawKeyDown",
+                    "key": "Backspace",
+                    "code": "Backspace",
+                    "windowsVirtualKeyCode": 8,
+                    "modifiers": 0,
+                    "commands": ["deleteBackward"],
+                })),
+                session_id,
+            ),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            CLIPBOARD_READ_TIMEOUT,
+            client.send_command(
+                "Input.dispatchKeyEvent",
+                Some(json!({
+                    "type": "keyUp",
+                    "key": "Backspace",
+                    "code": "Backspace",
+                    "windowsVirtualKeyCode": 8,
+                    "modifiers": 0,
+                })),
+                session_id,
+            ),
+        )
+        .await;
+    }
+
+    json!({ "type": "clipboard", "text": text })
+}
+
+fn is_user_input_message_type(msg_type: &str) -> bool {
+    matches!(
+        msg_type,
+        "input_mouse"
+            | "input_keyboard"
+            | "input_touch"
+            | "input_insert_text"
+            | "input_read_clipboard"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_input_messages_count_as_user_activity() {
+        for msg_type in [
+            "input_mouse",
+            "input_keyboard",
+            "input_touch",
+            "input_insert_text",
+            "input_read_clipboard",
+        ] {
+            assert!(is_user_input_message_type(msg_type));
+        }
+        assert!(!is_user_input_message_type("status"));
+        assert!(!is_user_input_message_type("frame"));
+    }
+
+    fn fps_of(msg: serde_json::Value) -> Option<u32> {
+        apply_config(ClientConfig::default(), &msg).map(|c| c.max_fps)
+    }
+
+    #[test]
+    fn test_parse_config_max_fps_valid() {
+        assert_eq!(fps_of(json!({"type": "config", "maxFps": 10})), Some(10));
+        assert_eq!(fps_of(json!({"type": "config", "maxFps": 0})), Some(0));
+        assert_eq!(fps_of(json!({"type": "config", "maxFps": 120})), Some(120));
+    }
+
+    #[test]
+    fn test_parse_config_max_fps_clamps_without_wrapping() {
+        assert_eq!(
+            fps_of(json!({"type": "config", "maxFps": 500})),
+            Some(MAX_CONFIGURABLE_FPS)
+        );
+        // u32::MAX + 2 would wrap to 1 if narrowed before clamping.
+        assert_eq!(
+            fps_of(json!({"type": "config", "maxFps": 4294967297u64})),
+            Some(MAX_CONFIGURABLE_FPS)
+        );
+    }
+
+    #[test]
+    fn test_parse_config_max_fps_invalid() {
+        assert_eq!(
+            apply_config(ClientConfig::default(), &json!({"type": "config"})),
+            None
+        );
+        assert_eq!(fps_of(json!({"type": "config", "maxFps": -5})), None);
+        assert_eq!(fps_of(json!({"type": "config", "maxFps": "fast"})), None);
+    }
+
+    #[test]
+    fn test_config_pacing_opt_in_and_out() {
+        let acked = apply_config(
+            ClientConfig::default(),
+            &json!({"type": "config", "pacing": "ack"}),
+        )
+        .expect("pacing is a recognized setting");
+        assert!(acked.ack_pacing);
+
+        let back_to_push = apply_config(acked, &json!({"type": "config", "pacing": "push"}))
+            .expect("push is a recognized setting");
+        assert!(!back_to_push.ack_pacing);
+
+        // An unknown pacing value leaves the connection as it was.
+        assert_eq!(
+            apply_config(acked, &json!({"type": "config", "pacing": "turbo"})),
+            None
+        );
+    }
+
+    #[test]
+    fn test_config_settings_are_independent() {
+        // Changing the cap must not drop the client out of ack pacing.
+        let acked = apply_config(
+            ClientConfig::default(),
+            &json!({"type": "config", "pacing": "ack"}),
+        )
+        .unwrap();
+        let recapped = apply_config(acked, &json!({"type": "config", "maxFps": 15})).unwrap();
+        assert_eq!(recapped.max_fps, 15);
+        assert!(recapped.ack_pacing);
+
+        let repaced = apply_config(recapped, &json!({"type": "config", "pacing": "push"})).unwrap();
+        assert_eq!(repaced.max_fps, 15);
+        assert!(!repaced.ack_pacing);
+    }
+
+    fn upgrade(target: &str) -> String {
+        format!(
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\r\n",
+            target
+        )
+    }
+
+    #[test]
+    fn test_config_from_upgrade_reads_url_settings() {
+        let cfg = config_from_upgrade(&upgrade("/?pacing=ack&maxFps=10"));
+        assert!(cfg.ack_pacing);
+        assert_eq!(cfg.max_fps, 10);
+
+        let cfg = config_from_upgrade(&upgrade("/?maxFps=5"));
+        assert!(!cfg.ack_pacing);
+        assert_eq!(cfg.max_fps, 5);
+    }
+
+    #[test]
+    fn test_config_from_upgrade_defaults_when_absent_or_unparsable() {
+        for target in [
+            "/",
+            "/?",
+            "/?pacing=turbo",
+            "/?maxFps=fast",
+            "/?maxFps=-1",
+            "/?other=1",
+        ] {
+            assert_eq!(
+                config_from_upgrade(&upgrade(target)),
+                ClientConfig::default(),
+                "target {} should leave the defaults alone",
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_from_upgrade_clamps_max_fps() {
+        assert_eq!(
+            config_from_upgrade(&upgrade("/?maxFps=100000")).max_fps,
+            MAX_CONFIGURABLE_FPS
+        );
+        // Wider than u32: must clamp rather than wrap or fall back to the default.
+        assert_eq!(
+            config_from_upgrade(&upgrade("/?maxFps=4294967297")).max_fps,
+            MAX_CONFIGURABLE_FPS
+        );
+    }
+
+    #[test]
+    fn test_parse_ack_seq() {
+        assert_eq!(parse_ack_seq(&json!({"type": "ack", "seq": 42})), Some(42));
+        assert_eq!(parse_ack_seq(&json!({"type": "ack"})), None);
+        assert_eq!(parse_ack_seq(&json!({"type": "ack", "seq": -1})), None);
+        assert_eq!(parse_ack_seq(&json!({"type": "ack", "seq": "42"})), None);
+    }
+
+    async fn silent_ws_server() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (_tx, mut rx) = ws.split();
+            while let Some(Ok(Message::Text(text))) = rx.next().await {
+                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    recorded.lock().await.push(v);
+                }
+            }
+        });
+        (url, seen)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_input_dispatch_does_not_wait_for_a_cdp_reply() {
+        let (url, seen) = silent_ws_server().await;
+        let client = CdpClient::connect(&url).await.expect("mock cdp connect");
+        let client = Arc::new(client);
+        let (reply_tx, _reply_rx) = mpsc::channel(4);
+        let mouse = |event| json!({ "eventType": event, "x": 1, "y": 1 });
+        let dispatched = tokio::time::timeout(Duration::from_secs(5), async {
+            dispatch_input(
+                "input_mouse",
+                &mouse("mouseMoved"),
+                &client,
+                None,
+                &reply_tx,
+            )
+            .await;
+            dispatch_input(
+                "input_mouse",
+                &mouse("mousePressed"),
+                &client,
+                None,
+                &reply_tx,
+            )
+            .await;
+            let key = json!({ "eventType": "keyDown", "key": "a", "text": "a" });
+            dispatch_input("input_keyboard", &key, &client, None, &reply_tx).await;
+        })
+        .await;
+        assert!(
+            dispatched.is_ok(),
+            "dispatch blocked on a CDP reply that never comes"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while seen.lock().await.len() < 3 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let sent = seen.lock().await;
+        let methods: Vec<_> = sent.iter().filter_map(|m| m["method"].as_str()).collect();
+        assert_eq!(
+            methods,
+            [
+                "Input.dispatchMouseEvent",
+                "Input.dispatchMouseEvent",
+                "Input.dispatchKeyEvent"
+            ]
+        );
+        assert_eq!(client.pending_len().await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_firefox_input_dispatch_does_not_wait_for_bidi_reply_or_block_ack() {
+        let (bidi_url, seen) = silent_ws_server().await;
+        let bidi = Arc::new(
+            crate::native::bidi::client::BidiClient::connect(&bidi_url)
+                .await
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream_url = format!("ws://{}", listener.local_addr().unwrap());
+        let (ack, mut ack_rx) = watch::channel(0);
+        let (config, _) = watch::channel(ClientConfig::default());
+        let firefox_live = Arc::new(RwLock::new(Some(FirefoxLive {
+            bidi,
+            context: "ctx".to_string(),
+            contexts: Default::default(),
+            modifiers: Default::default(),
+        })));
+        let reader_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (_, ws_rx) = ws.split();
+            let (reply_tx, _reply_rx) = mpsc::channel(4);
+            reader_loop(
+                ws_rx,
+                Arc::new(RwLock::new(None)),
+                firefox_live,
+                Arc::new(RwLock::new(None)),
+                config,
+                ack,
+                reply_tx,
+                Arc::new(IdleActivity::new()),
+            )
+            .await;
+        });
+        let (mut client, _) = tokio_tungstenite::connect_async(&stream_url).await.unwrap();
+
+        for message in [
+            json!({"type": "input_mouse", "eventType": "mouseMoved", "x": 1, "y": 1}),
+            json!({"type": "input_mouse", "eventType": "mousePressed", "x": 1, "y": 1}),
+            json!({"type": "input_keyboard", "eventType": "keyDown", "key": "a"}),
+            json!({"type": "ack", "seq": 42}),
+        ] {
+            client
+                .send(Message::Text(message.to_string()))
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while *ack_rx.borrow_and_update() < 42 {
+                    ack_rx.changed().await.unwrap();
+                }
+            })
+            .await
+            .is_ok(),
+            "reader blocked on a BiDi reply before processing the ack"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if seen.lock().await.len() == 3 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok(),
+            "input commands did not reach BiDi"
+        );
+
+        let commands = seen.lock().await;
+        assert!(commands
+            .iter()
+            .all(|command| command["method"] == "input.performActions"));
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| { command["params"]["actions"][0]["actions"][0]["type"].as_str() })
+                .collect::<Vec<_>>(),
+            vec![Some("pointerMove"), Some("pointerMove"), Some("keyDown")]
+        );
+        assert_eq!(
+            commands[1]["params"]["actions"][0]["actions"][1]["type"],
+            "pointerDown"
+        );
+
+        client.send(Message::Close(None)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reader_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_keyboard_params_omit_absent_strings_instead_of_sending_null() {
+        // The dashboard's keyUp shape carries no text at all.
+        let up = keyboard_params(&json!({
+            "eventType": "keyUp", "key": "a", "code": "KeyA", "windowsVirtualKeyCode": 65
+        }));
+        assert_eq!(up["type"], "keyUp");
+        assert_eq!(up["key"], "a");
+        assert!(
+            up.get("text").is_none(),
+            "absent text must be omitted: {}",
+            up
+        );
+
+        // The documented `char` shape carries only text.
+        let ch = keyboard_params(&json!({ "eventType": "char", "text": "z" }));
+        assert_eq!(ch["text"], "z");
+        assert!(ch.get("key").is_none() && ch.get("code").is_none());
+
+        // A non-string value is dropped rather than forwarded.
+        let bad = keyboard_params(&json!({ "eventType": "keyDown", "key": 5, "code": null }));
+        assert!(bad.get("key").is_none() && bad.get("code").is_none());
+
+        // Numeric fields keep defaults so CDP always receives them.
+        assert_eq!(bad["windowsVirtualKeyCode"], 0);
+        assert_eq!(bad["modifiers"], 0);
+        assert_eq!(keyboard_params(&json!({}))["type"], "keyDown");
+    }
+
+    #[test]
+    fn test_keyboard_params_forwards_allowlisted_commands() {
+        let params = keyboard_params(&json!({
+            "eventType": "rawKeyDown",
+            "key": "a",
+            "code": "KeyA",
+            "windowsVirtualKeyCode": 65,
+            "modifiers": 4,
+            "commands": ["selectAll"]
+        }));
+        assert_eq!(params["type"], "rawKeyDown");
+        assert_eq!(params.get("commands"), Some(&json!(["selectAll"])));
+    }
+
+    #[test]
+    fn test_keyboard_params_rejects_disallowed_and_malformed_commands() {
+        for bad in [
+            json!(["executeArbitrary"]),
+            json!(["Page.navigate"]),
+            json!([1]),
+            json!("selectAll"),
+            json!([["selectAll"]]),
+            json!([]),
+        ] {
+            let params = keyboard_params(&json!({
+                "eventType": "keyDown",
+                "key": "a",
+                "commands": bad
+            }));
+            assert!(
+                params.get("commands").is_none(),
+                "disallowed/malformed commands must be omitted: {bad} -> {params}"
+            );
+        }
+
+        // Mixed array keeps only allowlisted entries and caps length.
+        let mixed = keyboard_params(&json!({
+            "eventType": "keyDown",
+            "key": "a",
+            "commands": ["selectAll", "unknownCmd", "copy", "undo", "redo", "cut"]
+        }));
+        assert_eq!(
+            mixed.get("commands"),
+            Some(&json!(["selectAll", "copy", "undo"]))
+        );
+
+        // Commands are never forwarded on keyUp or char events.
+        for event_type in ["keyUp", "char"] {
+            let params = keyboard_params(&json!({
+                "eventType": event_type,
+                "key": "a",
+                "commands": ["selectAll"]
+            }));
+            assert!(params.get("commands").is_none());
+        }
+    }
+
+    #[test]
+    fn test_keyboard_params_resolves_vk_code_and_validates_event_type() {
+        // Missing VK code falls back to interaction::named_key_info via code/key.
+        let from_code = keyboard_params(&json!({
+            "eventType": "rawKeyDown",
+            "key": "c",
+            "code": "KeyC",
+            "modifiers": 2
+        }));
+        assert_eq!(from_code["windowsVirtualKeyCode"], 67);
+
+        let from_key = keyboard_params(&json!({
+            "eventType": "keyDown",
+            "key": "ArrowLeft",
+            "modifiers": 4
+        }));
+        assert_eq!(from_key["windowsVirtualKeyCode"], 37);
+
+        // Unknown eventType defaults to keyDown and modifiers are masked to 4 bits.
+        let invalid = keyboard_params(&json!({
+            "eventType": "bogus",
+            "key": "a",
+            "modifiers": 0xFF
+        }));
+        assert_eq!(invalid["type"], "keyDown");
+        assert_eq!(invalid["modifiers"], 0x0F);
+
+        // AltGr sends Ctrl+Alt (modifiers=3) with printable text; strip Ctrl|Alt
+        // so Chrome does not ignore `text` on keyDown.
+        let altgr = keyboard_params(&json!({
+            "eventType": "keyDown",
+            "key": "@",
+            "code": "KeyQ",
+            "text": "@",
+            "windowsVirtualKeyCode": 81,
+            "modifiers": 3
+        }));
+        assert_eq!(altgr["text"], "@");
+        assert_eq!(altgr["modifiers"], 0);
+    }
+
+    #[test]
+    fn test_validated_insert_text_bounds() {
+        assert_eq!(
+            validated_insert_text(&json!({ "text": "hello world" })),
+            Some("hello world")
+        );
+        assert_eq!(validated_insert_text(&json!({ "text": "" })), None);
+        assert_eq!(validated_insert_text(&json!({ "text": 42 })), None);
+        assert_eq!(validated_insert_text(&json!({})), None);
+
+        let oversized = "x".repeat(MAX_INSERT_TEXT_BYTES + 1);
+        assert_eq!(validated_insert_text(&json!({ "text": oversized })), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cut_completes_before_following_input_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("ws://{addr}");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = seen.clone();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+            while let Some(Ok(Message::Text(text))) = rx.next().await {
+                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    let method = v
+                        .get("method")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let key = v
+                        .pointer("/params/key")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("");
+                    let label = if key.is_empty() {
+                        method.clone()
+                    } else {
+                        format!("{method}:{key}")
+                    };
+                    recorded.lock().await.push(label);
+                    if method == "Runtime.evaluate" {
+                        if let Some(id) = v.get("id").and_then(|i| i.as_i64()) {
+                            tokio::time::sleep(Duration::from_millis(40)).await;
+                            let reply = json!({
+                                "id": id,
+                                "result": {
+                                    "result": {
+                                        "type": "object",
+                                        "value": { "text": "cut-text", "editable": true }
+                                    }
+                                }
+                            });
+                            let _ = tx.send(Message::Text(reply.to_string())).await;
+                        }
+                    } else if method == "Input.dispatchKeyEvent" && key == "Backspace" {
+                        if let Some(id) = v.get("id").and_then(|i| i.as_i64()) {
+                            let reply = json!({ "id": id, "result": {} });
+                            let _ = tx.send(Message::Text(reply.to_string())).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        let client = Arc::new(CdpClient::connect(&url).await.expect("mock cdp connect"));
+        let (reply_tx, mut reply_rx) = mpsc::channel(4);
+
+        dispatch_input(
+            "input_read_clipboard",
+            &json!({ "cut": true, "modifiers": 4 }),
+            &client,
+            None,
+            &reply_tx,
+        )
+        .await;
+        dispatch_input(
+            "input_keyboard",
+            &json!({ "eventType": "rawKeyDown", "key": "Tab", "code": "Tab", "windowsVirtualKeyCode": 9 }),
+            &client,
+            None,
+            &reply_tx,
+        )
+        .await;
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), reply_rx.recv())
+            .await
+            .expect("clipboard reply should arrive")
+            .expect("reply channel open");
+        let parsed: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(parsed["text"], "cut-text");
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            *seen.lock().await,
+            vec![
+                "Runtime.evaluate",
+                "Input.dispatchKeyEvent:Backspace",
+                "Input.dispatchKeyEvent:Backspace",
+                "Input.dispatchKeyEvent:Tab"
+            ],
+            "cut must finish inline before any subsequent input event reaches CDP"
+        );
+    }
+
+    /// A cap bounds the gap between deliveries and never postpones the first.
+    #[test]
+    fn test_deadline_charges_only_real_deliveries() {
+        let now = Instant::now();
+        assert!(deadline_from(None, 1) <= Instant::now());
+        assert!(deadline_from(None, 0) <= Instant::now());
+        assert_eq!(deadline_from(Some(now), 0), now);
+        assert_eq!(
+            deadline_from(Some(now), 2),
+            now + Duration::from_millis(500)
+        );
+        assert_eq!(
+            deadline_from(Some(now), 10),
+            now + Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn mouse_event_params_validates_type_buttons_and_bounds() {
+        assert!(mouse_event_params(&json!({ "eventType": "bogus" })).is_none());
+
+        let drag = mouse_event_params(&json!({
+            "eventType": "mouseMoved",
+            "x": 120.5,
+            "y": 80.0,
+            "button": "left",
+            "buttons": 1,
+            "modifiers": 2,
+        }))
+        .unwrap();
+        assert_eq!(drag["type"], "mouseMoved");
+        assert_eq!(drag["button"], "left");
+        assert_eq!(drag["buttons"], 1);
+        assert_eq!(drag["modifiers"], 2);
+
+        let fallback_press = mouse_event_params(&json!({
+            "eventType": "mousePressed",
+            "button": "right",
+            "clickCount": 99,
+            "modifiers": 0xff,
+        }))
+        .unwrap();
+        assert_eq!(fallback_press["buttons"], 2);
+        assert_eq!(fallback_press["clickCount"], 3);
+        assert_eq!(fallback_press["modifiers"], 15);
+
+        let bad_button = mouse_event_params(&json!({
+            "eventType": "mouseMoved",
+            "button": "invalid",
+            "buttons": -5,
+        }))
+        .unwrap();
+        assert_eq!(bad_button["button"], "none");
+        assert_eq!(bad_button["buttons"], 0);
+    }
+}

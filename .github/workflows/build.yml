@@ -48,6 +48,8 @@ jobs:
 
   cli:
     runs-on: ubuntu-latest
+    env:
+      PLAYWRIGHT_SKIP_DRIVER_DOWNLOAD: "1"
     steps:
       - uses: actions/checkout@v4
 
