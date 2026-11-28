@@ -157,6 +157,63 @@ fn saved_names(dir: &Path) -> Vec<String> {
     names
 }
 
+/// The script's `args`: a string holding a JSON object or array becomes that value (a client
+/// that sent it as text); any other value as given.
+pub fn script_args(args: Option<Value>, notes: &mut Vec<String>) -> Value {
+    match args {
+        Some(Value::String(text)) => match serde_json::from_str::<Value>(text.trim()) {
+            Ok(v @ (Value::Object(_) | Value::Array(_))) => {
+                let kind = if v.is_object() { "object" } else { "array" };
+                notes.push(format!("coerced 'args' from string to {kind}"));
+                v
+            }
+            _ => Value::String(text),
+        },
+        Some(v) => v,
+        None => Value::Null,
+    }
+}
+
+/// Refuses a block whose wait is longer than the whole call: block waits count in seconds, so a
+/// millisecond value would outlast the run.
+#[allow(clippy::cast_precision_loss)]
+pub fn check_block_waits(
+    blocks: &[Value],
+    timeout: Duration,
+    param: &str,
+) -> Result<(), ToolError> {
+    let ms = timeout.as_millis();
+    for (i, block) in blocks.iter().enumerate() {
+        let kind = block
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let key = match kind {
+            "wait" => "seconds",
+            "waitLoad" | "waitFor" | "waitGone" | "waitText" | "waitUrl" => "timeout",
+            _ => continue,
+        };
+        // A `{{variable}}` is only known when the block runs.
+        let secs = match block.get("params").and_then(|p| p.get(key)) {
+            Some(Value::Number(n)) => n.as_f64(),
+            Some(Value::String(s)) => s.trim().parse::<f64>().ok(),
+            _ => None,
+        };
+        if let Some(secs) = secs
+            && secs * 1000.0 > ms as f64
+        {
+            return Err(ToolError::new(
+                Code::InvalidArguments,
+                format!(
+                    "blocks[{i}] ({kind}) {key} is {secs} s, longer than this call's timeout_ms ({ms} ms): block waits are in seconds, not milliseconds"
+                ),
+            )
+            .param(param));
+        }
+    }
+    Ok(())
+}
+
 fn millis(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -307,7 +364,7 @@ impl Hub {
                     format!("starting {}: {e}", node.display()),
                 )
             })?;
-        let input = json!({"code": code, "args": args.args.clone().unwrap_or(Value::Null)});
+        let input = json!({"code": code, "args": script_args(args.args.clone(), &mut call.notes)});
         if let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(input.to_string().as_bytes())
@@ -393,8 +450,14 @@ impl Hub {
             let project = self
                 .saved_project(call, wanted, args.profile_id.as_deref())
                 .await?;
+            let blocks = project
+                .get("blocks")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            check_block_waits(blocks, timeout, "project")?;
             (project, false)
         } else {
+            check_block_waits(args.blocks.as_deref().unwrap_or(&[]), timeout, "blocks")?;
             let blocks = prepare_blocks(
                 args.blocks.clone().unwrap_or_default(),
                 args.profile_id.as_deref(),

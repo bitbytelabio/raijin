@@ -29,6 +29,8 @@ fn reply(method: &str, path: &str) -> (u16, Value) {
         ("GET", "/fingerprint/new/Windows") => (200, json!({"fingerprint": {"k": "v"}})),
         ("POST", "/profiles") => (200, json!({"id": "p1", "name": "x"})),
         ("GET", "/profiles") => (200, json!([{"id": "p1", "name": "Shop Test"}])),
+        ("POST", "/profiles/p1/stop") => (200, json!({"stopped": true})),
+        ("GET", "/running") => (200, json!([])),
         _ => (404, json!({"error": "no such thing"})),
     }
 }
@@ -215,13 +217,33 @@ async fn browser_actions_reach_the_launcher() {
             .is_some_and(|e| e.contains("GET /profiles/zz → no such thing")),
         "{missing}"
     );
+
+    let stopped = call(
+        &client,
+        "browser",
+        json!({"do": "stop_profile", "id": "p1"}),
+    )
+    .await;
+    assert_ne!(stopped.is_error, Some(true), "{}", text(&stopped));
+    {
+        let seen = log.lock().expect("log").clone();
+        let last: Vec<(&str, &str)> = seen[seen.len() - 2..]
+            .iter()
+            .map(|s| (s.method.as_str(), s.path.as_str()))
+            .collect();
+        assert_eq!(
+            last,
+            [("POST", "/profiles/p1/stop"), ("GET", "/running")],
+            "stop_profile waits on the running list"
+        );
+    }
     client.cancel().await.expect("close");
 }
 
 #[tokio::test]
 async fn browser_refuses_what_it_cannot_run() {
     let fixture = common::target("");
-    let (port, _log) = launcher().await;
+    let (port, log) = launcher().await;
     let client = connect(&fixture, port).await;
 
     let typo = call(&client, "browser", json!({"do": "crate_profile"})).await;
@@ -262,6 +284,28 @@ async fn browser_refuses_what_it_cannot_run() {
         "burp_not_running",
         "{}",
         text(&burp)
+    );
+
+    let close = call(
+        &client,
+        "browser",
+        json!({"do": "page", "profile_id": "p1", "cmd": "close"}),
+    )
+    .await;
+    assert_eq!(close.is_error, Some(true), "{}", text(&close));
+    let typo = call(
+        &client,
+        "browser",
+        json!({"do": "page", "profile_id": "p1", "cmds": ["get url", "nonsense-cmd"]}),
+    )
+    .await;
+    assert_eq!(typo.is_error, Some(true), "{}", text(&typo));
+    assert_eq!(json_of(&typo)["step"], 2, "{}", text(&typo));
+    let seen = log.lock().expect("log").clone();
+    assert!(
+        seen.iter()
+            .all(|s| s.path != "/running" && !s.path.ends_with("/start")),
+        "a line that does not parse must not start the profile: {seen:?}"
     );
     client.cancel().await.expect("close");
 }

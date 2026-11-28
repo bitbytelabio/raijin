@@ -1222,7 +1222,7 @@ pub(crate) fn build_count_elements_js(selector: &str) -> String {
 /// sibling inside the same label).
 /// Returns a CSS-like description of the element blocking `(x, y)` for `el`, or `null` if clear.
 /// When `rejectInteractiveDescendant` is true, an interactive control strictly inside `el` also blocks.
-pub(crate) const BLOCKER_AT_JS: &str = r#"(doc, el, x, y, rejectInteractiveDescendant) => {
+pub const BLOCKER_AT_JS: &str = r#"(doc, el, x, y, rejectInteractiveDescendant) => {
     // Descend from the given document through same-origin iframes so a point
     // over a frame resolves to the element inside it, in that frame's space.
     let d = doc, lx = x, ly = y;
@@ -1449,7 +1449,7 @@ async fn resolve_by_selector(
     }
 }
 
-pub(crate) fn intercepted_error(target: &str, blocker: &str) -> String {
+pub fn intercepted_error(target: &str, blocker: &str) -> String {
     format!(
         "Element '{}' is covered by <{}> at its click point, so the input would land on that element instead. Dismiss or interact with the covering element first (it is often a dialog, banner, or sticky header).",
         target, blocker

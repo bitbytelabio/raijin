@@ -30,13 +30,15 @@ Commands:
 - get text|html|value|attr|count|box|url|title ...; is visible|enabled|checked <sel>
 - wait <sel> [--state visible|hidden] [--timeout <ms>] | wait <ms> | wait --url <glob> | wait --load <state> | wait --fn <js> | wait --download <abs path>
 - scroll down <px> | scrollintoview <sel>
-- screenshot [--full] [<sel>] <abs.png> (returns the path) | pdf <abs.pdf> | eval <js>
+- screenshot [--full] [<sel>] <abs.png> (returns the path) | pdf <abs.pdf> | eval <js> (everything after "eval " is the JavaScript, quotes included; one wholly quoted token is unquoted)
 - cookies [set <name> <value> --url <u>|clear] | storage local [get <k>|set <k> <v>|clear]
-- tab list|new [url]|<tN>|close [tN] | frame <name|url>|main | dialog accept [text]|dismiss
+- tab list|new [url]|<tN>|close [tN] | frame <css selector of the iframe element>|main (e.g. frame iframe[name=x]) | dialog accept [text]|dismiss (confirm and prompt; alert and beforeunload are accepted automatically)
 - set viewport <w> <h> | set headers <json> | set offline on|off
-- network requests [--filter <s>] [--clear] | network request <id> | network route <url> [--abort|--body <json>] [--resource-type <csv>] | network unroute [url] | network har start | network har stop <path>
+- network requests [--filter <s>] [--type <csv>] [--method <m>] [--status <code|4xx|400-499>] [--full] [--clear] | network request <id> | network route <url> [--abort|--body <json>] [--resource-type <csv>] | network unroute [url] | network har start | network har stop <path>
 - console | errors | mouse move <x> <y> | mouse down|up [button] | keyboard inserttext <text>
 - find text|role|label <value> <action> [text]
+
+Network capture runs from the moment raijin attaches to the profile. network requests prints one line per request (id method status type url), --full every field, --clear empties the log. Redirect hops share an id; network request <id> shows the last hop with its body.
 
 Selectors: CSS, xpath=..., or snapshot refs (@eN). text= and role= are not selectors here: use find text|role|label <value> <action>.
 Not available: connect, close, session, install, upgrade, dashboard, stream, batch, --stdin (start_profile / stop_profile manage the browser).
@@ -48,9 +50,9 @@ Kinds and params:
 - Profiles and proxies: profile.create|profile.temp (name, folder, platform, proxy, into); profile.use (id); profile.keep (folder); profile.delete (id); proxy.set|proxy.swap (proxy)
 - Variables: var.set (name, value); var.math (op, a, b, into); var.random (into, list, min, max)
 - http.request (url, method, into, headers, body, session, via, timeout)
-- Navigation: goto (url); reload; back; forward; waitLoad (timeout)
+- Navigation: goto (url; returns once the page has loaded); reload; back; forward; waitLoad (timeout in seconds, default 30: waits for the next load event, so use it only after a click or script that navigates, never right after goto; it returns at the timeout without failing)
 - Input: click|doubleClick|rightClick|hover (selector | x, y); drag|swipe (selector, to, dx, dy, holdMs, button); scroll (deltaY, deltaX, selector); type (selector, text); press (key, modifiers); clear (selector, count)
-- Waits: wait (seconds); waitFor (selector, timeout); waitGone (selector); waitText (selector, text); waitUrl (url)
+- Waits, all in seconds, not ms (a wait longer than the call's timeout_ms is refused): wait (seconds, default 1); waitFor (selector, timeout, default 15); waitGone (selector, timeout); waitText (selector, text, timeout); waitUrl (url, timeout)
 - Conditions: if.exists (selector); if.text (selector, op, text); if.url (op, text); if.value (a, op, b)
 - Reads: count (selector, into); readText (selector, into); readAttribute (selector, name, into)
 - screenshot (path); log (text); stop
@@ -163,7 +165,7 @@ pub const LEGACY: &[(&str, &str)] = &[
     ("browser_set_extra_headers", r#"page "set headers <json>""#),
     (
         "browser_dialog",
-        r#"page "dialog accept [text]" / "dialog dismiss" (an open dialog); a standing policy: script with page.on('dialog', ...)"#,
+        r#"page "dialog accept [text]" / "dialog dismiss" (an open dialog); a standing policy: script with page.on('dialog', ...) — alert and beforeunload are accepted automatically"#,
     ),
     (
         "browser_block_resources",
@@ -175,7 +177,7 @@ pub const LEGACY: &[(&str, &str)] = &[
     ),
     (
         "browser_frame_evaluate",
-        r#"page cmds ["frame <name|url>","eval <js>","frame main"]"#,
+        r#"page cmds ["frame iframe[name=x]","eval <js>","frame main"]"#,
     ),
     (
         "browser_get_texts",
@@ -192,7 +194,7 @@ pub const LEGACY: &[(&str, &str)] = &[
     ),
     (
         "browser_capture_start",
-        r#"page "network requests --clear" (or "network har start")"#,
+        r#"page "network requests --clear" (capture is always on; this empties the log) (or "network har start")"#,
     ),
     (
         "browser_capture_stop",

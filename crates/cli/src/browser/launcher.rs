@@ -252,6 +252,28 @@ impl Launcher {
         self.api(Method::GET, segments, &[], None).await
     }
 
+    /// Whether `profile_id` left the launcher's running list within `within` (polled every
+    /// 250 ms); `false` when the list cannot be read.
+    pub async fn wait_stopped(&self, profile_id: &str, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let Ok(running) = self.get(&["running"]).await else {
+                return false;
+            };
+            let listed = running.as_array().is_some_and(|all| {
+                all.iter()
+                    .any(|r| r.get("profile_id").and_then(Value::as_str) == Some(profile_id))
+            });
+            if !listed {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     /// Whether the API answers and takes the token; what it found, never an error. `/health` is
     /// open, so a refusal after it answered means a wrong token rather than nothing listening.
     pub async fn health(&self) -> Value {

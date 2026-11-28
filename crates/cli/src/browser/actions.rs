@@ -1,6 +1,8 @@
 //! Launcher actions: one `ShardBrowser` API call each (profiles, proxies, folders, extensions,
 //! bookmarks, tags, templates, trash, cookies, automation projects and modules).
 
+use std::time::Duration;
+
 use reqwest::Method;
 use rmcp::model::CallToolResult;
 use schemars::JsonSchema;
@@ -527,9 +529,15 @@ impl Hub {
                 .iter()
                 .map(|s| if *s == "{id}" { id.as_str() } else { s })
                 .collect();
-            return Ok(json_result(
-                &l.api(r.verb.method(), &path, &[], None).await?,
-            ));
+            let value = l.api(r.verb.method(), &path, &[], None).await?;
+            // The launcher answers before the browser has exited.
+            if name == "stop_profile" && !l.wait_stopped(&id, Duration::from_secs(15)).await {
+                call.notes.push(
+                    "the browser was not seen to exit within 15 s of stop_profile (still running, or the running list could not be read); check list_running before starting this profile again"
+                        .to_owned(),
+                );
+            }
+            return Ok(json_result(&value));
         }
         let value = match name {
             "health_check" => {

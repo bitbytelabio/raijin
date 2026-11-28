@@ -1,6 +1,7 @@
 //! Page sessions (one agent-browser `DaemonState` attached to each profile's browser) and the
 //! `page` action that runs agent-browser command lines on them.
 
+use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::{Call, Hub, error_with, text_result};
 use crate::mcp::error::{Code, ToolError};
@@ -55,6 +56,13 @@ pub struct PageArgs {
     pub continue_on_error: Option<bool>,
     /// Start the profile without a window when it is not running.
     pub headless: Option<bool>,
+}
+
+/// A page command line ready to run.
+struct Prepared {
+    cmd: Value,
+    /// `network requests --full`: keep every field.
+    full: bool,
 }
 
 /// First words agent-browser has that manage something raijin owns, with why they are refused.
@@ -172,6 +180,19 @@ impl Hub {
                 ),
             )
         })?;
+        // Without a stream server the engine turns capture on only at the first `network
+        // requests`; everything loaded before that would be lost.
+        let capture = ["network".to_owned(), "requests".to_owned()];
+        if let Err(e) = self.exec(&mut attached, &capture).await {
+            self.detach(&mut attached).await;
+            return Err(ToolError::new(
+                Code::ToolFailed,
+                format!(
+                    "agent-browser could not start network capture on profile {profile_id}: {}",
+                    e.error
+                ),
+            ));
+        }
         let fresh = Arc::new(Mutex::new(Session {
             state: *attached,
             pointer_on: None,
@@ -301,23 +322,43 @@ impl Hub {
                 .example(call.action.example()));
             }
         };
-        let session = self
-            .session(&args.profile_id, args.headless.unwrap_or(false))
-            .await?;
-        let mut session = session.lock().await;
+        // Every line is checked before the browser starts: a typo never starts a profile.
+        let prepared: Vec<Result<Prepared, ToolError>> = lines
+            .iter()
+            .map(|l| self.prepare_line(l, &mut call.notes))
+            .collect();
+        let headless = args.headless.unwrap_or(false);
         if !many {
-            let data = self
-                .page_line(&mut session.state, &lines[0], &mut call.notes)
-                .await?;
+            let p = prepared.into_iter().next().expect("one line")?;
+            let session = self.session(&args.profile_id, headless).await?;
+            let mut session = session.lock().await;
+            let data = run_line(&mut session.state, &p).await?;
             return Ok(text_result(shape(&data)));
         }
         let bail = !args.continue_on_error.unwrap_or(false);
+        if bail && let Some((i, Err(e))) = prepared.iter().enumerate().find(|(_, p)| p.is_err()) {
+            return Ok(error_with(e, json!({"step": i + 1, "done": ""})));
+        }
+        // Opened at the first runnable line: lines that all failed to parse start nothing.
+        let mut session: Option<OwnedMutexGuard<Session>> = None;
         let mut done: Vec<String> = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            let shown = match self
-                .page_line(&mut session.state, line, &mut call.notes)
-                .await
-            {
+        for (i, (line, p)) in lines.iter().zip(&prepared).enumerate() {
+            let ran = match p {
+                Ok(p) => {
+                    let s = match &mut session {
+                        Some(s) => s,
+                        None => session.insert(
+                            self.session(&args.profile_id, headless)
+                                .await?
+                                .lock_owned()
+                                .await,
+                        ),
+                    };
+                    run_line(&mut s.state, p).await
+                }
+                Err(e) => Err(e.clone()),
+            };
+            let shown = match ran {
                 Ok(data) => shape(&data),
                 Err(e) if bail => {
                     return Ok(error_with(
@@ -334,13 +375,9 @@ impl Hub {
         )]))
     }
 
-    /// One command line: split, checked against what raijin manages itself, parsed and run.
-    async fn page_line(
-        &self,
-        state: &mut DaemonState,
-        line: &str,
-        notes: &mut Vec<String>,
-    ) -> Result<Value, ToolError> {
+    /// One command line, split, checked against what raijin manages itself and parsed; nothing
+    /// runs yet.
+    fn prepare_line(&self, line: &str, notes: &mut Vec<String>) -> Result<Prepared, ToolError> {
         let mut argv = shell_words_split(line);
         if argv.first().is_some_and(|w| w == "agent-browser") {
             argv.remove(0);
@@ -364,6 +401,15 @@ impl Hub {
                 ToolError::new(Code::InvalidArguments, format!("'{first}': {why}")).param("cmd"),
             );
         }
+        // Shell splitting eats the quotes of the JavaScript; the line after `eval` is the script.
+        if first == "eval"
+            && !argv
+                .get(1)
+                .is_some_and(|w| matches!(w.as_str(), "-b" | "--base64" | "--stdin"))
+            && let Some(js) = eval_script(line)
+        {
+            argv = vec!["eval".to_owned(), "-b".to_owned(), STANDARD.encode(js)];
+        }
         // agent-browser would read it from this server's stdin, which carries the MCP stream.
         if argv.iter().any(|w| w == "--stdin") {
             return Err(ToolError::new(
@@ -371,6 +417,13 @@ impl Hub {
                 "--stdin is not available inside raijin: put the script inline, or base64 it with -b",
             )
             .param("cmd"));
+        }
+        // raijin's own flag: the engine does not know it.
+        let mut full = false;
+        if argv.len() >= 2 && argv[0].eq_ignore_ascii_case("network") && argv[1] == "requests" {
+            let before = argv.len();
+            argv.retain(|w| w != "--full");
+            full = argv.len() != before;
         }
         let cmd = parse_command(&argv, self.flags()?)
             .map_err(|e| ToolError::new(Code::InvalidArguments, e.format()).param("cmd"))?;
@@ -387,6 +440,108 @@ impl Hub {
             )
             .param("cmd"));
         }
-        run_parsed(state, &cmd).await
+        Ok(Prepared { cmd, full })
     }
+}
+
+/// Runs a prepared line; `network requests` comes back one line per request unless `--full`.
+async fn run_line(state: &mut DaemonState, p: &Prepared) -> Result<Value, ToolError> {
+    let data = run_parsed(state, &p.cmd).await?;
+    if p.cmd.get("action").and_then(Value::as_str) == Some("requests") && !p.full {
+        return Ok(summarize_requests(data));
+    }
+    Ok(data)
+}
+
+/// The JavaScript of an `eval` line as written: everything after the word `eval`, with one wholly
+/// quoted token unquoted. `None` when the line is not `eval` or has no script.
+pub fn eval_script(line: &str) -> Option<String> {
+    /// `s` without its leading `word` (any case) when the word stands alone.
+    fn strip_word<'a>(s: &'a str, word: &str) -> Option<&'a str> {
+        let head = s.get(..word.len())?;
+        let rest = &s[word.len()..];
+        (head.eq_ignore_ascii_case(word) && rest.chars().next().is_none_or(char::is_whitespace))
+            .then(|| rest.trim_start())
+    }
+    let line = line.trim_start();
+    let line = strip_word(line, "agent-browser").unwrap_or(line);
+    let rest = strip_word(line, "eval")?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut chars = rest.char_indices();
+    let (_, q) = chars.next()?;
+    if q == '"' || q == '\'' {
+        let mut escaped = false;
+        let mut close = None;
+        for (i, c) in chars {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && q == '"' {
+                escaped = true;
+            } else if c == q {
+                close = Some(i);
+                break;
+            }
+        }
+        if close == Some(rest.len() - 1) {
+            let inside = &rest[1..rest.len() - 1];
+            let js = if q == '"' {
+                unescape_double(inside)
+            } else {
+                inside.to_owned()
+            };
+            return (!js.is_empty()).then_some(js);
+        }
+    }
+    Some(rest.to_owned())
+}
+
+/// The inside of a double-quoted token: `\"` and `\\` unescaped, every other backslash kept.
+fn unescape_double(inside: &str) -> String {
+    let mut out = String::with_capacity(inside.len());
+    let mut chars = inside.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(&next) = chars.peek()
+            && (next == '"' || next == '\\')
+        {
+            out.push(next);
+            chars.next();
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `network requests` data as one line per request; any other data (`--clear`) unchanged.
+pub fn summarize_requests(data: Value) -> Value {
+    let Some(requests) = data.get("requests").and_then(Value::as_array) else {
+        return data;
+    };
+    let n = requests.len();
+    if n == 0 {
+        return Value::String("0 requests".to_owned());
+    }
+    let s = if n == 1 { "" } else { "s" };
+    let mut out = format!(
+        "{n} request{s} (id method status type url); network request <id> shows one with headers and body, --full shows every field:"
+    );
+    for r in requests {
+        let field = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default();
+        let status = r
+            .get("status")
+            .filter(|v| !v.is_null())
+            .map_or_else(|| "-".to_owned(), Value::to_string);
+        let _ = write!(
+            out,
+            "\n{} {} {status} {} {}",
+            field("requestId"),
+            field("method"),
+            field("resourceType"),
+            field("url")
+        );
+    }
+    Value::String(out)
 }

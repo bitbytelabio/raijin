@@ -22,3 +22,5 @@ Changes from upstream:
 6. Cargo.toml: added `publish = false`, `autobins = false` and a `[lib]` section; removed
    `[dev-dependencies]`, every `[profile.*]` section and the crates.io metadata fields that
    point outside this directory.
+7. src/native/element.rs: `BLOCKER_AT_JS` and `intercepted_error` are `pub` instead of
+   `pub(crate)`, so raijin's Motion input refuses a covered target the way `click` does.

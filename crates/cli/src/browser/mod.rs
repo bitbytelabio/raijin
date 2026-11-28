@@ -646,7 +646,7 @@ const ACTIONS: &[Action] = &[
         TouchSwipeArgs,
         Write,
         r#"{"do":"browser.touch_swipe","profile_id":"p1","dy":-400}"#,
-        "Swipe a finger across the glass — the way a phone scrolls. Start at a selector or x+y (default: the middle of the viewport), then give either dx+dy or to_x+to_y. Phone profiles only.",
+        "Swipe a finger across the glass — the way a phone scrolls. Start at a selector or x+y (default: the middle of the viewport), then give either dx+dy or to_x+to_y. Phone profiles only. An end outside the viewport is kept at its edge (the result's note says so).",
     ),
     action!(
         "touch_drag",
@@ -654,7 +654,7 @@ const ACTIONS: &[Action] = &[
         TouchDragArgs,
         Write,
         r#"{"do":"browser.touch_drag","profile_id":"p1","selector":"@e3","to_selector":"@e7"}"#,
-        "Press, wait for the item to be picked up, carry it and set it down — a list reorder, a card moved between columns. Different from touch_swipe in the wait, which is what makes it a drag and not a scroll. Phone profiles only.",
+        "Press, wait for the item to be picked up, carry it and set it down — a list reorder, a card moved between columns. Different from touch_swipe in the wait, which is what makes it a drag and not a scroll. Phone profiles only. Give the end as to_selector, to_x+to_y, or dx+dy (an offset from the start); an end outside the viewport is kept at its edge.",
     ),
     action!(
         "touch_pinch",
@@ -1008,5 +1008,110 @@ mod tests {
         assert_eq!(blocks[1]["id"], "s1");
         let err = script::prepare_blocks(vec![json!({"params": {}})], None).expect_err("no kind");
         assert_eq!(err.code, Code::InvalidArguments);
+    }
+
+    #[test]
+    fn eval_lines_keep_their_javascript() {
+        let js = |line: &str| page::eval_script(line);
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(
+            js("eval localStorage.setItem('k','v')"),
+            some("localStorage.setItem('k','v')")
+        );
+        assert_eq!(js("eval 'abc'.length"), some("'abc'.length"));
+        assert_eq!(
+            js("eval document.querySelectorAll('p').length"),
+            some("document.querySelectorAll('p').length")
+        );
+        assert_eq!(js(r#"eval "document.title""#), some("document.title"));
+        assert_eq!(js(r#"eval "a"+"b""#), some(r#""a"+"b""#));
+        assert_eq!(js(r#"eval "say \"hi\"""#), some(r#"say "hi""#));
+        assert_eq!(js("agent-browser eval 1+1"), some("1+1"));
+        assert_eq!(js("EVAL 1"), some("1"));
+        assert_eq!(js("eval"), None);
+        assert_eq!(js("evaluate x"), None);
+    }
+
+    #[test]
+    fn network_requests_are_one_line_each() {
+        let data = json!({"requests": [
+            {"requestId": "1.1", "method": "GET", "status": 301, "resourceType": "Document", "url": "https://a/"},
+            {"requestId": "1.1", "method": "GET", "resourceType": "Fetch", "url": "https://a/x"},
+        ]});
+        let text = page::summarize_requests(data);
+        let lines: Vec<&str> = text.as_str().expect("text").lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[0].starts_with("2 requests "), "{}", lines[0]);
+        assert_eq!(lines[1], "1.1 GET 301 Document https://a/");
+        assert_eq!(lines[2], "1.1 GET - Fetch https://a/x");
+        assert_eq!(
+            page::summarize_requests(json!({"requests": []})),
+            json!("0 requests")
+        );
+        assert_eq!(
+            page::summarize_requests(json!({"cleared": true})),
+            json!({"cleared": true})
+        );
+    }
+
+    #[test]
+    fn swipe_ends_stay_in_the_viewport() {
+        assert_eq!(
+            motion::clamp_into(480.0, -227.0, (960.0, 345.0)),
+            (480.0, 0.0, true)
+        );
+        assert_eq!(
+            motion::clamp_into(2000.0, 400.0, (960.0, 345.0)),
+            (959.0, 344.0, true)
+        );
+        assert_eq!(
+            motion::clamp_into(10.0, 10.0, (960.0, 345.0)),
+            (10.0, 10.0, false)
+        );
+    }
+
+    #[test]
+    fn string_script_args_become_json() {
+        let mut notes = Vec::new();
+        let args = script::script_args(Some(json!("{\"hello\": \"world\"}")), &mut notes);
+        assert_eq!(args, json!({"hello": "world"}));
+        assert_eq!(notes, ["coerced 'args' from string to object"]);
+        let mut notes = Vec::new();
+        assert_eq!(
+            script::script_args(Some(json!("plain")), &mut notes),
+            json!("plain")
+        );
+        assert_eq!(
+            script::script_args(Some(json!("42")), &mut notes),
+            json!("42")
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(script::script_args(None, &mut notes), Value::Null);
+    }
+
+    #[test]
+    fn block_waits_longer_than_the_call_are_refused() {
+        let call = std::time::Duration::from_secs(120);
+        let goto = json!({"kind": "goto", "params": {"url": "u"}});
+        let err = script::check_block_waits(
+            &[
+                goto.clone(),
+                json!({"kind": "waitLoad", "params": {"timeout": 15000}}),
+            ],
+            call,
+            "blocks",
+        )
+        .expect_err("15000 s");
+        assert_eq!(err.code, Code::InvalidArguments);
+        assert!(
+            err.error
+                .starts_with("blocks[1] (waitLoad) timeout is 15000 s"),
+            "{}",
+            err.error
+        );
+        let fine = [goto, json!({"kind": "waitLoad", "params": {"timeout": 10}})];
+        assert!(script::check_block_waits(&fine, call, "blocks").is_ok());
+        let variable = [json!({"kind": "wait", "params": {"seconds": "{{x}}"}})];
+        assert!(script::check_block_waits(&variable, call, "blocks").is_ok());
     }
 }

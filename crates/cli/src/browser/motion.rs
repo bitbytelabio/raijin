@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use agent_browser::native::element::{BLOCKER_AT_JS, intercepted_error, resolve_element_object_id};
 use rmcp::model::CallToolResult;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -144,6 +145,9 @@ pub struct TouchDragArgs {
     pub to_selector: Option<String>,
     pub to_x: Option<f64>,
     pub to_y: Option<f64>,
+    /// Carry it this far from the start (CSS px) instead of to an absolute point.
+    pub dx: Option<f64>,
+    pub dy: Option<f64>,
     pub hold_ms: Option<f64>,
     pub headless: Option<bool>,
 }
@@ -223,6 +227,32 @@ fn px(v: f64) -> i64 {
 
 fn duration_ms(result: &Value) -> Value {
     result.get("durationMs").cloned().unwrap_or(json!(0))
+}
+
+/// The sum of several `duration_ms` values, a missing one counting as 0.
+#[allow(clippy::cast_possible_truncation)]
+fn total_ms(parts: &[&Value]) -> Value {
+    let sum: f64 = parts.iter().filter_map(|v| v.as_f64()).sum();
+    json!(sum.round() as i64)
+}
+
+/// `(x, y)` kept inside a `w`×`h` viewport, and whether it had to move.
+pub(super) fn clamp_into(x: f64, y: f64, (w, h): (f64, f64)) -> (f64, f64, bool) {
+    let cx = x.clamp(0.0, (w - 1.0).max(0.0));
+    let cy = y.clamp(0.0, (h - 1.0).max(0.0));
+    #[allow(clippy::float_cmp)]
+    let moved = cx != x || cy != y;
+    (cx, cy, moved)
+}
+
+fn off_screen(x: f64, y: f64, (w, h): (f64, f64)) -> String {
+    format!(
+        "the end point {},{} is outside the {}x{} viewport, so the finger stops at its edge",
+        px(x),
+        px(y),
+        px(w),
+        px(h)
+    )
 }
 
 fn in_range(param: &str, value: Option<u32>, max: u32) -> Result<(), ToolError> {
@@ -336,12 +366,17 @@ impl Hub {
             offset_y: a.offset_y,
         };
         let t = self.point_of(&mut s, aim).await?;
+        if let Some(sel) = a.selector.as_deref() {
+            self.ensure_hit(&s, sel, t).await?;
+        }
         let label = a.selector.clone().unwrap_or_else(|| t.at());
         if !self.is_touch(&mut s).await {
             let ms = self.glide(&mut s, t).await?;
             let tap = json!({"button": a.button.unwrap_or(Button::Left), "clickCount": a.click_count.unwrap_or(1)});
-            send(&s, "Motion.tap", tap).await?;
-            return Ok(json!({"clicked": label, "duration_ms": ms}));
+            let r = send(&s, "Motion.tap", tap).await?;
+            return Ok(
+                json!({"clicked": label, "duration_ms": total_ms(&[&ms, &duration_ms(&r)])}),
+            );
         }
         // The engine refuses a pointer on a handset: a finger instead, and a phone's context menu
         // is a long press.
@@ -375,6 +410,7 @@ impl Hub {
     async fn human_fill(&self, a: HumanFillArgs) -> Result<Value, ToolError> {
         let mut s = self.open(&a.profile_id, a.headless).await?;
         let t = self.point_of(&mut s, Aim::element(&a.selector)).await?;
+        self.ensure_hit(&s, &a.selector, t).await?;
         let clear = a.clear.unwrap_or(false);
         let moved = if self.is_touch(&mut s).await {
             let tap = json!({"x": t.x, "y": t.y, "targetWidth": t.width});
@@ -410,6 +446,9 @@ impl Hub {
             offset_y: a.offset_y,
         };
         let t = self.finger_point(&mut s, aim).await?;
+        if let Some(sel) = a.selector.as_deref() {
+            self.ensure_hit(&s, sel, t).await?;
+        }
         let mut params = json!({"x": t.x, "y": t.y, "tapCount": a.tap_count.unwrap_or(1)});
         if let Some(w) = t.width {
             params["targetWidth"] = json!(w);
@@ -429,6 +468,9 @@ impl Hub {
             offset_y: a.offset_y,
         };
         let t = self.finger_point(&mut s, aim).await?;
+        if let Some(sel) = a.selector.as_deref() {
+            self.ensure_hit(&s, sel, t).await?;
+        }
         let mut params = json!({"x": t.x, "y": t.y});
         if let Some(hold) = a.hold_ms {
             params["holdMs"] = json!(hold);
@@ -454,20 +496,43 @@ impl Hub {
                 "a swipe of nothing goes nowhere — give dx/dy or to_x/to_y",
             ));
         }
-        let mut params =
-            json!({"fromX": from.x, "fromY": from.y, "toX": px(to_x), "toY": px(to_y)});
+        let view = self.viewport(&mut s, (390.0, 844.0)).await;
+        let (cx, cy, clamped) = clamp_into(to_x, to_y, view);
+        if px(cx) == from.x && px(cy) == from.y {
+            return Err(ToolError::new(
+                Code::InvalidArguments,
+                "the swipe ends where it starts once kept inside the viewport: start further from that edge",
+            ));
+        }
+        let mut params = json!({"fromX": from.x, "fromY": from.y, "toX": px(cx), "toY": px(cy)});
         if let Some(flick) = a.flick {
             params["flick"] = json!(flick);
         }
         let r = send(&s, "Motion.touchSwipe", params).await?;
-        Ok(json!({
+        let mut out = json!({
             "from": from.at(),
-            "to": format!("{},{}", px(to_x), px(to_y)),
+            "to": format!("{},{}", px(cx), px(cy)),
             "duration_ms": duration_ms(&r),
-        }))
+        });
+        if clamped {
+            out["note"] = json!(off_screen(to_x, to_y, view));
+        }
+        Ok(out)
     }
 
     async fn touch_drag(&self, a: TouchDragArgs) -> Result<Value, ToolError> {
+        if a.to_selector.is_none()
+            && a.to_x.is_none()
+            && a.to_y.is_none()
+            && a.dx.is_none()
+            && a.dy.is_none()
+        {
+            return Err(ToolError::new(
+                Code::InvalidArguments,
+                "touch_drag needs where to set it down: to_selector, to_x+to_y, or dx/dy",
+            )
+            .param("to_selector"));
+        }
         let mut s = self.open(&a.profile_id, a.headless).await?;
         self.require_touch(&mut s, "touch_drag").await?;
         let from_aim = Aim {
@@ -475,21 +540,39 @@ impl Hub {
             ..Aim::point(a.x, a.y)
         };
         let from = self.finger_point(&mut s, from_aim).await?;
-        let to_aim = match &a.to_selector {
-            Some(sel) => Aim::element(sel),
-            None => Aim::point(a.to_x, a.to_y),
+        let mut note = None;
+        let to = if let Some(sel) = &a.to_selector {
+            self.finger_point(&mut s, Aim::element(sel)).await?
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let (from_x, from_y) = (from.x as f64, from.y as f64);
+            let x = a.to_x.unwrap_or(from_x + a.dx.unwrap_or(0.0));
+            let y = a.to_y.unwrap_or(from_y + a.dy.unwrap_or(0.0));
+            let view = self.viewport(&mut s, (390.0, 844.0)).await;
+            let (cx, cy, clamped) = clamp_into(x, y, view);
+            if clamped {
+                note = Some(off_screen(x, y, view));
+            }
+            Point {
+                x: px(cx),
+                y: px(cy),
+                width: None,
+            }
         };
-        let to = self.finger_point(&mut s, to_aim).await?;
         let mut params = json!({"fromX": from.x, "fromY": from.y, "toX": to.x, "toY": to.y});
         if let Some(hold) = a.hold_ms {
             params["holdMs"] = json!(hold);
         }
         let r = send(&s, "Motion.touchDrag", params).await?;
-        Ok(json!({
+        let mut out = json!({
             "from": a.selector.unwrap_or_else(|| from.at()),
             "to": a.to_selector.unwrap_or_else(|| to.at()),
             "duration_ms": duration_ms(&r),
-        }))
+        });
+        if let Some(note) = note {
+            out["note"] = json!(note);
+        }
+        Ok(out)
     }
 
     async fn touch_pinch(&self, a: TouchPinchArgs) -> Result<Value, ToolError> {
@@ -568,6 +651,12 @@ impl Hub {
         if self.is_touch(s).await {
             return Ok(());
         }
+        if what == "rotate_screen" {
+            return Err(ToolError::new(
+                Code::InvalidArguments,
+                "rotate_screen turns a handset and this profile is not a phone — start a phone profile",
+            ));
+        }
         Err(ToolError::new(
             Code::InvalidArguments,
             format!(
@@ -600,6 +689,57 @@ impl Hub {
         send(s, "Motion.createPointer", rest).await?;
         s.pointer_on = Some(sid);
         Ok(())
+    }
+
+    /// Fails when a click at `t` would land on something other than `selector` or inside it.
+    async fn ensure_hit(&self, s: &Session, selector: &str, t: Point) -> Result<(), ToolError> {
+        let browser = s
+            .state
+            .browser
+            .as_ref()
+            .ok_or_else(|| ToolError::new(Code::ToolFailed, "browser not attached"))?;
+        let sid = active_sid(s)?;
+        let (object_id, on) = resolve_element_object_id(
+            &browser.client,
+            &sid,
+            &s.state.ref_map,
+            selector,
+            &s.state.iframe_sessions,
+        )
+        .await
+        .map_err(|e| ToolError::new(Code::ToolFailed, e))?;
+        // An element in a cross-process frame has coordinates of its own: nothing to compare.
+        if on != sid {
+            return Ok(());
+        }
+        let check = json!({
+            "objectId": object_id,
+            "functionDeclaration": format!(
+                "function(x, y) {{ let doc = document; try {{ doc = window.top.document; }} catch (e) {{}} return ({BLOCKER_AT_JS})(doc, this, x, y); }}"
+            ),
+            "arguments": [{"value": t.x}, {"value": t.y}],
+            "returnByValue": true,
+        });
+        let r = browser
+            .client
+            .send_command("Runtime.callFunctionOn", Some(check), Some(&sid))
+            .await
+            .map_err(|e| ToolError::new(Code::ToolFailed, format!("Runtime.callFunctionOn: {e}")));
+        let _ = browser
+            .client
+            .send_command(
+                "Runtime.releaseObject",
+                Some(json!({"objectId": object_id})),
+                Some(&sid),
+            )
+            .await;
+        match r?.pointer("/result/value").and_then(Value::as_str) {
+            Some(blocker) => Err(ToolError::new(
+                Code::ToolFailed,
+                intercepted_error(selector, blocker),
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Moves the pointer onto `t`; the glide's duration.
